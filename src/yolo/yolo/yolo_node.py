@@ -15,12 +15,12 @@ from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String
 
 
-class CentralYoloNode(Node):
+class YoloNode(Node):
     def __init__(self):
-        super().__init__('central_yolo_node')
+        super().__init__('yolo_node')
 
-        self.declare_parameter('input_topic', '/camera/image_rect/compressed')
-        self.declare_parameter('input_is_compressed', True)
+        self.declare_parameter('input_topic', '/camera/image_rect')
+        self.declare_parameter('input_is_compressed', False)
         self.declare_parameter('annotated_topic', '/central/yolo/image_annotated')
         self.declare_parameter('detection_topic', '/central/yolo/detections')
         self.declare_parameter('weights_path', 'config/weights/best.pt')
@@ -176,7 +176,7 @@ class CentralYoloNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CentralYoloNode()
+    node = YoloNode()
 
     try:
         rclpy.spin(node)

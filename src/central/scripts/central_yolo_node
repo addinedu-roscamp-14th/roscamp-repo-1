@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-
-exec /home/jio/yolo_env/bin/python -m central.yolo_node "$@"
