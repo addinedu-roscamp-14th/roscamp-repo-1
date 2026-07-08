@@ -18,7 +18,7 @@ gst-launch-1.0 -v v4l2src device=/dev/video2 ! image/jpeg,width=640,height=480,f
 ros2 run udp udp_camera_node --ros-args \
   -p port:=5000 \
   -p bind_address:="127.0.0.1" \
-  -p camera_info_yaml:="config/calibration/camera_info.yaml"
+  -p camera_info_yaml:="config/main_camera/camera_info.yaml"
 ```
 
 ### 3. 이미지 보정 노드 실행
@@ -34,8 +34,8 @@ ros2 run image_proc rectify_node \
 
 ## 설정 파일 위치
 
-- 카메라 보정 파일: `config/calibration/camera_info.yaml`
-- 추가 보정 파일: `config/calibration/ost.yaml`
+- 카메라 보정 파일: `config/main_camera/camera_info.yaml`
+- 추가 보정 파일: `config/main_camera/ost.yaml`
 - YOLO 가중치 보관 폴더: `config/weights/`
 
 ## 참고
