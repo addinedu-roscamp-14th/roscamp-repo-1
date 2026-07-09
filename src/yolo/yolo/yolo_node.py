@@ -24,7 +24,7 @@ class YoloNode(Node):
         self.declare_parameter('annotated_topic', '/central/yolo/image_annotated')
         self.declare_parameter('detection_topic', '/central/yolo/detections')
         self.declare_parameter('weights_path', 'config/weights/best.pt')
-        self.declare_parameter('confidence_threshold', 0.25)
+        self.declare_parameter('confidence_threshold', 0.6)
         self.declare_parameter('device', '')
         self.declare_parameter('publish_annotated_image', True)
         self.declare_parameter('class_names', ['red', 'blue'])
@@ -81,8 +81,17 @@ class YoloNode(Node):
         if path.is_absolute():
             return path
 
-        workspace_root = Path(__file__).resolve().parents[3]
-        return workspace_root / path
+        candidates = [Path.cwd() / path]
+        module_path = Path(__file__).resolve()
+
+        for parent in module_path.parents:
+            candidates.append(parent / path)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        return candidates[0]
 
     def on_image(self, msg: Image):
         try:
@@ -142,6 +151,10 @@ class YoloNode(Node):
                 if masks is not None and masks.xy is not None and index < len(masks.xy):
                     polygon = masks.xy[index]
                     detection['mask_xy'] = [[round(float(x), 2), round(float(y), 2)] for x, y in polygon.tolist()]
+                    heading_deg = self.compute_heading_deg(polygon)
+                    if heading_deg is not None:
+                        detection['heading_deg'] = round(heading_deg, 2)
+                        self.draw_heading_label(annotated_frame, x1, y1, heading_deg)
 
                 if not self.expected_class_names or label in self.expected_class_names:
                     detections.append(detection)
@@ -172,6 +185,55 @@ class YoloNode(Node):
             annotated_msg.step = int(annotated_frame.shape[1] * annotated_frame.shape[2])
             annotated_msg.data = annotated_frame.tobytes()
             self.annotated_pub.publish(annotated_msg)
+
+    def compute_heading_deg(self, polygon):
+        if polygon is None or len(polygon) < 3:
+            return None
+
+        points = np.asarray(polygon, dtype=np.float32)
+        rect = cv2.minAreaRect(points)
+        (width, height) = rect[1]
+
+        if width <= 0.0 or height <= 0.0:
+            return None
+
+        angle = float(rect[2])
+        if width < height:
+            angle += 90.0
+
+        while angle >= 90.0:
+            angle -= 180.0
+        while angle < -90.0:
+            angle += 180.0
+
+        return angle
+
+    def draw_heading_label(self, image, x1, y1, heading_deg):
+        text = f'heading={heading_deg:.1f} deg'
+        origin_x = max(0, int(x1))
+        origin_y = max(18, int(y1) - 28)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.55
+        thickness = 2
+
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
+        top_left = (origin_x, max(0, origin_y - text_height - baseline - 4))
+        bottom_right = (
+            min(image.shape[1] - 1, origin_x + text_width + 8),
+            min(image.shape[0] - 1, origin_y + baseline + 4),
+        )
+
+        cv2.rectangle(image, top_left, bottom_right, (20, 20, 20), -1)
+        cv2.putText(
+            image,
+            text,
+            (origin_x + 4, origin_y),
+            font,
+            scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
 
 
 def main(args=None):
