@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+from pathlib import Path
 import yaml
 
 import gi
@@ -23,7 +24,7 @@ class UdpCameraBridge(Node):
         self.declare_parameter('camera_info_topic', '/camera/camera_info')
         self.declare_parameter('width', 640)
         self.declare_parameter('height', 480)
-        self.declare_parameter('camera_info_yaml', '/home/jio/camera_calib/camera_info.yaml')
+        self.declare_parameter('camera_info_yaml', 'config/main_camera/camera_info.yaml')
         self.declare_parameter('frame_id', 'camera_optical_frame')
 
         self.port = int(self.get_parameter('port').value)
@@ -33,7 +34,7 @@ class UdpCameraBridge(Node):
         self.camera_info_topic = str(self.get_parameter('camera_info_topic').value)
         self.width = int(self.get_parameter('width').value)
         self.height = int(self.get_parameter('height').value)
-        self.camera_info_yaml = str(self.get_parameter('camera_info_yaml').value)
+        self.camera_info_yaml = self.resolve_yaml_path(str(self.get_parameter('camera_info_yaml').value))
         self.frame_id = str(self.get_parameter('frame_id').value)
 
         self.image_pub = self.create_publisher(Image, self.image_topic, 10)
@@ -84,6 +85,22 @@ class UdpCameraBridge(Node):
             f'video/x-raw,format=RGB,width={self.width},height={self.height} ! '
             f'appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true'
         )
+
+    def resolve_yaml_path(self, yaml_path):
+        path = Path(yaml_path)
+        if path.is_absolute():
+            return path
+
+        candidates = [Path.cwd() / path]
+        module_path = Path(__file__).resolve()
+        for parent in module_path.parents:
+            candidates.append(parent / path)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        raise FileNotFoundError(f'Camera info yaml not found: {yaml_path}')
 
     def load_camera_info(self, yaml_path):
         if not os.path.exists(yaml_path):
