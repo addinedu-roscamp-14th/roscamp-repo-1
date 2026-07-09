@@ -9,7 +9,7 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name, ['package.xml', 'README.md']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -20,6 +20,11 @@ setup(
     extras_require={
         'test': [
             'pytest',
+        ],
+    },
+    entry_points={
+        'console_scripts': [
+            'camera_to_map_bridge = central.camera_to_map_bridge:main',
         ],
     },
 )
