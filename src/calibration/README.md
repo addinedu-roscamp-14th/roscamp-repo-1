@@ -13,7 +13,7 @@
 기본 입력:
 
 ```text
-/camera/image_rect
+/image_rect/compressed
 config/SLAM/current_map.yaml
 config/SLAM/current_map.pgm
 ```
@@ -56,11 +56,11 @@ source install/setup.bash
 ros2 run calibration direct_calibrator
 ```
 
-카메라 이미지 토픽은 왜곡 보정된 rectified 이미지인 `/camera/image_rect`를 사용해야 합니다. 다른 토픽을 임시로 쓰려면:
+카메라 이미지 토픽은 압축된 왜곡 보정 이미지인 `/image_rect/compressed`를 기본으로 사용합니다. 다른 토픽을 임시로 쓰려면:
 
 ```bash
 ros2 run calibration direct_calibrator --ros-args \
-  -p camera_topic:=/central/yolo/image_annotated
+  -p camera_topic:=/image_rect/compressed
 ```
 
 ## Click Workflow
@@ -192,7 +192,7 @@ source install/setup.bash
 
 ```bash
 ros2 topic list | grep image_rect
-ros2 topic hz /camera/image_rect
+ros2 topic hz /image_rect/compressed
 ```
 
-`/camera/image_rect`는 왜곡 보정된 이미지입니다. 이 토픽이 발행되지 않으면 `direct_calibrator`와 `calibration_verifier`의 카메라 창은 비어 있습니다.
+`/image_rect/compressed`는 압축된 왜곡 보정 이미지입니다. 이 토픽이 발행되지 않으면 `direct_calibrator`와 `calibration_verifier`의 카메라 창은 비어 있습니다.

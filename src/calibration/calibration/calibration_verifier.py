@@ -3,14 +3,13 @@
 from pathlib import Path
 
 import cv2
-from cv_bridge import CvBridge
 import numpy as np
 import yaml
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 
 
 class CalibrationVerifier(Node):
@@ -18,7 +17,7 @@ class CalibrationVerifier(Node):
         super().__init__('calibration_verifier')
 
         self.declare_parameter('calibration_yaml', 'config/central/camera_map_calibration.yaml')
-        self.declare_parameter('camera_topic', '/camera/image_rect')
+        self.declare_parameter('camera_topic', '/image_rect/compressed')
         self.declare_parameter('map_display_scale', 3.0)
         self.declare_parameter('camera_window_name', 'Verifier camera image')
         self.declare_parameter('map_window_name', 'Verifier projected PGM map')
@@ -29,7 +28,6 @@ class CalibrationVerifier(Node):
         self.camera_window_name = str(self.get_parameter('camera_window_name').value)
         self.map_window_name = str(self.get_parameter('map_window_name').value)
 
-        self.bridge = CvBridge()
         self.calibration = self.load_yaml(self.calibration_yaml_path)
         self.map_yaml_path = Path(self.calibration['map']['yaml'])
         self.map_image = self.load_map_image(self.map_yaml_path)
@@ -46,7 +44,7 @@ class CalibrationVerifier(Node):
         self.pending_camera_pixel = None
         self.validation_count = 0
 
-        self.create_subscription(Image, self.camera_topic, self.on_camera_image, 10)
+        self.create_subscription(CompressedImage, self.camera_topic, self.on_camera_image, 10)
         self.timer = self.create_timer(0.03, self.spin_windows)
         self.status_timer = self.create_timer(5.0, self.log_status)
 
@@ -110,7 +108,13 @@ class CalibrationVerifier(Node):
 
     def on_camera_image(self, msg):
         try:
-            self.latest_camera_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            buffer = np.frombuffer(msg.data, dtype=np.uint8)
+            frame = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+            if frame is None:
+                self.get_logger().warn('Failed to decode compressed camera image')
+                return
+
+            self.latest_camera_image = frame
         except Exception as exc:
             self.get_logger().warn(f'Failed to convert camera image: {exc}')
 
@@ -204,7 +208,7 @@ class CalibrationVerifier(Node):
         if self.latest_camera_image is None:
             self.get_logger().warn(
                 f'Waiting for camera frames on {self.camera_topic}. '
-                'Check: ros2 topic hz /camera/image_rect'
+                'Check: ros2 topic hz /image_rect/compressed'
             )
 
     def destroy_node(self):

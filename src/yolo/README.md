@@ -9,11 +9,10 @@ cd /home/jio/poter_ws
 source install/setup.bash
 
 ros2 run yolo yolo_node --ros-args \
-  -p input_is_compressed:=False \
-  -p input_topic:=/camera/image_rect \
-  -p weights_path:=config/weights/best.pt \
-  -p confidence_threshold:=0.6
+  -p weights_path:=config/weights/best.pt
 ```
+
+기본 입력 토픽은 압축된 왜곡 보정 이미지인 `/image_rect/compressed`입니다.
 
 
 시각화 토픽:

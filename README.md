@@ -25,7 +25,7 @@ poter_ws/
 
 | Package | 역할 | 주요 노드/상태 |
 | --- | --- | --- |
-| `udp` | UDP/GStreamer 방식 카메라 입력 fallback. 현재 기본 카메라 경로는 `v4l2_camera + image_transport compressed` 사용 | `udp_camera_node` |
+| `udp` | UDP/GStreamer 방식 카메라 입력 fallback. 로컬 기본 카메라 경로는 `v4l2_camera + image_proc` 사용 | `udp_camera_node` |
 | `yolo` | 카메라 이미지에서 객체/영역을 인식하고 annotated image와 detection JSON 발행 | `yolo_node` |
 | `calibration` | `/camera/image_rect` 픽셀 좌표와 SLAM `/map` 좌표를 homography로 캘리브레이션 | `direct_calibrator`, `calibration_verifier` |
 | `central` | 캘리브레이션 결과를 사용해 카메라 픽셀 좌표를 `/map` 기준 좌표로 변환하고 JSON/PoseStamped 발행 | `camera_to_map_bridge` |
@@ -37,10 +37,6 @@ poter_ws/
 ```text
 v4l2_camera
   → /camera/image_raw
-  → image_transport compressed
-  → /camera/image_raw/compressed
-  → image_transport raw relay
-  → /camera/image_raw_relay
   → image rectification
   → /camera/image_rect
   → yolo / calibration
@@ -51,12 +47,10 @@ v4l2_camera
 
 ## Camera Transport
 
-현재 카메라 입력은 UDP 대신 ROS2 compressed image 경로를 기본으로 사용합니다. raw 이미지를 그대로 네트워크로 보내면 프레임이 끊길 수 있으므로, `/camera/image_raw`를 compressed로 압축한 뒤 수신 쪽에서 다시 raw로 복원합니다.
+현재 로컬 카메라 입력은 UDP나 compressed relay 없이 `v4l2_camera`와 `image_proc`를 기본으로 사용합니다.
 
 ```text
 /camera/image_raw
-→ /camera/image_raw/compressed
-→ /camera/image_raw_relay
 → /camera/image_rect
 ```
 
@@ -66,7 +60,7 @@ v4l2_camera
 /camera/image_rect
 ```
 
-`udp` 패키지는 ROS compressed 경로가 불안정할 때 사용할 fallback입니다.
+`udp` 패키지는 다른 노트북으로 영상을 보내야 할 때 사용할 fallback입니다.
 
 ### Camera Commands
 
@@ -82,30 +76,12 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
   -r camera_info:=/camera/camera_info
 ```
 
-compressed 발행:
-
-```bash
-ros2 run image_transport republish raw compressed \
-  --ros-args \
-  -r in:=/camera/image_raw \
-  -r out:=/camera/image_raw
-```
-
-compressed를 raw relay로 복원:
-
-```bash
-ros2 run image_transport republish compressed raw \
-  --ros-args \
-  -r in:=/camera/image_raw \
-  -r out:=/camera/image_raw_relay
-```
-
 왜곡 보정 이미지 생성:
 
 ```bash
 ros2 run image_proc rectify_node \
   --ros-args \
-  -r image:=/camera/image_raw_relay \
+  -r image:=/camera/image_raw \
   -r camera_info:=/camera/camera_info \
   -r image_rect:=/camera/image_rect
 ```
@@ -114,8 +90,6 @@ ros2 run image_proc rectify_node \
 
 ```bash
 ros2 topic hz /camera/image_raw
-ros2 topic hz /camera/image_raw/compressed
-ros2 topic hz /camera/image_raw_relay
 ros2 topic hz /camera/image_rect
 ```
 

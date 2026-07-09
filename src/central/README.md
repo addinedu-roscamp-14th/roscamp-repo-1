@@ -2,7 +2,25 @@
 
 중앙 관제에서 카메라 픽셀 좌표를 SLAM `/map` 좌표로 변환하고, 차량/브릿지에 전달 가능한 형태로 발행하는 패키지입니다.
 
-현재 핵심 노드는 `camera_to_map_bridge`입니다.
+현재 핵심 노드는 `rqt_click_to_target`와 `camera_to_map_bridge`입니다.
+
+## `rqt_click_to_target`
+
+rqt image view에서 마우스로 클릭한 픽셀 좌표를 `/central/target_pixel`로 변환해 발행합니다.
+
+입력:
+
+```text
+/central/yolo/image_annotated_mouse_left
+geometry_msgs/Point
+```
+
+출력:
+
+```text
+/central/target_pixel
+geometry_msgs/PointStamped
+```
 
 ## `camera_to_map_bridge`
 
@@ -44,6 +62,36 @@ source install/setup.bash
 ```
 
 ## Run
+
+전체 실행 흐름:
+
+```text
+rqt click
+→ /central/yolo/image_annotated_mouse_left
+→ rqt_click_to_target
+→ /central/target_pixel
+→ camera_to_map_bridge
+→ /central/target_map_pose
+→ /central/target_map_json
+```
+
+### rqt 클릭 좌표 발행
+
+먼저 rqt image view에서 `/central/yolo/image_annotated`를 열고 마우스로 클릭합니다.
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+ros2 run central rqt_click_to_target
+```
+
+클릭 좌표 확인:
+
+```bash
+ros2 topic echo /central/target_pixel
+```
+
+### map 좌표 변환
 
 ```bash
 cd ~/poter_ws
@@ -155,6 +203,14 @@ target id 변경:
 ```bash
 ros2 run central camera_to_map_bridge --ros-args \
   -p target_id:=AGV_goal_1
+```
+
+rqt mouse 입력 토픽 변경:
+
+```bash
+ros2 run central rqt_click_to_target --ros-args \
+  -p mouse_topic:=/central/yolo/image_annotated_mouse_left \
+  -p target_pixel_topic:=/central/target_pixel
 ```
 
 ## Important Notes
