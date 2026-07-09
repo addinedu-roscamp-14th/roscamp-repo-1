@@ -26,6 +26,8 @@ setup(
         'console_scripts': [
             'direct_calibrator = calibration.direct_calibrator:main',
             'calibration_verifier = calibration.calibration_verifier:main',
+            'pgm_click_publisher = calibration.pgm_click_publisher:main',
+            'calibration_collector = calibration.calibration_collector:main',
         ],
     },
 )

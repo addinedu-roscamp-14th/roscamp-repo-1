@@ -3,60 +3,60 @@
 from pathlib import Path
 
 import cv2
-from cv_bridge import CvBridge
+from geometry_msgs.msg import PointStamped
 import numpy as np
 import yaml
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from sensor_msgs.msg import Image
 
 
-class DirectCalibrator(Node):
+class CalibrationCollector(Node):
     def __init__(self):
-        super().__init__('direct_calibrator')
+        super().__init__('calibration_collector')
 
         self.declare_parameter('map_yaml', 'config/SLAM/current_map.yaml')
-        self.declare_parameter('camera_topic', '/camera/image_rect')
+        self.declare_parameter('camera_click_topic', '/central/yolo/image_annotated_mouse_left')
+        self.declare_parameter('map_click_topic', '/central/calib/pgm_point')
         self.declare_parameter('output_yaml', 'config/central/camera_map_calibration.yaml')
-        self.declare_parameter('map_display_scale', 3.0)
-        self.declare_parameter('camera_window_name', 'Camera calibration image')
-        self.declare_parameter('map_window_name', 'PGM calibration map')
 
         self.map_yaml_path = self.resolve_path(str(self.get_parameter('map_yaml').value))
-        self.camera_topic = str(self.get_parameter('camera_topic').value)
+        self.camera_click_topic = str(self.get_parameter('camera_click_topic').value)
+        self.map_click_topic = str(self.get_parameter('map_click_topic').value)
         self.output_yaml_path = self.resolve_path(str(self.get_parameter('output_yaml').value))
-        self.map_display_scale = float(self.get_parameter('map_display_scale').value)
-        self.camera_window_name = str(self.get_parameter('camera_window_name').value)
-        self.map_window_name = str(self.get_parameter('map_window_name').value)
 
-        self.bridge = CvBridge()
         self.map_config = self.load_map_config(self.map_yaml_path)
-        self.map_image = self.load_map_image(self.map_yaml_path, self.map_config)
-        self.map_width, self.map_height = self.map_image.shape[1], self.map_image.shape[0]
-        self.map_display_image = self.build_display_image(self.map_image, self.map_display_scale)
+        self.map_width, self.map_height = self.load_map_size(self.map_yaml_path, self.map_config)
         self.resolution = float(self.map_config['resolution'])
         self.origin = [float(value) for value in self.map_config['origin']]
 
-        self.latest_camera_image = None
-        self.last_camera_frame_time = None
         self.pending_camera_pixel = None
         self.pending_pgm_pixel = None
         self.points = []
+        self.camera_click_topics = set()
+        self.auto_mouse_subscriptions = {}
 
-        self.create_subscription(Image, self.camera_topic, self.on_camera_image, 10)
-        self.timer = self.create_timer(0.03, self.spin_windows)
+        if self.camera_click_topic:
+            self.add_camera_click_subscription(self.camera_click_topic)
+        self.create_subscription(
+            PointStamped,
+            self.map_click_topic,
+            self.on_map_click,
+            10,
+        )
+        self.discovery_timer = self.create_timer(1.0, self.discover_mouse_topics)
         self.status_timer = self.create_timer(5.0, self.log_status)
 
-        cv2.namedWindow(self.camera_window_name, cv2.WINDOW_NORMAL)
-        cv2.namedWindow(self.map_window_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(self.camera_window_name, self.on_camera_mouse)
-        cv2.setMouseCallback(self.map_window_name, self.on_map_mouse)
-
-        self.get_logger().info(f'Subscribed camera image: {self.camera_topic}')
-        self.get_logger().info(f'Loaded map: {self.map_yaml_path} ({self.map_width}x{self.map_height})')
-        self.get_logger().info('Click matching points in the PGM and camera windows. Press q or ESC to quit.')
+        self.get_logger().info(
+            f'Listening camera clicks: {self.camera_click_topic} '
+            'and auto-discovered */mouse_left topics'
+        )
+        self.get_logger().info(f'Listening PGM map clicks: {self.map_click_topic}')
+        self.get_logger().info(
+            'Click one point in the PGM map image and the matching point in the camera image. '
+            'Order does not matter.'
+        )
 
     def resolve_path(self, configured_path):
         path = Path(configured_path)
@@ -80,7 +80,7 @@ class DirectCalibrator(Node):
         with open(map_yaml_path, 'r') as stream:
             return yaml.safe_load(stream)
 
-    def load_map_image(self, map_yaml_path, map_config):
+    def load_map_size(self, map_yaml_path, map_config):
         image_path = Path(map_config['image'])
         if not image_path.is_absolute():
             image_path = map_yaml_path.parent / image_path
@@ -89,63 +89,69 @@ class DirectCalibrator(Node):
         if image is None:
             raise FileNotFoundError(f'Map image not found or unreadable: {image_path}')
 
-        return image
+        height, width = image.shape[:2]
+        return width, height
 
-    def build_display_image(self, image, scale):
-        scale = max(scale, 1.0)
-        if scale == 1.0:
-            return image
-
-        return cv2.resize(
-            image,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_NEAREST,
-        )
-
-    def on_camera_image(self, msg):
-        try:
-            self.latest_camera_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            self.last_camera_frame_time = self.get_clock().now()
-        except Exception as exc:
-            self.get_logger().warn(f'Failed to convert camera image: {exc}')
-
-    def log_status(self):
-        if self.latest_camera_image is None:
-            self.get_logger().warn(
-                f'Waiting for camera frames on {self.camera_topic}. '
-                'Calibration must use the rectified camera image. '
-                'Start the image rectification node and check: ros2 topic list | grep image_rect'
-            )
-
-    def on_camera_mouse(self, event, x, y, flags, param):
-        if event != cv2.EVENT_LBUTTONDOWN:
+    def add_camera_click_subscription(self, topic_name):
+        if topic_name in self.camera_click_topics:
             return
 
-        self.pending_camera_pixel = [float(x), float(y)]
-        self.get_logger().info(f'Camera click: {self.pending_camera_pixel}')
+        subscription = self.create_subscription(
+            PointStamped,
+            topic_name,
+            lambda msg, source_topic=topic_name: self.on_camera_click(msg, source_topic),
+            10,
+        )
+        self.camera_click_topics.add(topic_name)
+        self.auto_mouse_subscriptions[topic_name] = subscription
+        self.get_logger().info(f'Camera click subscription active: {topic_name}')
+
+    def discover_mouse_topics(self):
+        for topic_name, topic_types in self.get_topic_names_and_types():
+            if not self.is_camera_mouse_topic(topic_name, topic_types):
+                continue
+            self.add_camera_click_subscription(topic_name)
+
+    def is_camera_mouse_topic(self, topic_name, topic_types):
+        if topic_name == self.map_click_topic:
+            return False
+        if 'mouse_left' not in topic_name:
+            return False
+        if 'geometry_msgs/msg/PointStamped' not in topic_types:
+            return False
+        return True
+
+    def on_camera_click(self, msg, source_topic=''):
+        self.pending_camera_pixel = self.point_to_pixel(msg)
+        suffix = f' from {source_topic}' if source_topic else ''
+        self.get_logger().info(f'Camera click{suffix}: {self.pending_camera_pixel}')
         self.try_add_pair()
 
-    def on_map_mouse(self, event, x, y, flags, param):
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-
-        scale = max(self.map_display_scale, 1.0)
-        self.pending_pgm_pixel = [float(x) / scale, float(y) / scale]
+    def on_map_click(self, msg):
+        self.pending_pgm_pixel = self.point_to_pixel(msg)
         self.get_logger().info(f'PGM click: {self.pending_pgm_pixel}')
         self.try_add_pair()
 
-    def spin_windows(self):
-        cv2.imshow(self.map_window_name, self.map_display_image)
+    def point_to_pixel(self, msg):
+        if hasattr(msg, 'point'):
+            point = msg.point
+        else:
+            point = msg
+        return [float(point.x), float(point.y)]
 
-        if self.latest_camera_image is not None:
-            cv2.imshow(self.camera_window_name, self.latest_camera_image)
+    def log_status(self):
+        pending = []
+        if self.pending_pgm_pixel is not None:
+            pending.append('PGM')
+        if self.pending_camera_pixel is not None:
+            pending.append('camera')
 
-        key = cv2.waitKey(1)
-        if key in (27, ord('q')):
-            self.get_logger().info('Closing direct calibrator')
-            rclpy.shutdown()
+        pending_text = ', '.join(pending) if pending else 'none'
+        self.get_logger().info(
+            f'Calibration status: pairs={len(self.points)}, pending={pending_text}, '
+            f'camera_topics={sorted(self.camera_click_topics)}, '
+            f'output={self.output_yaml_path}'
+        )
 
     def try_add_pair(self):
         if self.pending_camera_pixel is None or self.pending_pgm_pixel is None:
@@ -185,8 +191,8 @@ class DirectCalibrator(Node):
                 'pgm_to_map_formula': 'map_x=origin_x+pgm_x*resolution; map_y=origin_y+(height-pgm_y)*resolution',
             },
             'topics': {
-                'camera_image': self.camera_topic,
-                'input_mode': 'direct_opencv_clicks',
+                'camera_click': sorted(self.camera_click_topics),
+                'map_click': self.map_click_topic,
             },
             'points': self.points,
         }
@@ -245,15 +251,10 @@ class DirectCalibrator(Node):
             for row in matrix.tolist()
         ]
 
-    def destroy_node(self):
-        cv2.destroyWindow(self.camera_window_name)
-        cv2.destroyWindow(self.map_window_name)
-        super().destroy_node()
-
 
 def main(args=None):
     rclpy.init(args=args)
-    node = DirectCalibrator()
+    node = CalibrationCollector()
 
     try:
         rclpy.spin(node)
