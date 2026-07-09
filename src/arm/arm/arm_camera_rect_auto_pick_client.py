@@ -545,8 +545,24 @@ class ArmCameraRectAutoPickClient:
         print("[KEY] a=startup pose, t=save current as camera_ready, s=save scan, p=save place")
 
         # 시작할 때 카메라 기본 자세로 이동합니다.
-        if bool(self.cfg["startup_move_enabled"]):
-            self.go_camera_ready_pose()
+        if bool(self.cfg.get("startup_move_enabled", True)):
+
+            # 로봇팔 서버와 실제 로봇 통신이 준비될 때까지 기다립니다.
+            server_ready = self.wait_for_arm_server(
+                timeout_sec=30.0
+            )
+
+            # 서버 준비가 완료된 경우에만 초기 자세로 이동합니다.
+            if server_ready:
+                self.go_camera_ready_pose()
+
+            # 서버가 준비되지 않으면 오류를 출력합니다.
+            else:
+                print(
+                    "[STARTUP ERROR] "
+                    "robot_arm_server가 준비되지 않아 "
+                    "초기 자세 이동을 실행하지 못했습니다."
+                )
 
     # 카메라에서 현재 보이는 물체를 집기 준비 상태로 기억합니다.
     def remember_visible_object(self, detection):
@@ -4330,23 +4346,194 @@ class ArmCameraRectAutoPickClient:
 
 
 
+    # 로봇팔 서버와 실제 로봇 통신이 준비될 때까지 기다리는 함수입니다.
+    def wait_for_arm_server(self, timeout_sec=30.0):
+
+        # 대기 종료 시간을 계산합니다.
+        deadline = time.time() + float(timeout_sec)
+
+        # 시도 횟수입니다.
+        attempt = 0
+
+        # 제한 시간 동안 서버 상태를 반복 확인합니다.
+        while time.time() < deadline:
+
+            # 시도 횟수를 증가시킵니다.
+            attempt += 1
+
+            # 서버에 현재 관절 각도를 요청합니다.
+            response = self.arm.request({
+                "cmd": "get_angles"
+            })
+
+            # 응답에서 관절 각도를 가져옵니다.
+            angles = response.get(
+                "angles",
+                None
+            )
+
+            # 정상적인 관절값이 반환되면 서버와 로봇이 준비된 것입니다.
+            if (
+                isinstance(response, dict)
+                and response.get("ok", False)
+                and isinstance(angles, list)
+                and len(angles) >= 6
+            ):
+
+                # 준비 완료 로그를 출력합니다.
+                print(
+                    "[ARM SERVER READY] "
+                    f"attempt={attempt} | "
+                    f"angles="
+                    f"{[round(float(value), 2) for value in angles[:6]]}"
+                )
+
+                # 준비 완료를 반환합니다.
+                return True
+
+            # 아직 준비되지 않았음을 출력합니다.
+            print(
+                "[ARM SERVER WAIT] "
+                f"{attempt}회 | "
+                f"response={response}"
+            )
+
+            # 서버와 시리얼 초기화를 기다립니다.
+            time.sleep(0.5)
+
+        # 제한 시간 안에 준비되지 않았습니다.
+        print(
+            "[ARM SERVER TIMEOUT] "
+            f"{float(timeout_sec):.1f}초 동안 준비되지 않았습니다."
+        )
+
+        # 준비 실패를 반환합니다.
+        return False
+
+
     # 시작 기본 자세로 이동하는 함수입니다.
     def go_camera_ready_pose(self):
 
-        # 설정된 기본 관절 각도를 가져옵니다.
-        angles = self.cfg["camera_ready_angles"]
+        # 설정된 초기 관절 각도를 가져옵니다.
+        angles = self.cfg.get(
+            "camera_ready_angles",
+            None
+        )
 
-        # 이동 로그입니다.
-        print("[STARTUP] camera_ready_angles로 이동:", angles)
+        # 관절 각도 형식을 확인합니다.
+        if (
+            not isinstance(angles, list)
+            or len(angles) < 6
+        ):
 
-        # 로봇팔 서버에 관절 이동 명령을 보냅니다.
-        self.arm.send_angles(angles, int(self.cfg["angle_speed"]), wait=1.0)
+            # 설정 오류를 출력합니다.
+            print(
+                "[STARTUP ERROR] "
+                "camera_ready_angles 값 오류:",
+                angles
+            )
 
-        # 관절 이동 후 TCP 좌표 캐시를 초기화합니다.
-        self.arm.reset_tcp_cache()
+            # 초기 자세 이동 실패입니다.
+            return False
 
-        # 그리퍼를 열어둡니다.
-        self.arm.set_gripper_value(int(self.cfg["gripper_open"]), int(self.cfg["gripper_speed"]), wait=0.5)
+        # 이동할 6개 관절값을 실수형으로 변환합니다.
+        target_angles = [
+            float(value)
+            for value in angles[:6]
+        ]
+
+        # 초기 자세 이동 속도입니다.
+        angle_speed = int(
+            self.cfg.get(
+                "angle_speed",
+                35
+            )
+        )
+
+        # 초기 자세 이동 완료 대기 시간입니다.
+        startup_wait_sec = float(
+            self.cfg.get(
+                "startup_move_wait_sec",
+                3.0
+            )
+        )
+
+        # 초기 자세 이동 정보를 출력합니다.
+        print(
+            "[STARTUP] camera_ready_angles로 이동:",
+            target_angles,
+            "| speed=",
+            angle_speed
+        )
+
+        # 로봇팔 서버에 초기 자세 이동 명령을 보냅니다.
+        response = self.arm.send_angles(
+            target_angles,
+            angle_speed,
+            wait=startup_wait_sec
+        )
+
+        # 서버가 이동 명령을 거부한 경우입니다.
+        if (
+            not isinstance(response, dict)
+            or not response.get("ok", False)
+        ):
+
+            # 이동 실패 내용을 출력합니다.
+            print(
+                "[STARTUP ERROR] "
+                "초기 자세 이동 명령 실패:",
+                response
+            )
+
+            # 실패를 반환합니다.
+            return False
+
+        # 좌표 이동 캐시를 초기화합니다.
+        reset_response = self.arm.reset_tcp_cache()
+
+        # 그리퍼를 열린 상태로 만듭니다.
+        gripper_response = self.arm.set_gripper_value(
+            int(
+                self.cfg.get(
+                    "gripper_open",
+                    100
+                )
+            ),
+            int(
+                self.cfg.get(
+                    "gripper_speed",
+                    30
+                )
+            ),
+            wait=0.5
+        )
+
+        # 좌표 캐시 초기화 실패를 출력합니다.
+        if not reset_response.get("ok", False):
+            print(
+                "[STARTUP WARNING] "
+                "TCP 좌표 캐시 초기화 실패:",
+                reset_response
+            )
+
+        # 그리퍼 열기 실패를 출력합니다.
+        if not gripper_response.get("ok", False):
+            print(
+                "[STARTUP WARNING] "
+                "그리퍼 열기 실패:",
+                gripper_response
+            )
+
+        # 초기 자세 이동 완료를 출력합니다.
+        print(
+            "[STARTUP OK] "
+            "초기 카메라 자세 이동 명령 완료"
+        )
+
+        # 성공을 반환합니다.
+        return True
+
 
     # 현재 자세를 시작 카메라 자세로 저장하는 함수입니다.
     def save_current_as_camera_ready(self):
