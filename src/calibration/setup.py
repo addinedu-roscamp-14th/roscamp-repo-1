@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'central'
+package_name = 'calibration'
 
 setup(
     name=package_name,
@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='jio',
     maintainer_email='jio@todo.todo',
-    description='Central control package',
+    description='Camera to SLAM map calibration tools',
     license='TODO: License declaration',
     extras_require={
         'test': [
@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'camera_to_map_bridge = central.camera_to_map_bridge:main',
+            'direct_calibrator = calibration.direct_calibrator:main',
+            'calibration_verifier = calibration.calibration_verifier:main',
         ],
     },
 )

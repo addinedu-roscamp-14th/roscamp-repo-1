@@ -1,0 +1,102 @@
+map:
+  yaml: /home/jio/poter_ws/config/SLAM/current_map.yaml
+  width: 216
+  height: 124
+  resolution: 0.01
+  origin:
+  - -1.668
+  - 0.058
+  - 0.0
+  pgm_to_map_formula: map_x=origin_x+pgm_x*resolution; map_y=origin_y+(height-pgm_y)*resolution
+topics:
+  camera_image: /camera/image_rect
+  input_mode: direct_opencv_clicks
+points:
+- index: 1
+  camera_pixel:
+  - 160.0
+  - 355.0
+  pgm_pixel:
+  - 173.333
+  - 2.0
+  map_xy:
+  - 0.065333
+  - 1.278
+- index: 2
+  camera_pixel:
+  - 160.0
+  - 305.0
+  pgm_pixel:
+  - 174.333
+  - 22.0
+  map_xy:
+  - 0.075333
+  - 1.078
+- index: 3
+  camera_pixel:
+  - 584.0
+  - 365.0
+  pgm_pixel:
+  - 5.667
+  - 23.0
+  map_xy:
+  - -1.611333
+  - 1.068
+- index: 4
+  camera_pixel:
+  - 601.0
+  - 96.0
+  pgm_pixel:
+  - 16.667
+  - 118.667
+  map_xy:
+  - -1.501333
+  - 0.111333
+- index: 5
+  camera_pixel:
+  - 78.0
+  - 94.0
+  pgm_pixel:
+  - 213.0
+  - 96.667
+  map_xy:
+  - 0.462
+  - 0.331333
+- index: 6
+  camera_pixel:
+  - 83.0
+  - 304.0
+  pgm_pixel:
+  - 204.667
+  - 22.333
+  map_xy:
+  - 0.378667
+  - 1.074667
+homography:
+  camera_pixel_to_map_xy:
+  - - -0.0037915601
+    - -0.0003298765
+    - 0.7794096452
+  - - -0.0004219779
+    - 0.0034128684
+    - 0.0377223308
+  - - 6.68186e-05
+    - -0.0002030577
+    - 1.0
+  inlier_mask:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  reprojection_error_m:
+    mean: 0.012131
+    max: 0.028459
+    per_point:
+    - 0.019866
+    - 0.01228
+    - 0.006718
+    - 0.002283
+    - 0.00318
+    - 0.028459
