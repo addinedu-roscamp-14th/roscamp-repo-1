@@ -11,19 +11,15 @@ source install/setup.bash
 ros2 run yolo yolo_node --ros-args \
   -p input_is_compressed:=False \
   -p input_topic:=/camera/image_rect \
-  -p weights_path:=config/weights/best.pt
+  -p weights_path:=config/weights/best.pt \
+  -p confidence_threshold:=0.6
 ```
 
-압축 이미지를 직접 받을 경우:
-
-```bash
-ros2 run yolo yolo_node --ros-args \
-  -p input_is_compressed:=True \
-  -p input_topic:=/camera/image_rect/compressed \
-  -p weights_path:=config/weights/best.pt
-```
 
 시각화 토픽:
 
 - `/central/yolo/image_annotated`
-- `/central/yolo/detections`
+- `/central/yolo/detections`   
+
+세그멘테이션 mask가 있을 경우 annotated image에 heading 각도를 함께 표시하고,
+`/central/yolo/detections` JSON에는 `heading_deg`를 포함합니다.
