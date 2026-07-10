@@ -8,7 +8,7 @@
 아래 명령으로 카메라 영상을 UDP로 전송합니다.
 
 ```bash
-gst-launch-1.0 -v v4l2src device=/dev/video2 ! image/jpeg,width=640,height=480,framerate=30/1 ! jpegparse ! rtpjpegpay ! udpsink host=127.0.0.1 port=5000
+gst-launch-1.0 -v v4l2src device=/dev/video2 ! image/jpeg,width=640,height=480,framerate=30/1 ! jpegparse ! rtpjpegpay ! udpsink host=192.168.0.60 port=5000
 ```
 
 ### 2. UDP 수신 노드 실행
@@ -17,7 +17,7 @@ gst-launch-1.0 -v v4l2src device=/dev/video2 ! image/jpeg,width=640,height=480,f
 ```bash
 ros2 run udp udp_camera_node --ros-args \
   -p port:=5000 \
-  -p bind_address:="127.0.0.1" \
+  -p bind_address:="0.0.0.0" \
   -p camera_info_yaml:="config/main_camera/camera_info.yaml"
 ```
 

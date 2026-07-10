@@ -34,7 +34,12 @@ import rclpy
 from rclpy.node import Node
 
 # 카메라 영상용 QoS 설정입니다.
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    HistoryPolicy,
+    DurabilityPolicy,
+)
 
 # ROS 카메라 영상 메시지입니다.
 from sensor_msgs.msg import Image
@@ -101,9 +106,39 @@ DEFAULT_CONFIG = {
 
     "target_u": None,
     "target_v": None,
+    "direct_pick_target_u": None,
+    "direct_pick_target_v": None,
 
     "scan_coords": None,
-    "place_coords": None
+    "place_coords": None,
+
+    "pick_manual_calibration_release_servos": True,
+    "pick_manual_calibration_return_ready_after_save": True,
+    "pick_manual_calibration_open_gripper": True,
+    "direct_pick_require_fresh_detection": True,
+    "direct_pick_use_relative_manual_calibration": True,
+    "direct_pick_open_gripper_before_move": True,
+    "manual_gripper_wait_sec": 0.6,
+    "direct_pick_manual_calibration_model": "visual_delta",
+    "zero_focus_center_max_iter": 4,
+    "center_direction_sign": 1.0,
+    "zero_focus_center_direction_sign": 1.0,
+    "zero_focus_use_simple_centering": True,
+    "zero_focus_simple_x_from_image_y": 0.025,
+    "zero_focus_simple_y_from_image_x": 0.025,
+    "zero_focus_auto_direction_tune": True,
+    "zero_focus_probe_scale": 0.35,
+    "zero_focus_probe_max_mm": 2.5,
+    "zero_focus_use_live_jacobian": True,
+    "zero_focus_live_probe_mm": 8.0,
+    "zero_focus_live_gain": 0.95,
+    "zero_focus_live_max_step_mm": 28.0,
+    "zero_focus_probe_wait_sec": 0.35,
+    "zero_focus_probe_settle_sec": 0.12,
+    "zero_focus_accept_px": 35.0,
+    "zero_focus_save_max_error_px": 35.0,
+    "zero_focus_jacobian_cache_sec": 120.0,
+    "zero_focus_allow_fallback_centering": False
 }
 
 
@@ -411,6 +446,20 @@ class ArmClient:
             "cmd": "jog_stop"
         })
 
+    # 손으로 위치를 맞출 수 있게 서보 토크를 풉니다.
+    def release_all_servos(self):
+
+        return self.request({
+            "cmd": "release_all_servos"
+        })
+
+    # 손으로 맞춘 위치를 유지하도록 서보 토크를 다시 잡습니다.
+    def focus_all_servos(self):
+
+        return self.request({
+            "cmd": "focus_all_servos"
+        })
+
     # 그리퍼 제어 명령입니다.
     def set_gripper_value(self, value, speed, wait=0.5):
 
@@ -450,15 +499,64 @@ class ArmCameraRectAutoPickClient:
         # ROS Image를 OpenCV 영상으로 바꾸는 객체입니다.
         self.bridge = CvBridge()
 
-        # 가장 최근에 수신한 보정 영상을 저장합니다.
+        # 가장 최근 영상 하나만 저장합니다.
         self.latest_frame = None
+
+        # 영상 콜백과 화면 스레드 사이의 프레임 접근을 보호합니다.
+        self.camera_lock = threading.Lock()
+
+        # 카메라에서는 과거 프레임보다 최신 프레임이 중요합니다.
+        # 큐를 1장으로 제한해 오래된 프레임이 쌓이지 않게 합니다.
+        camera_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE
+        )
 
         # 보정된 로봇팔 카메라 영상을 구독합니다.
         self.image_sub = self.ros_node.create_subscription(
             Image,
             self.video_device,
             self.image_callback,
-            qos_profile_sensor_data
+            camera_qos
+        )
+
+        # ROS 영상 수신을 화면 처리와 별도 스레드에서 실행합니다.
+        self.ros_spin_running = True
+
+        self.ros_spin_thread = threading.Thread(
+            target=self.ros_spin_loop,
+            daemon=True
+        )
+
+        self.ros_spin_thread.start()
+
+        # 영상 검출 부하 조절 변수입니다.
+        self.vision_frame_count = 0
+        self.cached_detection = None
+        self.cached_edges = np.zeros(
+            (480, 640),
+            dtype=np.uint8
+        )
+
+        # 기본값 2이면 검출은 약 15FPS, 화면은 최신 프레임으로 갱신합니다.
+        self.vision_process_every_n_frames = max(
+            1,
+            int(
+                self.cfg.get(
+                    "vision_process_every_n_frames",
+                    2
+                )
+            )
+        )
+
+        # 디버그 에지 창은 기본적으로 끕니다.
+        self.show_edges = bool(
+            self.cfg.get(
+                "show_edges",
+                False
+            )
         )
 
         # 창 이름입니다.
@@ -483,8 +581,7 @@ class ArmCameraRectAutoPickClient:
         # 관절 제어 스레드를 시작합니다.
         self.joint_jog_worker.start()
 
-        # 메인 화면과 자동 집기 스레드가 카메라를 동시에 읽지 않도록 보호합니다.
-        self.camera_lock = threading.Lock()
+        # camera_lock은 영상 구독 생성 전에 이미 초기화했습니다.
 
         # 수동 이동 명령입니다.
         self.manual_cmd = None
@@ -535,6 +632,15 @@ class ArmCameraRectAutoPickClient:
         # 같은 물체에 대해 READY 로그가 반복되지 않게 합니다.
         self.object_ready_announced = False
 
+        # n 키로 시작한 직접 집기 수동 보정 상태입니다.
+        self.pick_manual_calibration_active = isinstance(
+            self.cfg.get(
+                "pending_direct_pick_manual_calibration",
+                None
+            ),
+            dict
+        )
+
         # 시작 로그입니다.
         print("[OK] arm_camera_rect_auto_pick_client started")
         print(f"[CAMERA] {self.video_device}")
@@ -543,6 +649,7 @@ class ArmCameraRectAutoPickClient:
         print("[KEY] i/k=z, j/l=y, u/m=x, q=center, w=pick+return home, e=place")
         print("[FLOW] 시작 자세 이동 -> 물체 인식 -> w 한 번 -> 집기 -> 시작 자세 복귀")
         print("[KEY] a=startup pose, t=save current as camera_ready, s=save scan, p=save place")
+        print("[KEY] n=start manual pick calibration, y=save manual pick pose")
 
         # 시작할 때 카메라 기본 자세로 이동합니다.
         if bool(self.cfg.get("startup_move_enabled", True)):
@@ -566,47 +673,90 @@ class ArmCameraRectAutoPickClient:
 
     # 카메라에서 현재 보이는 물체를 집기 준비 상태로 기억합니다.
     def remember_visible_object(self, detection):
-
-        # 물체가 보이지 않으면 기억 상태를 변경하지 않습니다.
-        if detection is None:
+        # 최초로 인식한 물체 좌표는 집기가 끝날 때까지 덮어쓰지 않습니다.
+        if not isinstance(detection, dict):
             return False
 
-        # 현재 인식 시간을 저장합니다.
-        self.last_recognized_time = time.time()
+        if (
+            bool(getattr(self, "object_ready", False))
+            and isinstance(
+                getattr(self, "last_recognized_detection", None),
+                dict
+            )
+        ):
+            return True
 
-        # 필요한 검출 정보만 복사해서 저장합니다.
+        center = detection.get("center", None)
+
+        if (
+            not isinstance(center, (list, tuple))
+            or len(center) < 2
+        ):
+            return False
+
+        recognition_coords = self.get_coords()
+
+        if (
+            not isinstance(recognition_coords, list)
+            or len(recognition_coords) < 6
+        ):
+            print("[FIRST TARGET LOCK ERROR] TCP 좌표 읽기 실패")
+            return False
+
+        frame_width = 640
+        frame_height = 480
+
+        with self.camera_lock:
+            if self.latest_frame is not None:
+                frame_height, frame_width = self.latest_frame.shape[:2]
+
+        locked_time = time.time()
+
+        self.last_recognized_time = locked_time
         self.last_recognized_detection = {
-            "center": tuple(detection.get("center", (0.0, 0.0))),
-            "confidence": float(detection.get("confidence", 0.0)),
+            "center": (
+                float(center[0]),
+                float(center[1])
+            ),
+            "confidence": float(
+                detection.get("confidence", 0.0)
+            ),
             "depth_mm": detection.get("depth_mm", None),
-            "px_per_mm": detection.get("px_per_mm", None)
+            "px_per_mm": detection.get("px_per_mm", None),
+            "long_px": detection.get("long_px", None),
+            "short_px": detection.get("short_px", None),
+            "frame_width": int(frame_width),
+            "frame_height": int(frame_height),
+            "tcp_coords_at_recognition": [
+                float(value)
+                for value in recognition_coords[:6]
+            ],
+            "recognized_at": locked_time,
         }
 
-        # 물체 집기 준비 상태로 변경합니다.
         self.object_ready = True
+        self.object_ready_announced = True
 
-        # 처음 READY 상태가 됐을 때만 로그를 출력합니다.
-        if not self.object_ready_announced:
+        confidence_percent = (
+            float(detection.get("confidence", 0.0)) * 100.0
+        )
 
-            # 검출 확률입니다.
-            confidence_percent = float(detection.get("confidence", 0.0)) * 100.0
+        print(
+            "[FIRST TARGET LOCK] "
+            f"pixel=({float(center[0]):.1f}, "
+            f"{float(center[1]):.1f}) | "
+            f"depth={detection.get('depth_mm', None)} | "
+            f"confidence={confidence_percent:.1f}%"
+        )
 
-            # 검출 중심입니다.
-            center_x, center_y = detection.get("center", (0.0, 0.0))
+        print(
+            "[FIRST TARGET LOCK] "
+            "이 좌표는 집기가 끝날 때까지 갱신하지 않습니다. "
+            "w 키를 누르면 자동 집기를 시작합니다."
+        )
 
-            # 물체 인식 완료 로그입니다.
-            print(
-                "[OBJECT READY] "
-                f"center=({center_x:.1f}, {center_y:.1f}) | "
-                f"confidence={confidence_percent:.1f}% | "
-                "w 키를 누르면 자동 집기 후 초기 자세로 복귀합니다."
-            )
-
-            # 중복 로그를 막습니다.
-            self.object_ready_announced = True
-
-        # 인식 성공입니다.
         return True
+
 
 
     # 그리퍼 상태를 바꾸지 않고 카메라 초기 자세로 복귀합니다.
@@ -631,7 +781,7 @@ class ArmCameraRectAutoPickClient:
         response = self.arm.send_angles(
             angles[:6],
             int(self.cfg.get("return_home_speed", self.cfg.get("angle_speed", 35))),
-            wait=float(self.cfg.get("return_home_wait_sec", 1.2))
+            wait=float(self.cfg.get("return_home_wait_sec", 0.8))
         )
 
         # 서버 응답이 올바른지 확인합니다.
@@ -647,6 +797,102 @@ class ArmCameraRectAutoPickClient:
         return True
 
 
+    # 그리퍼를 엽니다.
+    def open_gripper(self):
+
+        value = int(
+            self.cfg.get(
+                "gripper_open",
+                100
+            )
+        )
+        speed = int(
+            self.cfg.get(
+                "gripper_speed",
+                50
+            )
+        )
+        wait_sec = float(
+            self.cfg.get(
+                "manual_gripper_wait_sec",
+                0.6
+            )
+        )
+
+        print(f"[GRIPPER] open value={value} speed={speed}")
+        response = self.arm.set_gripper_value(
+            value,
+            speed,
+            wait=wait_sec
+        )
+
+        if (
+            not isinstance(response, dict)
+            or not response.get("ok", False)
+        ):
+            print("[GRIPPER ERROR] open failed:", response)
+            return False
+
+        self.cfg["last_gripper_command"] = {
+            "action": "open",
+            "value": value,
+            "speed": speed,
+            "timestamp": round(time.time(), 3)
+        }
+        save_config(self.cfg)
+
+        print("[GRIPPER] open complete")
+        return True
+
+
+    # 그리퍼를 닫습니다.
+    def close_gripper(self):
+
+        value = int(
+            self.cfg.get(
+                "gripper_close",
+                20
+            )
+        )
+        speed = int(
+            self.cfg.get(
+                "gripper_speed",
+                50
+            )
+        )
+        wait_sec = float(
+            self.cfg.get(
+                "manual_gripper_wait_sec",
+                0.6
+            )
+        )
+
+        print(f"[GRIPPER] close value={value} speed={speed}")
+        response = self.arm.set_gripper_value(
+            value,
+            speed,
+            wait=wait_sec
+        )
+
+        if (
+            not isinstance(response, dict)
+            or not response.get("ok", False)
+        ):
+            print("[GRIPPER ERROR] close failed:", response)
+            return False
+
+        self.cfg["last_gripper_command"] = {
+            "action": "close",
+            "value": value,
+            "speed": speed,
+            "timestamp": round(time.time(), 3)
+        }
+        save_config(self.cfg)
+
+        print("[GRIPPER] close complete")
+        return True
+
+
     # 기억된 물체를 자동으로 집고 초기 자세로 복귀하는 전체 동작입니다.
     # 카메라에서 인식한 물체의 근처까지 X/Y로 이동합니다.
     def coarse_approach_to_object(self):
@@ -655,7 +901,7 @@ class ArmCameraRectAutoPickClient:
         maximum_iterations = int(
             self.cfg.get(
                 "coarse_approach_max_iter",
-                4
+                10
             )
         )
 
@@ -663,7 +909,7 @@ class ArmCameraRectAutoPickClient:
         tolerance_px = float(
             self.cfg.get(
                 "coarse_approach_tolerance_px",
-                35.0
+                18.0
             )
         )
 
@@ -672,10 +918,38 @@ class ArmCameraRectAutoPickClient:
             float(
                 self.cfg.get(
                     "coarse_approach_max_step_mm",
-                    18.0
+                    24.0
                 )
             )
         )
+
+        # 보정 행렬이 있으면 픽셀 오차를 로봇 X/Y 이동량으로 직접 변환합니다.
+        use_pixel_jacobian = bool(
+            self.cfg.get(
+                "coarse_use_pixel_jacobian",
+                True
+            )
+        )
+
+        pixel_jacobian = None
+
+        if use_pixel_jacobian:
+            matrix_data = self.cfg.get(
+                "pixel_jacobian",
+                None
+            )
+
+            try:
+                pixel_jacobian = np.array(
+                    matrix_data,
+                    dtype=float
+                )
+
+                if pixel_jacobian.shape != (2, 2):
+                    pixel_jacobian = None
+
+            except Exception:
+                pixel_jacobian = None
 
         # 영상 세로 오차를 로봇 X축 이동으로 바꾸는 값입니다.
         x_from_image_y = float(
@@ -701,6 +975,8 @@ class ArmCameraRectAutoPickClient:
 
         # 가장 최근 중심 오차입니다.
         last_error_distance = None
+        previous_safe_coords = None
+        used_jacobian_fallback = False
 
         # 물체가 화면 중앙 근처로 올 때까지 반복합니다.
         for iteration in range(1, maximum_iterations + 1):
@@ -781,6 +1057,46 @@ class ArmCameraRectAutoPickClient:
                 last_error_distance is not None
                 and error_distance > last_error_distance * 1.35
             ):
+                if (
+                    isinstance(previous_safe_coords, list)
+                    and len(previous_safe_coords) >= 6
+                ):
+                    print(
+                        "[COARSE APPROACH ROLLBACK] "
+                        "오차 증가 전 좌표로 복귀"
+                    )
+                    self.send_coords(
+                        previous_safe_coords,
+                        "coarse_approach_rollback",
+                        wait=float(
+                            self.cfg.get(
+                                "coarse_approach_wait_sec",
+                                0.32
+                            )
+                        )
+                    )
+
+                if (
+                    pixel_jacobian is not None
+                    and not used_jacobian_fallback
+                ):
+                    print(
+                        "[COARSE APPROACH FALLBACK] "
+                        "보정 행렬 이동 방향이 맞지 않아 "
+                        "부호 기반 보정으로 전환합니다."
+                    )
+                    pixel_jacobian = None
+                    used_jacobian_fallback = True
+                    last_error_distance = None
+                    time.sleep(
+                        float(
+                            self.cfg.get(
+                                "coarse_approach_settle_sec",
+                                0.12
+                            )
+                        )
+                    )
+                    continue
 
                 print(
                     "[COARSE APPROACH STOP] "
@@ -794,11 +1110,36 @@ class ArmCameraRectAutoPickClient:
             # 현재 오차를 다음 반복 비교용으로 저장합니다.
             last_error_distance = error_distance
 
-            # 영상 세로 오차를 로봇 X축 이동량으로 변환합니다.
-            delta_x = error_v * x_from_image_y
+            if pixel_jacobian is not None:
+                try:
+                    pixel_error = np.array(
+                        [error_u, error_v],
+                        dtype=float
+                    )
+                    robot_delta = (
+                        -np.linalg.inv(pixel_jacobian)
+                        @ pixel_error
+                        * float(
+                            self.cfg.get(
+                                "coarse_approach_gain",
+                                0.85
+                            )
+                        )
+                    )
+                    delta_x = float(robot_delta[0])
+                    delta_y = float(robot_delta[1])
 
-            # 영상 가로 오차를 로봇 Y축 이동량으로 변환합니다.
-            delta_y = error_u * y_from_image_x
+                except np.linalg.LinAlgError:
+                    pixel_jacobian = None
+                    delta_x = error_v * x_from_image_y
+                    delta_y = error_u * y_from_image_x
+
+            else:
+                # 영상 세로 오차를 로봇 X축 이동량으로 변환합니다.
+                delta_x = error_v * x_from_image_y
+
+                # 영상 가로 오차를 로봇 Y축 이동량으로 변환합니다.
+                delta_y = error_u * y_from_image_x
 
             # 한 번에 이동할 최대 거리로 제한합니다.
             delta_x = max(
@@ -816,7 +1157,7 @@ class ArmCameraRectAutoPickClient:
                 float(
                     self.cfg.get(
                         "coarse_approach_min_step_mm",
-                        2.0
+                        1.0
                     )
                 )
             )
@@ -854,6 +1195,8 @@ class ArmCameraRectAutoPickClient:
                 )
                 return False
 
+            previous_safe_coords = coords[:6]
+
             # 현재 좌표를 복사합니다.
             target_coords = coords[:6]
 
@@ -875,7 +1218,7 @@ class ArmCameraRectAutoPickClient:
                 wait=float(
                     self.cfg.get(
                         "coarse_approach_wait_sec",
-                        0.55
+                        0.32
                     )
                 )
             )
@@ -893,7 +1236,7 @@ class ArmCameraRectAutoPickClient:
                 float(
                     self.cfg.get(
                         "coarse_approach_settle_sec",
-                        0.30
+                        0.12
                     )
                 )
             )
@@ -906,6 +1249,77 @@ class ArmCameraRectAutoPickClient:
         )
 
         return False
+
+
+    # 초기 카메라 접근 후 현재 보이는 컨테이너 좌표로 다시 잠급니다.
+    def relock_visible_object_after_approach(self):
+
+        frame = self.read_frame()
+
+        if frame is None:
+            print("[TARGET RELOCK ERROR] 카메라 영상 없음")
+            return False
+
+        detection, _ = self.detect_rectangle_object(frame)
+
+        if not isinstance(detection, dict):
+            print("[TARGET RELOCK ERROR] 현재 프레임에서 컨테이너 미검출")
+            return False
+
+        center = detection.get("center", None)
+
+        if (
+            not isinstance(center, (list, tuple))
+            or len(center) < 2
+        ):
+            print("[TARGET RELOCK ERROR] 중심 좌표 없음")
+            return False
+
+        recognition_coords = self.get_coords()
+
+        if (
+            not isinstance(recognition_coords, list)
+            or len(recognition_coords) < 6
+        ):
+            print("[TARGET RELOCK ERROR] TCP 좌표 읽기 실패")
+            return False
+
+        frame_height, frame_width = frame.shape[:2]
+        locked_time = time.time()
+
+        self.last_recognized_time = locked_time
+        self.last_recognized_detection = {
+            "center": (
+                float(center[0]),
+                float(center[1])
+            ),
+            "confidence": float(
+                detection.get("confidence", 0.0)
+            ),
+            "depth_mm": detection.get("depth_mm", None),
+            "px_per_mm": detection.get("px_per_mm", None),
+            "long_px": detection.get("long_px", None),
+            "short_px": detection.get("short_px", None),
+            "frame_width": int(frame_width),
+            "frame_height": int(frame_height),
+            "tcp_coords_at_recognition": [
+                float(value)
+                for value in recognition_coords[:6]
+            ],
+            "recognized_at": locked_time,
+        }
+        self.object_ready = True
+        self.object_ready_announced = True
+
+        print(
+            "[TARGET RELOCK OK] "
+            f"pixel=({float(center[0]):.1f}, "
+            f"{float(center[1]):.1f}) | "
+            f"depth={detection.get('depth_mm', None)} | "
+            f"tcp={[round(float(value), 2) for value in recognition_coords[:3]]}"
+        )
+
+        return True
 
 
     # 첫 프레임에서 저장한 물체 위치로 이동하고 자동 집기합니다.
@@ -969,33 +1383,6 @@ class ArmCameraRectAutoPickClient:
 
             return start_coords
 
-        # 현재 관절 각도를 읽습니다.
-        angles_response = self.arm.request(
-            {
-                "cmd": "get_angles"
-            }
-        )
-
-        # 관절값을 확인합니다.
-        current_angles = angles_response.get(
-            "angles",
-            None
-        )
-
-        # 관절값을 읽지 못하면 기존 하강만 사용합니다.
-        if (
-            not isinstance(current_angles, list)
-            or len(current_angles) < 6
-        ):
-
-            print(
-                "[JOINT2 ASSIST WARNING] "
-                "get_angles 실패, TCP Z 하강만 사용:",
-                angles_response
-            )
-
-            return start_coords
-
         # 관절 이동 속도입니다.
         joint_speed = int(
             self.cfg.get(
@@ -1012,36 +1399,43 @@ class ArmCameraRectAutoPickClient:
             )
         )
 
-        # 2번 관절의 안전 최소 각도입니다.
-        joint_min_deg = float(
-            self.cfg.get(
-                "joint2_assist_min_deg",
-                self.cfg.get(
-                    "joint2_min_deg",
-                    -90.0
-                )
-            )
+        candidate_joints = self.cfg.get(
+            "joint_assist_candidate_joints",
+            [2, 3, 4]
         )
 
-        # 2번 관절의 안전 최대 각도입니다.
-        joint_max_deg = float(
-            self.cfg.get(
-                "joint2_assist_max_deg",
-                self.cfg.get(
-                    "joint2_max_deg",
-                    90.0
-                )
-            )
+        if not isinstance(candidate_joints, list):
+            candidate_joints = [2, 3, 4]
+
+        candidate_joints = [
+            int(joint_id)
+            for joint_id in candidate_joints
+            if 1 <= int(joint_id) <= 6
+        ]
+
+        if not candidate_joints:
+            candidate_joints = [2, 3, 4]
+
+        joint_min_values = self.cfg.get(
+            "self_collision_joint_min_deg",
+            [-165.0, -125.0, -145.0, -135.0, -155.0, -175.0]
+        )
+        joint_max_values = self.cfg.get(
+            "self_collision_joint_max_deg",
+            [165.0, 125.0, 145.0, 135.0, 155.0, 175.0]
         )
 
-        # 2번 관절을 한 번 이동시키는 내부 함수입니다.
-        def move_joint2(delta_deg):
+        # 지정 관절을 한 번 이동시키는 내부 함수입니다.
+        def move_joint(joint_id, delta_deg):
+            joint_index = int(joint_id) - 1
+            joint_min_deg = float(joint_min_values[joint_index])
+            joint_max_deg = float(joint_max_values[joint_index])
 
-            # 서버에 2번 관절 상대 이동을 요청합니다.
+            # 서버에 관절 상대 이동을 요청합니다.
             response = self.arm.request(
                 {
                     "cmd": "joint_step",
-                    "joint": 2,
+                    "joint": int(joint_id),
                     "delta": float(delta_deg),
                     "speed": joint_speed,
                     "wait": joint_wait_sec,
@@ -1056,54 +1450,30 @@ class ArmCameraRectAutoPickClient:
                 and response.get("ok", False)
             )
 
-        # 설정에서 고정 방향을 읽습니다.
-        # 0이면 자동으로 내려가는 방향을 시험합니다.
-        configured_direction = int(
-            self.cfg.get(
-                "joint2_descent_direction",
-                0
+        # 시험 이동 각도입니다.
+        probe_deg = abs(
+            float(
+                self.cfg.get(
+                    "joint2_probe_deg",
+                    2.0
+                )
             )
         )
 
-        # 실제 사용할 관절 방향입니다.
-        joint_direction = 0
-
-        # 사용자가 +1 또는 -1을 지정한 경우입니다.
-        if configured_direction in (-1, 1):
-
-            joint_direction = configured_direction
-
-            print(
-                "[JOINT2 ASSIST] "
-                f"설정된 방향 사용: {joint_direction:+d}"
-            )
-
-        # 방향을 자동으로 찾습니다.
-        else:
-
-            # 시험 이동 각도입니다.
-            probe_deg = abs(
-                float(
-                    self.cfg.get(
-                        "joint2_probe_deg",
-                        2.0
-                    )
+        # 시험 이동에서 최소한 줄어야 할 Z입니다.
+        minimum_probe_drop_mm = abs(
+            float(
+                self.cfg.get(
+                    "joint2_probe_min_drop_mm",
+                    0.7
                 )
             )
+        )
 
-            # 시험 이동에서 최소한 줄어야 할 Z입니다.
-            minimum_probe_drop_mm = abs(
-                float(
-                    self.cfg.get(
-                        "joint2_probe_min_drop_mm",
-                        0.7
-                    )
-                )
-            )
+        # 후보 관절과 양방향을 모두 시험합니다.
+        probe_results = []
 
-            # +방향과 -방향을 순서대로 시험합니다.
-            probe_results = []
-
+        for candidate_joint in candidate_joints:
             for candidate_direction in (1, -1):
 
                 # 시험 직전 좌표를 읽습니다.
@@ -1117,7 +1487,8 @@ class ArmCameraRectAutoPickClient:
                     continue
 
                 # 시험 방향으로 관절을 이동합니다.
-                moved_probe = move_joint2(
+                moved_probe = move_joint(
+                    candidate_joint,
                     candidate_direction
                     * probe_deg
                 )
@@ -1133,7 +1504,8 @@ class ArmCameraRectAutoPickClient:
                 after_probe = self.get_coords()
 
                 # 원래 각도로 되돌립니다.
-                move_joint2(
+                move_joint(
+                    candidate_joint,
                     -candidate_direction
                     * probe_deg
                 )
@@ -1158,45 +1530,48 @@ class ArmCameraRectAutoPickClient:
                 probe_results.append(
                     (
                         drop_mm,
+                        candidate_joint,
                         candidate_direction
                     )
                 )
 
                 print(
-                    "[JOINT2 PROBE] "
+                    "[JOINT ASSIST PROBE] "
+                    f"joint={candidate_joint} | "
                     f"direction={candidate_direction:+d} | "
                     f"z={float(before_probe[2]):.2f}"
                     f"->{float(after_probe[2]):.2f} | "
                     f"drop={drop_mm:+.2f}mm"
                 )
 
-            # 가장 많이 내려간 방향을 선택합니다.
-            if probe_results:
+        best_joint = 0
+        joint_direction = 0
 
-                best_drop_mm, best_direction = max(
-                    probe_results,
-                    key=lambda item: item[0]
+        # 가장 많이 내려간 관절/방향을 선택합니다.
+        if probe_results:
+            best_drop_mm, best_joint, best_direction = max(
+                probe_results,
+                key=lambda item: item[0]
+            )
+
+            # 실제로 Z가 내려간 경우에만 사용합니다.
+            if best_drop_mm >= minimum_probe_drop_mm:
+                best_joint = int(best_joint)
+                joint_direction = int(best_direction)
+
+                print(
+                    "[JOINT ASSIST PROBE OK] "
+                    f"joint={best_joint} | "
+                    f"direction={joint_direction:+d} | "
+                    f"시험 하강={best_drop_mm:.2f}mm"
                 )
 
-                # 실제로 Z가 내려간 경우에만 사용합니다.
-                if best_drop_mm >= minimum_probe_drop_mm:
-
-                    joint_direction = int(
-                        best_direction
-                    )
-
-                    print(
-                        "[JOINT2 PROBE OK] "
-                        f"하강 방향={joint_direction:+d} | "
-                        f"시험 하강={best_drop_mm:.2f}mm"
-                    )
-
-        # 내려가는 방향을 찾지 못하면 기존 Z 하강으로 넘어갑니다.
-        if joint_direction == 0:
+        # 내려가는 관절을 찾지 못하면 기존 Z 하강으로 넘어갑니다.
+        if best_joint == 0 or joint_direction == 0:
 
             print(
-                "[JOINT2 ASSIST WARNING] "
-                "2번 관절 하강 방향을 찾지 못했습니다. "
+                "[JOINT ASSIST WARNING] "
+                "TCP Z가 내려가는 관절 방향을 찾지 못했습니다. "
                 "TCP Z 하강만 사용합니다."
             )
 
@@ -1276,8 +1651,9 @@ class ArmCameraRectAutoPickClient:
             # 이동 전 좌표입니다.
             before_step = current_coords[:6]
 
-            # 2번 관절을 내려가는 방향으로 이동합니다.
-            moved = move_joint2(
+            # 선택된 관절을 내려가는 방향으로 이동합니다.
+            moved = move_joint(
+                best_joint,
                 joint_direction
                 * this_step_deg
             )
@@ -1286,8 +1662,8 @@ class ArmCameraRectAutoPickClient:
             if not moved:
 
                 print(
-                    "[JOINT2 ASSIST STOP] "
-                    "2번 관절 이동 명령 실패"
+                    "[JOINT ASSIST STOP] "
+                    f"관절 {best_joint} 이동 명령 실패"
                 )
 
                 break
@@ -1304,13 +1680,14 @@ class ArmCameraRectAutoPickClient:
                 or len(after_step) < 6
             ):
 
-                move_joint2(
+                move_joint(
+                    best_joint,
                     -joint_direction
                     * this_step_deg
                 )
 
                 print(
-                    "[JOINT2 ASSIST STOP] "
+                    "[JOINT ASSIST STOP] "
                     "이동 후 좌표 읽기 실패"
                 )
 
@@ -1337,13 +1714,14 @@ class ArmCameraRectAutoPickClient:
             # 내려가지 않았거나 반대로 움직였으면 마지막 이동을 취소합니다.
             if actual_drop_mm < minimum_step_drop_mm:
 
-                move_joint2(
+                move_joint(
+                    best_joint,
                     -joint_direction
                     * this_step_deg
                 )
 
                 print(
-                    "[JOINT2 ASSIST STOP] "
+                    "[JOINT ASSIST STOP] "
                     f"Z 하강 부족: {actual_drop_mm:.2f}mm"
                 )
 
@@ -1352,13 +1730,14 @@ class ArmCameraRectAutoPickClient:
             # X/Y가 너무 많이 벗어나면 마지막 이동을 취소합니다.
             if xy_drift_mm > maximum_xy_drift_mm:
 
-                move_joint2(
+                move_joint(
+                    best_joint,
                     -joint_direction
                     * this_step_deg
                 )
 
                 print(
-                    "[JOINT2 ASSIST STOP] "
+                    "[JOINT ASSIST STOP] "
                     f"X/Y 이탈 과다: {xy_drift_mm:.2f}mm"
                 )
 
@@ -1374,8 +1753,9 @@ class ArmCameraRectAutoPickClient:
             used_total_deg += this_step_deg
 
             print(
-                "[JOINT2 ASSIST MOVE] "
-                f"joint2={joint_direction * this_step_deg:+.2f}deg | "
+                "[JOINT ASSIST MOVE] "
+                f"joint={best_joint} | "
+                f"delta={joint_direction * this_step_deg:+.2f}deg | "
                 f"z={float(before_step[2]):.2f}"
                 f"->{float(current_coords[2]):.2f} | "
                 f"drop={actual_drop_mm:.2f}mm | "
@@ -1388,10 +1768,11 @@ class ArmCameraRectAutoPickClient:
 
         # 완료 상태를 출력합니다.
         print(
-            "[JOINT2 ASSIST COMPLETE] "
+            "[JOINT ASSIST COMPLETE] "
             f"start_z={float(start_coords[2]):.2f} | "
             f"current_z={float(current_coords[2]):.2f} | "
             f"target_with_reserve={assist_target_z:.2f} | "
+            f"joint={best_joint} | "
             f"used={used_total_deg:.2f}deg"
         )
 
@@ -1873,51 +2254,61 @@ class ArmCameraRectAutoPickClient:
 
     # 현재 TCP 회전값을 카메라 바닥 보기 자세로 저장합니다.
     def save_current_floor_camera_rpy(self):
-
-        # 현재 TCP 좌표를 읽습니다.
+        # 바닥 보기 TCP 회전값과 6개 관절값을 함께 저장합니다.
         coords = self.get_coords()
+        angles_response = self.arm.request({"cmd": "get_angles"})
+        angles = angles_response.get("angles", None)
 
         if (
             not isinstance(coords, list)
             or len(coords) < 6
         ):
-
-            print(
-                "[FLOOR CAMERA SAVE ERROR] "
-                "현재 TCP 좌표 읽기 실패"
-            )
-
+            print("[FLOOR CAMERA SAVE ERROR] TCP 좌표 읽기 실패")
             return False
 
-        # 현재 회전값 rx, ry, rz를 저장합니다.
+        if (
+            not isinstance(angles, list)
+            or len(angles) < 6
+        ):
+            print(
+                "[FLOOR CAMERA SAVE ERROR] 관절 각도 읽기 실패:",
+                angles_response
+            )
+            return False
+
         floor_rpy = [
             float(coords[3]),
             float(coords[4]),
             float(coords[5])
         ]
 
+        floor_angles = [
+            float(value)
+            for value in angles[:6]
+        ]
+
         self.cfg["floor_camera_rpy"] = floor_rpy
-
-        save_config(
-            self.cfg
-        )
+        self.cfg["floor_camera_angles"] = floor_angles
+        save_config(self.cfg)
 
         print(
-            "[FLOOR CAMERA SAVE] "
-            f"rx={floor_rpy[0]:.2f}, "
-            f"ry={floor_rpy[1]:.2f}, "
-            f"rz={floor_rpy[2]:.2f}"
+            "[FLOOR CAMERA SAVE OK] "
+            f"rpy={[round(value, 2) for value in floor_rpy]}"
         )
-
+        print(
+            "[FLOOR CAMERA SAVE OK] "
+            f"angles={[round(value, 2) for value in floor_angles]}"
+        )
         print(
             "[FLOOR CAMERA SAVE] "
-            "이후 w 자동 집기에서 이 자세를 사용합니다."
+            "자동 동작에서는 6개 관절을 한 번에 이동합니다."
         )
 
         return True
 
 
-    # 잠근 X/Y/Z를 유지하고 카메라가 바닥을 보도록 회전합니다.
+
+        # 잠근 X/Y/Z를 유지하고 카메라가 바닥을 보도록 회전합니다.
     def orient_camera_to_floor(self, lock_coords):
 
         # 저장된 바닥 보기 자세입니다.
@@ -2466,10 +2857,10 @@ class ArmCameraRectAutoPickClient:
 
             camera_depth_mm = None
 
-        # 최종 깊이가 있으면 제한 없이 하강 거리를 계산합니다.
+        # 최종 깊이가 있으면 하강 거리를 계산합니다.
         if camera_depth_mm is not None:
 
-            vertical_down_mm = max(
+            raw_vertical_down_mm = max(
                 0.0,
                 (
                     camera_depth_mm
@@ -2478,11 +2869,28 @@ class ArmCameraRectAutoPickClient:
                 )
             )
 
+            vertical_down_mm = (
+                raw_vertical_down_mm
+                * float(
+                    self.cfg.get(
+                        "locked_vertical_depth_scale",
+                        1.0
+                    )
+                )
+                + float(
+                    self.cfg.get(
+                        "locked_vertical_depth_bias_mm",
+                        0.0
+                    )
+                )
+            )
+
             print(
                 "[VERTICAL DEPTH FLOOR0] "
                 f"camera_depth={camera_depth_mm:.2f}mm | "
                 f"camera_to_gripper_z={camera_to_gripper_z_mm:.2f}mm | "
                 f"clearance={target_clearance_mm:.2f}mm | "
+                f"raw_down={raw_vertical_down_mm:.2f}mm | "
                 f"down={vertical_down_mm:.2f}mm"
             )
 
@@ -2505,6 +2913,42 @@ class ArmCameraRectAutoPickClient:
                 vertical_down_mm
             )
 
+        minimum_vertical_down_mm = max(
+            0.0,
+            float(
+                self.cfg.get(
+                    "locked_vertical_min_down_mm",
+                    105.0
+                )
+            )
+        )
+
+        maximum_vertical_down_mm = max(
+            minimum_vertical_down_mm,
+            float(
+                self.cfg.get(
+                    "locked_vertical_max_down_mm",
+                    165.0
+                )
+            )
+        )
+
+        if vertical_down_mm < minimum_vertical_down_mm:
+            print(
+                "[VERTICAL DEPTH ADJUST] "
+                f"계산 하강량 {vertical_down_mm:.2f}mm가 작아 "
+                f"최소 {minimum_vertical_down_mm:.2f}mm로 보정"
+            )
+            vertical_down_mm = minimum_vertical_down_mm
+
+        if vertical_down_mm > maximum_vertical_down_mm:
+            print(
+                "[VERTICAL DEPTH LIMIT] "
+                f"계산 하강량 {vertical_down_mm:.2f}mm를 "
+                f"최대 {maximum_vertical_down_mm:.2f}mm로 제한"
+            )
+            vertical_down_mm = maximum_vertical_down_mm
+
         # 관절 충돌을 확인하기 위해 작은 단계로 이동합니다.
         vertical_step_mm = max(
             1.0,
@@ -2512,7 +2956,7 @@ class ArmCameraRectAutoPickClient:
                 float(
                     self.cfg.get(
                         "self_collision_guard_vertical_step_mm",
-                        3.0
+                        15.0
                     )
                 )
             )
@@ -2532,17 +2976,133 @@ class ArmCameraRectAutoPickClient:
             for value in gripper_center_coords[:6]
         ]
 
-        # 바닥 Z=0까지 하강을 허용합니다.
-        target_z = max(
-            floor_contact_z_mm,
-            float(current_coords[2])
-            - vertical_down_mm
+        target_z_override = self.cfg.get(
+            "locked_vertical_target_z_mm",
+            None
         )
+
+        try:
+            target_z_override = float(target_z_override)
+        except (TypeError, ValueError):
+            target_z_override = None
+
+        if target_z_override is not None:
+            target_z = max(
+                floor_contact_z_mm,
+                min(
+                    float(current_coords[2]),
+                    target_z_override
+                )
+            )
+            vertical_down_mm = (
+                float(current_coords[2])
+                - target_z
+            )
+            print(
+                "[VERTICAL TARGET Z] "
+                f"locked_vertical_target_z_mm={target_z_override:.2f} | "
+                f"down={vertical_down_mm:.2f}mm"
+            )
+        else:
+            # 바닥 Z=0까지 하강을 허용합니다.
+            target_z = max(
+                floor_contact_z_mm,
+                float(current_coords[2])
+                - vertical_down_mm
+            )
 
         actual_total_down_mm = (
             float(current_coords[2])
             - target_z
         )
+
+        if bool(
+            self.cfg.get(
+                "joint2_assist_before_vertical_pick",
+                True
+            )
+        ):
+            assisted_coords = self.joint2_assisted_descent(
+                target_z
+            )
+
+            if (
+                isinstance(assisted_coords, list)
+                and len(assisted_coords) >= 6
+            ):
+                current_coords = [
+                    float(value)
+                    for value in assisted_coords[:6]
+                ]
+
+                print(
+                    "[LOCKED VERTICAL JOINT ASSIST] "
+                    f"z_after_assist={float(current_coords[2]):.2f} | "
+                    f"target_z={target_z:.2f}"
+                )
+
+                if float(current_coords[2]) <= target_z + 0.8:
+                    print(
+                        "[LOCKED VERTICAL JOINT ASSIST OK] "
+                        "관절 보조 하강으로 목표 Z에 도달"
+                    )
+                    target_z = float(current_coords[2])
+
+        actual_total_down_mm = (
+            float(current_coords[2])
+            - target_z
+        )
+
+        descent_start_z_for_free_pick = float(
+            gripper_center_coords[2]
+        )
+        actual_joint_down_mm = (
+            descent_start_z_for_free_pick
+            - float(current_coords[2])
+        )
+        minimum_required_vertical_down_mm = float(
+            self.cfg.get(
+                "locked_vertical_min_required_down_mm",
+                55.0
+            )
+        )
+
+        if (
+            bool(
+                self.cfg.get(
+                    "free_joint_descent_pick_enabled",
+                    True
+                )
+            )
+            and actual_joint_down_mm
+            >= minimum_required_vertical_down_mm
+        ):
+            print(
+                "[FREE JOINT PICK OK] "
+                f"actual_down={actual_joint_down_mm:.2f}mm | "
+                "X/Y 고정 Cartesian 하강 없이 현재 자세에서 집기"
+            )
+
+            self.cfg["last_vertical_pick_coords"] = [
+                round(value, 3)
+                for value in current_coords
+            ]
+
+            self.cfg["last_vertical_pick_calculation"] = {
+                "camera_depth_mm": camera_depth_mm,
+                "camera_to_gripper_z_mm": camera_to_gripper_z_mm,
+                "target_clearance_mm": target_clearance_mm,
+                "applied_down_mm": vertical_down_mm,
+                "minimum_down_mm": minimum_vertical_down_mm,
+                "maximum_down_mm": maximum_vertical_down_mm,
+                "target_z_mm": target_z,
+                "actual_down_mm": actual_joint_down_mm,
+                "free_joint_descent_pick_enabled": True,
+                "timestamp": round(time.time(), 3)
+            }
+
+            save_config(self.cfg)
+            return current_coords
 
         # 하강 시작 관절 각도를 읽습니다.
         descent_start_angles = (
@@ -2580,6 +3140,14 @@ class ArmCameraRectAutoPickClient:
 
         previous_angles = descent_start_angles[:6]
         previous_safe_coords = current_coords[:6]
+        descent_start_z = float(current_coords[2])
+        vertical_iteration = 0
+        maximum_vertical_iterations = int(
+            self.cfg.get(
+                "locked_vertical_max_iter",
+                24
+            )
+        )
 
         print(
             "[LOCKED VERTICAL PICK FLOOR0] "
@@ -2592,7 +3160,15 @@ class ArmCameraRectAutoPickClient:
         )
 
         # 목표 Z까지 수직 하강합니다.
-        while float(current_coords[2]) - target_z > 0.01:
+        while float(current_coords[2]) - target_z > 0.8:
+            vertical_iteration += 1
+
+            if vertical_iteration > maximum_vertical_iterations:
+                print(
+                    "[LOCKED VERTICAL STOP] "
+                    "최대 수직 하강 반복 횟수 초과"
+                )
+                return None
 
             # 이동 전 관절 상태를 다시 확인합니다.
             before_angles = (
@@ -2634,12 +3210,14 @@ class ArmCameraRectAutoPickClient:
             )
 
             next_coords = current_coords[:6]
+            before_command_z = float(current_coords[2])
 
             # X/Y와 회전값은 고정하고 Z만 변경합니다.
             next_coords[2] = next_z
 
             print(
                 "[LOCKED VERTICAL MOVE GUARDED] "
+                f"{vertical_iteration}/{maximum_vertical_iterations} | "
                 f"z={float(current_coords[2]):.2f}"
                 f"->{next_z:.2f}"
             )
@@ -2650,7 +3228,7 @@ class ArmCameraRectAutoPickClient:
                 wait=float(
                     self.cfg.get(
                         "locked_vertical_wait_sec",
-                        0.32
+                        0.45
                     )
                 )
             )
@@ -2668,10 +3246,47 @@ class ArmCameraRectAutoPickClient:
                 float(
                     self.cfg.get(
                         "self_collision_guard_check_delay_sec",
-                        0.10
+                        0.08
                     )
                 )
             )
+
+            measured_after_coords = self.get_coords()
+
+            if (
+                isinstance(measured_after_coords, list)
+                and len(measured_after_coords) >= 6
+            ):
+                measured_after_coords = [
+                    float(value)
+                    for value in measured_after_coords[:6]
+                ]
+                measured_step_down_mm = (
+                    before_command_z
+                    - float(measured_after_coords[2])
+                )
+
+                print(
+                    "[LOCKED VERTICAL VERIFY] "
+                    f"actual_step={measured_step_down_mm:.2f}mm | "
+                    f"actual_z={float(measured_after_coords[2]):.2f}"
+                )
+
+                current_coords = measured_after_coords[:6]
+
+                if measured_step_down_mm < float(
+                    self.cfg.get(
+                        "locked_vertical_min_actual_step_mm",
+                        1.5
+                    )
+                ):
+                    print(
+                        "[LOCKED VERTICAL WARNING] "
+                        "실제 Z 하강량이 작습니다. "
+                        "다음 반복에서 다시 하강합니다."
+                    )
+            else:
+                current_coords = next_coords[:6]
 
             # 이동 후 실제 관절 각도를 확인합니다.
             after_angles = (
@@ -2737,8 +3352,7 @@ class ArmCameraRectAutoPickClient:
                 return None
 
             # 안전한 이동이 확인되면 현재 상태를 저장합니다.
-            previous_safe_coords = next_coords[:6]
-            current_coords = next_coords[:6]
+            previous_safe_coords = current_coords[:6]
             previous_angles = after_angles[:6]
 
             time.sleep(
@@ -2763,6 +3377,25 @@ class ArmCameraRectAutoPickClient:
                 for value in measured_final_coords[:6]
             ]
 
+        actual_total_down_measured_mm = (
+            descent_start_z
+            - float(current_coords[2])
+        )
+        minimum_required_vertical_down_mm = float(
+            self.cfg.get(
+                "locked_vertical_min_required_down_mm",
+                55.0
+            )
+        )
+
+        if actual_total_down_measured_mm < minimum_required_vertical_down_mm:
+            print(
+                "[LOCKED VERTICAL ERROR] "
+                f"실제 Z 하강 부족: {actual_total_down_measured_mm:.2f}mm "
+                f"< {minimum_required_vertical_down_mm:.2f}mm"
+            )
+            return None
+
         # 최종 집기 좌표와 계산값을 저장합니다.
         self.cfg["last_vertical_pick_coords"] = [
             round(value, 3)
@@ -2774,6 +3407,10 @@ class ArmCameraRectAutoPickClient:
             "camera_to_gripper_z_mm": camera_to_gripper_z_mm,
             "target_clearance_mm": target_clearance_mm,
             "applied_down_mm": vertical_down_mm,
+            "minimum_down_mm": minimum_vertical_down_mm,
+            "maximum_down_mm": maximum_vertical_down_mm,
+            "target_z_mm": target_z,
+            "actual_down_mm": actual_total_down_measured_mm,
             "floor_contact_z_mm": floor_contact_z_mm,
             "self_collision_guard_enabled": True,
             "timestamp": round(
@@ -2803,191 +3440,53 @@ class ArmCameraRectAutoPickClient:
     # 화면 확대 접근 -> 좌표 잠금 -> 그리퍼 중심 이동 -> 수직 집기를 실행합니다.
     # 첫 화면에서 컨테이너 중심·거리·현재 TCP 좌표를 저장합니다.
     def capture_initial_container_coordinate(self):
-
-        # 여러 프레임을 읽어 초기 좌표 흔들림을 줄입니다.
-        sample_count = int(
-            self.cfg.get(
-                "initial_capture_sample_count",
-                7
-            )
+        # 최초 인식 시 잠긴 픽셀·깊이만 사용합니다.
+        remembered = getattr(
+            self,
+            "last_recognized_detection",
+            None
         )
 
-        sample_interval_sec = float(
-            self.cfg.get(
-                "initial_capture_interval_sec",
-                0.04
-            )
-        )
-
-        detections = []
-        frame_shape = None
-
-        for sample_index in range(sample_count):
-
-            frame = self.read_frame()
-
-            if frame is None:
-
-                time.sleep(sample_interval_sec)
-
-                continue
-
-            detection, _ = self.detect_rectangle_object(
-                frame
-            )
-
-            if not isinstance(detection, dict):
-
-                time.sleep(sample_interval_sec)
-
-                continue
-
-            detections.append(
-                dict(detection)
-            )
-
-            frame_shape = frame.shape[:2]
-
-            print(
-                "[INITIAL CAPTURE] "
-                f"{len(detections)}/{sample_count} | "
-                f"center={detection.get('center')} | "
-                f"depth={detection.get('depth_mm')}"
-            )
-
-            time.sleep(sample_interval_sec)
-
-        # 새 프레임 검출이 없으면 최근 저장 검출을 사용합니다.
-        if not detections:
-
-            remembered = getattr(
-                self,
-                "last_recognized_detection",
-                None
-            )
-
-            if not isinstance(remembered, dict):
-
-                print(
-                    "[INITIAL CAPTURE ERROR] "
-                    "초기 컨테이너 좌표를 얻지 못했습니다."
-                )
-
-                return None
-
-            detections = [
-                dict(remembered)
-            ]
-
-        center_u_values = []
-        center_v_values = []
-        depth_values = []
-
-        for detection in detections:
-
-            center = detection.get(
-                "center",
-                None
-            )
-
-            if (
-                isinstance(center, (list, tuple))
-                and len(center) >= 2
-            ):
-
-                center_u_values.append(
-                    float(center[0])
-                )
-
-                center_v_values.append(
-                    float(center[1])
-                )
-
-            depth_value = detection.get(
-                "depth_mm",
-                None
-            )
-
-            try:
-
-                depth_value = float(
-                    depth_value
-                )
-
-                if depth_value > 0.0:
-
-                    depth_values.append(
-                        depth_value
-                    )
-
-            except (TypeError, ValueError):
-
-                pass
-
-        if not center_u_values or not center_v_values:
-
-            print(
-                "[INITIAL CAPTURE ERROR] "
-                "컨테이너 중심 좌표가 없습니다."
-            )
-
+        if not isinstance(remembered, dict):
+            print("[INITIAL CAPTURE ERROR] 잠긴 최초 좌표가 없습니다.")
             return None
 
-        # 중앙값을 초기 컨테이너 중심으로 사용합니다.
-        center_u = float(
-            np.median(
-                center_u_values
-            )
+        center = remembered.get("center", None)
+
+        if (
+            not isinstance(center, (list, tuple))
+            or len(center) < 2
+        ):
+            print("[INITIAL CAPTURE ERROR] 잠긴 픽셀 중심이 없습니다.")
+            return None
+
+        center_u = float(center[0])
+        center_v = float(center[1])
+
+        depth_mm = remembered.get(
+            "depth_mm",
+            self.cfg.get("initial_default_depth_mm", 210.0)
         )
 
-        center_v = float(
-            np.median(
-                center_v_values
+        try:
+            depth_mm = float(depth_mm)
+        except (TypeError, ValueError):
+            depth_mm = float(
+                self.cfg.get("initial_default_depth_mm", 210.0)
+            )
+
+        frame_width = int(
+            remembered.get(
+                "frame_width",
+                self.cfg.get("snapshot_frame_width", 640)
             )
         )
-
-        if depth_values:
-
-            depth_mm = float(
-                np.median(
-                    depth_values
-                )
+        frame_height = int(
+            remembered.get(
+                "frame_height",
+                self.cfg.get("snapshot_frame_height", 480)
             )
-
-        else:
-
-            depth_mm = float(
-                self.cfg.get(
-                    "initial_default_depth_mm",
-                    210.0
-                )
-            )
-
-        if frame_shape is not None:
-
-            frame_height = int(
-                frame_shape[0]
-            )
-
-            frame_width = int(
-                frame_shape[1]
-            )
-
-        else:
-
-            frame_width = int(
-                self.cfg.get(
-                    "snapshot_frame_width",
-                    640
-                )
-            )
-
-            frame_height = int(
-                self.cfg.get(
-                    "snapshot_frame_height",
-                    480
-                )
-            )
+        )
 
         target_u = float(
             self.cfg.get(
@@ -2995,7 +3494,6 @@ class ArmCameraRectAutoPickClient:
                 frame_width / 2.0
             )
         )
-
         target_v = float(
             self.cfg.get(
                 "floor_camera_target_v",
@@ -3007,35 +3505,17 @@ class ArmCameraRectAutoPickClient:
         error_v = center_v - target_v
 
         focal_x_px = float(
-            self.cfg.get(
-                "camera_fx_rect_px",
-                973.32886
-            )
+            self.cfg.get("camera_fx_rect_px", 973.32886)
         )
-
         focal_y_px = float(
-            self.cfg.get(
-                "camera_fy_rect_px",
-                989.13171
-            )
+            self.cfg.get("camera_fy_rect_px", 989.13171)
         )
 
         camera_horizontal_mm = (
-            error_u
-            * depth_mm
-            / max(
-                1.0,
-                focal_x_px
-            )
+            error_u * depth_mm / max(1.0, focal_x_px)
         )
-
         camera_vertical_mm = (
-            error_v
-            * depth_mm
-            / max(
-                1.0,
-                focal_y_px
-            )
+            error_v * depth_mm / max(1.0, focal_y_px)
         )
 
         x_sign = float(
@@ -3044,19 +3524,14 @@ class ArmCameraRectAutoPickClient:
                 1.0
             )
         )
-
         y_sign = float(
             self.cfg.get(
                 "floor_image_x_to_robot_y_sign",
                 -1.0
             )
         )
-
         initial_gain = float(
-            self.cfg.get(
-                "initial_floor_xy_gain",
-                0.90
-            )
+            self.cfg.get("initial_floor_xy_gain", 1.0)
         )
 
         delta_x = (
@@ -3064,7 +3539,6 @@ class ArmCameraRectAutoPickClient:
             * camera_vertical_mm
             * initial_gain
         )
-
         delta_y = (
             y_sign
             * camera_horizontal_mm
@@ -3075,85 +3549,103 @@ class ArmCameraRectAutoPickClient:
             float(
                 self.cfg.get(
                     "initial_floor_max_xy_mm",
-                    55.0
+                    80.0
                 )
             )
         )
 
         delta_x = max(
             -maximum_initial_xy_mm,
-            min(
-                maximum_initial_xy_mm,
-                delta_x
-            )
+            min(maximum_initial_xy_mm, delta_x)
         )
-
         delta_y = max(
             -maximum_initial_xy_mm,
-            min(
-                maximum_initial_xy_mm,
-                delta_y
-            )
+            min(maximum_initial_xy_mm, delta_y)
         )
 
-        start_coords = self.get_coords()
+        current_coords = self.get_coords()
 
         if (
-            not isinstance(start_coords, list)
-            or len(start_coords) < 6
+            not isinstance(current_coords, list)
+            or len(current_coords) < 6
         ):
-
-            print(
-                "[INITIAL CAPTURE ERROR] "
-                "현재 TCP 좌표 읽기 실패"
-            )
-
+            print("[INITIAL CAPTURE ERROR] 현재 TCP 좌표 읽기 실패")
             return None
 
-        start_coords = [
+        current_coords = [
             float(value)
-            for value in start_coords[:6]
+            for value in current_coords[:6]
         ]
 
-        floor_rpy = self.cfg.get(
-            "floor_camera_rpy",
+        recognition_coords = remembered.get(
+            "tcp_coords_at_recognition",
             None
         )
 
+        recognition_base_coords = None
+
         if (
-            not isinstance(floor_rpy, list)
-            or len(floor_rpy) < 3
+            isinstance(recognition_coords, list)
+            and len(recognition_coords) >= 6
         ):
+            recognition_base_coords = [
+                float(value)
+                for value in recognition_coords[:6]
+            ]
 
-            print(
-                "[INITIAL CAPTURE ERROR] "
-                "floor_camera_rpy가 저장되지 않았습니다."
+            pose_shift_mm = (
+                (
+                    current_coords[0]
+                    - recognition_base_coords[0]
+                ) ** 2
+                + (
+                    current_coords[1]
+                    - recognition_base_coords[1]
+                ) ** 2
+                + (
+                    current_coords[2]
+                    - recognition_base_coords[2]
+                ) ** 2
+            ) ** 0.5
+
+            maximum_pose_shift_mm = abs(
+                float(
+                    self.cfg.get(
+                        "first_target_pose_guard_mm",
+                        10.0
+                    )
+                )
             )
 
-            print(
-                "[GUIDE] 카메라가 바닥을 보도록 수동 조정한 뒤 "
-                "카메라 창에서 g를 누르세요."
-            )
+            if pose_shift_mm > maximum_pose_shift_mm:
+                print(
+                    "[INITIAL CAPTURE ERROR] "
+                    "첫 인식 후 로봇 위치가 변경되었습니다. "
+                    f"shift={pose_shift_mm:.2f}mm"
+                )
+                print(
+                    "[GUIDE] 물체를 화면에서 잠시 치웠다가 "
+                    "다시 보여 새 좌표를 잠그세요."
+                )
+                return None
 
-            return None
-
-        # 첫 화면 좌표로 카메라가 이동할 근처 위치를 계산합니다.
-        near_coords = start_coords[:6]
-
-        near_coords[0] += delta_x
-        near_coords[1] += delta_y
-
-        # 카메라를 바닥 방향으로 회전합니다.
-        near_coords[3] = float(
-            floor_rpy[0]
+        absolute_base_coords = (
+            recognition_base_coords
+            if recognition_base_coords is not None
+            else current_coords
         )
 
-        near_coords[4] = float(
-            floor_rpy[1]
+        target_camera_x_mm = (
+            float(absolute_base_coords[0])
+            + delta_x
         )
-
-        near_coords[5] = float(
-            floor_rpy[2]
+        target_camera_y_mm = (
+            float(absolute_base_coords[1])
+            + delta_y
+        )
+        estimated_container_surface_z_mm = (
+            float(absolute_base_coords[2])
+            - depth_mm
         )
 
         initial_target = {
@@ -3162,10 +3654,16 @@ class ArmCameraRectAutoPickClient:
             "depth_mm": depth_mm,
             "delta_x_mm": delta_x,
             "delta_y_mm": delta_y,
-            "start_coords": start_coords,
-            "near_coords": near_coords,
+            "start_coords": current_coords,
+            "recognition_coords": absolute_base_coords,
+            "target_camera_x_mm": target_camera_x_mm,
+            "target_camera_y_mm": target_camera_y_mm,
+            "estimated_container_surface_z_mm": (
+                estimated_container_surface_z_mm
+            ),
             "frame_width": frame_width,
-            "frame_height": frame_height
+            "frame_height": frame_height,
+            "recognized_at": remembered.get("recognized_at", None),
         }
 
         self.cfg["last_initial_container_target"] = {
@@ -3176,84 +3674,241 @@ class ArmCameraRectAutoPickClient:
             "delta_y_mm": round(delta_y, 3),
             "start_coords": [
                 round(value, 3)
-                for value in start_coords
+                for value in current_coords
             ],
-            "near_coords": [
+            "recognition_coords": [
                 round(value, 3)
-                for value in near_coords
+                for value in absolute_base_coords
             ],
-            "timestamp": round(
-                time.time(),
+            "target_camera_x_mm": round(
+                target_camera_x_mm,
                 3
-            )
+            ),
+            "target_camera_y_mm": round(
+                target_camera_y_mm,
+                3
+            ),
+            "estimated_container_surface_z_mm": round(
+                estimated_container_surface_z_mm,
+                3
+            ),
+            "timestamp": round(time.time(), 3),
         }
 
-        save_config(
-            self.cfg
-        )
+        save_config(self.cfg)
 
         print(
-            "[INITIAL TARGET LOCK] "
+            "[FLOW 1/5] 최초 좌표 잠금 완료 | "
             f"pixel=({center_u:.1f}, {center_v:.1f}) | "
             f"depth={depth_mm:.1f}mm | "
-            f"delta=({delta_x:+.2f}, {delta_y:+.2f})"
-        )
-
-        print(
-            "[INITIAL FLOOR TARGET] "
-            f"xyz=({near_coords[0]:.2f}, "
-            f"{near_coords[1]:.2f}, "
-            f"{near_coords[2]:.2f})"
+            f"xy_delta=({delta_x:+.2f}, {delta_y:+.2f})mm | "
+            f"target_xy=({target_camera_x_mm:.2f}, "
+            f"{target_camera_y_mm:.2f})"
         )
 
         return initial_target
 
 
+
     # 첫 화면 좌표 근처로 이동하면서 카메라를 바닥 방향으로 전환합니다.
     def move_to_initial_floor_target(self, initial_target):
+        # 1) 카메라 바닥 보기, 2) 잠긴 좌표로 X/Y 이동 순서로 실행합니다.
+        delta_x = float(
+            initial_target.get("delta_x_mm", 0.0)
+        )
+        delta_y = float(
+            initial_target.get("delta_y_mm", 0.0)
+        )
 
-        near_coords = initial_target.get(
-            "near_coords",
+        floor_angles = self.cfg.get(
+            "floor_camera_angles",
+            None
+        )
+        floor_rpy = self.cfg.get(
+            "floor_camera_rpy",
             None
         )
 
         if (
-            not isinstance(near_coords, list)
-            or len(near_coords) < 6
+            isinstance(floor_angles, list)
+            and len(floor_angles) >= 6
         ):
-
             print(
-                "[INITIAL FLOOR MOVE ERROR] "
-                "초기 근접 좌표가 없습니다."
+                "[FLOW 2/5] 카메라 바닥 보기 "
+                "(6관절 동시 이동)"
             )
 
+            response = self.arm.send_angles(
+                [
+                    float(value)
+                    for value in floor_angles[:6]
+                ],
+                int(
+                    self.cfg.get(
+                        "floor_orientation_speed",
+                        55
+                    )
+                ),
+                wait=float(
+                    self.cfg.get(
+                        "floor_orientation_wait_sec",
+                        1.0
+                    )
+                )
+            )
+
+            if (
+                not isinstance(response, dict)
+                or not response.get("ok", False)
+            ):
+                print("[FLOOR ORIENTATION ERROR]", response)
+                return None
+
+            self.arm.reset_tcp_cache()
+
+        elif (
+            isinstance(floor_rpy, list)
+            and len(floor_rpy) >= 3
+        ):
+            print(
+                "[FLOOR ORIENTATION WARNING] "
+                "floor_camera_angles가 없어 RPY fallback 사용"
+            )
+            print(
+                "[GUIDE] 바닥 보기 자세에서 g를 누르면 "
+                "다음부터 6관절 동시 이동을 사용합니다."
+            )
+
+            current_coords = self.get_coords()
+
+            if (
+                not isinstance(current_coords, list)
+                or len(current_coords) < 6
+            ):
+                return None
+
+            orientation_coords = [
+                float(value)
+                for value in current_coords[:6]
+            ]
+            orientation_coords[3] = float(floor_rpy[0])
+            orientation_coords[4] = float(floor_rpy[1])
+            orientation_coords[5] = float(floor_rpy[2])
+
+            if not self.send_coords(
+                orientation_coords,
+                "camera_face_floor_fallback",
+                wait=float(
+                    self.cfg.get(
+                        "floor_orientation_wait_sec",
+                        1.0
+                    )
+                )
+            ):
+                return None
+
+        else:
+            print(
+                "[FLOOR ORIENTATION ERROR] "
+                "바닥 보기 자세가 저장되지 않았습니다."
+            )
+            print(
+                "[GUIDE] 카메라를 바닥으로 맞춘 뒤 g를 누르세요."
+            )
             return None
 
+        time.sleep(
+            float(
+                self.cfg.get(
+                    "floor_camera_settle_sec",
+                    0.15
+                )
+            )
+        )
+
+        oriented_coords = self.get_coords()
+
+        if (
+            not isinstance(oriented_coords, list)
+            or len(oriented_coords) < 6
+        ):
+            print(
+                "[FLOOR ORIENTATION ERROR] "
+                "자세 전환 후 TCP 좌표 읽기 실패"
+            )
+            return None
+
+        oriented_coords = [
+            float(value)
+            for value in oriented_coords[:6]
+        ]
+
+        xy_target_coords = oriented_coords[:6]
+
+        target_camera_x_mm = initial_target.get(
+            "target_camera_x_mm",
+            None
+        )
+        target_camera_y_mm = initial_target.get(
+            "target_camera_y_mm",
+            None
+        )
+
+        try:
+            target_camera_x_mm = float(target_camera_x_mm)
+            target_camera_y_mm = float(target_camera_y_mm)
+        except (TypeError, ValueError):
+            target_camera_x_mm = None
+            target_camera_y_mm = None
+
+        if (
+            target_camera_x_mm is not None
+            and target_camera_y_mm is not None
+            and bool(
+                self.cfg.get(
+                    "initial_floor_use_absolute_xy",
+                    True
+                )
+            )
+        ):
+            xy_target_coords[0] = target_camera_x_mm
+            xy_target_coords[1] = target_camera_y_mm
+            move_mode_text = "absolute"
+
+        else:
+            xy_target_coords[0] += delta_x
+            xy_target_coords[1] += delta_y
+            move_mode_text = "relative"
+
+        print(
+            "[FLOW 3/5] 최초 잠금 좌표로 X/Y 동시 이동 | "
+            f"mode={move_mode_text} | "
+            f"dx={delta_x:+.2f}mm, "
+            f"dy={delta_y:+.2f}mm | "
+            f"target=({xy_target_coords[0]:.2f}, "
+            f"{xy_target_coords[1]:.2f})"
+        )
+
         moved = self.send_coords(
-            near_coords[:6],
-            "initial_floor_target",
+            xy_target_coords,
+            "first_locked_xy_move",
             wait=float(
                 self.cfg.get(
-                    "initial_floor_move_wait_sec",
-                    0.90
+                    "floor_xy_move_wait_sec",
+                    0.65
                 )
             )
         )
 
         if not moved:
-
-            print(
-                "[INITIAL FLOOR MOVE ERROR] "
-                "바닥 보기 초기 좌표 이동 실패"
-            )
-
+            print("[INITIAL XY MOVE ERROR] 이동 실패")
             return None
 
         time.sleep(
             float(
                 self.cfg.get(
                     "initial_floor_settle_sec",
-                    0.40
+                    0.18
                 )
             )
         )
@@ -3264,18 +3919,102 @@ class ArmCameraRectAutoPickClient:
             isinstance(measured_coords, list)
             and len(measured_coords) >= 6
         ):
-
-            near_coords = [
+            xy_target_coords = [
                 float(value)
                 for value in measured_coords[:6]
             ]
 
         print(
-            "[INITIAL FLOOR MOVE OK] "
-            f"coords={[round(value, 2) for value in near_coords]}"
+            "[INITIAL XY MOVE OK] "
+            f"{[round(value, 2) for value in xy_target_coords]}"
         )
 
-        return near_coords
+        return xy_target_coords
+
+
+
+    # 바닥 카메라 정렬용 검출값을 여러 프레임 중앙값으로 안정화합니다.
+    def get_stable_floor_detection(self):
+        sample_count = max(
+            1,
+            int(
+                self.cfg.get(
+                    "floor_detection_sample_count",
+                    3
+                )
+            )
+        )
+        sample_interval_sec = max(
+            0.0,
+            float(
+                self.cfg.get(
+                    "floor_detection_sample_interval_sec",
+                    0.035
+                )
+            )
+        )
+
+        detections = []
+        frame_shape = None
+
+        for _ in range(sample_count):
+            frame = self.read_frame()
+
+            if frame is None:
+                time.sleep(sample_interval_sec)
+                continue
+
+            detection, _ = self.detect_rectangle_object(frame)
+
+            if isinstance(detection, dict):
+                detections.append(dict(detection))
+                frame_shape = frame.shape[:2]
+
+            if sample_interval_sec > 0.0:
+                time.sleep(sample_interval_sec)
+
+        if not detections:
+            return None, None
+
+        centers_u = []
+        centers_v = []
+        depths = []
+
+        for detection in detections:
+            center = detection.get("center", None)
+
+            if (
+                isinstance(center, (list, tuple))
+                and len(center) >= 2
+            ):
+                centers_u.append(float(center[0]))
+                centers_v.append(float(center[1]))
+
+            depth_value = detection.get("depth_mm", None)
+
+            try:
+                depth_value = float(depth_value)
+            except (TypeError, ValueError):
+                depth_value = None
+
+            if depth_value is not None and depth_value > 0.0:
+                depths.append(depth_value)
+
+        stable_detection = dict(detections[-1])
+
+        if centers_u and centers_v:
+            stable_detection["center"] = (
+                float(np.median(centers_u)),
+                float(np.median(centers_v))
+            )
+
+        if depths:
+            stable_detection["depth_mm"] = float(
+                np.median(depths)
+            )
+
+        return stable_detection, frame_shape
+
 
 
     # 바닥 보기 카메라로 확대하면서 컨테이너 중심을 X/Y로 계속 맞춥니다.
@@ -3284,30 +4023,23 @@ class ArmCameraRectAutoPickClient:
         initial_target,
         floor_start_coords
     ):
-
-        target_long_ratio = float(
-            self.cfg.get(
-                "floor_fill_target_long_ratio",
-                0.72
-            )
+        # Z와 RPY를 고정하고 카메라 영상으로 X/Y만 정밀 보정합니다.
+        maximum_iterations = int(
+            self.cfg.get("floor_center_only_max_iter", 12)
         )
-
-        target_short_ratio = float(
-            self.cfg.get(
-                "floor_fill_target_short_ratio",
-                0.42
-            )
-        )
-
-        approach_step_mm = abs(
+        center_tolerance_px = abs(
             float(
                 self.cfg.get(
-                    "floor_approach_step_mm",
-                    4.0
+                    "floor_center_tolerance_px",
+                    12.0
                 )
             )
         )
-
+        acceptance_px = abs(
+            float(
+            self.cfg.get("floor_center_accept_px", 18.0)
+            )
+        )
         maximum_xy_correction_mm = abs(
             float(
                 self.cfg.get(
@@ -3316,200 +4048,84 @@ class ArmCameraRectAutoPickClient:
                 )
             )
         )
-
+        minimum_xy_step_mm = abs(
+            float(
+                self.cfg.get(
+                    "floor_center_min_step_mm",
+                    0.6
+                )
+            )
+        )
         center_gain = float(
-            self.cfg.get(
-                "floor_center_gain",
-                0.75
-            )
+            self.cfg.get("floor_center_gain", 0.75)
         )
-
-        center_tolerance_px = abs(
-            float(
-                self.cfg.get(
-                    "floor_center_tolerance_px",
-                    16.0
-                )
-            )
-        )
-
-        maximum_down_mm = abs(
-            float(
-                self.cfg.get(
-                    "floor_approach_max_down_mm",
-                    90.0
-                )
-            )
-        )
-
-        maximum_iterations = int(
-            self.cfg.get(
-                "floor_approach_max_iter",
-                35
-            )
-        )
-
         maximum_missing_frames = int(
-            self.cfg.get(
-                "floor_missing_frame_limit",
-                8
-            )
-        )
-
-        maximum_recovery_count = int(
-            self.cfg.get(
-                "floor_recovery_max_count",
-                3
-            )
-        )
-
-        recovery_up_mm = abs(
-            float(
-                self.cfg.get(
-                    "floor_recovery_up_mm",
-                    8.0
-                )
-            )
-        )
-
-        minimum_safe_z = float(
-            self.cfg.get(
-                "minimum_safe_z_mm",
-                25.0
-            )
+            self.cfg.get("floor_missing_frame_limit", 5)
         )
 
         current_coords = [
             float(value)
             for value in floor_start_coords[:6]
         ]
+        locked_z = float(current_coords[2])
+        locked_rpy = [
+            float(current_coords[3]),
+            float(current_coords[4]),
+            float(current_coords[5]),
+        ]
 
-        initial_near_coords = initial_target.get(
-            "near_coords",
-            current_coords
-        )
-
-        initial_reference_x = float(
-            initial_near_coords[0]
-        )
-
-        initial_reference_y = float(
-            initial_near_coords[1]
-        )
-
-        total_down_mm = 0.0
         missing_frames = 0
-        recovery_count = 0
         last_detection = None
         last_frame_shape = None
-        last_long_ratio = 0.0
-        last_short_ratio = 0.0
+        last_error_distance = None
 
         print(
-            "[FLOOR VISUAL APPROACH] 시작 | "
-            f"target_ratio=({target_long_ratio:.2f}, "
-            f"{target_short_ratio:.2f})"
+            "[FLOW 4/5] 카메라-컨테이너 X/Y 정밀 정렬 | "
+            f"z_fixed={locked_z:.2f}"
         )
 
-        for iteration in range(1, maximum_iterations + 1):
+        for iteration in range(
+            1,
+            maximum_iterations + 1
+        ):
+            detection, frame_shape = self.get_stable_floor_detection()
 
-            frame = self.read_frame()
-            detection = None
-
-            if frame is not None:
-
-                detection, _ = self.detect_rectangle_object(
-                    frame
-                )
-
-            # 인식이 잠시 사라져도 즉시 중단하지 않습니다.
             if not isinstance(detection, dict):
-
                 missing_frames += 1
-
                 print(
-                    "[FLOOR VISUAL LOST] "
-                    f"{missing_frames}/{maximum_missing_frames} | "
-                    "초기 좌표를 유지하며 재검출"
+                    "[FLOOR XY LOST] "
+                    f"{missing_frames}/{maximum_missing_frames}"
                 )
 
-                if missing_frames < maximum_missing_frames:
-
-                    time.sleep(
-                        float(
-                            self.cfg.get(
-                                "floor_missing_wait_sec",
-                                0.15
-                            )
-                        )
-                    )
-
-                    continue
-
-                # 계속 사라지면 첫 좌표 X/Y 근처로 이동하고 조금 상승합니다.
-                if recovery_count >= maximum_recovery_count:
-
-                    print(
-                        "[FLOOR VISUAL ERROR] "
-                        "재검출 최대 횟수 초과"
-                    )
-
+                if missing_frames >= maximum_missing_frames:
                     return None
 
-                recovery_count += 1
-                missing_frames = 0
-
-                recovery_coords = current_coords[:6]
-
-                recovery_coords[0] = initial_reference_x
-                recovery_coords[1] = initial_reference_y
-                recovery_coords[2] = (
-                    float(current_coords[2])
-                    + recovery_up_mm
-                )
-
-                print(
-                    "[FLOOR VISUAL RECOVERY] "
-                    f"{recovery_count}/{maximum_recovery_count} | "
-                    f"coords={[round(value, 2) for value in recovery_coords]}"
-                )
-
-                recovered = self.send_coords(
-                    recovery_coords,
-                    "floor_visual_recovery",
-                    wait=float(
-                        self.cfg.get(
-                            "floor_recovery_wait_sec",
-                            0.55
-                        )
-                    )
-                )
-
-                if not recovered:
-
-                    print(
-                        "[FLOOR VISUAL ERROR] "
-                        "초기 좌표 기반 복구 이동 실패"
-                    )
-
-                    return None
-
-                current_coords = recovery_coords[:6]
-
-                time.sleep(
-                    float(
-                        self.cfg.get(
-                            "floor_recovery_settle_sec",
-                            0.30
-                        )
-                    )
-                )
-
+                time.sleep(0.12)
                 continue
 
             missing_frames = 0
+            last_detection = dict(detection)
+            last_frame_shape = frame_shape
 
-            frame_height, frame_width = frame.shape[:2]
+            if (
+                isinstance(frame_shape, (list, tuple))
+                and len(frame_shape) >= 2
+            ):
+                frame_height = int(frame_shape[0])
+                frame_width = int(frame_shape[1])
+            else:
+                frame_height = int(
+                    initial_target.get(
+                        "frame_height",
+                        480
+                    )
+                )
+                frame_width = int(
+                    initial_target.get(
+                        "frame_width",
+                        640
+                    )
+                )
 
             center_u, center_v = detection.get(
                 "center",
@@ -3519,16 +4135,12 @@ class ArmCameraRectAutoPickClient:
                 )
             )
 
-            center_u = float(center_u)
-            center_v = float(center_v)
-
             target_u = float(
                 self.cfg.get(
                     "floor_camera_target_u",
                     frame_width / 2.0
                 )
             )
-
             target_v = float(
                 self.cfg.get(
                     "floor_camera_target_v",
@@ -3536,42 +4148,56 @@ class ArmCameraRectAutoPickClient:
                 )
             )
 
-            error_u = center_u - target_u
-            error_v = center_v - target_v
+            error_u = float(center_u) - target_u
+            error_v = float(center_v) - target_v
+            error_distance = (
+                error_u ** 2 + error_v ** 2
+            ) ** 0.5
+
+            print(
+                "[FLOOR XY] "
+                f"{iteration}/{maximum_iterations} | "
+                f"error=({error_u:+.1f}, "
+                f"{error_v:+.1f})px"
+            )
+
+            if (
+                abs(error_u) <= center_tolerance_px
+                and abs(error_v) <= center_tolerance_px
+            ):
+                print("[FLOOR XY LOCK] 중심 정렬 완료")
+                break
+
+            if (
+                last_error_distance is not None
+                and error_distance
+                > last_error_distance * 1.45
+            ):
+                print(
+                    "[FLOOR XY STOP] 오차가 증가했습니다. "
+                    "floor_image_*_sign을 확인하세요."
+                )
+                return None
+
+            last_error_distance = error_distance
 
             depth_mm = detection.get(
                 "depth_mm",
-                initial_target.get(
-                    "depth_mm",
-                    210.0
-                )
+                initial_target.get("depth_mm", 210.0)
             )
 
             try:
-
                 depth_mm = float(depth_mm)
-
             except (TypeError, ValueError):
-
                 depth_mm = float(
-                    initial_target.get(
-                        "depth_mm",
-                        210.0
-                    )
+                    initial_target.get("depth_mm", 210.0)
                 )
 
             focal_x_px = float(
-                self.cfg.get(
-                    "camera_fx_rect_px",
-                    973.32886
-                )
+                self.cfg.get("camera_fx_rect_px", 973.32886)
             )
-
             focal_y_px = float(
-                self.cfg.get(
-                    "camera_fy_rect_px",
-                    989.13171
-                )
+                self.cfg.get("camera_fy_rect_px", 989.13171)
             )
 
             correction_x = (
@@ -3586,7 +4212,6 @@ class ArmCameraRectAutoPickClient:
                 / max(1.0, focal_y_px)
                 * center_gain
             )
-
             correction_y = (
                 float(
                     self.cfg.get(
@@ -3602,170 +4227,127 @@ class ArmCameraRectAutoPickClient:
 
             correction_x = max(
                 -maximum_xy_correction_mm,
-                min(
-                    maximum_xy_correction_mm,
-                    correction_x
-                )
+                min(maximum_xy_correction_mm, correction_x)
             )
-
             correction_y = max(
                 -maximum_xy_correction_mm,
-                min(
-                    maximum_xy_correction_mm,
-                    correction_y
-                )
+                min(maximum_xy_correction_mm, correction_y)
             )
 
-            long_px = float(
-                detection.get(
-                    "long_px",
-                    0.0
-                )
-            )
-
-            short_px = float(
-                detection.get(
-                    "short_px",
-                    0.0
-                )
-            )
-
-            long_ratio = (
-                long_px
-                / max(1.0, float(frame_width))
-            )
-
-            short_ratio = (
-                short_px
-                / max(1.0, float(frame_height))
-            )
-
-            last_detection = dict(detection)
-            last_frame_shape = (
-                frame_height,
-                frame_width
-            )
-            last_long_ratio = long_ratio
-            last_short_ratio = short_ratio
-
-            print(
-                "[FLOOR VISUAL] "
-                f"{iteration}/{maximum_iterations} | "
-                f"error=({error_u:+.1f}, {error_v:+.1f})px | "
-                f"move=({correction_x:+.2f}, "
-                f"{correction_y:+.2f})mm | "
-                f"ratio=({long_ratio:.3f}, "
-                f"{short_ratio:.3f})"
-            )
-
-            # 충분히 확대되고 중심까지 맞으면 좌표를 잠급니다.
             if (
-                long_ratio >= target_long_ratio
-                and short_ratio >= target_short_ratio
-                and abs(error_u) <= center_tolerance_px
-                and abs(error_v) <= center_tolerance_px
+                abs(error_v) > center_tolerance_px
+                and 0.0 < abs(correction_x)
+                < minimum_xy_step_mm
             ):
-
-                print(
-                    "[FLOOR VISUAL LOCK] "
-                    "확대와 카메라 중심 정렬 완료"
+                correction_x = (
+                    minimum_xy_step_mm
+                    if correction_x > 0.0
+                    else -minimum_xy_step_mm
                 )
 
-                break
+            if (
+                abs(error_u) > center_tolerance_px
+                and 0.0 < abs(correction_y)
+                < minimum_xy_step_mm
+            ):
+                correction_y = (
+                    minimum_xy_step_mm
+                    if correction_y > 0.0
+                    else -minimum_xy_step_mm
+                )
+
+            measured_coords = self.get_coords()
+
+            if (
+                isinstance(measured_coords, list)
+                and len(measured_coords) >= 6
+            ):
+                current_coords = [
+                    float(value)
+                    for value in measured_coords[:6]
+                ]
 
             next_coords = current_coords[:6]
-
-            # 컨테이너 중심에 맞게 X/Y를 수정합니다.
             next_coords[0] += correction_x
             next_coords[1] += correction_y
+            next_coords[2] = locked_z
+            next_coords[3] = locked_rpy[0]
+            next_coords[4] = locked_rpy[1]
+            next_coords[5] = locked_rpy[2]
 
-            # 충분히 확대되지 않았으면 Z를 더 내립니다.
-            if (
-                long_ratio < target_long_ratio
-                or short_ratio < target_short_ratio
-            ):
-
-                remaining_down_mm = max(
-                    0.0,
-                    maximum_down_mm - total_down_mm
-                )
-
-                this_down_mm = min(
-                    approach_step_mm,
-                    remaining_down_mm
-                )
-
-                next_coords[2] = max(
-                    minimum_safe_z,
-                    float(next_coords[2])
-                    - this_down_mm
-                )
-
-                actual_down_mm = (
-                    float(current_coords[2])
-                    - float(next_coords[2])
-                )
-
-            else:
-
-                actual_down_mm = 0.0
-
-            if (
-                abs(correction_x) < 0.05
-                and abs(correction_y) < 0.05
-                and actual_down_mm <= 0.05
-            ):
-
-                print(
-                    "[FLOOR VISUAL LIMIT] "
-                    "더 이상 이동할 수 없어 현재 좌표 사용"
-                )
-
-                break
+            print(
+                "[FLOOR XY MOVE] "
+                f"dx={correction_x:+.2f}mm, "
+                f"dy={correction_y:+.2f}mm | "
+                f"z={locked_z:.2f} 고정"
+            )
 
             moved = self.send_coords(
                 next_coords,
-                "floor_visual_center_approach",
+                "floor_xy_only",
                 wait=float(
                     self.cfg.get(
                         "floor_visual_move_wait_sec",
-                        0.38
+                        0.22
                     )
                 )
             )
 
             if not moved:
-
-                print(
-                    "[FLOOR VISUAL ERROR] "
-                    "확대·중심 보정 이동 실패"
-                )
-
                 return None
 
-            current_coords = next_coords[:6]
-            total_down_mm += max(
-                0.0,
-                actual_down_mm
-            )
+            current_coords = next_coords
 
             time.sleep(
                 float(
                     self.cfg.get(
                         "floor_visual_settle_sec",
-                        0.18
+                        0.08
                     )
                 )
             )
 
         if not isinstance(last_detection, dict):
+            return None
 
-            print(
-                "[FLOOR VISUAL ERROR] "
-                "최종 컨테이너 좌표를 재검출하지 못했습니다."
+        final_center = last_detection.get("center", None)
+
+        if (
+            isinstance(final_center, (list, tuple))
+            and len(final_center) >= 2
+            and last_frame_shape is not None
+        ):
+            frame_height, frame_width = last_frame_shape
+            final_target_u = float(
+                self.cfg.get(
+                    "floor_camera_target_u",
+                    frame_width / 2.0
+                )
+            )
+            final_target_v = float(
+                self.cfg.get(
+                    "floor_camera_target_v",
+                    frame_height / 2.0
+                )
             )
 
-            return None
+            final_error_distance = (
+                (
+                    float(final_center[0])
+                    - final_target_u
+                ) ** 2
+                + (
+                    float(final_center[1])
+                    - final_target_v
+                ) ** 2
+            ) ** 0.5
+
+            if final_error_distance > acceptance_px:
+                print(
+                    "[FLOOR XY ERROR] 최종 중심 오차가 큽니다: "
+                    f"{final_error_distance:.1f}px"
+                )
+                return None
 
         measured_coords = self.get_coords()
 
@@ -3773,54 +4355,38 @@ class ArmCameraRectAutoPickClient:
             isinstance(measured_coords, list)
             and len(measured_coords) >= 6
         ):
-
             current_coords = [
                 float(value)
                 for value in measured_coords[:6]
             ]
 
+        current_coords[2] = locked_z
+        current_coords[3] = locked_rpy[0]
+        current_coords[4] = locked_rpy[1]
+        current_coords[5] = locked_rpy[2]
+
         self.cfg["last_floor_visual_lock"] = {
-            "center": last_detection.get(
-                "center",
-                None
-            ),
-            "long_ratio": round(
-                last_long_ratio,
-                5
-            ),
-            "short_ratio": round(
-                last_short_ratio,
-                5
-            ),
-            "depth_mm": last_detection.get(
-                "depth_mm",
-                None
-            ),
+            "center": last_detection.get("center", None),
+            "depth_mm": last_detection.get("depth_mm", None),
             "tcp_coords": [
                 round(value, 3)
                 for value in current_coords
             ],
-            "recovery_count": recovery_count,
-            "timestamp": round(
-                time.time(),
-                3
-            )
+            "z_was_locked": True,
+            "timestamp": round(time.time(), 3),
         }
 
-        save_config(
-            self.cfg
-        )
+        save_config(self.cfg)
 
         return {
             "lock_coords": current_coords,
             "detection": last_detection,
             "frame_shape": last_frame_shape,
-            "long_ratio": last_long_ratio,
-            "short_ratio": last_short_ratio
         }
 
 
-    # 확대 후 컨테이너 중심을 그리퍼 중심 X/Y에 맞춥니다.
+
+        # 확대 후 컨테이너 중심을 그리퍼 중심 X/Y에 맞춥니다.
     def align_gripper_to_floor_locked_container(
         self,
         floor_lock_result
@@ -3981,6 +4547,20 @@ class ArmCameraRectAutoPickClient:
             )
         )
 
+        final_gripper_offset_x_mm = float(
+            self.cfg.get(
+                "final_gripper_offset_x_mm",
+                0.0
+            )
+        )
+
+        final_gripper_offset_y_mm = float(
+            self.cfg.get(
+                "final_gripper_offset_y_mm",
+                120.0
+            )
+        )
+
         gripper_coords = [
             float(value)
             for value in lock_coords[:6]
@@ -3989,11 +4569,13 @@ class ArmCameraRectAutoPickClient:
         gripper_coords[0] += (
             residual_x_mm
             + camera_to_gripper_x_mm
+            + final_gripper_offset_x_mm
         )
 
         gripper_coords[1] += (
             residual_y_mm
             + camera_to_gripper_y_mm
+            + final_gripper_offset_y_mm
         )
 
         print(
@@ -4001,7 +4583,9 @@ class ArmCameraRectAutoPickClient:
             f"residual=({residual_x_mm:+.2f}, "
             f"{residual_y_mm:+.2f})mm | "
             f"offset=({camera_to_gripper_x_mm:+.2f}, "
-            f"{camera_to_gripper_y_mm:+.2f})mm"
+            f"{camera_to_gripper_y_mm:+.2f})mm | "
+            f"final=({final_gripper_offset_x_mm:+.2f}, "
+            f"{final_gripper_offset_y_mm:+.2f})mm"
         )
 
         moved = self.send_coords(
@@ -4010,7 +4594,7 @@ class ArmCameraRectAutoPickClient:
             wait=float(
                 self.cfg.get(
                     "gripper_xy_align_wait_sec",
-                    0.65
+                    0.35
                 )
             )
         )
@@ -4028,7 +4612,7 @@ class ArmCameraRectAutoPickClient:
             float(
                 self.cfg.get(
                     "gripper_xy_align_settle_sec",
-                    0.30
+                    0.12
                 )
             )
         )
@@ -4062,6 +4646,14 @@ class ArmCameraRectAutoPickClient:
                 camera_to_gripper_y_mm,
                 3
             ),
+            "final_gripper_offset_x_mm": round(
+                final_gripper_offset_x_mm,
+                3
+            ),
+            "final_gripper_offset_y_mm": round(
+                final_gripper_offset_y_mm,
+                3
+            ),
             "target_coords": [
                 round(value, 3)
                 for value in gripper_coords
@@ -4079,8 +4671,1089 @@ class ArmCameraRectAutoPickClient:
         return gripper_coords
 
 
+    # 직접 집기 목표 좌표를 계산합니다. 실제 이동 전 보정 저장에도 사용합니다.
+    def calculate_direct_xyz_pick_target(
+        self,
+        current_coords,
+        detection,
+        frame_shape,
+        apply_manual_calibration=True
+    ):
+
+        if (
+            not isinstance(current_coords, list)
+            or len(current_coords) < 6
+        ):
+            return None
+
+        if not isinstance(detection, dict):
+            return None
+
+        current_coords = [
+            float(value)
+            for value in current_coords[:6]
+        ]
+
+        frame_height, frame_width = frame_shape[:2]
+        center_u, center_v = detection.get(
+            "center",
+            (
+                frame_width / 2.0,
+                frame_height / 2.0
+            )
+        )
+
+        target_u_value = self.cfg.get(
+            "direct_pick_target_u",
+            None
+        )
+        if target_u_value is None:
+            target_u_value = self.cfg.get(
+                "target_u",
+                None
+            )
+        if target_u_value is None:
+            target_u_value = frame_width / 2.0
+
+        target_v_value = self.cfg.get(
+            "direct_pick_target_v",
+            None
+        )
+        if target_v_value is None:
+            target_v_value = self.cfg.get(
+                "target_v",
+                None
+            )
+        if target_v_value is None:
+            target_v_value = frame_height / 2.0
+
+        target_u = float(target_u_value)
+        target_v = float(target_v_value)
+
+        depth_mm = detection.get(
+            "depth_mm",
+            self.cfg.get(
+                "initial_default_depth_mm",
+                210.0
+            )
+        )
+
+        try:
+            depth_mm = float(depth_mm)
+        except (TypeError, ValueError):
+            depth_mm = float(
+                self.cfg.get(
+                    "initial_default_depth_mm",
+                    210.0
+                )
+            )
+
+        error_u = float(center_u) - target_u
+        error_v = float(center_v) - target_v
+
+        focal_x_px = float(
+            self.cfg.get("camera_fx_rect_px", 973.32886)
+        )
+        focal_y_px = float(
+            self.cfg.get("camera_fy_rect_px", 989.13171)
+        )
+
+        xy_gain = float(
+            self.cfg.get(
+                "direct_pick_xy_gain",
+                1.0
+            )
+        )
+
+        delta_x = (
+            float(
+                self.cfg.get(
+                    "direct_pick_x_sign",
+                    -1.0
+                )
+            )
+            * error_v
+            * depth_mm
+            / max(1.0, focal_y_px)
+            * xy_gain
+        )
+        delta_y = (
+            float(
+                self.cfg.get(
+                    "direct_pick_y_sign",
+                    1.0
+                )
+            )
+            * error_u
+            * depth_mm
+            / max(1.0, focal_x_px)
+            * xy_gain
+        )
+
+        maximum_xy_mm = abs(
+            float(
+                self.cfg.get(
+                    "direct_pick_max_xy_mm",
+                    180.0
+                )
+            )
+        )
+        delta_x = max(
+            -maximum_xy_mm,
+            min(maximum_xy_mm, delta_x)
+        )
+        delta_y = max(
+            -maximum_xy_mm,
+            min(maximum_xy_mm, delta_y)
+        )
+
+        camera_to_gripper_x_mm = float(
+            self.cfg.get("camera_to_gripper_x_mm", 20.0)
+        )
+        camera_to_gripper_y_mm = float(
+            self.cfg.get("camera_to_gripper_y_mm", 35.0)
+        )
+        final_offset_x_mm = float(
+            self.cfg.get("final_gripper_offset_x_mm", 0.0)
+        )
+        final_offset_y_mm = float(
+            self.cfg.get("final_gripper_offset_y_mm", 0.0)
+        )
+
+        z_down_mm = max(
+            0.0,
+            float(
+                self.cfg.get(
+                    "direct_pick_down_mm",
+                    self.cfg.get(
+                        "locked_vertical_min_down_mm",
+                        105.0
+                    )
+                )
+            )
+        )
+
+        if bool(
+            self.cfg.get(
+                "direct_pick_use_depth_z",
+                True
+            )
+        ):
+            camera_to_gripper_z_mm = abs(
+                float(
+                    self.cfg.get(
+                        "camera_to_gripper_z_mm",
+                        60.0
+                    )
+                )
+            )
+            z_clearance_mm = float(
+                self.cfg.get(
+                    "direct_pick_z_clearance_mm",
+                    20.0
+                )
+            )
+            depth_based_down_mm = (
+                depth_mm
+                - camera_to_gripper_z_mm
+                - z_clearance_mm
+            )
+            z_down_mm = max(
+                0.0,
+                depth_based_down_mm
+            )
+
+        z_down_mm += float(
+            self.cfg.get(
+                "direct_pick_extra_down_mm",
+                0.0
+            )
+        )
+
+        minimum_z_down_mm = abs(
+            float(
+                self.cfg.get(
+                    "direct_pick_min_down_mm",
+                    65.0
+                )
+            )
+        )
+        maximum_z_down_mm = abs(
+            float(
+                self.cfg.get(
+                    "direct_pick_max_down_mm",
+                    105.0
+                )
+            )
+        )
+        z_down_mm = max(
+            minimum_z_down_mm,
+            min(maximum_z_down_mm, z_down_mm)
+        )
+
+        move_x_mm = (
+            delta_x
+            + camera_to_gripper_x_mm
+            + final_offset_x_mm
+        )
+        move_y_mm = (
+            delta_y
+            + camera_to_gripper_y_mm
+            + final_offset_y_mm
+        )
+
+        if bool(
+            self.cfg.get(
+                "direct_pick_invert_total_xy",
+                True
+            )
+        ):
+            move_x_mm = -move_x_mm
+            move_y_mm = -move_y_mm
+
+        visual_move_x_mm = move_x_mm
+        visual_move_y_mm = move_y_mm
+        visual_move_z_mm = -z_down_mm
+
+        maximum_total_xy_mm = abs(
+            float(
+                self.cfg.get(
+                    "direct_pick_max_total_xy_mm",
+                    90.0
+                )
+            )
+        )
+        move_x_mm = max(
+            -maximum_total_xy_mm,
+            min(maximum_total_xy_mm, move_x_mm)
+        )
+        move_y_mm = max(
+            -maximum_total_xy_mm,
+            min(maximum_total_xy_mm, move_y_mm)
+        )
+
+        target_coords = current_coords[:6]
+        target_coords[0] += move_x_mm
+        target_coords[1] += move_y_mm
+        target_coords[2] = max(
+            float(
+                self.cfg.get(
+                    "floor_contact_z_mm",
+                    0.0
+                )
+            ),
+            float(current_coords[2]) - z_down_mm
+        )
+
+        base_target_coords = target_coords[:6]
+
+        manual_offset_x_mm = 0.0
+        manual_offset_y_mm = 0.0
+        manual_offset_z_mm = 0.0
+        calibration_source = "none"
+
+        if (
+            apply_manual_calibration
+            and bool(
+                self.cfg.get(
+                    "direct_pick_use_relative_manual_calibration",
+                    True
+                )
+            )
+        ):
+            calibration = self.cfg.get(
+                "last_direct_pick_manual_calibration",
+                None
+            )
+
+            if isinstance(calibration, dict):
+                manual_offset_x_mm = float(
+                    calibration.get(
+                        "correction_x_mm",
+                        self.cfg.get(
+                            "direct_pick_manual_offset_x_mm",
+                            0.0
+                        )
+                    )
+                )
+                manual_offset_y_mm = float(
+                    calibration.get(
+                        "correction_y_mm",
+                        self.cfg.get(
+                            "direct_pick_manual_offset_y_mm",
+                            0.0
+                        )
+                    )
+                )
+                manual_offset_z_mm = float(
+                    calibration.get(
+                        "correction_z_mm",
+                        self.cfg.get(
+                            "direct_pick_manual_offset_z_mm",
+                            0.0
+                        )
+                    )
+                )
+                calibration_source = "manual_correction_offset"
+
+        elif apply_manual_calibration:
+            manual_offset_x_mm = float(
+                self.cfg.get(
+                    "direct_pick_final_robot_x_mm",
+                    0.0
+                )
+            )
+            manual_offset_y_mm = float(
+                self.cfg.get(
+                    "direct_pick_final_robot_y_mm",
+                    0.0
+                )
+            )
+            manual_offset_z_mm = -max(
+                0.0,
+                float(
+                    self.cfg.get(
+                        "direct_pick_final_extra_down_mm",
+                        0.0
+                    )
+                )
+            )
+            calibration_source = "legacy_final_offset"
+
+        if calibration_source in (
+            "none",
+            "legacy_final_offset",
+            "last_manual_relative",
+            "manual_correction_offset"
+        ):
+            target_coords[0] += manual_offset_x_mm
+            target_coords[1] += manual_offset_y_mm
+            target_coords[2] = max(
+                float(
+                    self.cfg.get(
+                        "floor_contact_z_mm",
+                        0.0
+                    )
+                ),
+                target_coords[2] + manual_offset_z_mm
+            )
+
+        return {
+            "target_coords": target_coords,
+            "center_u": float(center_u),
+            "center_v": float(center_v),
+            "depth_mm": depth_mm,
+            "move_x_mm": move_x_mm,
+            "move_y_mm": move_y_mm,
+            "move_z_mm": target_coords[2] - current_coords[2],
+            "visual_move_x_mm": visual_move_x_mm,
+            "visual_move_y_mm": visual_move_y_mm,
+            "visual_move_z_mm": visual_move_z_mm,
+            "base_target_coords": base_target_coords,
+            "manual_offset_x_mm": manual_offset_x_mm,
+            "manual_offset_y_mm": manual_offset_y_mm,
+            "manual_offset_z_mm": manual_offset_z_mm,
+            "calibration_source": calibration_source,
+            "start_coords": current_coords,
+            "frame_width": int(frame_width),
+            "frame_height": int(frame_height),
+        }
+
+
+    # 현재 카메라가 보는 컨테이너를 기준으로 X/Y/Z를 한 번에 이동해 집습니다.
+    def direct_xyz_pick_and_return_home(self):
+
+        # w를 여러 번 실행할 때 이전 이동 좌표 캐시가 섞이지 않게 합니다.
+        self.arm.reset_tcp_cache()
+
+        frame = self.read_frame()
+
+        if frame is None:
+            print("[DIRECT XYZ PICK ERROR] 카메라 영상 없음")
+            return False
+
+        detection, _ = self.detect_rectangle_object(frame)
+
+        if (
+            not isinstance(detection, dict)
+            and not bool(
+                self.cfg.get(
+                    "direct_pick_require_fresh_detection",
+                    True
+                )
+            )
+        ):
+            detection = getattr(
+                self,
+                "last_recognized_detection",
+                None
+            )
+
+        if not isinstance(detection, dict):
+            print(
+                "[DIRECT XYZ PICK ERROR] "
+                "현재 화면에서 컨테이너를 새로 인식하지 못했습니다."
+            )
+            return False
+
+        current_coords = self.get_coords()
+
+        if (
+            not isinstance(current_coords, list)
+            or len(current_coords) < 6
+        ):
+            print("[DIRECT XYZ PICK ERROR] 현재 TCP 좌표 읽기 실패")
+            return False
+
+        current_coords = [
+            float(value)
+            for value in current_coords[:6]
+        ]
+
+        if bool(
+            self.cfg.get(
+                "direct_pick_open_gripper_before_move",
+                True
+            )
+        ):
+            if not self.open_gripper():
+                print("[DIRECT XYZ PICK ERROR] 시작 전 그리퍼 열기 실패")
+                return False
+
+            self.arm.reset_tcp_cache()
+
+            refreshed_coords = self.get_coords()
+
+            if (
+                isinstance(refreshed_coords, list)
+                and len(refreshed_coords) >= 6
+            ):
+                current_coords = [
+                    float(value)
+                    for value in refreshed_coords[:6]
+                ]
+
+        pick_plan = self.calculate_direct_xyz_pick_target(
+            current_coords,
+            detection,
+            frame.shape,
+            apply_manual_calibration=True
+        )
+
+        if not isinstance(pick_plan, dict):
+            print("[DIRECT XYZ PICK ERROR] 목표 좌표 계산 실패")
+            return False
+
+        target_coords = pick_plan["target_coords"]
+        center_u = pick_plan["center_u"]
+        center_v = pick_plan["center_v"]
+        depth_mm = pick_plan["depth_mm"]
+        move_x_mm = pick_plan["move_x_mm"]
+        move_y_mm = pick_plan["move_y_mm"]
+        base_target_coords = pick_plan["base_target_coords"]
+        manual_offset_x_mm = pick_plan["manual_offset_x_mm"]
+        manual_offset_y_mm = pick_plan["manual_offset_y_mm"]
+        manual_offset_z_mm = pick_plan["manual_offset_z_mm"]
+        calibration_source = pick_plan["calibration_source"]
+
+        print(
+            "[DIRECT XYZ PICK] "
+            f"pixel=({float(center_u):.1f}, {float(center_v):.1f}) | "
+            f"depth={depth_mm:.1f} | "
+            f"move=({move_x_mm:+.2f}, "
+            f"{move_y_mm:+.2f}, "
+            f"{target_coords[2] - current_coords[2]:+.2f})"
+        )
+        print(
+            "[DIRECT XYZ PICK CALIB] "
+            f"source={calibration_source} | "
+            f"base=({base_target_coords[0]:.2f}, "
+            f"{base_target_coords[1]:.2f}, "
+            f"{base_target_coords[2]:.2f}) | "
+            f"delta=({manual_offset_x_mm:+.2f}, "
+            f"{manual_offset_y_mm:+.2f}, "
+            f"{manual_offset_z_mm:+.2f})"
+        )
+
+        xy_first_clearance_mm = abs(
+            float(
+                self.cfg.get(
+                    "direct_pick_xy_first_clearance_mm",
+                    15.0
+                )
+            )
+        )
+        xy_first_coords = target_coords[:6]
+        xy_first_coords[2] = max(
+            float(current_coords[2]),
+            float(target_coords[2]) + xy_first_clearance_mm
+        )
+
+        print(
+            "[DIRECT XYZ PICK] X/Y 먼저 이동 | "
+            f"target=({xy_first_coords[0]:.2f}, "
+            f"{xy_first_coords[1]:.2f}, "
+            f"{xy_first_coords[2]:.2f})"
+        )
+
+        moved = self.send_coords(
+            xy_first_coords,
+            "direct_pick_xy_first",
+            wait=float(
+                self.cfg.get(
+                    "direct_pick_move_wait_sec",
+                    1.2
+                )
+            )
+        )
+
+        if not moved:
+            print("[DIRECT XYZ PICK ERROR] X/Y 선이동 실패")
+            return False
+
+        z_target_coords = xy_first_coords[:6]
+        z_target_coords[2] = float(target_coords[2])
+
+        print(
+            "[DIRECT XYZ PICK] Z 하강 이동 | "
+            f"target_z={z_target_coords[2]:.2f}"
+        )
+
+        moved = self.send_coords(
+            z_target_coords,
+            "direct_pick_z_down",
+            wait=float(
+                self.cfg.get(
+                    "direct_pick_z_move_wait_sec",
+                    self.cfg.get(
+                        "direct_pick_move_wait_sec",
+                        1.2
+                    )
+                )
+            )
+        )
+
+        if not moved:
+            print("[DIRECT XYZ PICK ERROR] Z 하강 이동 실패")
+            return False
+
+        time.sleep(
+            float(
+                self.cfg.get(
+                    "direct_pick_settle_sec",
+                    0.20
+                )
+            )
+        )
+
+        measured_coords = self.get_coords()
+
+        if (
+            isinstance(measured_coords, list)
+            and len(measured_coords) >= 6
+        ):
+            target_coords = [
+                float(value)
+                for value in measured_coords[:6]
+            ]
+
+        print("[DIRECT XYZ PICK] 그리퍼 닫기")
+
+        if not self.close_gripper():
+            print("[DIRECT XYZ PICK ERROR] 그리퍼 닫기 실패")
+            return False
+
+        time.sleep(
+            float(
+                self.cfg.get(
+                    "lock_pick_after_grip_wait_sec",
+                    0.15
+                )
+            )
+        )
+
+        lift_coords = target_coords[:6]
+        lift_coords[2] = float(lift_coords[2]) + abs(
+            float(
+                self.cfg.get(
+                    "locked_vertical_lift_mm",
+                    55.0
+                )
+            )
+        )
+
+        lifted = self.send_coords(
+            lift_coords,
+            "direct_xyz_pick_lift",
+            wait=float(
+                self.cfg.get(
+                    "locked_vertical_lift_wait_sec",
+                    0.45
+                )
+            )
+        )
+
+        if not lifted:
+            print("[DIRECT XYZ PICK ERROR] 들어올리기 실패")
+            return False
+
+        returned = self.return_to_camera_ready_pose()
+
+        if not returned:
+            print("[DIRECT XYZ PICK ERROR] 초기 위치 복귀 실패")
+            return False
+
+        self.object_ready = False
+        self.object_ready_announced = False
+        self.last_recognized_detection = None
+        self.last_recognized_time = 0.0
+        self.auto_pick_latched = False
+        self.auto_stable_count = 0
+        self.auto_missing_count = 0
+        self.last_detect_center = None
+
+        self.cfg["last_direct_xyz_pick"] = {
+            "center_u_px": round(float(center_u), 3),
+            "center_v_px": round(float(center_v), 3),
+            "depth_mm": round(depth_mm, 3),
+            "target_coords": [
+                round(value, 3)
+                for value in target_coords
+            ],
+            "timestamp": round(time.time(), 3)
+        }
+        save_config(self.cfg)
+
+        print("[DIRECT XYZ PICK COMPLETE]")
+        return True
+
+
+    # 수동 보정 시작: 현재 카메라 인식값과 자동 계산 목표 좌표를 저장합니다.
+    def start_direct_pick_manual_calibration(self):
+
+        frame = self.read_frame()
+
+        if frame is None:
+            print("[PICK CALIB ERROR] 카메라 영상 없음")
+            return False
+
+        # 보정은 현재 화면의 컨테이너 위치를 기준으로 새로 시작합니다.
+        detection, _ = self.detect_rectangle_object(frame)
+
+        if not isinstance(detection, dict):
+            detection = getattr(
+                self,
+                "last_recognized_detection",
+                None
+            )
+
+        if not isinstance(detection, dict):
+            print("[PICK CALIB ERROR] 컨테이너 인식값 없음")
+            return False
+
+        current_coords = self.get_coords()
+
+        if (
+            not isinstance(current_coords, list)
+            or len(current_coords) < 6
+        ):
+            print("[PICK CALIB ERROR] 현재 TCP 좌표 읽기 실패")
+            return False
+
+        current_coords = [
+            float(value)
+            for value in current_coords[:6]
+        ]
+
+        pick_plan = self.calculate_direct_xyz_pick_target(
+            current_coords,
+            detection,
+            frame.shape,
+            apply_manual_calibration=False
+        )
+
+        if not isinstance(pick_plan, dict):
+            print("[PICK CALIB ERROR] 자동 목표 좌표 계산 실패")
+            return False
+
+        recognition_coords = detection.get(
+            "tcp_coords_at_recognition",
+            current_coords
+        )
+        if (
+            not isinstance(recognition_coords, (list, tuple))
+            or len(recognition_coords) < 6
+        ):
+            recognition_coords = current_coords
+
+        detection_center = detection.get(
+            "center",
+            (
+                pick_plan["center_u"],
+                pick_plan["center_v"]
+            )
+        )
+        if (
+            not isinstance(detection_center, (list, tuple))
+            or len(detection_center) < 2
+        ):
+            detection_center = (
+                pick_plan["center_u"],
+                pick_plan["center_v"]
+            )
+
+        self.cfg["auto_pick_enabled"] = False
+        self.pick_manual_calibration_active = True
+        self.cfg["pending_direct_pick_manual_calibration"] = {
+            "start_coords": [
+                round(value, 3)
+                for value in current_coords
+            ],
+            "tcp_coords_at_recognition": [
+                round(value, 3)
+                for value in recognition_coords[:6]
+            ],
+            "auto_target_coords": [
+                round(value, 3)
+                for value in pick_plan["target_coords"]
+            ],
+            "base_target_coords": [
+                round(value, 3)
+                for value in pick_plan["base_target_coords"]
+            ],
+            "detected_container": {
+                "center": [
+                    round(float(value), 3)
+                    for value in detection_center[:2]
+                ],
+                "depth_mm": round(pick_plan["depth_mm"], 3),
+                "confidence": round(
+                    float(detection.get("confidence", 0.0)),
+                    4
+                ),
+                "recognized_at": detection.get(
+                    "recognized_at",
+                    None
+                )
+            },
+            "center_u_px": round(pick_plan["center_u"], 3),
+            "center_v_px": round(pick_plan["center_v"], 3),
+            "depth_mm": round(pick_plan["depth_mm"], 3),
+            "move_x_mm": round(pick_plan["move_x_mm"], 3),
+            "move_y_mm": round(pick_plan["move_y_mm"], 3),
+            "move_z_mm": round(pick_plan["move_z_mm"], 3),
+            "visual_move_x_mm": round(
+                pick_plan["visual_move_x_mm"],
+                3
+            ),
+            "visual_move_y_mm": round(
+                pick_plan["visual_move_y_mm"],
+                3
+            ),
+            "visual_move_z_mm": round(
+                pick_plan["visual_move_z_mm"],
+                3
+            ),
+            "old_direct_pick_final_robot_x_mm": round(
+                float(
+                    self.cfg.get(
+                        "direct_pick_final_robot_x_mm",
+                        0.0
+                    )
+                ),
+                3
+            ),
+            "old_direct_pick_final_robot_y_mm": round(
+                float(
+                    self.cfg.get(
+                        "direct_pick_final_robot_y_mm",
+                        0.0
+                    )
+                ),
+                3
+            ),
+            "old_direct_pick_final_extra_down_mm": round(
+                float(
+                    self.cfg.get(
+                        "direct_pick_final_extra_down_mm",
+                        0.0
+                    )
+                ),
+                3
+            ),
+            "timestamp": round(time.time(), 3),
+        }
+
+        save_config(self.cfg)
+
+        if bool(
+            self.cfg.get(
+                "pick_manual_calibration_open_gripper",
+                True
+            )
+        ):
+            self.arm.set_gripper_value(
+                int(
+                    self.cfg.get(
+                        "gripper_open",
+                        100
+                    )
+                ),
+                int(
+                    self.cfg.get(
+                        "gripper_speed",
+                        50
+                    )
+                ),
+                wait=float(
+                    self.cfg.get(
+                        "lock_pick_gripper_open_wait_sec",
+                        0.25
+                    )
+                )
+            )
+
+        if bool(
+            self.cfg.get(
+                "pick_manual_calibration_release_servos",
+                False
+            )
+        ):
+            release_response = self.arm.release_all_servos()
+
+            if (
+                not isinstance(release_response, dict)
+                or not release_response.get("ok", False)
+            ):
+                print(
+                    "[PICK CALIB WARNING] "
+                    "서보 토크 해제 실패:",
+                    release_response
+                )
+            else:
+                print(
+                    "[PICK CALIB] "
+                    "서보 토크 해제 완료. 손으로 그리퍼를 물체 집기 위치에 맞추세요."
+                )
+        else:
+            print(
+                "[PICK CALIB] "
+                "키보드 수동 조작 모드입니다. "
+                "필요하면 i/k/j/l/u/m 또는 1~0/-/= 관절키로 그리퍼를 컨테이너 집기 위치까지 이동하세요."
+            )
+
+        print(
+            "[PICK CALIB START] "
+            "위치를 맞춘 뒤 y를 누르면 현재 좌표를 저장합니다. "
+            "그 다음 w를 누르면 저장한 보정값으로 집습니다."
+        )
+        print(
+            "[PICK CALIB START] "
+            f"auto_target="
+            f"{[round(value, 2) for value in pick_plan['target_coords'][:3]]}"
+        )
+
+        return True
+
+
+    # 수동으로 맞춘 현재 TCP 좌표를 성공 좌표로 저장하고 보정값을 갱신합니다.
+    def save_direct_pick_manual_calibration(self):
+
+        pending = self.cfg.get(
+            "pending_direct_pick_manual_calibration",
+            None
+        )
+
+        if not isinstance(pending, dict):
+            print("[PICK CALIB ERROR] 먼저 n을 눌러 보정을 시작하세요.")
+            return False
+
+        auto_target = pending.get("auto_target_coords", None)
+
+        if (
+            not isinstance(auto_target, list)
+            or len(auto_target) < 6
+        ):
+            print("[PICK CALIB ERROR] 저장된 자동 목표 좌표가 없습니다.")
+            return False
+
+        actual_coords = self.get_coords()
+
+        if (
+            not isinstance(actual_coords, list)
+            or len(actual_coords) < 6
+        ):
+            print("[PICK CALIB ERROR] 현재 TCP 좌표 읽기 실패")
+            return False
+
+        actual_coords = [
+            float(value)
+            for value in actual_coords[:6]
+        ]
+
+        focus_response = self.arm.focus_all_servos()
+
+        if (
+            not isinstance(focus_response, dict)
+            or not focus_response.get("ok", False)
+        ):
+            print(
+                "[PICK CALIB WARNING] "
+                "서보 토크 고정 실패:",
+                focus_response
+            )
+        else:
+            print("[PICK CALIB] 서보 토크 고정 완료")
+
+        auto_target = [
+            float(value)
+            for value in auto_target[:6]
+        ]
+
+        correction_x = actual_coords[0] - auto_target[0]
+        correction_y = actual_coords[1] - auto_target[1]
+        correction_z = actual_coords[2] - auto_target[2]
+        actual_down_from_start = None
+
+        start_coords = pending.get("start_coords", None)
+        if (
+            isinstance(start_coords, list)
+            and len(start_coords) >= 3
+        ):
+            actual_down_from_start = (
+                float(start_coords[2])
+                - float(actual_coords[2])
+            )
+
+        new_offset_x = correction_x
+        new_offset_y = correction_y
+        new_offset_z = correction_z
+        new_extra_down = max(
+            0.0,
+            -correction_z
+        )
+
+        self.cfg["direct_pick_final_robot_x_mm"] = round(
+            new_offset_x,
+            3
+        )
+        self.cfg["direct_pick_final_robot_y_mm"] = round(
+            new_offset_y,
+            3
+        )
+        self.cfg["direct_pick_final_extra_down_mm"] = round(
+            new_extra_down,
+            3
+        )
+        self.cfg["direct_pick_manual_offset_x_mm"] = round(
+            new_offset_x,
+            3
+        )
+        self.cfg["direct_pick_manual_offset_y_mm"] = round(
+            new_offset_y,
+            3
+        )
+        self.cfg["direct_pick_manual_offset_z_mm"] = round(
+            new_offset_z,
+            3
+        )
+        self.cfg["direct_pick_use_relative_manual_calibration"] = True
+        self.cfg["direct_pick_require_fresh_detection"] = True
+        self.cfg["direct_pick_manual_calibration_model"] = "visual_delta"
+
+        self.cfg["last_direct_pick_manual_calibration"] = {
+            "auto_target_coords": [
+                round(value, 3)
+                for value in auto_target
+            ],
+            "actual_success_coords": [
+                round(value, 3)
+                for value in actual_coords
+            ],
+            "correction_x_mm": round(correction_x, 3),
+            "correction_y_mm": round(correction_y, 3),
+            "correction_z_mm": round(correction_z, 3),
+            "actual_down_from_start_mm": (
+                None
+                if actual_down_from_start is None
+                else round(actual_down_from_start, 3)
+            ),
+            "direct_pick_final_robot_x_mm": round(
+                new_offset_x,
+                3
+            ),
+            "direct_pick_final_robot_y_mm": round(
+                new_offset_y,
+                3
+            ),
+            "direct_pick_final_extra_down_mm": round(
+                new_extra_down,
+                3
+            ),
+            "direct_pick_manual_offset_x_mm": round(
+                new_offset_x,
+                3
+            ),
+            "direct_pick_manual_offset_y_mm": round(
+                new_offset_y,
+                3
+            ),
+            "direct_pick_manual_offset_z_mm": round(
+                new_offset_z,
+                3
+            ),
+            "model": "visual_delta",
+            "source": pending,
+            "timestamp": round(time.time(), 3),
+        }
+        self.cfg["pending_direct_pick_manual_calibration"] = None
+        self.pick_manual_calibration_active = False
+
+        save_config(self.cfg)
+
+        print(
+            "[PICK CALIB SAVED] "
+            f"correction=({correction_x:+.2f}, "
+            f"{correction_y:+.2f}, {correction_z:+.2f})mm"
+        )
+        print(
+            "[PICK CALIB SAVED] "
+            f"offset=({new_offset_x:+.2f}, "
+            f"{new_offset_y:+.2f}, "
+            f"{new_offset_z:+.2f})"
+        )
+
+        if actual_down_from_start is not None:
+            print(
+                "[PICK CALIB SAVED] "
+                f"actual_down_from_start={actual_down_from_start:.2f}mm"
+            )
+
+        if bool(
+            self.cfg.get(
+                "pick_manual_calibration_return_ready_after_save",
+                True
+            )
+        ):
+            print(
+                "[PICK CALIB] "
+                "저장 완료. w 재실행을 위해 카메라 준비 자세로 복귀합니다."
+            )
+            self.return_to_camera_ready_pose()
+
+        return True
+
+
     # 첫 좌표 -> 바닥 카메라 -> 확대 정렬 -> 그리퍼 정렬 -> 수직 집기입니다.
     def pick_and_return_home(self):
+
+        if bool(
+            self.cfg.get(
+                "direct_xyz_pick_enabled",
+                True
+            )
+        ):
+            return self.direct_xyz_pick_and_return_home()
 
         if not getattr(
             self,
@@ -4117,7 +5790,7 @@ class ArmCameraRectAutoPickClient:
             wait=float(
                 self.cfg.get(
                     "lock_pick_gripper_open_wait_sec",
-                    0.45
+                    0.25
                 )
             )
         )
@@ -4137,6 +5810,41 @@ class ArmCameraRectAutoPickClient:
             )
 
             return False
+
+        if bool(
+            self.cfg.get(
+                "initial_coarse_approach_enabled",
+                True
+            )
+        ):
+            print(
+                "[FLOW 0/5] 초기 카메라 기준 컨테이너 중심 접근"
+            )
+
+            coarse_ok = self.coarse_approach_to_object()
+
+            if not coarse_ok:
+                print(
+                    "[INITIAL FLOOR PICK ERROR] "
+                    "초기 카메라 중심 접근 실패"
+                )
+                return False
+
+            time.sleep(
+                float(
+                    self.cfg.get(
+                        "initial_relock_settle_sec",
+                        0.12
+                    )
+                )
+            )
+
+            if not self.relock_visible_object_after_approach():
+                print(
+                    "[INITIAL FLOOR PICK ERROR] "
+                    "초기 접근 후 목표 재잠금 실패"
+                )
+                return False
 
         # 1단계: 첫 화면 좌표를 저장합니다.
         initial_target = (
@@ -4230,7 +5938,7 @@ class ArmCameraRectAutoPickClient:
             wait=float(
                 self.cfg.get(
                     "lock_pick_gripper_close_wait_sec",
-                    0.70
+                    0.45
                 )
             )
         )
@@ -4255,7 +5963,7 @@ class ArmCameraRectAutoPickClient:
             float(
                 self.cfg.get(
                     "lock_pick_after_grip_wait_sec",
-                    0.30
+                    0.15
                 )
             )
         )
@@ -4288,7 +5996,7 @@ class ArmCameraRectAutoPickClient:
             wait=float(
                 self.cfg.get(
                     "locked_vertical_lift_wait_sec",
-                    0.80
+                    0.45
                 )
             )
         )
@@ -4306,7 +6014,7 @@ class ArmCameraRectAutoPickClient:
             float(
                 self.cfg.get(
                     "before_return_home_wait_sec",
-                    0.35
+                    0.15
                 )
             )
         )
@@ -4558,43 +6266,69 @@ class ArmCameraRectAutoPickClient:
         # 저장 로그입니다.
         print("[SAVE] camera_ready_angles:", angles[:6])
 
+    # ROS 영상 콜백을 지속적으로 실행하는 별도 스레드입니다.
+    def ros_spin_loop(self):
+
+        # 프로그램이 실행 중인 동안 ROS 콜백을 빠르게 처리합니다.
+        while (
+            self.ros_spin_running
+            and rclpy.ok()
+        ):
+
+            try:
+
+                # 짧은 대기 시간으로 최신 영상 콜백을 처리합니다.
+                rclpy.spin_once(
+                    self.ros_node,
+                    timeout_sec=0.01
+                )
+
+            except Exception as error:
+
+                print(
+                    "[ROS SPIN ERROR]",
+                    type(error).__name__,
+                    error
+                )
+
+                time.sleep(0.02)
+
+
     # /camera/image_rect 영상이 들어올 때 실행되는 함수입니다.
     def image_callback(self, msg):
 
         try:
-            # ROS Image 메시지를 OpenCV BGR 영상으로 변환합니다.
-            self.latest_frame = self.bridge.imgmsg_to_cv2(
+
+            # ROS Image를 OpenCV BGR 영상으로 변환합니다.
+            frame = self.bridge.imgmsg_to_cv2(
                 msg,
                 desired_encoding="bgr8"
             )
 
+            # 이전 영상은 버리고 최신 영상으로 덮어씁니다.
+            with self.camera_lock:
+                self.latest_frame = frame
+
         except Exception as error:
-            # 영상 변환 오류를 출력합니다.
+
             print(
                 f"[CAMERA ERROR] 영상 변환 실패: {error}"
             )
 
-    # 가장 최근의 보정 영상 프레임을 읽는 함수입니다.
+
+    # 가장 최근에 받은 보정 영상을 반환합니다.
     def read_frame(self):
 
-        # 여러 스레드가 동시에 ROS 콜백을 처리하지 않게 보호합니다.
+        # ROS 콜백은 별도 스레드가 처리하므로 여기서는 기다리지 않습니다.
         with self.camera_lock:
 
-            # ROS 콜백을 한 번 처리하며 영상을 기다립니다.
-            rclpy.spin_once(
-                self.ros_node,
-                timeout_sec=0.2
-            )
-
-            # 아직 영상이 수신되지 않았다면 None을 반환합니다.
+            # 아직 영상이 없으면 None을 반환합니다.
             if self.latest_frame is None:
                 return None
 
-            # 원본 프레임이 변경되지 않도록 복사합니다.
-            frame = self.latest_frame.copy()
+            # 최신 프레임을 복사해서 반환합니다.
+            return self.latest_frame.copy()
 
-        # 보정된 영상을 반환합니다.
-        return frame
 
     def detect_rectangle_object(self, frame):
 
@@ -5046,7 +6780,11 @@ class ArmCameraRectAutoPickClient:
             "t: save current angles as camera ready",
             "i/k: z +/-   j/l: y +/-   u/m: x +/-",
             "q: auto center rectangle",
+            "z: move view to container zero",
+            "v: save current container as zero",
             "f: save current pose as object memory",
+            "n: start manual pick calib",
+            "y: save manual pick pose",
             "w/b: pick recognized object + return home",
             "e: place",
             "s: save scan coords",
@@ -5056,6 +6794,12 @@ class ArmCameraRectAutoPickClient:
             "[/]: pick_down -/+   ;/\': depth bias +/-",
             "ESC: exit"
         ]
+
+        if self.pick_manual_calibration_active:
+            lines.insert(
+                1,
+            "PICK CALIB: move arm by hand to real grip pose, press y, then w"
+            )
 
         # 안내 문구를 출력합니다.
         for idx, line in enumerate(lines):
@@ -5476,7 +7220,7 @@ class ArmCameraRectAutoPickClient:
         return True
 
     # 컨테이너 중심을 목표 픽셀로 한 번 이동시키는 함수입니다.
-    def center_once(self):
+    def center_once(self, direction_sign=None, target_pixel=None, use_simple=False):
 
         # 최신 보정 영상을 읽습니다.
         frame = self.read_frame()
@@ -5497,11 +7241,18 @@ class ArmCameraRectAutoPickClient:
         # 영상 크기를 가져옵니다.
         height, width = frame.shape[:2]
 
-        # 저장된 목표 픽셀을 가져옵니다.
-        target_u, target_v = self.get_target_pixel(
-            width,
-            height
-        )
+        # 목표 픽셀을 가져옵니다. z 영점 맞춤은 저장된 십자가가 아니라 화면 중앙을 씁니다.
+        if (
+            isinstance(target_pixel, (list, tuple))
+            and len(target_pixel) >= 2
+        ):
+            target_u = float(target_pixel[0])
+            target_v = float(target_pixel[1])
+        else:
+            target_u, target_v = self.get_target_pixel(
+                width,
+                height
+            )
 
         # 검출된 컨테이너 중심입니다.
         center_u, center_v = detection["center"]
@@ -5547,25 +7298,21 @@ class ArmCameraRectAutoPickClient:
         if coords is None:
             return False
 
-        # 저장된 방향 변환 행렬을 가져옵니다.
-        matrix_data = self.cfg.get(
-            "pixel_jacobian",
-            None
-        )
+        jacobian = None
 
-        # 방향 행렬이 없으면 이동하지 않습니다.
-        if matrix_data is None:
-            print(
-                "[CENTER ERROR] XY 방향 보정값이 없습니다. "
-                "영상 창에서 d 키를 먼저 누르세요."
+        if not bool(use_simple):
+            # 저장된 방향 변환 행렬을 가져옵니다.
+            matrix_data = self.cfg.get(
+                "pixel_jacobian",
+                None
             )
-            return False
 
-        # 방향 행렬을 numpy 배열로 변환합니다.
-        jacobian = np.array(
-            matrix_data,
-            dtype=float
-        )
+            if matrix_data is not None:
+                # 방향 행렬을 numpy 배열로 변환합니다.
+                jacobian = np.array(
+                    matrix_data,
+                    dtype=float
+                )
 
         # 현재 픽셀 오차 벡터입니다.
         # 영상의 좌우 오차만 반대로 적용합니다.
@@ -5580,17 +7327,49 @@ class ArmCameraRectAutoPickClient:
             self.cfg.get("center_gain", 0.70)
         )
 
+        if direction_sign is None:
+            direction_sign = float(
+                self.cfg.get(
+                    "center_direction_sign",
+                    1.0
+                )
+            )
+        else:
+            direction_sign = float(direction_sign)
+
         try:
             # 픽셀 오차를 줄이는 로봇 X/Y 이동량을 계산합니다.
+            if jacobian is None:
+                raise np.linalg.LinAlgError()
+
             robot_delta = (
                 -np.linalg.inv(jacobian)
                 @ pixel_error
                 * gain
+                * direction_sign
             )
 
         except np.linalg.LinAlgError:
             print("[CENTER ERROR] 방향 행렬 역변환 실패")
-            return False
+            robot_delta = np.array(
+                [
+                    float(
+                        self.cfg.get(
+                            "zero_focus_simple_x_from_image_y",
+                            -0.025
+                        )
+                    )
+                    * error_v,
+                    float(
+                        self.cfg.get(
+                            "zero_focus_simple_y_from_image_x",
+                            -0.025
+                        )
+                    )
+                    * error_u,
+                ],
+                dtype=float
+            ) * gain * direction_sign
 
         # 계산된 로봇 X축 이동량입니다.
         delta_x = float(robot_delta[0])
@@ -5661,7 +7440,8 @@ class ArmCameraRectAutoPickClient:
         print(
             "[CENTER MATRIX] "
             f"dx={delta_x:.2f}, "
-            f"dy={delta_y:.2f}"
+            f"dy={delta_y:.2f} "
+            f"sign={direction_sign:+.0f}"
         )
 
         # 로봇을 이동합니다.
@@ -5677,13 +7457,23 @@ class ArmCameraRectAutoPickClient:
 
 
     # 자동 중심 맞추기입니다.
-    def auto_center(self, max_iter=5):
+    def auto_center(
+        self,
+        max_iter=5,
+        direction_sign=None,
+        target_pixel=None,
+        use_simple=False
+    ):
 
         # 여러 번 반복합니다.
         for _ in range(max_iter):
 
             # 1회 중심 맞추기입니다.
-            done = self.center_once()
+            done = self.center_once(
+                direction_sign=direction_sign,
+                target_pixel=target_pixel,
+                use_simple=use_simple
+            )
 
             # 완료되면 True입니다.
             if done:
@@ -6391,13 +8181,16 @@ class ArmCameraRectAutoPickClient:
 
         # 그리퍼를 엽니다.
         print("[PLACE] gripper open")
-        self.arm.set_gripper_value(int(self.cfg["gripper_open"]), int(self.cfg["gripper_speed"]), wait=0.7)
+        if not self.open_gripper():
+            print("[PLACE ERROR] 그리퍼 열기 실패")
+            return False
 
         # 다시 위로 올라갑니다.
         self.send_coords(above_coords, "place_lift", wait=0.8)
 
         # 완료입니다.
         print("[PLACE] 완료")
+        return True
 
     # scan 좌표 저장입니다.
     def save_scan_pose(self):
@@ -6434,8 +8227,8 @@ class ArmCameraRectAutoPickClient:
             save_config(self.cfg)
             print("[SAVE] place_coords:", coords)
 
-    # 현재 직사각형 중심을 목표 픽셀로 저장합니다.
-    def save_target_pixel(self):
+    # 현재 직사각형 중심을 화면 십자가와 직접 집기 영점으로 저장합니다.
+    def save_target_pixel(self, use_image_center=False):
 
         # 프레임을 읽습니다.
         frame = self.read_frame()
@@ -6445,26 +8238,814 @@ class ArmCameraRectAutoPickClient:
             print("[ERROR] frame 없음")
             return
 
-        # 직사각형 검출입니다.
-        detection, _ = self.detect_rectangle_object(frame)
+        if bool(use_image_center):
+            height, width = frame.shape[:2]
+            cx = width / 2.0
+            cy = height / 2.0
+        else:
+            # 여러 프레임 중앙값을 우선 사용해서 흔들림을 줄입니다.
+            stable_center = self.get_stable_detection_center(
+                attempts=int(
+                    self.cfg.get(
+                        "zero_calibration_sample_count",
+                        18
+                    )
+                )
+            )
 
-        # 검출 실패 시 종료합니다.
-        if detection is None:
-            print("[TARGET] 직사각형 없음")
-            return
+            detection = None
 
-        # 중심을 가져옵니다.
-        cx, cy = detection["center"]
+            if stable_center is None:
+                # 직사각형 검출입니다.
+                detection, _ = self.detect_rectangle_object(frame)
 
-        # 목표 픽셀 저장입니다.
+                # 검출 실패 시 종료합니다.
+                if detection is None:
+                    print("[ZERO CALIB ERROR] 컨테이너 인식값 없음")
+                    return False
+
+                # 중심을 가져옵니다.
+                cx, cy = detection["center"]
+            else:
+                cx, cy = stable_center
+
+        cx = float(cx)
+        cy = float(cy)
+
+        # 화면 십자가 기준점과 직접 집기 계산 기준점을 같이 저장합니다.
         self.cfg["target_u"] = cx
         self.cfg["target_v"] = cy
+        self.cfg["direct_pick_target_u"] = cx
+        self.cfg["direct_pick_target_v"] = cy
+        self.cfg["last_zero_focus_calibration"] = {
+            "target_u": round(cx, 3),
+            "target_v": round(cy, 3),
+            "source": (
+                "image_center"
+                if bool(use_image_center)
+                else "container_center"
+            ),
+            "timestamp": round(time.time(), 3)
+        }
 
         # 설정 저장입니다.
         save_config(self.cfg)
 
         # 출력입니다.
-        print(f"[TARGET] u={cx:.1f}, v={cy:.1f}")
+        print(
+            "[ZERO CALIB] "
+            f"screen/direct_pick target=({cx:.1f}, {cy:.1f})"
+        )
+        print(
+            "[ZERO CALIB] "
+            "빨간 십자가와 현재 컨테이너 중심을 영점으로 맞췄습니다."
+        )
+        return True
+
+
+    # z 영점 이동 방향이 맞는지 작은 시험 이동으로 자동 판별합니다.
+    def auto_tune_zero_focus_direction(self, target_pixel):
+
+        if not bool(
+            self.cfg.get(
+                "zero_focus_auto_direction_tune",
+                True
+            )
+        ):
+            return True
+
+        frame = self.read_frame()
+
+        if frame is None:
+            print("[ZERO FOCUS TUNE] 카메라 영상 없음")
+            return False
+
+        detection, _ = self.detect_rectangle_object(frame)
+
+        if not isinstance(detection, dict):
+            print("[ZERO FOCUS TUNE] 컨테이너 인식값 없음")
+            return False
+
+        center = detection.get("center", None)
+
+        if (
+            not isinstance(center, (list, tuple))
+            or len(center) < 2
+        ):
+            print("[ZERO FOCUS TUNE] 컨테이너 중심값 없음")
+            return False
+
+        target_u = float(target_pixel[0])
+        target_v = float(target_pixel[1])
+        before_error_u = float(center[0]) - target_u
+        before_error_v = float(center[1]) - target_v
+        before_error = (
+            before_error_u ** 2
+            + before_error_v ** 2
+        ) ** 0.5
+
+        if before_error < float(
+            self.cfg.get(
+                "center_tolerance_px",
+                18.0
+            )
+        ):
+            return True
+
+        coords = self.get_coords()
+
+        if (
+            not isinstance(coords, list)
+            or len(coords) < 6
+        ):
+            print("[ZERO FOCUS TUNE] 현재 좌표 읽기 실패")
+            return False
+
+        start_coords = [
+            float(value)
+            for value in coords[:6]
+        ]
+
+        x_gain = float(
+            self.cfg.get(
+                "zero_focus_simple_x_from_image_y",
+                0.025
+            )
+        )
+        y_gain = float(
+            self.cfg.get(
+                "zero_focus_simple_y_from_image_x",
+                0.025
+            )
+        )
+        sign = float(
+            self.cfg.get(
+                "zero_focus_center_direction_sign",
+                1.0
+            )
+        )
+        probe_scale = float(
+            self.cfg.get(
+                "zero_focus_probe_scale",
+                0.35
+            )
+        )
+        max_probe_mm = abs(
+            float(
+                self.cfg.get(
+                    "zero_focus_probe_max_mm",
+                    2.5
+                )
+            )
+        )
+
+        probe_dx = x_gain * before_error_v * sign * probe_scale
+        probe_dy = y_gain * before_error_u * sign * probe_scale
+        probe_dx = max(-max_probe_mm, min(max_probe_mm, probe_dx))
+        probe_dy = max(-max_probe_mm, min(max_probe_mm, probe_dy))
+
+        if abs(probe_dx) < 0.05 and abs(probe_dy) < 0.05:
+            return True
+
+        probe_coords = start_coords[:6]
+        probe_coords[0] += probe_dx
+        probe_coords[1] += probe_dy
+
+        print(
+            "[ZERO FOCUS TUNE] "
+            f"probe dx={probe_dx:+.2f}, dy={probe_dy:+.2f}, "
+            f"before={before_error:.1f}px"
+        )
+
+        moved = self.send_coords(
+            probe_coords,
+            "zero_focus_direction_probe",
+            wait=float(
+                self.cfg.get(
+                    "zero_focus_probe_wait_sec",
+                    0.25
+                )
+            )
+        )
+
+        if not moved:
+            print("[ZERO FOCUS TUNE] 시험 이동 실패")
+            return False
+
+        time.sleep(
+            float(
+                self.cfg.get(
+                    "zero_focus_probe_settle_sec",
+                    0.12
+                )
+            )
+        )
+
+        after_frame = self.read_frame()
+        after_detection = None
+
+        if after_frame is not None:
+            after_detection, _ = self.detect_rectangle_object(after_frame)
+
+        after_error = before_error
+
+        if isinstance(after_detection, dict):
+            after_center = after_detection.get("center", None)
+
+            if (
+                isinstance(after_center, (list, tuple))
+                and len(after_center) >= 2
+            ):
+                after_error_u = float(after_center[0]) - target_u
+                after_error_v = float(after_center[1]) - target_v
+                after_error = (
+                    after_error_u ** 2
+                    + after_error_v ** 2
+                ) ** 0.5
+
+        # 시험 이동 후 원위치로 복귀하고, 실제 정렬은 판별된 방향으로 다시 수행합니다.
+        self.send_coords(
+            start_coords,
+            "zero_focus_direction_probe_return",
+            wait=float(
+                self.cfg.get(
+                    "zero_focus_probe_wait_sec",
+                    0.25
+                )
+            )
+        )
+        time.sleep(
+            float(
+                self.cfg.get(
+                    "zero_focus_probe_settle_sec",
+                    0.12
+                )
+            )
+        )
+
+        print(
+            "[ZERO FOCUS TUNE] "
+            f"after={after_error:.1f}px"
+        )
+
+        if after_error > before_error + float(
+            self.cfg.get(
+                "zero_focus_probe_margin_px",
+                3.0
+            )
+        ):
+            self.cfg["zero_focus_simple_x_from_image_y"] = round(
+                -x_gain,
+                6
+            )
+            self.cfg["zero_focus_simple_y_from_image_x"] = round(
+                -y_gain,
+                6
+            )
+            save_config(self.cfg)
+            print(
+                "[ZERO FOCUS TUNE] "
+                "방향이 반대라서 simple gain 부호를 뒤집어 저장했습니다."
+            )
+
+        return True
+
+
+    # 현재 화면에서 컨테이너 중심을 읽습니다.
+    def read_zero_focus_center(self):
+
+        frame = self.read_frame()
+
+        if frame is None:
+            return None
+
+        detection, _ = self.detect_rectangle_object(frame)
+
+        if not isinstance(detection, dict):
+            return None
+
+        center = detection.get("center", None)
+
+        if (
+            not isinstance(center, (list, tuple))
+            or len(center) < 2
+        ):
+            return None
+
+        return (
+            float(center[0]),
+            float(center[1])
+        )
+
+
+    # X/Y 시험 이동으로 실제 화면-로봇 방향 행렬을 측정해 한 번 중심으로 이동합니다.
+    def zero_focus_center_once_live(self, target_pixel):
+
+        start_center = self.read_zero_focus_center()
+
+        if start_center is None:
+            print("[ZERO FOCUS LIVE] 컨테이너 인식값 없음")
+            return False
+
+        target_u = float(target_pixel[0])
+        target_v = float(target_pixel[1])
+        error = np.array(
+            [
+                start_center[0] - target_u,
+                start_center[1] - target_v
+            ],
+            dtype=float
+        )
+        error_norm = float(np.linalg.norm(error))
+
+        tolerance = float(
+            self.cfg.get(
+                "zero_focus_accept_px",
+                self.cfg.get(
+                    "center_tolerance_px",
+                    18.0
+                )
+            )
+        )
+
+        print(
+            "[ZERO FOCUS LIVE] "
+            f"err=({error[0]:+.1f},{error[1]:+.1f}) "
+            f"norm={error_norm:.1f}px"
+        )
+
+        if error_norm <= tolerance:
+            print("[ZERO FOCUS LIVE] 정렬 완료")
+            return True
+
+        coords = self.get_coords()
+
+        if (
+            not isinstance(coords, list)
+            or len(coords) < 6
+        ):
+            print("[ZERO FOCUS LIVE] 현재 좌표 읽기 실패")
+            return False
+
+        start_coords = [
+            float(value)
+            for value in coords[:6]
+        ]
+        probe_mm = abs(
+            float(
+                self.cfg.get(
+                    "zero_focus_live_probe_mm",
+                    8.0
+                )
+            )
+        )
+        wait_sec = float(
+            self.cfg.get(
+                "zero_focus_probe_wait_sec",
+                0.65
+            )
+        )
+        settle_sec = float(
+            self.cfg.get(
+                "zero_focus_probe_settle_sec",
+                0.35
+            )
+        )
+
+        jacobian = None
+        cached_jacobian = self.cfg.get(
+            "zero_focus_cached_jacobian",
+            None
+        )
+        cached_time = float(
+            self.cfg.get(
+                "zero_focus_cached_jacobian_time",
+                0.0
+            )
+        )
+        cache_sec = float(
+            self.cfg.get(
+                "zero_focus_jacobian_cache_sec",
+                120.0
+            )
+        )
+
+        if (
+            isinstance(cached_jacobian, list)
+            and time.time() - cached_time <= cache_sec
+        ):
+            try:
+                candidate = np.array(
+                    cached_jacobian,
+                    dtype=float
+                )
+                if candidate.shape == (2, 2):
+                    jacobian = candidate
+                    print("[ZERO FOCUS LIVE] cached direction matrix 사용")
+            except Exception:
+                jacobian = None
+
+        if jacobian is None:
+            columns = []
+
+            for axis_index, axis_name in ((0, "x"), (1, "y")):
+                plus_coords = start_coords[:6]
+                plus_coords[axis_index] += probe_mm
+
+                moved = self.send_coords(
+                    plus_coords,
+                    f"zero_focus_live_probe_{axis_name}_plus",
+                    wait=wait_sec
+                )
+
+                if not moved:
+                    print(
+                        "[ZERO FOCUS LIVE] "
+                        f"{axis_name} 시험 이동 실패"
+                    )
+                    return False
+
+                time.sleep(settle_sec)
+
+                plus_center = self.read_zero_focus_center()
+
+                self.send_coords(
+                    start_coords,
+                    f"zero_focus_live_probe_{axis_name}_plus_return",
+                    wait=wait_sec
+                )
+                time.sleep(settle_sec)
+
+                minus_coords = start_coords[:6]
+                minus_coords[axis_index] -= probe_mm
+
+                moved = self.send_coords(
+                    minus_coords,
+                    f"zero_focus_live_probe_{axis_name}_minus",
+                    wait=wait_sec
+                )
+
+                if not moved:
+                    print(
+                        "[ZERO FOCUS LIVE] "
+                        f"{axis_name} -시험 이동 실패"
+                    )
+                    return False
+
+                time.sleep(settle_sec)
+
+                minus_center = self.read_zero_focus_center()
+
+                self.send_coords(
+                    start_coords,
+                    f"zero_focus_live_probe_{axis_name}_minus_return",
+                    wait=wait_sec
+                )
+                time.sleep(settle_sec)
+
+                if plus_center is None or minus_center is None:
+                    print(
+                        "[ZERO FOCUS LIVE] "
+                        f"{axis_name} 시험 후 컨테이너 인식 실패"
+                    )
+                    return False
+
+                columns.append(
+                    [
+                        (plus_center[0] - minus_center[0]) / (2.0 * probe_mm),
+                        (plus_center[1] - minus_center[1]) / (2.0 * probe_mm)
+                    ]
+                )
+
+            jacobian = np.array(
+                [
+                    [columns[0][0], columns[1][0]],
+                    [columns[0][1], columns[1][1]]
+                ],
+                dtype=float
+            )
+
+        determinant = float(np.linalg.det(jacobian))
+
+        if abs(determinant) < float(
+            self.cfg.get(
+                "zero_focus_live_min_det",
+                0.01
+            )
+        ):
+            print(
+                "[ZERO FOCUS LIVE] 방향 행렬 불안정:",
+                jacobian.tolist()
+            )
+            return False
+
+        self.cfg["zero_focus_cached_jacobian"] = jacobian.tolist()
+        self.cfg["zero_focus_cached_jacobian_time"] = round(time.time(), 3)
+
+        gain = float(
+            self.cfg.get(
+                "zero_focus_live_gain",
+                0.8
+            )
+        )
+
+        try:
+            robot_delta = -np.linalg.inv(jacobian) @ error * gain
+        except np.linalg.LinAlgError:
+            print("[ZERO FOCUS LIVE] 방향 행렬 역변환 실패")
+            return False
+
+        max_step = abs(
+            float(
+                self.cfg.get(
+                    "zero_focus_live_max_step_mm",
+                    18.0
+                )
+            )
+        )
+        delta_x = max(
+            -max_step,
+            min(max_step, float(robot_delta[0]))
+        )
+        delta_y = max(
+            -max_step,
+            min(max_step, float(robot_delta[1]))
+        )
+
+        target_coords = start_coords[:6]
+        target_coords[0] += delta_x
+        target_coords[1] += delta_y
+
+        print(
+            "[ZERO FOCUS LIVE] "
+            f"J={jacobian.tolist()} "
+            f"move=({delta_x:+.2f},{delta_y:+.2f})"
+        )
+
+        moved = self.send_coords(
+            target_coords,
+            "zero_focus_live_center",
+            wait=float(
+                self.cfg.get(
+                    "zero_focus_live_move_wait_sec",
+                    0.45
+                )
+            )
+        )
+
+        time.sleep(
+            float(
+                self.cfg.get(
+                    "zero_focus_live_settle_sec",
+                    0.15
+                )
+            )
+        )
+
+        if not moved:
+            return False
+
+        final_center = self.read_zero_focus_center()
+
+        if final_center is None:
+            return False
+
+        final_error = np.array(
+            [
+                final_center[0] - float(target_pixel[0]),
+                final_center[1] - float(target_pixel[1])
+            ],
+            dtype=float
+        )
+        final_error_norm = float(np.linalg.norm(final_error))
+
+        print(
+            "[ZERO FOCUS LIVE] "
+            f"after_err=({final_error[0]:+.1f},{final_error[1]:+.1f}) "
+            f"norm={final_error_norm:.1f}px"
+        )
+
+        return final_error_norm <= tolerance
+
+
+    # 로봇팔 카메라 시점을 컨테이너 중앙으로 이동한 뒤 그 위치를 영점으로 저장합니다.
+    def zero_focus_to_container(self):
+
+        print(
+            "[ZERO FOCUS] "
+            "컨테이너 중심이 카메라 시점 중앙에 오도록 로봇팔을 이동합니다."
+        )
+
+        max_iter = int(
+            self.cfg.get(
+                "zero_focus_center_max_iter",
+                self.cfg.get(
+                    "auto_center_max_iter",
+                    8
+                )
+            )
+        )
+
+        frame = self.read_frame()
+
+        if frame is None:
+            print("[ZERO FOCUS ERROR] 카메라 영상 없음")
+            return False
+
+        frame_height, frame_width = frame.shape[:2]
+        image_center_target = (
+            frame_width / 2.0,
+            frame_height / 2.0
+        )
+
+        centered = False
+
+        if bool(
+            self.cfg.get(
+                "zero_focus_use_live_jacobian",
+                True
+            )
+        ):
+            for _ in range(max_iter):
+                centered = self.zero_focus_center_once_live(
+                    image_center_target
+                )
+
+                if centered:
+                    break
+
+                time.sleep(0.12)
+
+        if not centered:
+            if bool(
+                self.cfg.get(
+                    "zero_focus_allow_fallback_centering",
+                    False
+                )
+            ):
+                self.auto_tune_zero_focus_direction(
+                    image_center_target
+                )
+
+                centered = self.auto_center(
+                    max_iter=max_iter,
+                    direction_sign=float(
+                        self.cfg.get(
+                            "zero_focus_center_direction_sign",
+                            1.0
+                        )
+                    ),
+                    target_pixel=image_center_target,
+                    use_simple=bool(
+                        self.cfg.get(
+                            "zero_focus_use_simple_centering",
+                            True
+                        )
+                    )
+                )
+
+        if not centered:
+            print(
+                "[ZERO FOCUS ERROR] "
+                "중앙 정렬 실패. 영점 저장을 중단합니다."
+            )
+            return False
+
+        self.arm.reset_tcp_cache()
+
+        verified_center = self.read_zero_focus_center()
+
+        if verified_center is None:
+            print(
+                "[ZERO FOCUS ERROR] "
+                "정렬 후 컨테이너 인식 실패. 영점 저장을 중단합니다."
+            )
+            return False
+
+        verify_error = (
+            (
+                verified_center[0]
+                - image_center_target[0]
+            ) ** 2
+            + (
+                verified_center[1]
+                - image_center_target[1]
+            ) ** 2
+        ) ** 0.5
+
+        max_save_error_px = float(
+            self.cfg.get(
+                "zero_focus_save_max_error_px",
+                self.cfg.get(
+                    "zero_focus_accept_px",
+                    35.0
+                )
+            )
+        )
+
+        if verify_error > max_save_error_px:
+            print(
+                "[ZERO FOCUS ERROR] "
+                f"정렬 오차가 큽니다: {verify_error:.1f}px "
+                f"> {max_save_error_px:.1f}px. 저장을 중단합니다."
+            )
+            return False
+
+        saved = self.save_target_pixel(
+            use_image_center=True
+        )
+
+        if not saved:
+            print("[ZERO FOCUS ERROR] 영점 저장 실패")
+            return False
+
+        coords = self.get_coords()
+
+        self.cfg["last_zero_focus_calibration"]["tcp_coords"] = (
+            None
+            if not isinstance(coords, list)
+            else [
+                round(float(value), 3)
+                for value in coords[:6]
+            ]
+        )
+        self.cfg["last_zero_focus_calibration"]["centered"] = bool(centered)
+        save_config(self.cfg)
+
+        frame = self.read_frame()
+        coords = self.get_coords()
+
+        if (
+            frame is not None
+            and isinstance(coords, list)
+            and len(coords) >= 6
+        ):
+            detection, _ = self.detect_rectangle_object(frame)
+
+            if isinstance(detection, dict):
+                pick_plan = self.calculate_direct_xyz_pick_target(
+                    [
+                        float(value)
+                        for value in coords[:6]
+                    ],
+                    detection,
+                    frame.shape,
+                    apply_manual_calibration=False
+                )
+
+                if isinstance(pick_plan, dict):
+                    self.cfg["last_zero_focus_pick_plan"] = {
+                        "center_u_px": round(
+                            float(pick_plan["center_u"]),
+                            3
+                        ),
+                        "center_v_px": round(
+                            float(pick_plan["center_v"]),
+                            3
+                        ),
+                        "depth_mm": round(
+                            float(pick_plan["depth_mm"]),
+                            3
+                        ),
+                        "current_coords": [
+                            round(float(value), 3)
+                            for value in coords[:6]
+                        ],
+                        "base_target_coords": [
+                            round(float(value), 3)
+                            for value in pick_plan["base_target_coords"]
+                        ],
+                        "target_coords": [
+                            round(float(value), 3)
+                            for value in pick_plan["target_coords"]
+                        ],
+                        "visual_move_x_mm": round(
+                            float(pick_plan["visual_move_x_mm"]),
+                            3
+                        ),
+                        "visual_move_y_mm": round(
+                            float(pick_plan["visual_move_y_mm"]),
+                            3
+                        ),
+                        "visual_move_z_mm": round(
+                            float(pick_plan["visual_move_z_mm"]),
+                            3
+                        ),
+                        "timestamp": round(time.time(), 3)
+                    }
+                    save_config(self.cfg)
+                    print(
+                        "[ZERO FOCUS PLAN] "
+                        f"target="
+                        f"{self.cfg['last_zero_focus_pick_plan']['target_coords'][:3]} "
+                        f"depth={self.cfg['last_zero_focus_pick_plan']['depth_mm']:.1f}mm"
+                    )
+
+        print(
+            "[ZERO FOCUS] "
+            "카메라 시점 중앙 정렬과 영점 저장 완료"
+        )
+        return True
 
     # 현재 TCP 좌표를 물체 집기 기준 위치로 기억하는 함수입니다.
     # 지정한 모터 하나만 현재 각도에서 미세하게 움직입니다.
@@ -6944,8 +9525,25 @@ class ArmCameraRectAutoPickClient:
         elif key == ord("q"):
             self.run_task("auto_center", self.auto_center)
 
+        # z는 로봇팔 카메라 시점을 컨테이너 중앙에 맞추고 영점으로 저장합니다.
+        elif key == ord("z"):
+            self.run_task("zero_focus_calibration", self.zero_focus_to_container)
+
         # w 또는 b는 기억된 물체를 집고 초기 자세로 복귀합니다.
         elif key == ord("w") or key == ord("b"):
+            if isinstance(
+                self.cfg.get(
+                    "pending_direct_pick_manual_calibration",
+                    None
+                ),
+                dict
+            ):
+                print(
+                    "[PICK CALIB] "
+                    "수동 보정 중입니다. 먼저 y로 현재 집기 좌표를 저장하세요."
+                )
+                return
+
             self.run_task(
                 "pick_and_return_home",
                 self.pick_and_return_home
@@ -6967,13 +9565,27 @@ class ArmCameraRectAutoPickClient:
         elif key == ord("p"):
             self.run_task("save_place_pose", self.save_place_pose)
 
-        # v는 현재 물체 중심을 목표 픽셀로 저장합니다.
+        # v는 로봇팔을 움직이지 않고 현재 물체 중심만 목표 픽셀로 저장합니다.
         elif key == ord("v"):
-            self.save_target_pixel()
+            self.run_task("zero_focus_calibration", self.save_target_pixel)
 
         # f는 현재 그리퍼 TCP 좌표를 물체 위치로 강제 저장합니다.
         elif key == ord("f"):
             self.remember_current_object_pose("manual_f_key")
+
+        # n은 자동 계산 목표를 저장하고 키보드 수동 보정을 시작합니다.
+        elif key == ord("n"):
+            self.run_task(
+                "start_pick_manual_calibration",
+                self.start_direct_pick_manual_calibration
+            )
+
+        # y는 손으로 맞춘 현재 TCP 좌표를 성공 집기 좌표로 저장합니다.
+        elif key == ord("y"):
+            self.run_task(
+                "save_pick_manual_calibration",
+                self.save_direct_pick_manual_calibration
+            )
 
         # [ 는 덜 내려가게 합니다.
         elif key == ord("["):
@@ -7048,13 +9660,11 @@ class ArmCameraRectAutoPickClient:
 
         # o는 그리퍼 열기입니다.
         elif key == ord("o"):
-            self.run_task("gripper_open", self.arm.set_gripper_value,
-                          int(self.cfg["gripper_open"]), int(self.cfg["gripper_speed"]), 0.5)
+            self.run_task("gripper_open", self.open_gripper)
 
         # c는 그리퍼 닫기입니다.
         elif key == ord("c"):
-            self.run_task("gripper_close", self.arm.set_gripper_value,
-                          int(self.cfg["gripper_close"]), int(self.cfg["gripper_speed"]), 0.5)
+            self.run_task("gripper_close", self.close_gripper)
 
         # 1은 x 방향 반전입니다.
         elif key == ord("1"):
@@ -7096,7 +9706,32 @@ class ArmCameraRectAutoPickClient:
                 continue
 
             # 직사각형 검출입니다.
-            detection, edges = self.detect_rectangle_object(frame)
+            # 화면 프레임 번호를 증가시킵니다.
+            self.vision_frame_count += 1
+
+            # 무거운 영상 검출은 설정된 프레임 간격마다 실행합니다.
+            if (
+                self.vision_frame_count
+                % self.vision_process_every_n_frames
+                == 0
+                or self.cached_edges is None
+            ):
+
+                detection, edges = (
+                    self.detect_rectangle_object(
+                        frame
+                    )
+                )
+
+                # 다음 프레임에서 재사용할 검출 결과를 저장합니다.
+                self.cached_detection = detection
+                self.cached_edges = edges
+
+            else:
+
+                # 검출을 생략한 프레임에서는 직전 결과를 사용합니다.
+                detection = self.cached_detection
+                edges = self.cached_edges
 
             # 카메라에 물체가 보이면 집기 준비 상태로 기억합니다.
             self.remember_visible_object(detection)
@@ -7112,7 +9747,12 @@ class ArmCameraRectAutoPickClient:
             cv2.imshow(self.window_name, frame)
 
             # 에지 화면입니다.
-            cv2.imshow("rect_edges", edges)
+            # 디버그가 필요할 때만 에지 영상을 표시합니다.
+            if self.show_edges:
+                cv2.imshow(
+                    "rect_edges",
+                    edges
+                )
 
             # 키 입력입니다.
             # waitKeyEx는 숫자 키패드와 기호키의 원시 코드도 읽을 수 있습니다.
@@ -7203,6 +9843,12 @@ class ArmCameraRectAutoPickClient:
 
             # 키 처리입니다.
             self.handle_key(key)
+
+        # ROS 영상 수신 스레드를 먼저 중지합니다.
+        self.ros_spin_running = False
+
+        # 스레드가 반복문을 빠져나올 시간을 줍니다.
+        time.sleep(0.03)
 
         # ROS 영상 수신 노드를 제거합니다.
         self.ros_node.destroy_node()

@@ -7,7 +7,7 @@ set -u
 SESSION_NAME="poter_ws"
 
 # 모든 ROS 2 노드에서 사용할 도메인 번호
-ROS_DOMAIN="12"
+ROS_DOMAIN="77"
 
 # 로봇팔 서버 파일 경로
 SERVER_FILE="$HOME/poter_ws/src/arm/arm/robot_arm_server.py"
@@ -15,12 +15,69 @@ SERVER_FILE="$HOME/poter_ws/src/arm/arm/robot_arm_server.py"
 # 자동 집기 클라이언트 파일 경로
 CLIENT_FILE="$HOME/poter_ws/src/arm/arm/arm_camera_rect_auto_pick_client.py"
 
-# 카메라 캘리브레이션 파일 경로
-CAMERA_INFO_FILE="$HOME/camera_calib/arm_camera_info.yaml"
+# camera_ros의 카메라 번호입니다. 기본값은 자동 감지입니다.
+# 주의: /dev/video 번호가 아니라 camera_ros 목록의 0, 1, 2 같은 순번입니다.
+# 필요하면 CAMERA_IDX=1 ./run_arm_auto_pick.sh 처럼 직접 지정할 수 있습니다.
+CAMERA_IDX="${CAMERA_IDX:-auto}"
+
+detect_camera_idx() {
+    local preferred_name="${CAMERA_NAME:-USB 2.0 Camera}"
+    local detected=""
+
+    if command -v v4l2-ctl >/dev/null 2>&1; then
+        detected="$(v4l2-ctl --list-devices 2>/dev/null | awk -v name="$preferred_name" '
+            /^[^[:space:]].*:$/ {
+                if ($0 ~ name) {
+                    print camera_idx
+                    exit
+                }
+                camera_idx++
+            }
+        ')"
+    fi
+
+    if [ -z "$detected" ] && command -v v4l2-ctl >/dev/null 2>&1; then
+        detected="$(v4l2-ctl --list-devices 2>/dev/null | awk '
+            /^[^[:space:]].*:$/ {
+                if ($0 !~ /HD Webcam/) {
+                    print camera_idx
+                    exit
+                }
+                camera_idx++
+            }
+        ')"
+    fi
+
+    if [ -z "$detected" ] && command -v v4l2-ctl >/dev/null 2>&1; then
+        detected="$(v4l2-ctl --list-devices 2>/dev/null | awk '
+            /^[^[:space:]].*:$/ {
+                print camera_idx
+                exit
+            }
+        ')"
+    fi
+
+    if [ -n "$detected" ]; then
+        echo "$detected"
+    else
+        echo "0"
+    fi
+}
+
+if [ "$CAMERA_IDX" = "auto" ]; then
+    CAMERA_IDX="$(detect_camera_idx)"
+fi
+
+# 카메라 캘리브레이션 파일 경로입니다. CAMERA_INFO_FILE로 직접 지정할 수도 있습니다.
+if [ -z "${CAMERA_INFO_FILE:-}" ]; then
+    CAMERA_INFO_FILE="$HOME/camera_calib/arm_camera_info.yaml"
+fi
 
 echo "=============================================="
 echo " JetCobot 자동 집기 시스템 실행"
 echo " ROS_DOMAIN_ID=$ROS_DOMAIN"
+echo " CAMERA_IDX=$CAMERA_IDX"
+echo " CAMERA_INFO_FILE=$CAMERA_INFO_FILE"
 echo "=============================================="
 
 # tmux 설치 여부 확인
@@ -91,22 +148,29 @@ tmux new-session -d \
             source \"\$HOME/poter_ws/install/setup.bash\"
         fi
 
-        export ROS_DOMAIN_ID=12
+        export ROS_DOMAIN_ID=$ROS_DOMAIN
 
         echo \"=======================================\"
         echo \"[터미널 1] 로봇팔 카메라 실행\"
         echo \"ROS_DOMAIN_ID=\$ROS_DOMAIN_ID\"
+        echo \"CAMERA_IDX=$CAMERA_IDX\"
+        echo \"CAMERA_INFO_FILE=$CAMERA_INFO_FILE\"
         echo \"=======================================\"
 
         exec ros2 run camera_ros camera_node \
             --ros-args \
-            -p camera:=0 \
+            -p camera:=$CAMERA_IDX \
             -p width:=640 \
             -p height:=480 \
             -p format:=YUYV \
             -p frame_id:=arm_camera_optical_frame \
-            -p camera_info_url:=file:///home/rsj/camera_calib/arm_camera_info.yaml
+            -p camera_info_url:=file://$CAMERA_INFO_FILE
     '"
+
+# 실행 중 오류가 발생해도 tmux 창을 유지합니다.
+tmux set-window-option -g -t "$SESSION_NAME" remain-on-exit on
+tmux set-window-option -g -t "$SESSION_NAME" automatic-rename off
+tmux set-option -t "$SESSION_NAME" allow-rename off
 
 echo "[실행] 왜곡 보정 노드를 준비합니다."
 
@@ -125,7 +189,7 @@ tmux new-window \
             source \"\$HOME/poter_ws/install/setup.bash\"
         fi
 
-        export ROS_DOMAIN_ID=12
+        export ROS_DOMAIN_ID=$ROS_DOMAIN
 
         echo \"=======================================\"
         echo \"[터미널 2] 카메라 원본 영상 대기\"
@@ -173,7 +237,7 @@ tmux new-window \
             source \"\$HOME/poter_ws/install/setup.bash\"
         fi
 
-        export ROS_DOMAIN_ID=12
+        export ROS_DOMAIN_ID=$ROS_DOMAIN
 
         echo \"=======================================\"
         echo \"[터미널 3] 로봇팔 서버 실행\"
@@ -203,7 +267,7 @@ tmux new-window \
             source \"\$HOME/poter_ws/install/setup.bash\"
         fi
 
-        export ROS_DOMAIN_ID=12
+        export ROS_DOMAIN_ID=$ROS_DOMAIN
 
         echo \"=======================================\"
         echo \"[터미널 4] 로봇팔 서버 준비 대기\"
@@ -257,5 +321,11 @@ echo " tmux 화면에서 나오기:"
 echo " Ctrl+B를 누른 후 D"
 echo "=============================================="
 
-# 실행 중인 tmux 세션에 접속
-exec tmux attach-session -t "$SESSION_NAME"
+# 실행 중인 tmux 세션에 접속합니다.
+# 터미널이 없는 상태에서 실행되면 세션만 띄워두고 종료합니다.
+if [ -t 0 ] && [ -t 1 ]; then
+    exec tmux attach-session -t "$SESSION_NAME"
+else
+    echo "비대화형 실행이라 tmux에 자동 접속하지 않습니다."
+    echo "접속 명령어: tmux attach-session -t $SESSION_NAME"
+fi

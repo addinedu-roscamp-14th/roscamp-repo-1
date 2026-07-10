@@ -33,9 +33,9 @@ import socket
 # TCP 명령을 JSON으로 주고받기 위해 사용합니다.
 import json
 
-
-# 실제 로봇팔 포트입니다.
-ROBOT_PORT = "/dev/ttyUSB0"
+# 환경 변수와 장치 파일 자동 감지에 사용합니다.
+import os
+import glob
 
 # MyCobot280 통신 속도입니다.
 ROBOT_BAUD = 1000000
@@ -45,6 +45,28 @@ TCP_HOST = "127.0.0.1"
 
 # 카메라 클라이언트 접속 포트입니다.
 TCP_PORT = 15000
+
+
+# USB를 다시 꽂으면 /dev/ttyUSB0, /dev/ttyUSB1 번호가 바뀔 수 있어서 자동으로 찾습니다.
+def detect_robot_port():
+    env_port = os.environ.get("ROBOT_PORT")
+    if env_port:
+        return env_port
+
+    by_id_ports = sorted(glob.glob("/dev/serial/by-id/*"))
+    if by_id_ports:
+        return by_id_ports[0]
+
+    for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*"):
+        ports = sorted(glob.glob(pattern))
+        if ports:
+            return ports[0]
+
+    return "/dev/ttyUSB0"
+
+
+# 실제 로봇팔 포트입니다.
+ROBOT_PORT = detect_robot_port()
 
 
 # radian을 degree로 변환하는 함수입니다.
@@ -296,6 +318,74 @@ class RobotArmServer(Node):
         if cmd == "get_angles":
             angles = self.get_angles_safe()
             return {"ok": angles is not None, "angles": angles}
+
+        # 손으로 로봇팔 위치를 맞출 수 있게 전체 서보 토크를 풉니다.
+        if cmd == "release_all_servos":
+
+            try:
+
+                with self.lock:
+
+                    if hasattr(self.robot, "release_all_servos"):
+                        self.robot.release_all_servos()
+                        method = "release_all_servos"
+
+                    elif hasattr(self.robot, "release_all_servo"):
+                        self.robot.release_all_servo()
+                        method = "release_all_servo"
+
+                    else:
+                        return {
+                            "ok": False,
+                            "error": "servo release API not available"
+                        }
+
+                    self.command_coords = None
+
+                return {
+                    "ok": True,
+                    "method": method
+                }
+
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": str(e)
+                }
+
+        # 손으로 맞춘 위치를 유지하도록 전체 서보 토크를 다시 잡습니다.
+        if cmd == "focus_all_servos":
+
+            try:
+
+                with self.lock:
+
+                    if hasattr(self.robot, "focus_all_servos"):
+                        self.robot.focus_all_servos()
+                        method = "focus_all_servos"
+
+                    elif hasattr(self.robot, "power_on"):
+                        self.robot.power_on()
+                        method = "power_on"
+
+                    else:
+                        return {
+                            "ok": False,
+                            "error": "servo focus API not available"
+                        }
+
+                    self.command_coords = None
+
+                return {
+                    "ok": True,
+                    "method": method
+                }
+
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": str(e)
+                }
 
         # 특정 관절 하나만 지정한 각도만큼 이동하는 명령입니다.
         if cmd == "joint_step":
