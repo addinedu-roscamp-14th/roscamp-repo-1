@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_to_map_bridge = central.camera_to_map_bridge:main',
+            'rqt_click_to_target = central.rqt_click_to_target:main',
         ],
     },
 )
