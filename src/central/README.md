@@ -75,6 +75,11 @@ rqt click
 → /central/target_map_json
 ```
 
+---
+
+# 노트북에서 실행
+
+
 ### rqt 클릭 좌표 발행
 
 먼저 rqt image view에서 `/central/yolo/image_annotated`를 열고 마우스로 클릭합니다.
@@ -98,6 +103,21 @@ cd ~/poter_ws
 source install/setup.bash
 ros2 run central camera_to_map_bridge
 ```
+
+# 차에서 실행
+
+```bash
+ros2 launch pinky_bringup bringup_robot.launch.xml
+```
+```bash
+ros2 launch pinky_navigation bringup_launch.xml map:=/home/pinky/current_map.yaml
+```
+```bash
+ros2 launch pinky_navigation target_map_pose_nav.launch.xml start_nav2:=false
+```
+
+
+
 
 기본 설정:
 

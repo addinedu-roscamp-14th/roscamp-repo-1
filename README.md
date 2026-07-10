@@ -17,7 +17,7 @@ poter_ws/
     ├── yolo/                 # YOLO 인식/시각화
     ├── calibration/          # 카메라 픽셀 ↔ SLAM map 캘리브레이션
     ├── central/              # 중앙 좌표 변환/차량 전달용 출력
-    ├── drive/                # 차량 주행 제어 
+    ├── drive/                # 차량 Nav2 goal 브릿지/테스트
     └── arm/                  # 로봇팔 제어 
 ```
 
@@ -29,7 +29,7 @@ poter_ws/
 | `yolo` | 카메라 이미지에서 객체/영역을 인식하고 annotated image와 detection JSON 발행 | `yolo_node` |
 | `calibration` | `/camera/image_rect` 픽셀 좌표와 SLAM `/map` 좌표를 homography로 캘리브레이션 | `direct_calibrator`, `calibration_verifier` |
 | `central` | 캘리브레이션 결과를 사용해 카메라 픽셀 좌표를 `/map` 기준 좌표로 변환하고 JSON/PoseStamped 발행 | `camera_to_map_bridge` |
-| `drive` | 차량 주행/Nav2 연동 담당 예정 | 뼈대 패키지 |
+| `drive` | `/central/target_map_pose`를 차량 Nav2 `NavigateToPose` goal로 전달하고 직접 goal 테스트 지원 | `target_map_pose_to_nav_goal`, `send_nav_goal` |
 | `arm` | 로봇팔/크레인 제어 담당 예정 | 뼈대 패키지 |
 
 ## Data Flow
