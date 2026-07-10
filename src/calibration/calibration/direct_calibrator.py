@@ -3,14 +3,13 @@
 from pathlib import Path
 
 import cv2
-from cv_bridge import CvBridge
 import numpy as np
 import yaml
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 
 
 class DirectCalibrator(Node):
@@ -18,7 +17,7 @@ class DirectCalibrator(Node):
         super().__init__('direct_calibrator')
 
         self.declare_parameter('map_yaml', 'config/SLAM/current_map.yaml')
-        self.declare_parameter('camera_topic', '/camera/image_rect')
+        self.declare_parameter('camera_topic', '/image_rect/compressed')
         self.declare_parameter('output_yaml', 'config/central/camera_map_calibration.yaml')
         self.declare_parameter('map_display_scale', 3.0)
         self.declare_parameter('camera_window_name', 'Camera calibration image')
@@ -31,7 +30,6 @@ class DirectCalibrator(Node):
         self.camera_window_name = str(self.get_parameter('camera_window_name').value)
         self.map_window_name = str(self.get_parameter('map_window_name').value)
 
-        self.bridge = CvBridge()
         self.map_config = self.load_map_config(self.map_yaml_path)
         self.map_image = self.load_map_image(self.map_yaml_path, self.map_config)
         self.map_width, self.map_height = self.map_image.shape[1], self.map_image.shape[0]
@@ -45,7 +43,7 @@ class DirectCalibrator(Node):
         self.pending_pgm_pixel = None
         self.points = []
 
-        self.create_subscription(Image, self.camera_topic, self.on_camera_image, 10)
+        self.create_subscription(CompressedImage, self.camera_topic, self.on_camera_image, 10)
         self.timer = self.create_timer(0.03, self.spin_windows)
         self.status_timer = self.create_timer(5.0, self.log_status)
 
@@ -106,7 +104,13 @@ class DirectCalibrator(Node):
 
     def on_camera_image(self, msg):
         try:
-            self.latest_camera_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            buffer = np.frombuffer(msg.data, dtype=np.uint8)
+            frame = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+            if frame is None:
+                self.get_logger().warn('Failed to decode compressed camera image')
+                return
+
+            self.latest_camera_image = frame
             self.last_camera_frame_time = self.get_clock().now()
         except Exception as exc:
             self.get_logger().warn(f'Failed to convert camera image: {exc}')
@@ -116,7 +120,7 @@ class DirectCalibrator(Node):
             self.get_logger().warn(
                 f'Waiting for camera frames on {self.camera_topic}. '
                 'Calibration must use the rectified camera image. '
-                'Start the image rectification node and check: ros2 topic list | grep image_rect'
+                'Check: ros2 topic hz /image_rect/compressed'
             )
 
     def on_camera_mouse(self, event, x, y, flags, param):
