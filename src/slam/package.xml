@@ -3,22 +3,16 @@
 <package format="3">
   <name>slam</name>
   <version>0.0.0</version>
-  <description>SLAM Toolbox mapping configuration for Pinky</description>
-  <maintainer email="jio@todo.todo">jio</maintainer>
+  <description>Minimal SLAM launch package for Pinky navigation mapping.</description>
+  <maintainer email="kyung133851@pinkab.art">mkh</maintainer>
   <license>TODO: License declaration</license>
 
-  <buildtool_depend>ament_python</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <exec_depend>slam_toolbox</exec_depend>
-  <exec_depend>nav2_map_server</exec_depend>
   <exec_depend>rviz2</exec_depend>
-
-  <test_depend>ament_copyright</test_depend>
-  <test_depend>ament_flake8</test_depend>
-  <test_depend>ament_pep257</test_depend>
-  <test_depend>python3-pytest</test_depend>
+  <exec_depend>slam_toolbox</exec_depend>
 
   <export>
-    <build_type>ament_python</build_type>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>

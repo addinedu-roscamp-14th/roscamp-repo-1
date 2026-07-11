@@ -80,48 +80,48 @@ controller_server:
       stateful: true                         # 플러그인이 이전 상태를 기억할지 여부
 
       # 기본 주행 및 속도
-      desired_linear_vel: 0.2                # [m/s] 목표 기본 직진 속도
+      desired_linear_vel: 0.1                # [m/s] 목표 기본 직진 속도
       allow_reversing: false                 # 후진 허용 여부 (false: 무조건 전진/제자리 회전으로 해결)
-      max_angular_accel: 3.2                 # [rad/s^2] 최대 각가속도 (회전할 때 얼마나 빨리 가속할지)
+      max_angular_accel: 1.6                 # [rad/s^2] 최대 각가속도 (회전할 때 얼마나 빨리 가속할지)
 
       # 경로 추종 (Lookahead, 시선 두기)
-      lookahead_dist: 0.6                    # [m] 기본 전방 주시 거리
+      lookahead_dist: 0.25                   # [m] 기본 전방 주시 거리
       use_velocity_scaled_lookahead_dist: true # 현재 속도에 비례해 주시 거리를 늘릴지 여부
       lookahead_time: 1.5                    # [s] 속도 비례 주시 시간 (속도 * 시간 = 주시 거리)
-      min_lookahead_dist: 0.3                # [m] 최소 주시 거리
-      max_lookahead_dist: 0.9                # [m] 최대 주시 거리
-      curvature_lookahead_dist: 0.6          # [m] 경로의 곡률(커브)을 계산하기 위해 내다보는 거리
+      min_lookahead_dist: 0.12               # [m] 최소 주시 거리
+      max_lookahead_dist: 0.4                # [m] 최대 주시 거리
+      curvature_lookahead_dist: 0.25         # [m] 경로의 곡률(커브)을 계산하기 위해 내다보는 거리
       use_fixed_curvature_lookahead: false   # 곡률 계산용 거리를 고정값으로 쓸지 여부 (false면 주시거리와 연동)
 
       # 제자리 회전 (고개 먼저 돌리기)
       use_rotate_to_heading: true            # 경로 방향과 로봇 헤딩이 다를 때 제자리 회전 먼저 하기
-      rotate_to_heading_min_angle: 0.35      # [rad] 약 20도 이상 차이나면 제자리 회전 모드 진입
-      rotate_to_heading_angular_vel: 1.0     # [rad/s] 제자리 회전할 때의 회전 속도
+      rotate_to_heading_min_angle: 0.6       # [rad] 약 34도 이상 차이나면 제자리 회전 모드 진입
+      rotate_to_heading_angular_vel: 0.375   # [rad/s] 제자리 회전할 때의 회전 속도
 
       # 커브길 감속 (Regulated)
       use_regulated_linear_velocity_scaling: false  # 급커브에서 속도 줄이기
       regulated_linear_scaling_min_radius: 0.5     # [m] 이 반경보다 좁은 커브를 돌 때는 속도를 최소로 낮춤
-      regulated_linear_scaling_min_speed: 0.05     # [m/s] 커브를 돌 때 낼 수 있는 최소 속도 방어선
+      regulated_linear_scaling_min_speed: 0.025    # [m/s] 커브를 돌 때 낼 수 있는 최소 속도 방어선
 
       # 장애물 접근 시 감속 (Cost Regulated)
       use_cost_regulated_linear_velocity_scaling: true # 장애물 근처(비용맵 높은 곳)에서 속도 줄이기
-      cost_scaling_dist: 0.3                 # [m] 장애물 중심으로부터 이 거리 안쪽일 때 감속 고려
-      cost_scaling_gain: 0.8                 # 장애물 감속 민감도 (클수록 더 팍 줄임)
+      cost_scaling_dist: 0.07                # [m] 장애물 중심으로부터 이 거리 안쪽일 때 감속 고려
+      cost_scaling_gain: 1.0                 # 장애물 감속 완화 계수 (클수록 속도를 덜 줄임)
       inflation_cost_scaling_factor: 3.0     # 컨트롤러 내부에서 비용을 계산할 때 쓰는 인플레이션 가중치
 
       # 목적지 접근 시 감속
-      approach_velocity_scaling_dist: 0.6    # [m] 목표 지점까지 이 거리만큼 남았을 때부터 서서히 감속
-      min_approach_linear_velocity: 0.05     # [m/s] 목표 지점 근처에서 속도를 줄이더라도 이 속도 밑으론 안 내림
+      approach_velocity_scaling_dist: 0.20   # [m] 목표 지점까지 이 거리만큼 남았을 때부터 서서히 감속
+      min_approach_linear_velocity: 0.025    # [m/s] 목표 지점 근처에서 속도를 줄이더라도 이 속도 밑으론 안 내림
 
       # 안전 및 충돌 방지
       use_collision_detection: true          # 현재 위치부터 주시점(Lookahead)까지 충돌 여부 미리 검사
-      max_allowed_time_to_collision_up_to_carrot: 1.0 # 주시점(Carrot)까지 가는 도중 충돌까지 허용되는 최대 시간 
+      max_allowed_time_to_collision_up_to_carrot: 0.3 # 주시점(Carrot)까지 가는 도중 충돌까지 허용되는 최대 시간 
       max_robot_pose_search_dist: 1.4875     # [m] 전역 경로 상에서 로봇과 가장 가까운 점을 찾을 때 최대 탐색 거리
       transform_tolerance: 0.2               # [s] TF(좌표계 변환) 데이터 최대 허용 지연 시간
 
       # 취소/종료 시 동작
       use_cancel_deceleration: false         # 내비게이션 취소 명령이 들어왔을 때 팍 멈추지 않고 부드럽게 감속할지
-      cancel_deceleration: 3.2               # [m/s^2] 취소 시 적용할 감속도
+      cancel_deceleration: 1.6               # [m/s^2] 취소 시 적용할 감속도
       interpolate_curvature_after_goal: false # 목표 도달 후 경로 곡률 보간을 계속할지 여부
 
     # ==========================================================
@@ -134,7 +134,7 @@ controller_server:
     bond_heartbeat_period: 0.1                   # [s] 시스템 상태 체크(하트비트) 주기
     costmap_update_timeout: 0.3                  # [s] 코스트맵 업데이트가 이 시간 지연되면 멈춤
     enable_stamped_cmd_vel: false                # TwistStamped 메시지 대신 일반 Twist 메시지 사용
-    failure_tolerance: 0.3                       # [s] 제어 계산 실패를 허용하는 시간
+    failure_tolerance: 1.0                       # [s] 제어 계산 실패를 허용하는 시간
     publish_zero_velocity: true                  # 목표 도달/취소 시 확실하게 정지하도록 0 속도 명령 발행
     speed_limit_topic: "speed_limit"             # 속도 제한 구역 적용 시 구독할 토픽 이름
     odom_topic: "odom"                           # 현재 속도를 읽어올 오도메트리 토픽
@@ -166,8 +166,8 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      movement_time_allowance: 10.0              # [s] 이 시간 동안 아래 거리만큼 못 움직이면 끼인 것으로 판단
-      required_movement_radius: 0.5              # [m] 위 시간 동안 최소 0.5m 반경은 벗어나야 함 (못 벗어나면 Recovery 실행)
+      movement_time_allowance: 20.0              # [s] 이 시간 동안 아래 거리만큼 못 움직이면 끼인 것으로 판단
+      required_movement_radius: 0.05             # [m] 위 시간 동안 최소 0.05m 반경은 벗어나야 함 (못 벗어나면 Recovery 실행)
 
 
 local_costmap:
@@ -216,7 +216,7 @@ local_costmap:
 global_costmap:
   global_costmap:
     ros__parameters:
-      footprint_padding: 0.01
+      footprint_padding: 0.005
       update_frequency: 1.0
       publish_frequency: 1.0
       global_frame: map
@@ -245,8 +245,8 @@ global_costmap:
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.0
-        inflation_radius: 0.10
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.06
       always_send_full_costmap: True
 
 # The yaml_filename does not need to be specified since it going to be set by defaults in launch.
@@ -306,9 +306,9 @@ behavior_server:
     robot_base_frame: base_footprint
     transform_tolerance: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
-    min_rotational_vel: 0.4
-    rotational_acc_lim: 3.2
+    max_rotational_vel: 0.75
+    min_rotational_vel: 0.3
+    rotational_acc_lim: 1.6
     enable_stamped_cmd_vel: false
 
 waypoint_follower:
@@ -327,10 +327,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.25, 0.0, 1.5]
-    min_velocity: [-0.25, 0.0, -1.5]
-    max_accel: [2.5, 0.0, 3.2]
-    max_decel: [-2.5, 0.0, -3.2]
+    max_velocity: [0.125, 0.0, 1.125]
+    min_velocity: [-0.125, 0.0, -1.125]
+    max_accel: [1.25, 0.0, 1.6]
+    max_decel: [-1.25, 0.0, -1.6]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
