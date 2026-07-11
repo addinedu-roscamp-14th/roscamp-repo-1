@@ -15,8 +15,8 @@ setup(
     zip_safe=True,
     maintainer='jio',
     maintainer_email='jio@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Camera-click pick and place control for JetCobot',
+    license='Apache-2.0',
     extras_require={
         'test': [
             'pytest',
@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'click_pick_place = arm.main:main',
         ],
     },
 )
