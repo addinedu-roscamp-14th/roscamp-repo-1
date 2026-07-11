@@ -23,8 +23,14 @@ source install/setup.bash
 ros2 launch slam map_building.launch.xml
 ```
 
-RViz만 확인하려면:
+RViz 확인
 
 ```bash
 ros2 launch slam map_view.launch.xml
+```
+
+맵 저장
+
+```bash
+ros2 run nav2_map_server map_saver_cli -f ~/poter_ws/config/SLAM/current_map
 ```

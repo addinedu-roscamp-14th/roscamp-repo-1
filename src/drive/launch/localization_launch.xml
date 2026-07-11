@@ -4,7 +4,7 @@
 
     <arg name="namespace" default=""/>
     <arg name="yaml_filename" default=""/>
-    <arg name="map" default="/home/baehh/poter_ws/src/drive/current_map.yaml"/>
+    <arg name="map" default="$(env HOME)/poter_ws/config/SLAM/current_map.yaml"/>
     <arg name="use_sim_time" default="false"/>
     <arg name="params_file" default="$(find-pkg-share drive)/params/nav2_params.yaml"/>
     <arg name="autostart" default="true"/>

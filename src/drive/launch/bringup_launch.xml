@@ -3,7 +3,7 @@
     <set_env name="RCUTILS_LOGGING_BUFFERED_STREAM" value="1"/>
 
     <arg name="namespace" default=""/>
-    <arg name="map" default="/home/baehh/poter_ws/src/drive/current_map.yaml"/>
+    <arg name="map" default="$(env HOME)/poter_ws/config/SLAM/current_map.yaml"/>
     <arg name="use_sim_time" default="False"/>
     <arg name="params_file" default="$(find-pkg-share drive)/params/nav2_params.yaml"/>
     <arg name="default_nav_to_pose_bt_xml" default="$(find-pkg-share drive)/behavior_trees/navigate_to_pose_w_replanning_and_recovery_45deg.xml"/>

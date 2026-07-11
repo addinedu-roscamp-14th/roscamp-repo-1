@@ -26,7 +26,9 @@ source install/setup.bash
 ros2 launch drive bringup_launch.xml
 ```
 
-RViz만 확인하려면:
+기본 map 경로는 `~/poter_ws/config/SLAM/current_map.yaml`입니다.
+
+RViz 확인
 
 ```bash
 ros2 launch drive nav2_view.launch.xml
