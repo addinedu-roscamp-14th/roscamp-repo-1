@@ -103,6 +103,21 @@ cd ~/poter_ws
 source install/setup.bash
 ros2 run central camera_to_map_bridge
 ```
+### Nav2 
+```bash
+ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
+```
+
+### 목표 위치와 방향 클릭
+
+rqt 영상에서 두 번 클릭합니다.
+
+1. 첫 번째 클릭: 차량이 도착할 목표 위치
+2. 두 번째 클릭: 목표 위치에서 차량이 바라볼 방향
+
+두 번째 클릭 지점은 차량이 이동할 위치가 아니라 방향을 계산하기 위한 점입니다.
+브릿지는 두 점을 모두 map 좌표로 변환하고 첫 번째 점에서 두 번째 점을 향하는 yaw를
+계산한 뒤 `/central/target_map_pose`를 한 번 발행합니다.
 
 # 차에서 실행
 
@@ -112,9 +127,7 @@ ros2 launch pinky_bringup bringup_robot.launch.xml
 ```bash
 ros2 launch pinky_navigation bringup_launch.xml map:=/home/pinky/current_map.yaml
 ```
-```bash
-ros2 launch pinky_navigation target_map_pose_nav.launch.xml start_nav2:=false
-```
+
 
 
 
@@ -127,16 +140,19 @@ input_pixel_topic: /central/target_pixel
 output_pose_topic: /central/target_map_pose
 output_json_topic: /central/target_map_json
 frame_id: map
-yaw: 0.0
+minimum_direction_distance: 0.02
 ```
 
 ## Test
 
-픽셀 좌표 하나를 직접 발행합니다.
+목표 위치와 방향점을 순서대로 직접 발행합니다.
 
 ```bash
 ros2 topic pub --once /central/target_pixel geometry_msgs/msg/PointStamped \
 "{header: {frame_id: camera}, point: {x: 160.0, y: 355.0, z: 0.0}}"
+
+ros2 topic pub --once /central/target_pixel geometry_msgs/msg/PointStamped \
+"{header: {frame_id: camera}, point: {x: 260.0, y: 355.0, z: 0.0}}"
 ```
 
 PoseStamped 출력 확인:
@@ -166,15 +182,24 @@ ros2 topic echo /central/target_map_json
     "sec": 0,
     "nanosec": 0
   },
-  "camera_pixel": {
+  "target_camera_pixel": {
     "u": 160.0,
     "v": 355.0
+  },
+  "direction_camera_pixel": {
+    "u": 260.0,
+    "v": 355.0
+  },
+  "direction_map_point": {
+    "x": 0.531234,
+    "y": 1.278
   },
   "map_pose": {
     "x": 0.065333,
     "y": 1.278,
     "z": 0.0,
-    "yaw": 0.0
+    "yaw": 1.570796,
+    "heading_deg": 90.0
   }
 }
 ```
@@ -188,7 +213,7 @@ header.frame_id: map
 pose.position.x: map x
 pose.position.y: map y
 pose.position.z: 0.0
-pose.orientation: yaw parameter 기준 quaternion
+pose.orientation: 첫 번째 map 점에서 두 번째 map 점을 향하는 yaw quaternion
 ```
 
 차량 라즈베리파이 쪽에서 이 좌표를 Nav2 `NavigateToPose` goal로 넘기면 됩니다.
@@ -211,11 +236,11 @@ ros2 run central camera_to_map_bridge --ros-args \
   -p output_json_topic:=/central/target_map_json
 ```
 
-목표 yaw 지정:
+방향점 최소 거리 변경:
 
 ```bash
 ros2 run central camera_to_map_bridge --ros-args \
-  -p yaw:=0.0
+  -p minimum_direction_distance:=0.05
 ```
 
 target id 변경:

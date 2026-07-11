@@ -11,7 +11,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 
 
-DEFAULT_MAP = '/home/pinky/current_map.yaml'
+DEFAULT_MAP = '/home/jio/poter_ws/config/SLAM/current_map.yaml'
 
 
 def read_map_yaml(path):
