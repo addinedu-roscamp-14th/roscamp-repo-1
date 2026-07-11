@@ -70,17 +70,26 @@ ros2 launch pinky_bringup bringup_robot.launch.xml
 
 ### 2. 노트북에서 Nav2 실행
 
-기본 지도는 `/home/jio/poter_ws/config/SLAM/current_map.yaml`입니다.
+기본 지도는 `~/poter_ws/config/SLAM/current_map.yaml`입니다.
 
 ```bash
 ros2 launch drive bringup_launch.xml \
-  map:=/home/jio/poter_ws/config/SLAM/current_map.yaml
+  map:=$HOME/poter_ws/config/SLAM/current_map.yaml
 ```
 
 ### 3. 노트북에서 RViz 실행
 
 ```bash
 ros2 launch drive nav2_view.launch.xml
+```
+
+RViz의 RobotModel mesh는 기본적으로 로컬 `~/pinky_pro/install/pinky_description`에서 찾습니다.
+이 mesh lookup 환경은 `drive` 패키지의 `nav2_view.launch.xml`에서 RViz 프로세스에 직접 적용합니다.
+다른 위치를 쓰는 경우:
+
+```bash
+ros2 launch drive nav2_view.launch.xml \
+  pinky_description_prefix:=$HOME/pinky_pro/install/pinky_description
 ```
 
 RViz 상단의 `2D Pose Estimate`를 선택하고 실제 차량 위치와 방향을 map 위에 지정합니다.
@@ -109,7 +118,7 @@ ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
 ```bash
 ros2 launch drive target_map_pose_nav.launch.xml \
   start_nav2:=true \
-  map:=/home/jio/poter_ws/config/SLAM/current_map.yaml
+  map:=$HOME/poter_ws/config/SLAM/current_map.yaml
 ```
 
 RViz는 별도 터미널에서 실행합니다.
