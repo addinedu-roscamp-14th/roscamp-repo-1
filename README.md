@@ -121,7 +121,23 @@ ros2 launch drive bringup_launch.xml \
 ```
 
 
-### 7. 중앙 목표를 Nav2에 연결
+### 7. RViz에서 차량 초기 위치 설정
+
+노트북 터미널 7:
+
+```bash
+ros2 launch drive nav2_view.launch.xml
+```
+
+RViz 상단의 `2D Pose Estimate`로 실제 차량 위치와 방향을 지정합니다. 초기 위치를 설정한
+후 AMCL과 `map -> odom` TF를 확인합니다.
+
+```bash
+ros2 topic echo /amcl_pose --once
+ros2 run tf2_ros tf2_echo map odom
+```
+
+### 8. 중앙 목표를 Nav2에 연결
 
 노트북 터미널 8:
 
@@ -136,7 +152,7 @@ ros2 action list | grep navigate_to_pose
 ros2 topic echo /cmd_vel
 ```
 
-### 8. RQT에서 목표 위치와 방향 클릭
+### 9. RQT에서 목표 위치와 방향 클릭
 
 노트북 터미널 9:
 
@@ -189,7 +205,7 @@ poter_ws/
 | --- | --- | --- |
 | `udp` | UDP/GStreamer 방식 카메라 입력 fallback. 로컬 기본 카메라 경로는 `v4l2_camera + image_proc` 사용 | `udp_camera_node` |
 | `yolo` | 카메라 이미지에서 객체/영역을 인식하고 annotated image와 detection JSON 발행 | `yolo_node` |
-| `calibration` | `/camera/image_rect` 픽셀 좌표와 SLAM `/map` 좌표를 homography로 캘리브레이션 | `direct_calibrator`, `calibration_verifier` |
+| `calibration` | `/image_rect/compressed` 픽셀 좌표와 SLAM `/map` 좌표를 homography로 캘리브레이션 | `direct_calibrator`, `calibration_verifier` |
 | `central` | 캘리브레이션 결과를 사용해 카메라 픽셀 좌표를 `/map` 기준 좌표로 변환하고 JSON/PoseStamped 발행 | `camera_to_map_bridge` |
 | `drive` | `/central/target_map_pose`를 차량 Nav2 `NavigateToPose` goal로 전달하고 직접 goal 테스트 지원 | `target_map_pose_to_nav_goal`, `send_nav_goal` |
 | `slam` | 차량의 `/scan`, `/odom`, TF를 사용해 노트북에서 SLAM 지도를 작성 | `slam_toolbox`, mapping RViz |

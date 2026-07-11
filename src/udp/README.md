@@ -1,22 +1,12 @@
-# UDP 패키지
+# UDP Package
 
-이 패키지는 UDP/GStreamer로 들어오는 카메라 영상을 ROS2 이미지 토픽으로 바꾸는 fallback 패키지입니다.
+UDP/GStreamer로 수신한 카메라 영상을 ROS 2 이미지 토픽으로 변환하는 fallback
+패키지입니다. 카메라와 처리 노드가 같은 노트북에 있으면 UDP 없이 `v4l2_camera`를
+사용합니다.
 
-현재 로컬 기본 카메라 경로는 UDP가 아니라 아래 `v4l2_camera + image_proc` 흐름을 사용합니다.
+## 로컬 기본 방식
 
-```text
-v4l2_camera
-→ /camera/image_raw
-→ /camera/image_rect
-```
-
-UDP 방식은 다른 노트북으로 영상을 보내야 할 때 사용하는 fallback입니다.
-
-## 기본 카메라 실행 방식
-
-UDP를 사용하지 않는 현재 기본 방식입니다.
-
-### 1. 원본 카메라 실행
+### 1. 원본 카메라
 
 ```bash
 ros2 run v4l2_camera v4l2_camera_node --ros-args \
@@ -27,71 +17,92 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
   -r image_raw:=/camera/image_raw \
   -r camera_info:=/camera/camera_info
 ```
-### 2. 이미지 압축 실행
+
+### 2. 왜곡 보정
 
 ```bash
-ros2 run image_transport republish raw compressed   --ros-args   -r in:=/camera/image_rect   -r out:=/camera/image_rect
-```
-
-
-### 3. 왜곡 보정 이미지 생성
-
-```bash
-ros2 run image_proc rectify_node \
-  --ros-args \
+ros2 run image_proc rectify_node --ros-args \
   -r image:=/camera/image_raw \
   -r camera_info:=/camera/camera_info \
   -r image_rect:=/camera/image_rect
 ```
 
-최종적으로 YOLO와 calibration은 아래 토픽을 사용합니다.
+YOLO와 calibration의 기본 입력 `/image_rect/compressed`가 자동으로 보이지 않으면
+명시적으로 image transport를 실행합니다.
 
-```text
-/camera/image_rect
+```bash
+ros2 run image_transport republish raw compressed --ros-args \
+  -r in:=/camera/image_rect \
+  -r out:=/image_rect
 ```
 
-## 실행 순서
+확인:
 
-아래는 UDP fallback 방식입니다.
+```bash
+ros2 topic hz /camera/image_raw
+ros2 topic hz /camera/image_rect
+ros2 topic hz /image_rect/compressed
+```
 
-### 1. 카메라 영상 송신
-아래 명령으로 카메라 영상을 UDP로 전송합니다.
+## 원격 UDP Fallback
+
+카메라가 연결된 송신 노트북과 영상을 처리할 수신 노트북에서 각각 실행합니다. 두 장비는
+같은 네트워크에 있어야 합니다.
+
+### 1. 송신 노트북
+
+`<RECEIVER_IP>`를 수신 노트북의 실제 IP로 바꿉니다. `127.0.0.1`은 다른 노트북으로
+전송되지 않습니다.
 
 ```bash
 gst-launch-1.0 -v \
-  v4l2src device=/dev/video2 ! image/jpeg,width=640,height=480,framerate=30/1 ! jpegparse ! rtpjpegpay ! tee name=t \
-  t. ! queue ! udpsink host=127.0.0.1 port=5000 
+  v4l2src device=/dev/video2 ! \
+  image/jpeg,width=640,height=480,framerate=30/1 ! \
+  jpegparse ! rtpjpegpay ! \
+  udpsink host=<RECEIVER_IP> port=5000 sync=false async=false
 ```
 
-### 2. UDP 수신 노드 실행
-`udp` 패키지의 노드를 실행합니다.
+### 2. 수신 노트북
+
+워크스페이스 루트에서 실행합니다. `0.0.0.0`은 모든 로컬 네트워크 인터페이스에서 UDP를
+수신합니다.
 
 ```bash
+cd ~/poter_ws
+source install/setup.bash
 ros2 run udp udp_camera_node --ros-args \
   -p port:=5000 \
-  -p bind_address:="127.0.0.1" \
-  -p camera_info_yaml:="config/main_camera/camera_info.yaml"
+  -p bind_address:=0.0.0.0 \
+  -p camera_info_yaml:=config/main_camera/camera_info.yaml
 ```
 
-### 3. 이미지 보정 노드 실행
-필요하면 보정 노드를 따로 실행합니다.
+수신 노드는 다음 토픽을 발행합니다.
+
+```text
+/camera/image_raw
+/camera/camera_info
+```
+
+### 3. 수신 영상 왜곡 보정
 
 ```bash
-ros2 run image_proc rectify_node \
-  --ros-args \
+ros2 run image_proc rectify_node --ros-args \
   -r image:=/camera/image_raw \
   -r camera_info:=/camera/camera_info \
   -r image_rect:=/camera/image_rect
 ```
 
-## 설정 파일 위치
+필요하면 위 로컬 방식과 동일하게 `/image_rect/compressed`를 발행합니다.
 
-- 카메라 보정 파일: `config/main_camera/camera_info.yaml`
-- 추가 보정 파일: `config/main_camera/ost.yaml`
-- YOLO 가중치 보관 폴더: `config/weights/`
+## 설정
 
-## 참고
+```text
+기본 UDP 포트: 5000
+기본 bind 주소: 0.0.0.0
+camera info: config/main_camera/camera_info.yaml
+출력 이미지: /camera/image_raw
+출력 camera info: /camera/camera_info
+```
 
-- 기본 포트는 `5000`입니다.
-- 기본 바인드 주소는 `0.0.0.0`입니다.
-- `camera_info_yaml`은 워크스페이스 기준 상대경로로 적어도 되고, 노드가 자동으로 찾아서 읽습니다.
+방화벽이 UDP 5000 포트를 차단하지 않는지 확인해야 합니다. UDP 영상 전송은 네트워크
+상태에 따라 프레임 손실이 생길 수 있으므로 로컬 처리에서는 사용하지 않습니다.

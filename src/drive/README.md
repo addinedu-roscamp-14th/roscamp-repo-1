@@ -36,7 +36,7 @@ Nav2를 중앙 시스템 없이 직접 시험하는 명령입니다. map 좌표 
 radian입니다.
 
 ```bash
-ros2 run drive send_nav_goal --world 1.767494 0.344350 --yaw 1.5708
+ros2 run drive send_nav_goal --world -0.5 -1.0 --yaw 1.5708
 ```
 
 `--world`를 생략하면 입력 `x`, `y`를 720x720 map canvas 픽셀로 해석하므로, map 좌표를
@@ -73,10 +73,11 @@ ros2 launch pinky_bringup bringup_robot.launch.xml
 기본 지도는 `/home/jio/poter_ws/config/SLAM/current_map.yaml`입니다.
 
 ```bash
-ros2 launch drive bringup_launch.xml map:=config/SLAM/current_map.yaml
+ros2 launch drive bringup_launch.xml \
+  map:=/home/jio/poter_ws/config/SLAM/current_map.yaml
 ```
 
-### 4. 노트북에서 RViz 실행
+### 3. 노트북에서 RViz 실행
 
 ```bash
 ros2 launch drive nav2_view.launch.xml
@@ -92,7 +93,7 @@ ros2 topic echo /amcl_pose --once
 ros2 run tf2_ros tf2_echo map odom
 ```
 
-### 5. 중앙 목표 브릿지 실행
+### 4. 중앙 목표 브릿지 실행
 
 ```bash
 ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
@@ -108,7 +109,7 @@ ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
 ```bash
 ros2 launch drive target_map_pose_nav.launch.xml \
   start_nav2:=true \
-  map:= ~/config/SLAM/current_map.yaml
+  map:=/home/jio/poter_ws/config/SLAM/current_map.yaml
 ```
 
 RViz는 별도 터미널에서 실행합니다.
@@ -123,7 +124,7 @@ Nav2와 AMCL 초기 위치 설정이 끝난 후 map 좌표를 직접 전송합�
 
 ```bash
 ros2 run drive send_nav_goal \
-  --world 1.767494 0.344350 \
+  --world -0.5 -1.0 \
   --yaw 0.0
 ```
 
@@ -131,7 +132,7 @@ ros2 run drive send_nav_goal \
 
 ```bash
 ros2 run drive send_nav_goal \
-  --world 1.767494 0.344350 \
+  --world -0.5 -1.0 \
   --yaw 0.0 \
   --dry-run
 ```
