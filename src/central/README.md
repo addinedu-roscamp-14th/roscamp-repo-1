@@ -113,9 +113,8 @@ ros2 launch pinky_bringup bringup_robot.launch.xml
 ros2 launch pinky_navigation bringup_launch.xml map:=/home/pinky/current_map.yaml
 ```
 ```bash
-ros2 launch pinky_navigation target_map_pose_nav.launch.xml start_nav2:=false
+ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
 ```
-
 
 
 

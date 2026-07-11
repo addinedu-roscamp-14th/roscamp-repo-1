@@ -8,12 +8,12 @@
 
 ### `direct_calibrator`
 
-카메라 이미지와 SLAM PGM 파일을 각각 OpenCV 창으로 띄우고, 두 창의 마우스 왼쪽 클릭 좌표를 한 쌍으로 저장합니다. rqt mouse 토픽에 의존하지 않는 권장 노드입니다.
+카메라 이미지와 SLAM PGM 파일을 각각 OpenCV 창으로 띄우고, 두 창의 마우스 왼쪽 클릭 좌표를 한 쌍으로 저장합니다. 외부 mouse 토픽에 의존하지 않는 권장 노드입니다.
 
 기본 입력:
 
 ```text
-/camera/image_rect
+/image_rect/compressed
 config/SLAM/current_map.yaml
 config/SLAM/current_map.pgm
 ```
@@ -23,36 +23,6 @@ config/SLAM/current_map.pgm
 ```text
 config/central/camera_map_calibration.yaml
 ```
-
-### `pgm_click_publisher`
-
-SLAM PGM 파일을 OpenCV 창으로 띄우고, 마우스 왼쪽 클릭 좌표를 ROS 토픽으로 발행합니다.
-
-기본 입력:
-
-```text
-config/SLAM/current_map.yaml
-config/SLAM/current_map.pgm
-```
-
-기본 출력:
-
-```text
-/central/calib/pgm_point
-```
-
-### `calibration_collector`
-
-카메라 mouse click 토픽과 PGM click 토픽을 받아서 한 쌍으로 저장합니다.
-
-기본 입력 토픽:
-
-```text
-/central/yolo/image_annotated_mouse_left
-/central/calib/pgm_point
-```
-
-collector는 `geometry_msgs/msg/PointStamped` 타입의 `*/mouse_left` 토픽도 자동 탐색해서 카메라 클릭 토픽으로 구독합니다.
 
 ### `calibration_verifier`
 
@@ -86,28 +56,12 @@ source install/setup.bash
 ros2 run calibration direct_calibrator
 ```
 
-카메라 이미지 토픽은 왜곡 보정된 rectified 이미지인 `/camera/image_rect`를 사용해야 합니다. 다른 토픽을 임시로 쓰려면:
+카메라 이미지 토픽은 압축된 왜곡 보정 이미지인 `/image_rect/compressed`를 기본으로 사용합니다. 다른 토픽을 임시로 쓰려면:
 
 ```bash
 ros2 run calibration direct_calibrator --ros-args \
-  -p camera_topic:=/central/yolo/image_annotated
+  -p camera_topic:=/image_rect/compressed
 ```
-
-기존 rqt mouse 토픽 방식이 필요하면 터미널을 나눠서 실행합니다.
-
-터미널 1:
-
-```bash
-ros2 run calibration pgm_click_publisher
-```
-
-터미널 2:
-
-```bash
-ros2 run calibration calibration_collector
-```
-
-터미널 3 또는 GUI에서 `rqt`를 열고 카메라 토픽을 선택합니다.
 
 ## Click Workflow
 
@@ -166,7 +120,7 @@ homography:
 
 ## Coordinate Notes
 
-OpenCV/rqt 이미지 픽셀 좌표는 보통 아래 기준입니다.
+OpenCV 이미지 픽셀 좌표는 보통 아래 기준입니다.
 
 ```text
 x: 오른쪽 증가
@@ -206,14 +160,6 @@ ros2 run calibration direct_calibrator --ros-args \
   -p output_yaml:=config/central/camera_map_calibration.yaml
 ```
 
-토픽 변경:
-
-```bash
-ros2 run calibration calibration_collector --ros-args \
-  -p camera_click_topic:=/central/yolo/image_annotated_mouse_left \
-  -p map_click_topic:=/central/calib/pgm_point
-```
-
 ## Troubleshooting
 
 ### `Map yaml not found`
@@ -223,7 +169,7 @@ ros2 run calibration calibration_collector --ros-args \
 ```bash
 cd ~/poter_ws
 source install/setup.bash
-ros2 run calibration pgm_click_publisher
+ros2 run calibration direct_calibrator
 ```
 
 기본 경로는 다음입니다.
@@ -242,27 +188,11 @@ colcon build --packages-select calibration
 source install/setup.bash
 ```
 
-### 카메라 rqt 클릭 토픽이 안 보임
-
-`rqt_image_view`에서 이미지를 선택하고 실제로 이미지 위를 클릭해야 `_mouse_left` 토픽이 생깁니다.
-
-토픽 확인:
+### 카메라 영상이 안 보임
 
 ```bash
-ros2 topic list | grep mouse
+ros2 topic list | grep image_rect
+ros2 topic hz /image_rect/compressed
 ```
 
-실제 mouse 토픽이 예를 들어 `/camera/image_raw/mouse_left`라면 collector를 이렇게 실행합니다.
-
-```bash
-ros2 run calibration calibration_collector --ros-args \
-  -p camera_click_topic:=/camera/image_raw/mouse_left
-```
-
-PGM 좌표는 rqt mouse 토픽 대신 `pgm_click_publisher`가 발행하는 `/central/calib/pgm_point`를 사용합니다.
-
-collector 로그에서 아래 메시지가 보여야 카메라 클릭 토픽을 잡은 상태입니다.
-
-```text
-Camera click subscription active: /camera/image_raw/mouse_left
-```
+`/image_rect/compressed`는 압축된 왜곡 보정 이미지입니다. 이 토픽이 발행되지 않으면 `direct_calibrator`와 `calibration_verifier`의 카메라 창은 비어 있습니다.
