@@ -2,7 +2,9 @@
 
 <launch>
     <arg name="rviz_config_file" default="$(find-pkg-share drive)/rviz/nav2_view.rviz"/>
+    <arg name="pinky_description_prefix" default="$(env HOME)/pinky_pro/install/pinky_description"/>
 
     <node pkg="rviz2" exec="rviz2" output="screen" args="-d $(var rviz_config_file)">
+        <env name="AMENT_PREFIX_PATH" value="$(var pinky_description_prefix):$(env AMENT_PREFIX_PATH)"/>
     </node>
 </launch>    
