@@ -26,7 +26,7 @@ source install/setup.bash
 차량에서는 하드웨어 bringup을 실행합니다.
 
 ```bash
-ros2 launch pinky_bringup bringup_robot.launch.xml
+ros2 launch pinky bringup_robot.launch.xml
 ```
 
 노트북에서는 SLAM과 RViz를 실행합니다.

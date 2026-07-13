@@ -65,7 +65,7 @@ source ~/poter_ws/install/setup.bash
 핑키에서 센서, odometry와 모터 제어만 실행합니다.
 
 ```bash
-ros2 launch pinky_bringup bringup_robot.launch.xml
+ros2 launch pinky bringup_robot.launch.xml
 ```
 
 ### 2. 노트북에서 Nav2 실행
