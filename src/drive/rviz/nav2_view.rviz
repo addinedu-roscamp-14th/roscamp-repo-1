@@ -9,7 +9,7 @@ Panels:
         - /TF1/Tree1
         - /Controller1
       Splitter Ratio: 0.5833333134651184
-    Tree Height: 343
+    Tree Height: 439
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
@@ -76,12 +76,10 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-          Value: true
         caster_roate_link:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-          Value: true
         caster_wheel:
           Alpha: 1
           Show Axes: false
@@ -95,7 +93,6 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-          Value: true
         imu_link:
           Alpha: 1
           Show Axes: false
@@ -126,7 +123,6 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-          Value: true
         rplidar_link:
           Alpha: 1
           Show Axes: false
@@ -135,12 +131,10 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-          Value: true
         screen_mount:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-          Value: true
         ultrasonic_link:
           Alpha: 1
           Show Axes: false
@@ -538,7 +532,7 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 396.7530517578125
+      Scale: 173.86776733398438
       Target Frame: <Fixed Frame>
       Value: TopDownOrtho (rviz_default_plugins)
       X: -0.7046383619308472
