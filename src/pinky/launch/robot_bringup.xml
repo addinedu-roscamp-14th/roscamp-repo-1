@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="use_sim_time" default="False"/>
+  <arg name="wheel_radius" default="0.027"/>
+  <arg name="wheel_separation" default="0.0961"/>
+
+  <include file="$(find-pkg-share pinky)/launch/bringup_robot.launch.xml">
+    <arg name="use_sim_time" value="$(var use_sim_time)"/>
+    <arg name="wheel_radius" value="$(var wheel_radius)"/>
+    <arg name="wheel_separation" value="$(var wheel_separation)"/>
+  </include>
+</launch>
