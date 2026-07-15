@@ -6,6 +6,99 @@
 
 ## Nodes
 
+### `topview_usb_camera`
+
+`~/show_usb_camera.sh`에서 사용하던 USB 탑뷰 카메라를 ROS 이미지 토픽으로 발행합니다.
+
+기본 출력:
+
+```text
+/top_camera/image_raw
+/top_camera/camera_info
+```
+
+직접 실행:
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+ros2 run calibration topview_usb_camera
+```
+
+기존 스크립트로 실행:
+
+```bash
+CAMERA_MODE=ros ~/show_usb_camera.sh
+```
+
+화면 미리보기와 ROS 발행을 같이 하려면:
+
+```bash
+CAMERA_MODE=both ~/show_usb_camera.sh
+```
+
+### `topview_bev_node`
+
+탑뷰 카메라 이미지를 위에서 내려다보는 BEV 이미지로 변환합니다.
+
+기본 입력/출력:
+
+```text
+/top_camera/image_raw
+/top_camera/bev/image_raw
+```
+
+처음에는 캘리브레이션 모드로 4개 모서리점을 찍어 BEV homography를 저장합니다.
+
+```bash
+ros2 run calibration topview_bev_node --ros-args \
+  -p calibration_mode:=true
+```
+
+클릭 순서:
+
+```text
+좌상단 → 우상단 → 우하단 → 좌하단
+```
+
+4점을 찍은 뒤 `s`를 누르면 저장됩니다.
+
+저장 파일:
+
+```text
+config/central/topview_bev_calibration.yaml
+```
+
+### `dual_camera_calibrator`
+
+BEV 탑뷰 이미지와 로봇팔 카메라 이미지를 동시에 띄우고 같은 실제 점을 클릭해 두 좌표계를 연결합니다.
+
+기본 입력:
+
+```text
+/top_camera/bev/image_raw
+/camera/image_rect
+```
+
+실행:
+
+```bash
+ros2 run calibration dual_camera_calibrator
+```
+
+최소 4쌍 이상 클릭하면 아래 homography가 저장됩니다.
+
+```text
+top_bev_pixel_to_arm_camera_pixel
+arm_camera_pixel_to_top_bev_pixel
+```
+
+저장 파일:
+
+```text
+config/central/topview_arm_camera_calibration.yaml
+```
+
 ### `direct_calibrator`
 
 카메라 이미지와 SLAM PGM 파일을 각각 OpenCV 창으로 띄우고, 두 창의 마우스 왼쪽 클릭 좌표를 한 쌍으로 저장합니다. 외부 mouse 토픽에 의존하지 않는 권장 노드입니다.
@@ -47,6 +140,19 @@ source install/setup.bash
 이미 빌드한 뒤 코드를 수정했다면 다시 `colcon build` 후 `source install/setup.bash`를 실행하세요.
 
 ## Run
+
+탑뷰와 로봇팔 카메라 좌표 결합 캘리브레이션을 한 번에 띄우려면:
+
+```bash
+cd ~/poter_ws
+DUAL_CAMERA_CALIB=1 BEV_CALIBRATION_MODE=true ./run_arm_auto_pick.sh
+```
+
+BEV 캘리브레이션을 이미 저장한 뒤에는:
+
+```bash
+DUAL_CAMERA_CALIB=1 ./run_arm_auto_pick.sh
+```
 
 권장 방식:
 

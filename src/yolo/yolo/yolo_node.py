@@ -27,7 +27,10 @@ class YoloNode(Node):
         self.declare_parameter('confidence_threshold', 0.6)
         self.declare_parameter('device', '')
         self.declare_parameter('publish_annotated_image', True)
-        self.declare_parameter('class_names', ['red', 'blue'])
+        # Empty means that every class contained in the loaded model is published.
+        # This lets a replacement best.pt define its own class map without silently
+        # filtering detections through names from the previous model.
+        self.declare_parameter('class_names', [])
 
         self.input_topic = str(self.get_parameter('input_topic').value)
         self.input_is_compressed = bool(self.get_parameter('input_is_compressed').value)
@@ -46,7 +49,8 @@ class YoloNode(Node):
         self.model = YOLO(str(self.weights_path))
         self.class_names = self.model.names
 
-        self.get_logger().info(f'Expected segmentation classes: {", ".join(self.expected_class_names)}')
+        expected_classes = ', '.join(self.expected_class_names) or 'all model classes'
+        self.get_logger().info(f'Expected segmentation classes: {expected_classes}')
         self.get_logger().info(f'Model class map: {self.class_names}')
 
         self.annotated_pub = None

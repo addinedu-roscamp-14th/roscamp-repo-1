@@ -1,3 +1,9 @@
 #!/usr/bin/env bash
 
-exec /home/jio/yolo_env/bin/python -m yolo.yolo_node "$@"
+set -e
+
+if [ -n "${YOLO_PYTHON:-}" ]; then
+    exec "$YOLO_PYTHON" -m yolo.yolo_node "$@"
+fi
+
+exec python3 -m yolo.yolo_node "$@"

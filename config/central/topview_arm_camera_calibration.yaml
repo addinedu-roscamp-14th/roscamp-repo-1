@@ -1,0 +1,66 @@
+topics:
+  top_bev_image: /top_camera/bev/image_raw
+  arm_image: /camera/image_raw
+points:
+- index: 1
+  top_bev_pixel:
+  - 527.917
+  - 145.833
+  arm_camera_pixel:
+  - 92.5
+  - 100.5
+- index: 2
+  top_bev_pixel:
+  - 651.875
+  - 142.917
+  arm_camera_pixel:
+  - 140.0
+  - 75.5
+- index: 3
+  top_bev_pixel:
+  - 525.0
+  - 233.333
+  arm_camera_pixel:
+  - 143.5
+  - 236.0
+- index: 4
+  top_bev_pixel:
+  - 640.208
+  - 228.958
+  arm_camera_pixel:
+  - 195.5
+  - 216.0
+homography:
+  top_bev_pixel_to_arm_camera_pixel:
+  - - 0.2209204851
+    - 0.2803405847
+    - -94.3806504633
+  - - -0.1431773666
+    - 0.846832614
+    - 20.6794505323
+  - - -0.0003578767
+    - -0.0008817282
+    - 1.0
+  arm_camera_pixel_to_top_bev_pixel:
+  - - 3.8071564395
+    - -0.8675360963
+    - 377.2620709674
+  - - 0.5975531096
+    - 0.8236200545
+    - 39.3654409933
+  - - 0.0018893718
+    - 0.0004157381
+    - 1.0
+  inlier_mask:
+  - 1
+  - 1
+  - 1
+  - 1
+  reprojection_error_px:
+    mean: 0.0
+    max: 0.0
+    per_point:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0

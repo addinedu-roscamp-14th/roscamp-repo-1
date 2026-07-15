@@ -1,0 +1,8 @@
+path: /home/rsj/poter_ws/datasets/topview
+train: images/train
+val: images/val2
+test: images/test
+
+names:
+  0: red
+  1: blue

@@ -26,6 +26,9 @@ setup(
         'console_scripts': [
             'direct_calibrator = calibration.direct_calibrator:main',
             'calibration_verifier = calibration.calibration_verifier:main',
+            'topview_usb_camera = calibration.topview_usb_camera:main',
+            'topview_bev_node = calibration.topview_bev_node:main',
+            'dual_camera_calibrator = calibration.dual_camera_calibrator:main',
         ],
     },
 )

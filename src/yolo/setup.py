@@ -25,4 +25,9 @@ setup(
             'pytest',
         ],
     },
+    entry_points={
+        'console_scripts': [
+            'image_viewer = yolo.image_viewer:main',
+        ],
+    },
 )

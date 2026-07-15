@@ -1,0 +1,26 @@
+topics:
+  input_image: /top_camera/image_raw
+  output_image: /top_camera/bev/image_raw
+bev:
+  width: 1000
+  height: 700
+  source_points_clockwise:
+  - - 134.0
+    - 109.0
+  - - 120.0
+    - 476.0
+  - - 501.0
+    - 477.0
+  - - 442.0
+    - 83.0
+homography:
+  image_pixel_to_bev_pixel:
+  - - 0.3147244939
+    - 3.7282747738
+    - -448.5550325242
+  - - 2.7315102507
+    - 0.1041993011
+    - -377.3800974116
+  - - 0.0003230347
+    - 0.0006858651
+    - 1.0
