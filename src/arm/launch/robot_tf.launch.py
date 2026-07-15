@@ -6,6 +6,7 @@ from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 
 from launch_ros.actions import Node
@@ -25,6 +26,9 @@ def generate_launch_description():
         DeclareLaunchArgument('baud_rate', default_value='1000000'),
         DeclareLaunchArgument('publish_rate', default_value='10.0'),
         DeclareLaunchArgument('frame_prefix', default_value='arm/'),
+        DeclareLaunchArgument(
+            'start_hardware_joint_publisher', default_value='true'
+        ),
     ]
 
     joint_state_node = Node(
@@ -33,6 +37,9 @@ def generate_launch_description():
         name='hardware_joint_state_publisher',
         namespace='arm',
         output='screen',
+        condition=IfCondition(
+            LaunchConfiguration('start_hardware_joint_publisher')
+        ),
         parameters=[{
             'serial_port': LaunchConfiguration('serial_port'),
             'baud_rate': LaunchConfiguration('baud_rate'),

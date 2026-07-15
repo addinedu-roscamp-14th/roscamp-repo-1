@@ -41,6 +41,12 @@ geometry_msgs/PoseStamped
 
 /central/target_map_json
 std_msgs/String
+
+/central/target_map_waypoints
+nav_msgs/Path
+
+/central/target_map_waypoints_preview
+nav_msgs/Path
 ```
 
 기본 calibration 파일:
@@ -119,6 +125,54 @@ rqt 영상에서 두 번 클릭합니다.
 브릿지는 두 점을 모두 map 좌표로 변환하고 첫 번째 점에서 두 번째 점을 향하는 yaw를
 계산한 뒤 `/central/target_map_pose`를 한 번 발행합니다.
 
+## 여러 웨이포인트 전송
+
+웨이포인트 모드에서는 중간 지점과 최종 목적지를 목록에 누적한 후 한 번에 차량으로
+보냅니다. 중간 지점의 헤딩은 다음 지점을 향하도록 자동 계산합니다.
+
+```bash
+ros2 run central camera_to_map_bridge --ros-args \
+  -p waypoint_mode:=true
+```
+
+영상에서 다음 순서로 클릭합니다.
+
+1. 중간 웨이포인트: 각각 위치만 한 번 클릭
+2. 최종 목적지: 위치를 한 번 클릭
+3. 최종 방향: 최종 목적지에서 차량이 바라볼 방향점을 한 번 클릭
+
+예를 들어 중간 웨이포인트가 2개라면 `중간1 -> 중간2 -> 최종 위치 -> 최종 방향`으로
+총 네 번 클릭합니다. 마지막 방향점은 차량이 이동할 웨이포인트에 포함되지 않습니다.
+
+필요한 웨이포인트를 모두 찍은 다음 `camera_to_map_bridge`를 실행한 터미널에 포커스를
+두고 **스페이스바**를 누르면 전체 경로가 차량으로 전송됩니다.
+
+스페이스바 입력은 브릿지 터미널에 포커스가 있을 때만 동작합니다. 터미널 입력을 사용할
+수 없는 환경에서는 기존 서비스를 호출합니다.
+
+```bash
+ros2 service call /central/commit_waypoints std_srvs/srv/Trigger "{}"
+```
+
+확정하면 `/central/target_map_waypoints`에 `nav_msgs/Path`가 한 번 발행됩니다. 작업 중인
+전체 클릭은 `/central/target_map_waypoints_preview`에서 확인할 수 있으며, 마지막 클릭은
+확정 시 최종 방향점으로 해석됩니다.
+
+잘못 찍었거나 처음부터 다시 찍으려면 전체 목록과 진행 중인 첫 클릭을 초기화합니다.
+
+```bash
+ros2 service call /central/clear_waypoints std_srvs/srv/Trigger "{}"
+```
+
+차량 측 Nav2 웨이포인트 브릿지:
+
+```bash
+ros2 launch drive target_map_waypoints_nav.launch.xml start_nav2:=false
+```
+
+단일 목적지를 사용할 때는 `waypoint_mode`를 켜지 않고 기존
+`target_map_pose_nav.launch.xml`을 사용합니다. 두 drive 브릿지를 동시에 실행하지 않습니다.
+
 # 차량에서 실행
 
 ```bash
@@ -150,6 +204,12 @@ output_pose_topic: /central/target_map_pose
 output_json_topic: /central/target_map_json
 frame_id: map
 minimum_direction_distance: 0.02
+waypoint_mode: false
+enable_spacebar_commit: true
+output_waypoints_topic: /central/target_map_waypoints
+output_waypoints_preview_topic: /central/target_map_waypoints_preview
+commit_waypoints_service: /central/commit_waypoints
+clear_waypoints_service: /central/clear_waypoints
 ```
 
 ## Test

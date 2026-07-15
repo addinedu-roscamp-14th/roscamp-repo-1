@@ -1,5 +1,6 @@
 """Keyboard TCP pose jog control with inverse-kinematics validation."""
 
+import math
 import select
 import sys
 import termios
@@ -8,8 +9,10 @@ import tty
 
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 
 from ._config import BAUD, PORT, SPEED
+from ._joint_limits import JOINT_LIMITS_DEG as JETCOBOT_JOINT_LIMITS_DEG
 from ._robot_utils import connect_robot
 
 
@@ -17,14 +20,7 @@ class ManualJogNode(Node):
     """Jog only the TCP pose while hiding joint-level control."""
 
     AXIS_NAMES = ('X', 'Y', 'Z', 'RX', 'RY', 'RZ')
-    JOINT_LIMITS_DEG = (
-        (-162.0, 162.0),
-        (-135.0, 135.0),
-        (-150.0, 150.0),
-        (-162.0, 162.0),
-        (-162.0, 162.0),
-        (-162.0, 162.0),
-    )
+    JOINT_LIMITS_DEG = JETCOBOT_JOINT_LIMITS_DEG
 
     def __init__(self):
         """Connect to the robot and prepare validated TCP jogging."""
@@ -37,6 +33,9 @@ class ManualJogNode(Node):
         self.declare_parameter('max_joint_delta_deg', 15.0)
         self.declare_parameter('min_z_mm', 20.0)
         self.declare_parameter('max_z_mm', 300.0)
+        self.declare_parameter('joint_states_topic', '/arm/joint_states')
+        self.declare_parameter('joint_publish_rate', 10.0)
+        self.declare_parameter('torque_release_seconds', 5.0)
 
         serial_port = str(self.get_parameter('serial_port').value)
         baud_rate = int(self.get_parameter('baud_rate').value)
@@ -49,11 +48,56 @@ class ManualJogNode(Node):
         )
         self.min_z = float(self.get_parameter('min_z_mm').value)
         self.max_z = float(self.get_parameter('max_z_mm').value)
+        joint_states_topic = str(
+            self.get_parameter('joint_states_topic').value
+        )
+        joint_publish_rate = float(
+            self.get_parameter('joint_publish_rate').value
+        )
+        self.torque_release_seconds = float(
+            self.get_parameter('torque_release_seconds').value
+        )
+        if joint_publish_rate <= 0.0:
+            raise ValueError('joint_publish_rate must be greater than zero')
+        if not 1.0 <= self.torque_release_seconds <= 15.0:
+            raise ValueError(
+                'torque_release_seconds must be between 1 and 15 seconds'
+            )
         self.translation_step = 1.0
         self.rotation_step = 1.0
         self.motion_fault = False
+        self.serial_read_failures = 0
         self.robot = connect_robot(serial_port, baud_rate)
+        self.joint_state_publisher = self.create_publisher(
+            JointState, joint_states_topic, 10
+        )
+        self.create_timer(
+            1.0 / joint_publish_rate, self._publish_joint_states
+        )
         self._prepare_control()
+
+    def _publish_joint_states(self):
+        angles = self._read_angles(log_error=False)
+        if angles is None:
+            return
+
+        self._publish_joint_angles(angles)
+
+    def _publish_joint_angles(self, angles):
+        message = JointState()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.name = [
+            '1_Joint',
+            '2_Joint',
+            '3_Joint',
+            '4_Joint',
+            '5_Joint',
+            '6_Joint',
+        ]
+        message.position = [math.radians(value) for value in angles]
+        message.velocity = [0.0] * 6
+        message.effort = [0.0] * 6
+        self.joint_state_publisher.publish(message)
 
     def _prepare_control(self):
         self.get_logger().warning(
@@ -88,18 +132,51 @@ class ManualJogNode(Node):
             )
         self.motion_fault = False
 
-    def _read_angles(self):
-        angles = self.robot.get_angles()
-        if not isinstance(angles, (list, tuple)) or len(angles) != 6:
-            self.get_logger().error(f'Invalid joint angles: {angles}')
+    def _read_angles(self, log_error=True):
+        try:
+            angles = self.robot.get_angles()
+        except Exception as exc:
+            self._handle_serial_read_error('joint angles', exc, log_error)
             return None
+        if not isinstance(angles, (list, tuple)) or len(angles) != 6:
+            if log_error:
+                self.get_logger().error(f'Invalid joint angles: {angles}')
+            return None
+        self.serial_read_failures = 0
         return [float(value) for value in angles]
 
+    def _handle_serial_read_error(self, operation, exception, log_error=True):
+        self.serial_read_failures += 1
+        self.motion_fault = True
+        if log_error or self.serial_read_failures in (1, 10, 50):
+            self.get_logger().error(
+                f'Failed to read {operation} from the robot: {exception}. '
+                'Check USB connection and ensure only one process owns the '
+                'serial port.'
+            )
+
+    def _read_servo_state(self, attempts=5):
+        for _ in range(attempts):
+            try:
+                state = self.robot.is_all_servo_enable()
+            except Exception as exc:
+                self._handle_serial_read_error('servo state', exc)
+                state = -1
+            if state in (0, 1):
+                return int(state)
+            time.sleep(0.2)
+        return -1
+
     def _read_coords(self):
-        coords = self.robot.get_coords()
+        try:
+            coords = self.robot.get_coords()
+        except Exception as exc:
+            self._handle_serial_read_error('TCP coordinates', exc)
+            return None
         if not isinstance(coords, (list, tuple)) or len(coords) < 6:
             self.get_logger().error(f'Invalid robot coordinates: {coords}')
             return None
+        self.serial_read_failures = 0
         return [float(value) for value in coords[:6]]
 
     def _print_pose(self):
@@ -114,6 +191,79 @@ class ManualJogNode(Node):
             self.get_logger().info(
                 f'IK joints [deg] = {[round(value, 2) for value in angles]}'
             )
+
+    def _release_torque_temporarily(self):
+        self.get_logger().warning(
+            'Releasing all servo torque. Support the arm continuously; '
+            'it can fall under gravity.'
+        )
+        self.robot.stop()
+        restore_required = False
+        try:
+            restore_required = True
+            result = self.robot.release_all_servos()
+            if result == -1:
+                self.get_logger().warning(
+                    'release_all_servos returned no ACK; checking actual '
+                    'servo state'
+                )
+            time.sleep(0.3)
+            servo_state = self._read_servo_state()
+            if servo_state != 0:
+                raise RuntimeError(
+                    'servo torque release was not verified: '
+                    f'is_all_servo_enable={servo_state}'
+                )
+            deadline = time.monotonic() + self.torque_release_seconds
+            last_countdown = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                countdown = max(1, math.ceil(remaining))
+                if countdown != last_countdown:
+                    self.get_logger().warning(
+                        f'Torque restores in {countdown} s'
+                    )
+                    last_countdown = countdown
+                angles = self._read_angles(log_error=False)
+                if angles is not None:
+                    self._publish_joint_angles(angles)
+                time.sleep(min(0.1, remaining))
+        except Exception as exc:
+            self.motion_fault = True
+            self.get_logger().error(f'Failed to release torque: {exc}')
+        finally:
+            if restore_required:
+                current_angles = self._read_angles(log_error=False)
+                try:
+                    result = self.robot.focus_all_servos()
+                    if result == -1:
+                        self.get_logger().warning(
+                            'focus_all_servos returned no ACK; checking actual '
+                            'servo state'
+                        )
+                    time.sleep(0.5)
+                    servo_state = self._read_servo_state()
+                    if servo_state != 1:
+                        raise RuntimeError(
+                            'servo torque restoration was not verified: '
+                            f'is_all_servo_enable={servo_state}'
+                        )
+                    if current_angles is not None:
+                        self.robot.send_angles(current_angles, self.speed)
+                        self._publish_joint_angles(current_angles)
+                    self.motion_fault = False
+                    self.get_logger().info(
+                        'All servo torque restored at the current pose. '
+                        'Wait for the arm to settle before taking a sample.'
+                    )
+                    self._print_pose()
+                except Exception as exc:
+                    self.motion_fault = True
+                    self.get_logger().error(
+                        f'CRITICAL: failed to restore servo torque: {exc}'
+                    )
 
     @staticmethod
     def _normalize_angle(angle):
@@ -240,6 +390,8 @@ class ManualJogNode(Node):
             self.get_logger().info(f'TCP step: {step:g} mm / deg')
         elif key == 'p':
             self._print_pose()
+        elif key == 't':
+            self._release_torque_temporarily()
         elif key == 'e':
             try:
                 self._prepare_control()
@@ -268,7 +420,8 @@ class ManualJogNode(Node):
             tty.setcbreak(sys.stdin.fileno())
             self.get_logger().info(
                 'W/S X | A/D Y | R/F Z | U/O RX | I/K RY | J/L RZ | '
-                '1/2/3 step | E check | P pose | SPACE stop | Q quit'
+                '1/2/3 step | T torque off 5s | E check | P pose | '
+                'SPACE stop | Q quit'
             )
             self._print_pose()
             while rclpy.ok():
