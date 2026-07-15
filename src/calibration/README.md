@@ -244,8 +244,8 @@ map_y = origin_y + (map_height - pgm_y) * resolution
 
 ```text
 resolution: 0.010
-origin: [-0.327, -3.731, 0]
-image size: 142 x 223
+origin: [-1.366, -1.903, 0]
+image size: 205 x 231
 ```
 
 카메라 각도 때문에 PGM의 좌측 상단이 카메라에서는 좌측 하단처럼 보일 수 있습니다. 이 반전/회전/원근 왜곡은 클릭한 대응점들을 기반으로 homography가 흡수합니다.
