@@ -9,13 +9,13 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name, ['package.xml', 'README.md']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='jio',
     maintainer_email='jio@todo.todo',
-    description='TODO: Package description',
+    description='Central control package',
     license='TODO: License declaration',
     extras_require={
         'test': [
@@ -24,6 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'camera_to_map_bridge = central.camera_to_map_bridge:main',
+            'rqt_click_to_target = central.rqt_click_to_target:main',
         ],
     },
 )
