@@ -1,0 +1,76 @@
+/arm/container_pick_coordinator:
+  ros__parameters:
+    base_frame: arm/base_link
+    marker_frame: arm/container_marker
+
+    # Motion requires the explicit execute_motion launch override.
+    execute_motion: false
+    motion_backend: direct
+    allow_full_pick: true
+    offsets_configured: true
+    use_marker_rotation_for_grasp: false
+    grasp_orientation_mode: marker_yaw
+
+    # Fixed-base grasp taught with an aligned container. The 15 mm marker
+    # supplies XYZ only because its planar rotation estimate is unstable.
+    grasp_offset_xyz_m: [-0.014261, -0.010785, -0.042962]
+    grasp_offset_rpy_deg: [-170.530, 8.370, 129.248]
+    # Aligned-container marker yaw measured in base_link on 2026-07-15.
+    reference_marker_yaw_deg: 29.4
+    # Accept every container direction. MoveIt and the Cartesian planner still
+    # reject orientations that are physically unreachable or unsafe.
+    max_yaw_spread_deg: 30.0
+    max_container_yaw_delta_deg: 180.0
+    pregrasp_lift_m: 0.08
+    # Keep the visual pregrasp unchanged and descend 5 mm deeper only for grasp.
+    grasp_extra_depth_m: 0.005
+    # The wrist camera loses the top marker near grasp. This is safe only while
+    # the container remains fixed after its base-frame target is locked.
+    refresh_marker_before_descent: false
+    # Use the taught grasp orientation directly. Holding an arbitrary current
+    # orientation near the workspace edge can select an unstable IK branch.
+    pregrasp_test_keep_current_orientation: false
+    # Lift 18 cm after closing: previous 8 cm plus 10 cm clearance.
+    lift_after_pick_m: 0.18
+    minimum_lift_after_pick_m: 0.05
+    lift_search_step_m: 0.02
+
+    minimum_stable_samples: 5
+    max_translation_std_m: 0.005
+    max_rotation_spread_deg: 15.0
+    dry_run_max_rotation_spread_deg: 30.0
+    max_marker_age_sec: 3.0
+    stabilization_timeout_sec: 20.0
+
+    # The manually taught grasp TCP is at base Z=0.011 m. With 5 mm extra
+    # depth the requested minimum is approximately 0.006 m.
+    workspace_min_xyz_m: [-0.28, -0.28, 0.005]
+    workspace_max_xyz_m: [0.28, 0.28, 0.30]
+    max_joint_delta_deg: 60.0
+
+    serial_port: /dev/ttyUSB0
+    baud_rate: 1000000
+    speed: 5
+    motion_timeout_sec: 30.0
+    gripper_open_value: 100
+    gripper_closed_value: 20
+    gripper_speed: 30
+
+    moveit_group: arm_group
+    moveit_ee_link: TCP
+    moveit_position_tolerance_m: 0.005
+    moveit_orientation_tolerance_deg: 10.0
+    moveit_planning_time_sec: 10.0
+    moveit_planning_attempts: 20
+    moveit_velocity_scale: 0.1
+    moveit_acceleration_scale: 0.1
+
+    # Pregrasp is planned normally. Grasp descent and lift are Cartesian Z
+    # paths with collision checking and joint-jump rejection.
+    # Use dense samples near the low-Z workspace boundary. A 5 mm step could
+    # produce a large joint change near the grasp.
+    cartesian_max_step_m: 0.002
+    cartesian_min_fraction: 0.98
+    cartesian_max_speed_mps: 0.02
+    cartesian_max_joint_jump_deg: 20.0
+    moveit_state_settle_sec: 0.5
