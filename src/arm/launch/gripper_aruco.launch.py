@@ -10,6 +10,7 @@ from launch.actions import (
 )
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def resolve_camera_info_url(context):
@@ -37,6 +38,9 @@ def generate_launch_description():
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
             'marker_frame_id', default_value='arm/container_marker'
+        ),
+        DeclareLaunchArgument(
+            'use_node_time_for_pose', default_value='false'
         ),
     ]
 
@@ -71,6 +75,10 @@ def generate_launch_description():
             'marker_id': LaunchConfiguration('marker_id'),
             'marker_size_m': LaunchConfiguration('marker_size_m'),
             'dictionary': LaunchConfiguration('dictionary'),
+            'use_node_time_for_pose': ParameterValue(
+                LaunchConfiguration('use_node_time_for_pose'),
+                value_type=bool,
+            ),
         }],
     )
 

@@ -86,6 +86,7 @@ class CharucoPosePublisher(Node):
         self.declare_parameter('minimum_charuco_corners', 8)
         self.declare_parameter('max_reprojection_error_px', 1.0)
         self.declare_parameter('publish_annotated', True)
+        self.declare_parameter('use_node_time_for_pose', False)
 
         self.image_topic = str(self.get_parameter('image_topic').value)
         self.camera_info_topic = str(
@@ -118,6 +119,9 @@ class CharucoPosePublisher(Node):
         )
         self.publish_annotated = bool(
             self.get_parameter('publish_annotated').value
+        )
+        self.use_node_time_for_pose = bool(
+            self.get_parameter('use_node_time_for_pose').value
         )
 
         if self.squares_x < 3 or self.squares_y < 3:
@@ -352,7 +356,11 @@ class CharucoPosePublisher(Node):
         xyz = translation.reshape(3)
 
         transform = TransformStamped()
-        transform.header.stamp = image_message.header.stamp
+        transform.header.stamp = (
+            self.get_clock().now().to_msg()
+            if self.use_node_time_for_pose
+            else image_message.header.stamp
+        )
         transform.header.frame_id = camera_frame
         transform.child_frame_id = self.board_frame_id
         transform.transform.translation.x = float(xyz[0])

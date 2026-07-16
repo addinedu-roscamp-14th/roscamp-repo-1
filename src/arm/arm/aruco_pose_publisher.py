@@ -84,6 +84,7 @@ class ArucoPosePublisher(Node):
         self.declare_parameter('dictionary', 'DICT_5X5_50')
         self.declare_parameter('max_reprojection_error_px', 3.0)
         self.declare_parameter('publish_annotated', True)
+        self.declare_parameter('use_node_time_for_pose', False)
 
         self.image_topic = str(self.get_parameter('image_topic').value)
         self.camera_info_topic = str(
@@ -109,6 +110,9 @@ class ArucoPosePublisher(Node):
         )
         self.publish_annotated = bool(
             self.get_parameter('publish_annotated').value
+        )
+        self.use_node_time_for_pose = bool(
+            self.get_parameter('use_node_time_for_pose').value
         )
 
         if self.marker_size <= 0.0:
@@ -171,6 +175,10 @@ class ArucoPosePublisher(Node):
         self.get_logger().info(
             f'Publishing marker TF: camera -> {self.marker_frame_id}'
         )
+        if self.use_node_time_for_pose:
+            self.get_logger().info(
+                'Marker pose timestamp source: detector node clock'
+            )
 
     def on_camera_info(self, message):
         matrix = np.asarray(message.k, dtype=np.float64).reshape(3, 3)
@@ -321,7 +329,11 @@ class ArucoPosePublisher(Node):
         translation = translation_vector.reshape(3)
 
         transform = TransformStamped()
-        transform.header.stamp = image_message.header.stamp
+        transform.header.stamp = (
+            self.get_clock().now().to_msg()
+            if self.use_node_time_for_pose
+            else image_message.header.stamp
+        )
         transform.header.frame_id = camera_frame
         transform.child_frame_id = self.marker_frame_id
         transform.transform.translation.x = float(translation[0])

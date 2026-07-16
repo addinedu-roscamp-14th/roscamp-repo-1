@@ -419,6 +419,7 @@ export ROS_LOCALHOST_ONLY=0
 ros2 launch arm container_pick_hardware.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   video_device:=/dev/video4 \
+  use_node_time_for_pose:=true \
   marker_id:=0 \
   marker_size_m:=0.015 \
   serial_port:=/dev/ttyUSB0 \

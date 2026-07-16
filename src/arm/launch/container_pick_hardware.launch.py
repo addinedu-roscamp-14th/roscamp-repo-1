@@ -30,6 +30,9 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('goal_tolerance_deg', default_value='2.5'),
         DeclareLaunchArgument('goal_timeout_sec', default_value='15.0'),
+        DeclareLaunchArgument(
+            'use_node_time_for_pose', default_value='true'
+        ),
     ]
     bridge = Node(
         package='arm',
@@ -68,6 +71,9 @@ def generate_launch_description():
             'marker_id': LaunchConfiguration('marker_id'),
             'marker_size_m': LaunchConfiguration('marker_size_m'),
             'marker_frame_id': 'arm/container_marker',
+            'use_node_time_for_pose': LaunchConfiguration(
+                'use_node_time_for_pose'
+            ),
         }.items(),
     )
     return LaunchDescription(arguments + [bridge, camera])

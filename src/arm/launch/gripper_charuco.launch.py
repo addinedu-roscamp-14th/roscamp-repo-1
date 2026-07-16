@@ -47,6 +47,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'max_reprojection_error_px', default_value='1.0'
         ),
+        DeclareLaunchArgument(
+            'use_node_time_for_pose', default_value='false'
+        ),
     ]
 
     camera = Node(
@@ -96,6 +99,10 @@ def generate_launch_description():
             'max_reprojection_error_px': ParameterValue(
                 LaunchConfiguration('max_reprojection_error_px'),
                 value_type=float,
+            ),
+            'use_node_time_for_pose': ParameterValue(
+                LaunchConfiguration('use_node_time_for_pose'),
+                value_type=bool,
             ),
         }],
     )
