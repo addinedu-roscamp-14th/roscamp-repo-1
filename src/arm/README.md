@@ -149,8 +149,8 @@ TF: arm/gripper_camera_optical_frame -> arm/handeye_target
 ## 3. Eye-in-Hand 캘리브레이션
 
 ArUco 마커를 작업대에 움직이지 않도록 고정합니다. 컨테이너 마커를 사용할 경우
-캘리브레이션이 끝날 때까지 컨테이너가 절대 움직이면 안 됩니다. 이 절차는 단일
-`DICT_5X5_50` 마커를 사용하며, 더 높은 정확도가 필요하면 아래 ChArUco 절차를
+캘리브레이션이 끝날 때까지 컨테이너가 절대 움직이면 안 됩니다. 바닥 전체를 덮는
+ArUco 보드는 필요하지 않으며, 현재 노드는 고정된 단일 `DICT_5X5_50` 마커를
 사용합니다.
 
 터미널 1에서 TCP 수동 조작을 실행합니다. 이 노드가 로봇 시리얼을 단독 점유하면서
@@ -168,8 +168,7 @@ ros2 run arm manual_jog --ros-args \
 ros2 launch arm handeye_calibration.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   marker_id:=0 \
-  marker_size_m:=0.02 \
-  calibration_directory:=config/arm
+  marker_size_m:=0.02
 ```
 
 TF 확인:
@@ -190,97 +189,79 @@ ros2 run tf2_ros tf2_echo \
 6. 서로 다른 자세를 최소 12개, 권장 15~20개 수집합니다.
 7. 계산 결과와 평가 오차를 확인한 뒤 저장합니다.
 
-저장 파일은 홈 디렉터리가 아니라 다음 프로젝트 상대경로에 생성됩니다.
-
-```text
-config/arm/jetcobot_eye_in_hand.calib
-```
-
-새 보정을 시험하기 전에 기존 파일을 다른 이름으로 백업합니다. 현재
-`jetcobot_eye_in_hand.calib`은 2026-07-14의 32개 샘플 보정이고,
-`jetcobot_eye_in_hand_2026-07-15.calib`은 이후 다시 수행한 보정의 백업입니다.
-
 로봇팔, 마커와 주변 장비가 충돌하지 않도록 낮은 속도로 이동합니다. `manual_jog`와
 `hardware_joint_state_publisher`는 `/dev/ttyUSB0`을 동시에 열면 안 됩니다.
 
-### ChArUco Board로 보정
+### 라즈베리파이와 노트북 분산 ChArUco 보정
 
-권장 보드는 `DICT_5X5_50`, 5x7 squares, square 25 mm, marker 18 mm입니다.
-인쇄용 PNG를 생성합니다.
+로봇팔과 그리퍼 카메라가 라즈베리파이에 연결된 경우 하드웨어 노드는 라즈베리파이에서,
+보정 GUI는 노트북에서 실행합니다. 두 컴퓨터의 `ROS_DOMAIN_ID`를 동일하게 설정하고
+`ROS_LOCALHOST_ONLY=0`을 사용합니다.
 
-```bash
-ros2 run arm generate_charuco_board
-```
-
-생성 파일:
-
-```text
-config/arm/charuco_5x7_25mm_18mm.png
-```
-
-인쇄 배율을 100%로 설정하고 페이지 맞춤을 끕니다. 출력 후 내부 보드 크기가
-125x175 mm, 각 square가 25 mm, 검은 마커 한 변이 18 mm인지 직접 측정합니다.
-보드를 휘지 않는 평판에 고정합니다.
-
-터미널 1에서 위와 동일하게 `manual_jog`를 실행하고, 터미널 2에서 ChArUco 전용
-Hand-Eye launch를 실행합니다.
+라즈베리파이 터미널 1에서 로봇팔 포트를 지정해 수동 조작을 실행합니다. 이 노드가
+`/arm/joint_states`도 발행합니다.
 
 ```bash
-ros2 launch arm handeye_charuco_calibration.launch.py \
+cd ~/poter_ws
+source install/setup.bash
+export ROS_DOMAIN_ID=10
+export ROS_LOCALHOST_ONLY=0
+
+ros2 run arm manual_jog --ros-args \
+  -p serial_port:=/dev/ttyUSB0 \
+  -p baud_rate:=1000000 \
+  -p speed:=10
+```
+
+라즈베리파이 터미널 2에서 실제 카메라 포트를 지정합니다.
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+export ROS_DOMAIN_ID=10
+export ROS_LOCALHOST_ONLY=0
+
+ros2 launch arm gripper_charuco.launch.py \
   video_device:=/dev/video4 \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   dictionary:=DICT_5X5_50 \
   squares_x:=5 \
   squares_y:=7 \
   square_length_m:=0.025 \
-  marker_length_m:=0.018 \
-  minimum_charuco_corners:=8 \
-  max_reprojection_error_px:=1.0 \
-  name:=jetcobot_eye_in_hand_charuco
+  marker_length_m:=0.018
 ```
 
-검출 확인:
+`/dev/ttyUSB0`과 `/dev/video4`는 고정값이 아닙니다. 라즈베리파이에서 확인한 장치
+경로로 각각 `serial_port`와 `video_device`만 바꾸면 됩니다.
+
+노트북에서는 카메라나 시리얼 장치를 열지 않는 GUI 전용 launch를 실행합니다.
 
 ```bash
+cd ~/poter_ws
+source install/setup.bash
+export ROS_DOMAIN_ID=10
+export ROS_LOCALHOST_ONLY=0
+
+ros2 launch arm handeye_charuco_gui.launch.py \
+  name:=jetcobot_eye_in_hand_charuco \
+  calibration_directory:=config/arm
+```
+
+GUI에서 샘플을 찍기 전에 노트북에서 원격 데이터가 수신되는지 확인합니다.
+
+```bash
+ros2 topic echo /arm/joint_states --once
 ros2 topic hz /arm/gripper_camera/charuco_pose
-ros2 run rqt_image_view rqt_image_view \
-  /arm/gripper_camera/charuco_annotated
+ros2 run tf2_ros tf2_echo arm/base_link arm/TCP
 ros2 run tf2_ros tf2_echo \
   arm/gripper_camera_optical_frame arm/handeye_target
 ```
-
-보드를 고정한 채 로봇이 완전히 멈춘 상태에서 20~30개 샘플을 수집합니다. Roll,
-Pitch, Yaw를 양방향으로 충분히 바꾸고, 검출 코너가 8개 미만이거나 재투영 오차가
-1 px를 넘는 프레임은 pose로 발행하지 않습니다. 저장 결과는 다음 파일입니다.
-
-```text
-config/arm/jetcobot_eye_in_hand_charuco.calib
-```
-
-검증 후 통합 파지에서 새 보정을 선택합니다.
-
-```bash
-ros2 launch arm container_pick_moveit.launch.py \
-  calibration_name:=jetcobot_eye_in_hand_charuco \
-  camera_info_url:=config/arm/gripper_camera_info.yaml \
-  video_device:=/dev/video4 \
-  marker_id:=0 \
-  marker_size_m:=0.015 \
-  serial_port:=/dev/ttyUSB0 \
-  trajectory_speed:=100 \
-  goal_correction_speed:=50 \
-  use_rviz:=true
-```
-
-ChArUco는 Hand-Eye 보정에만 사용합니다. 실제 컨테이너 추적은 기존 15 mm 단일
-ArUco를 계속 사용하며, 새 Hand-Eye 결과를 선택한 뒤 grasp offset을 다시 측정합니다.
 
 ## 4. 저장한 Hand-Eye TF 사용
 
 ```bash
 ros2 launch arm handeye_publish.launch.py \
-  name:=jetcobot_eye_in_hand \
-  calibration_directory:=config/arm
+  name:=jetcobot_eye_in_hand
 ```
 
 저장된 결과가 발행되면 다음 TF 연결이 완성됩니다.
@@ -454,27 +435,20 @@ launch를 실행합니다.
 
 ```bash
 ros2 launch arm container_pick_moveit.launch.py \
-  calibration_name:=jetcobot_eye_in_hand_charuco \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   video_device:=/dev/video4 \
   marker_id:=0 \
   marker_size_m:=0.015 \
   serial_port:=/dev/ttyUSB0 \
   trajectory_speed:=100 \
-  goal_correction_speed:=50 \
+  goal_correction_speed:=100 \
   goal_tolerance_deg:=2.5 \
   goal_timeout_sec:=15.0 \
   use_rviz:=true
 ```
 
-아직 ChArUco 보정을 저장하지 않았다면 `calibration_name`을 기존
-`jetcobot_eye_in_hand`으로 지정합니다.
-
 `trajectory_speed`는 JetCobot 내부 위치 제어기가 MoveIt의 시간 기반 중간 목표를
 따라가는 속도입니다. 전체 이동 속도는 MoveIt의 velocity scaling으로 제한합니다.
-현재 빠른 작업 프로필은 관절 속도 35%, 가속도 25%, Cartesian 속도 0.04 m/s,
-그리퍼 속도 50과 동작 후 안정화 대기 0.2초를 사용합니다. `goal_correction_speed`는
-빠른 이동이 끝난 뒤 목표 관절로 정밀 수렴할 때만 사용합니다.
 
 이 launch는 다음을 한 번에 실행합니다.
 
@@ -502,37 +476,20 @@ ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
 상승을 실행합니다. 첫 실기기 테스트에서는 항상 `/arm/move_to_pregrasp`의 위치와
 자세를 먼저 확인합니다.
 
-컨테이너 yaw를 100% 적용한 수직 하강이 IK 한계로 실패하면 pregrasp 높이에서 yaw
-적용률을 `75%, 50%, 25%, 0%` 순서로 줄여 다시 계획합니다. 100% 하강 가능한 후보
-중 컨테이너 방향을 가장 많이 유지하는 자세를 실행합니다. Cartesian 경로는 97% 이상을
-우선 사용합니다. 90~97% 경로는 현재 TCP부터 목표까지 계산한 미도달 거리가 5 mm
-이하일 때만 실행합니다.
-
 완화된 실행 조건은 다음과 같습니다.
 
 ```text
 마커 yaw spread: 12도 (전체 회전 spread: 10도)
 컨테이너 기준 yaw 변화: 180도 (모든 방향 허용)
 MoveIt 자세 허용오차: 5도
-MoveIt 관절 속도/가속도: 35% / 25%
-Cartesian 최대 속도: 0.04 m/s
 Cartesian 관절 점프: 15도
-Cartesian 권장 완성도: 97%
-Cartesian 절대 최소 완성도: 90%
-Cartesian 최대 미도달 거리: 5 mm
 실기기 목표 관절 오차: 2.5도
 실기기 최종 수렴 대기: 15초
 MoveIt 실행 여유: 계획 시간 x 2 + 20초
 ```
 
-물리 관절 한계, 작업공간, 충돌 검사와 위치 안정성 5 mm 조건은 완화하지 않습니다.
-
-XY 작업공간은 `base_link` 기준으로 오른쪽 세로 막대와 아래쪽 가로 막대를 합친
-`┘` 형태입니다. `config/arm/container_pick.yaml`의
-`workspace_horizontal_*_xy_m`와 `workspace_vertical_*_xy_m`에서 두 직사각형의
-경계를 조정합니다. 기본 설정은 `x < 0, y > 0`인 왼쪽 위 영역을 제외하며, Z는
-별도의 `workspace_min_xyz_m`, `workspace_max_xyz_m` 경계를 사용합니다. 현재 Z
-범위는 `base_link` 기준 `0.005~0.30 m`입니다.
+물리 관절 한계, 작업공간, 충돌 검사, 위치 안정성 5 mm와 Cartesian 경로 완성도
+98% 조건은 완화하지 않습니다.
 
 즉시 정지:
 
