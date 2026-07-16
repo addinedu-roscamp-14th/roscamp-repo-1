@@ -416,6 +416,8 @@ class ContainerPickCoordinator(Node):
         self.history = deque(maxlen=max(100, self.minimum_samples * 3))
         self.history_lock = threading.Lock()
         self.last_transform_stamp = None
+        self.last_tracking_error = ''
+        self.last_tracking_error_time = 0.0
         self.motion_lock = threading.Lock()
         self.serial_lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -604,7 +606,19 @@ class ContainerPickCoordinator(Node):
             transform = self.buffer.lookup_transform(
                 self.base_frame, self.marker_frame, Time()
             )
-        except TransformException:
+        except TransformException as exc:
+            error = str(exc)
+            now = time.monotonic()
+            if (
+                error != self.last_tracking_error
+                or now - self.last_tracking_error_time >= 5.0
+            ):
+                self.get_logger().warning(
+                    'Cannot collect marker sample: '
+                    f'{self.base_frame} -> {self.marker_frame}: {error}'
+                )
+                self.last_tracking_error = error
+                self.last_tracking_error_time = now
             return
 
         stamp = (

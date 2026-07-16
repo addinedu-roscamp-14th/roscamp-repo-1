@@ -439,11 +439,15 @@ export ROS_DOMAIN_ID=10
 export ROS_LOCALHOST_ONLY=0
 
 ros2 launch arm container_pick_remote.launch.py \
-  calibration_name:=jetcobot_eye_in_hand_charuco \
+  calibration_name:=jetcobot_eye_in_hand \
   calibration_directory:=config/arm \
   params_file:=config/arm/container_pick.yaml \
   use_rviz:=true
 ```
+
+ChArUco 보정을 저장한 이후에만 `calibration_name`을
+`jetcobot_eye_in_hand_charuco`로 변경합니다. 지정한 이름의 `.calib` 파일이 없으면
+Hand-Eye TF가 끊어져 마커를 검출해도 안정화 샘플은 수집되지 않습니다.
 
 서비스 호출도 노트북에서 그대로 실행합니다.
 

@@ -18,7 +18,7 @@ def generate_launch_description():
     )
     arguments = [
         DeclareLaunchArgument(
-            'calibration_name', default_value='jetcobot_eye_in_hand_charuco'
+            'calibration_name', default_value='jetcobot_eye_in_hand'
         ),
         DeclareLaunchArgument(
             'calibration_directory', default_value='config/arm'
