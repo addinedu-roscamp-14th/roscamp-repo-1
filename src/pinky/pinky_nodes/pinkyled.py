@@ -1,14 +1,48 @@
 import os
+from pathlib import Path
+import shlex
 import sys
+
+
+def find_workspace_setup():
+    env_ws = os.environ.get("POTER_WS")
+    if env_ws:
+        setup = Path(env_ws).expanduser() / "install" / "setup.bash"
+        if setup.exists():
+            return setup
+
+    for prefix in os.environ.get("AMENT_PREFIX_PATH", "").split(os.pathsep):
+        if not prefix:
+            continue
+        prefix_path = Path(prefix).expanduser()
+        candidates = []
+        if prefix_path.name == "install":
+            candidates.append(prefix_path / "setup.bash")
+        if prefix_path.parent.name == "install":
+            candidates.append(prefix_path.parent / "setup.bash")
+        for setup in candidates:
+            if setup.exists():
+                return setup
+
+    return Path.home() / "poter_ws" / "install" / "setup.bash"
+
 
 if os.geteuid() != 0:
     ros_setup = "/opt/ros/jazzy/setup.bash"
-    ws_setup = os.path.expanduser("~/poter_ws/install/setup.bash")
+    ws_setup = find_workspace_setup()
     fastdds_xml = os.path.expanduser("~/.fastdds.xml")
     domain_id = os.environ.get('ROS_DOMAIN_ID', '0')
-    
-    cmd = f'sudo bash -c "export FASTRTPS_DEFAULT_PROFILES_FILE={fastdds_xml} && export ROS_DOMAIN_ID={domain_id} && source {ros_setup} && source {ws_setup} && {sys.executable} {" ".join(sys.argv)}"'
-    
+
+    script_args = ' '.join(shlex.quote(arg) for arg in sys.argv)
+    command = (
+        f'export FASTRTPS_DEFAULT_PROFILES_FILE={shlex.quote(fastdds_xml)} && '
+        f'export ROS_DOMAIN_ID={shlex.quote(domain_id)} && '
+        f'source {shlex.quote(ros_setup)} && '
+        f'source {shlex.quote(str(ws_setup))} && '
+        f'{shlex.quote(sys.executable)} {script_args}'
+    )
+    cmd = f'sudo bash -c {shlex.quote(command)}'
+
     os.system(cmd)
     sys.exit()
 
