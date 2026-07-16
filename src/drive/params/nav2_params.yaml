@@ -257,7 +257,7 @@ global_costmap:
 
 filter_mask_server:
   ros__parameters:
-    yaml_filename: "/home/baehh/poter_ws/config/SLAM/keepout_mask.yaml"
+    yaml_filename: ""
     topic_name: "/keepout_filter_mask"
     frame_id: "map"
 
