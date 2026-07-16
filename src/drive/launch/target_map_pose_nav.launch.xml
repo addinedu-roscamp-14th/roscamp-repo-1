@@ -1,6 +1,7 @@
 <?xml version='1.0'?>
 <launch>
-    <arg name="map" default="/home/jio/poter_ws/config/SLAM/current_map.yaml"/>
+    <arg name="map" default="$(env HOME)/poter_ws/config/SLAM/current_map.yaml"/>
+    <arg name="keepout_mask" default="$(env HOME)/poter_ws/config/SLAM/keepout_mask.yaml"/>
     <arg name="use_sim_time" default="false"/>
     <arg name="params_file" default="$(find-pkg-share drive)/params/nav2_params.yaml"/>
     <arg name="start_nav2" default="false"/>
@@ -11,6 +12,7 @@
     <include if="$(var start_nav2)" file="$(find-pkg-share drive)/launch/bringup_launch.xml">
         <arg name="params_file" value="$(var params_file)"/>
         <arg name="map" value="$(var map)"/>
+        <arg name="keepout_mask" value="$(var keepout_mask)"/>
         <arg name="use_sim_time" value="$(var use_sim_time)"/>
     </include>
 

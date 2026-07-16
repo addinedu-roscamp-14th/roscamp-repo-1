@@ -3,15 +3,33 @@
 <package format="3">
   <name>arm</name>
   <version>0.0.0</version>
-  <description>Camera-click pick and place control for JetCobot</description>
+  <description>ArUco and MoveIt based container picking for JetCobot</description>
   <maintainer email="jio@todo.todo">jio</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>moveit_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>shape_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>jetcobot_description</exec_depend>
+  <exec_depend>jetcobot_moveit_config</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>camera_calibration</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>easy_handeye2</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-serial</exec_depend>
+  <exec_depend>v4l2_camera</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -1,0 +1,23 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: jetcobot_description
+    relative_path: urdf/jetcobot.urdf
+  srdf:
+    relative_path: config/jetcobot.srdf
+  package_settings:
+    author_name: Jinseok Kim
+    author_email: jinseok.kim970@gmail.com
+    generated_timestamp: 1753326306
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position

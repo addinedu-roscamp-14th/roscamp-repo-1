@@ -2,6 +2,9 @@
 
 스마트 항만 관제를 위한 ROS2 워크스페이스입니다. 각 패키지는 역할별로 분리되어 있으며, 자세한 실행 방법은 각 패키지의 `README.md`에 정리합니다.
 
+별도 설명이 없는 명령은 모두 `poter_ws/` 워크스페이스 루트에서 실행하며, 프로젝트
+파일 경로는 워크스페이스 기준 상대경로를 사용합니다.
+
 ## Quick Start: 카메라부터 차량 주행까지
 
 차량과 노트북은 같은 네트워크와 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. 아래 노트북
@@ -12,7 +15,6 @@
 노트북:
 
 ```bash
-cd ~/poter_ws
 colcon build
 source install/setup.bash
 ```
@@ -20,7 +22,7 @@ source install/setup.bash
 새 터미널 공통:
 
 ```bash
-source ~/poter_ws/install/setup.bash
+source install/setup.bash
 ```
 
 ### 1. 차량 하드웨어 실행
@@ -28,16 +30,16 @@ source ~/poter_ws/install/setup.bash
 핑키에서 센서, odometry와 모터 제어만 실행합니다. 차량에서는 Nav2를 실행하지 않습니다.
 
 ```bash
-ros2 launch pinky_bringup bringup_robot.launch.xml
+ros2 launch pinky bringup_robot.launch.xml
 ```
 
 ```bash
-ros2 run pinky_led led_server
+ros2 run pinky led_server
 ```
 
 ```bash
-ros2 service call /set_led pinky_interfaces/srv/SetLed "{command: 'fill', r: 255, g: 0,
-b: 0}"
+ros2 service call /set_led pinky_interfaces/srv/SetLed "{command: 'fill', r: 0, g: 0,
+b: 255}"
 ```
 
 노트북에서 차량 데이터가 들어오는지 확인합니다.
@@ -57,10 +59,23 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
   -p video_device:=/dev/video2 \
   -p image_size:="[640, 480]" \
   -p time_per_frame:="[1, 30]" \
-  -p camera_info_url:=file:///home/jio/poter_ws/config/main_camera/camera_info.yaml \
+  -p camera_info_url:="file://$(realpath config/main_camera/camera_info.yaml)" \
   -r image_raw:=/camera/image_raw \
   -r camera_info:=/camera/camera_info
 ```
+
+원본 영상과 보정값을 먼저 확인합니다. `camera_info`의 `k`, `d`가 비어 있거나 모두
+0이면 다음 단계로 진행하지 않습니다.
+
+```bash
+ros2 topic hz /camera/image_raw
+ros2 topic echo /camera/camera_info --once
+```
+
+`camera_name ... does not match ...`는 장치 이름 비교 경고이며 CameraInfo 로드
+실패를 의미하지는 않습니다. 위 명령으로 실제 `k`, `d` 값을 확인합니다. 특정
+V4L2 control의 `Permission denied`와 YUYV→RGB 변환 메시지도 영상이 정상 발행되면
+치명적인 오류가 아닙니다.
 
 ### 3. 카메라 왜곡 보정
 
@@ -77,15 +92,29 @@ ros2 run image_proc rectify_node --ros-args \
 
 ```bash
 ros2 topic hz /camera/image_rect
-ros2 topic hz /image_rect/compressed
 ```
 
-### 4. YOLO 실행
+### 4. 왜곡 보정 영상 compressed 발행
 
 노트북 터미널 3:
 
 ```bash
-cd ~/poter_ws
+ros2 run image_transport republish raw compressed --ros-args \
+  -r in:=/camera/image_rect \
+  -r out:=/image_rect
+```
+
+YOLO와 calibration이 구독하는 토픽을 확인합니다.
+
+```bash
+ros2 topic hz /image_rect/compressed
+```
+
+### 5. YOLO 실행
+
+노트북 터미널 4:
+
+```bash
 source install/setup.bash
 ros2 run yolo yolo_node --ros-args \
   -p weights_path:=config/weights/best.pt
@@ -97,33 +126,33 @@ ros2 run yolo yolo_node --ros-args \
 ros2 topic hz /central/yolo/image_annotated
 ```
 
-### 5. 카메라 클릭 좌표를 map 좌표로 변환
+### 6. 카메라 클릭 좌표를 map 좌표로 변환
 
-노트북 터미널 4:
+노트북 터미널 5:
 
 ```bash
 ros2 run central rqt_click_to_target
 ```
 
-노트북 터미널 5:
+노트북 터미널 6:
 
 ```bash
 ros2 run central camera_to_map_bridge
 ```
 
-### 6. 노트북에서 Nav2 실행
+### 7. 노트북에서 Nav2 실행
 
-노트북 터미널 6:
+노트북 터미널 7:
 
 ```bash
 ros2 launch drive bringup_launch.xml \
-  map:=/home/jio/poter_ws/config/SLAM/current_map.yaml
+  map:="$(realpath config/SLAM/current_map.yaml)"
 ```
 
 
-### 7. RViz에서 차량 초기 위치 설정
+### 8. RViz에서 차량 초기 위치 설정
 
-노트북 터미널 7:
+노트북 터미널 8:
 
 ```bash
 ros2 launch drive nav2_view.launch.xml
@@ -137,9 +166,9 @@ ros2 topic echo /amcl_pose --once
 ros2 run tf2_ros tf2_echo map odom
 ```
 
-### 8. 중앙 목표를 Nav2에 연결
+### 9. 중앙 목표를 Nav2에 연결
 
-노트북 터미널 8:
+노트북 터미널 9:
 
 ```bash
 ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
@@ -152,9 +181,9 @@ ros2 action list | grep navigate_to_pose
 ros2 topic echo /cmd_vel
 ```
 
-### 9. RQT에서 목표 위치와 방향 클릭
+### 10. RQT에서 목표 위치와 방향 클릭
 
-노트북 터미널 9:
+노트북 터미널 10:
 
 ```bash
 ros2 run rqt_image_view rqt_image_view
@@ -171,6 +200,47 @@ RQT에서 `/central/yolo/image_annotated`를 선택하고 영상 안을 두 번 
 ros2 topic echo /central/target_map_pose
 ```
 
+### 여러 웨이포인트를 찍어서 순서대로 주행
+
+단일 목표 대신 여러 중간 지점을 사용할 때는 터미널 6과 9의 명령을 다음과 같이
+바꿉니다.
+
+터미널 6:
+
+```bash
+ros2 run central camera_to_map_bridge --ros-args \
+  -p waypoint_mode:=true
+```
+
+터미널 9:
+
+```bash
+ros2 launch drive target_map_waypoints_nav.launch.xml start_nav2:=false
+```
+
+RQT에서 중간 웨이포인트는 위치만 한 번씩 클릭합니다. 마지막에는 `최종 위치 -> 최종
+방향` 순서로 두 번 클릭합니다. 중간 지점의 헤딩은 다음 지점을 향하도록 자동 계산되며,
+마지막 방향점은 주행 지점에 포함되지 않습니다. 모든 클릭을 마친 후
+`camera_to_map_bridge` 실행 터미널에 포커스를 두고 **스페이스바**를 누르면 전체 경로를
+차량으로 보냅니다.
+
+터미널 키 입력을 사용할 수 없으면 기존 서비스 명령으로도 전송할 수 있습니다.
+
+```bash
+ros2 service call /central/commit_waypoints std_srvs/srv/Trigger "{}"
+```
+
+잘못 찍어서 전체 목록을 지울 때:
+
+```bash
+ros2 service call /central/clear_waypoints std_srvs/srv/Trigger "{}"
+```
+
+```bash
+ros2 topic echo /central/target_map_waypoints_preview
+ros2 topic echo /central/target_map_waypoints
+```
+
 ### 중요 확인
 
 - `config/SLAM/current_map.yaml`과 `config/central/camera_map_calibration.yaml`은 같은 지도 기준이어야 합니다.
@@ -179,6 +249,38 @@ ros2 topic echo /central/target_map_pose
 - 차량과 노트북 양쪽에서 Nav2를 동시에 실행하지 않습니다.
 - `/central/target_map_pose`가 지도 밖이면 Nav2가 `Goal Coordinates ... outside bounds`로 거부합니다.
 
+## Quick Start: 로봇팔 컨테이너 Pick
+
+상세한 캘리브레이션, 설정과 문제 해결은 `src/arm/README.md`를 확인합니다.
+
+```bash
+source install/setup.bash
+
+ros2 launch arm container_pick_moveit.launch.py \
+  camera_info_url:=config/arm/gripper_camera_info.yaml \
+  video_device:=/dev/video4 \
+  marker_id:=0 \
+  marker_size_m:=0.015 \
+  serial_port:=/dev/ttyUSB0 \
+  trajectory_speed:=100 \
+  goal_correction_speed:=50 \
+  goal_tolerance_deg:=3.0 \
+  goal_timeout_sec:=15.0 \
+  use_rviz:=true
+```
+
+```bash
+ros2 service call /arm/preview_pregrasp std_srvs/srv/Trigger '{}'
+ros2 service call /arm/move_to_pregrasp std_srvs/srv/Trigger '{}'
+ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
+```
+
+비상 정지:
+
+```bash
+ros2 service call /arm/stop_pick std_srvs/srv/Trigger '{}'
+```
+
 ## Package Structure
 
 ```text
@@ -186,6 +288,7 @@ poter_ws/
 ├── config/
 │   ├── SLAM/                 # SLAM map yaml/pgm
 │   ├── central/              # calibration 결과 yaml
+│   ├── arm/                  # 그리퍼 카메라 내부 보정
 │   ├── main_camera/          # camera_info, calibration yaml
 │   └── weights/              # YOLO weight
 │
@@ -196,7 +299,9 @@ poter_ws/
     ├── central/              # 중앙 좌표 변환/차량 전달용 출력
     ├── drive/                # 노트북 Nav2 실행/차량 goal 브릿지
     ├── slam/                 # LiDAR SLAM 지도 작성/저장
-    └── arm/                  # 로봇팔 제어 
+    ├── arm/                  # 로봇팔 ArUco 추적/파지 동작 조정
+    ├── jetcobot_description/ # JetCobot URDF와 mesh
+    └── jetcobot_moveit_config/ # MoveIt2 IK/경로 계획 설정
 ```
 
 ## Package Summary
@@ -206,10 +311,12 @@ poter_ws/
 | `udp` | UDP/GStreamer 방식 카메라 입력 fallback. 로컬 기본 카메라 경로는 `v4l2_camera + image_proc` 사용 | `udp_camera_node` |
 | `yolo` | 카메라 이미지에서 객체/영역을 인식하고 annotated image와 detection JSON 발행 | `yolo_node` |
 | `calibration` | `/image_rect/compressed` 픽셀 좌표와 SLAM `/map` 좌표를 homography로 캘리브레이션 | `direct_calibrator`, `calibration_verifier` |
-| `central` | 캘리브레이션 결과를 사용해 카메라 픽셀 좌표를 `/map` 기준 좌표로 변환하고 JSON/PoseStamped 발행 | `camera_to_map_bridge` |
-| `drive` | `/central/target_map_pose`를 차량 Nav2 `NavigateToPose` goal로 전달하고 직접 goal 테스트 지원 | `target_map_pose_to_nav_goal`, `send_nav_goal` |
+| `central` | 카메라 픽셀을 `/map` 좌표로 변환하고 단일 Pose 또는 웨이포인트 Path 발행 | `camera_to_map_bridge` |
+| `drive` | 단일 목표와 웨이포인트 목록을 차량 Nav2 action으로 전달 | `target_map_pose_to_nav_goal`, `target_map_waypoints_to_nav_goal` |
 | `slam` | 차량의 `/scan`, `/odom`, TF를 사용해 노트북에서 SLAM 지도를 작성 | `slam_toolbox`, mapping RViz |
-| `arm` | 로봇팔/크레인 제어 담당 예정 | 뼈대 패키지 |
+| `arm` | ArUco XYZ/yaw 추적, Eye-in-Hand, MoveIt2 정렬, Cartesian 파지와 적응형 상승 | `container_pick_coordinator`, `jetcobot_trajectory_bridge` |
+| `jetcobot_description` | JetCobot의 관절·링크 구조와 시각/충돌 mesh 제공 | `jetcobot.urdf` |
+| `jetcobot_moveit_config` | JetCobot용 KDL IK, 충돌 검사, 경로 계획과 controller action 연결 | `real_planning.launch.py` |
 
 ## Data Flow
 

@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 
 import json
+import os
 from pathlib import Path
+import select
+import sys
+import termios
+import tty
 
 from geometry_msgs.msg import PointStamped, PoseStamped
+from nav_msgs.msg import Path as PathMsg
 import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 import yaml
 
 
@@ -23,6 +30,21 @@ class CameraToMapBridge(Node):
         self.declare_parameter('target_id', 'target')
         self.declare_parameter('frame_id', 'map')
         self.declare_parameter('minimum_direction_distance', 0.02)
+        self.declare_parameter('waypoint_mode', False)
+        self.declare_parameter('enable_spacebar_commit', True)
+        self.declare_parameter(
+            'output_waypoints_topic', '/central/target_map_waypoints'
+        )
+        self.declare_parameter(
+            'output_waypoints_preview_topic',
+            '/central/target_map_waypoints_preview',
+        )
+        self.declare_parameter(
+            'commit_waypoints_service', '/central/commit_waypoints'
+        )
+        self.declare_parameter(
+            'clear_waypoints_service', '/central/clear_waypoints'
+        )
 
         self.calibration_yaml_path = self.resolve_path(
             str(self.get_parameter('calibration_yaml').value)
@@ -35,12 +57,43 @@ class CameraToMapBridge(Node):
         self.minimum_direction_distance = float(
             self.get_parameter('minimum_direction_distance').value
         )
+        self.waypoint_mode = bool(self.get_parameter('waypoint_mode').value)
+        self.enable_spacebar_commit = bool(
+            self.get_parameter('enable_spacebar_commit').value
+        )
+        self.output_waypoints_topic = str(
+            self.get_parameter('output_waypoints_topic').value
+        )
+        self.output_waypoints_preview_topic = str(
+            self.get_parameter('output_waypoints_preview_topic').value
+        )
+        self.commit_waypoints_service = str(
+            self.get_parameter('commit_waypoints_service').value
+        )
+        self.clear_waypoints_service = str(
+            self.get_parameter('clear_waypoints_service').value
+        )
         self.pending_target = None
+        self.waypoint_points = []
+        self.stdin_fd = None
+        self.stdin_settings = None
 
         self.homography = self.load_homography(self.calibration_yaml_path)
 
         self.pose_pub = self.create_publisher(PoseStamped, self.output_pose_topic, 10)
         self.json_pub = self.create_publisher(String, self.output_json_topic, 10)
+        self.waypoints_pub = self.create_publisher(
+            PathMsg, self.output_waypoints_topic, 10
+        )
+        self.waypoints_preview_pub = self.create_publisher(
+            PathMsg, self.output_waypoints_preview_topic, 10
+        )
+        self.create_service(
+            Trigger, self.commit_waypoints_service, self.on_commit_waypoints
+        )
+        self.create_service(
+            Trigger, self.clear_waypoints_service, self.on_clear_waypoints
+        )
         self.create_subscription(
             PointStamped,
             self.input_pixel_topic,
@@ -51,9 +104,18 @@ class CameraToMapBridge(Node):
         self.get_logger().info(f'Subscribing pixel points: {self.input_pixel_topic}')
         self.get_logger().info(f'Publishing map PoseStamped: {self.output_pose_topic}')
         self.get_logger().info(f'Publishing map JSON: {self.output_json_topic}')
-        self.get_logger().info(
-            'Click 1: target position, click 2: target heading direction'
-        )
+        if self.waypoint_mode:
+            self.get_logger().info(
+                'Waypoint mode enabled. Click intermediate positions once, then '
+                'click the final position and final heading direction; '
+                f'commit with service {self.commit_waypoints_service}'
+            )
+            if self.enable_spacebar_commit:
+                self.setup_keyboard_commit()
+        else:
+            self.get_logger().info(
+                'Click 1: target position, click 2: target heading direction'
+            )
 
     def resolve_path(self, configured_path):
         path = Path(configured_path)
@@ -89,6 +151,20 @@ class CameraToMapBridge(Node):
     def on_pixel_point(self, msg):
         camera_pixel = [float(msg.point.x), float(msg.point.y)]
         map_x, map_y = self.camera_pixel_to_map_xy(camera_pixel)
+
+        if self.waypoint_mode:
+            self.waypoint_points.append({
+                'source_msg': msg,
+                'camera_pixel': camera_pixel,
+                'map_xy': [map_x, map_y],
+            })
+            self.publish_waypoints_preview()
+            self.get_logger().info(
+                f'Added waypoint click {len(self.waypoint_points)}: '
+                f'camera_pixel={self.round_list(camera_pixel, 3)}, '
+                f'map_xy={[round(map_x, 6), round(map_y, 6)]}'
+            )
+            return
 
         if self.pending_target is None:
             self.pending_target = {
@@ -129,14 +205,185 @@ class CameraToMapBridge(Node):
             yaw,
         )
 
-        self.pose_pub.publish(pose_msg)
-        self.json_pub.publish(json_msg)
         self.pending_target = None
 
+        self.pose_pub.publish(pose_msg)
+        self.json_pub.publish(json_msg)
         self.get_logger().info(
             f'Published target map_xy={[round(target_x, 6), round(target_y, 6)]}, '
             f'heading={heading_deg:.1f} deg'
         )
+
+    def on_commit_waypoints(self, _request, response):
+        response.success, response.message = self.commit_waypoints()
+        return response
+
+    def commit_waypoints(self):
+        if not self.waypoint_mode:
+            return False, 'waypoint_mode is disabled'
+
+        if len(self.waypoint_points) < 2:
+            return False, (
+                'At least a final position and final heading click are required'
+            )
+
+        try:
+            poses = self.build_waypoint_poses()
+        except ValueError as exc:
+            return False, str(exc)
+
+        path_msg = self.build_path_msg(poses)
+        count = len(path_msg.poses)
+        self.waypoints_pub.publish(path_msg)
+        self.json_pub.publish(self.build_waypoints_json_msg(path_msg))
+        self.waypoint_points.clear()
+        self.publish_waypoints_preview()
+
+        self.get_logger().info(
+            f'Published {count} waypoint(s): {self.output_waypoints_topic}'
+        )
+        return True, f'Published {count} waypoint(s)'
+
+    def setup_keyboard_commit(self):
+        if not sys.stdin.isatty():
+            self.get_logger().warning(
+                'Spacebar commit disabled because stdin is not a terminal. '
+                f'Use service {self.commit_waypoints_service}'
+            )
+            return
+
+        try:
+            self.stdin_fd = sys.stdin.fileno()
+            self.stdin_settings = termios.tcgetattr(self.stdin_fd)
+            tty.setcbreak(self.stdin_fd)
+            self.create_timer(0.05, self.poll_keyboard)
+            self.get_logger().info(
+                'SPACE: publish all waypoint clicks | service command also available'
+            )
+        except (OSError, termios.error) as exc:
+            self.stdin_fd = None
+            self.stdin_settings = None
+            self.get_logger().warning(
+                f'Failed to enable spacebar commit: {exc}. '
+                f'Use service {self.commit_waypoints_service}'
+            )
+
+    def poll_keyboard(self):
+        if self.stdin_fd is None:
+            return
+
+        readable, _, _ = select.select([self.stdin_fd], [], [], 0.0)
+        if not readable:
+            return
+
+        key = os.read(self.stdin_fd, 1)
+        if key != b' ':
+            return
+
+        success, message = self.commit_waypoints()
+        if not success:
+            self.get_logger().warning(f'SPACE commit rejected: {message}')
+
+    def restore_keyboard(self):
+        if self.stdin_fd is None or self.stdin_settings is None:
+            return
+        try:
+            termios.tcsetattr(
+                self.stdin_fd, termios.TCSADRAIN, self.stdin_settings
+            )
+        except (OSError, termios.error):
+            pass
+        self.stdin_fd = None
+        self.stdin_settings = None
+
+    def destroy_node(self):
+        self.restore_keyboard()
+        return super().destroy_node()
+
+    def on_clear_waypoints(self, _request, response):
+        click_count = len(self.waypoint_points)
+        self.pending_target = None
+        self.waypoint_points.clear()
+        self.publish_waypoints_preview()
+        response.success = True
+        response.message = f'Cleared {click_count} waypoint click(s)'
+        self.get_logger().info(response.message)
+        return response
+
+    def publish_waypoints_preview(self):
+        preview_poses = [
+            self.build_pose_msg(
+                point['source_msg'],
+                point['map_xy'][0],
+                point['map_xy'][1],
+                0.0,
+            )
+            for point in self.waypoint_points
+        ]
+        self.waypoints_preview_pub.publish(self.build_path_msg(preview_poses))
+
+    def build_waypoint_poses(self):
+        position_points = self.waypoint_points[:-1]
+        final_direction = self.waypoint_points[-1]
+        poses = []
+
+        for index, point in enumerate(position_points):
+            if index + 1 < len(position_points):
+                direction_point = position_points[index + 1]
+                point_kind = f'waypoint {index + 1} and {index + 2}'
+            else:
+                direction_point = final_direction
+                point_kind = 'final position and final heading point'
+
+            delta_x = direction_point['map_xy'][0] - point['map_xy'][0]
+            delta_y = direction_point['map_xy'][1] - point['map_xy'][1]
+            distance = float(np.hypot(delta_x, delta_y))
+            if distance < self.minimum_direction_distance:
+                raise ValueError(
+                    f'Distance between {point_kind} is too short '
+                    f'({distance:.3f} m)'
+                )
+
+            yaw = float(np.arctan2(delta_y, delta_x))
+            poses.append(self.build_pose_msg(
+                point['source_msg'],
+                point['map_xy'][0],
+                point['map_xy'][1],
+                yaw,
+            ))
+
+        return poses
+
+    def build_path_msg(self, poses):
+        path_msg = PathMsg()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = self.frame_id
+        path_msg.poses = list(poses)
+        for pose in path_msg.poses:
+            pose.header.frame_id = self.frame_id
+        return path_msg
+
+    def build_waypoints_json_msg(self, path_msg):
+        waypoints = []
+        for index, pose_msg in enumerate(path_msg.poses, start=1):
+            orientation = pose_msg.pose.orientation
+            yaw = 2.0 * np.arctan2(orientation.z, orientation.w)
+            waypoints.append({
+                'index': index,
+                'x': round(pose_msg.pose.position.x, 6),
+                'y': round(pose_msg.pose.position.y, 6),
+                'yaw': round(float(yaw), 6),
+                'heading_deg': round(float(np.rad2deg(yaw)), 3),
+            })
+
+        msg = String()
+        msg.data = json.dumps({
+            'command': 'navigate_through_poses',
+            'frame_id': self.frame_id,
+            'target_id': self.target_id,
+            'waypoints': waypoints,
+        }, ensure_ascii=False)
+        return msg
 
     def camera_pixel_to_map_xy(self, camera_pixel):
         u, v = camera_pixel
@@ -222,13 +469,14 @@ class CameraToMapBridge(Node):
     def round_list(self, values, digits):
         return [round(float(value), digits) for value in values]
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = CameraToMapBridge()
 
     try:
         rclpy.spin(node)
-    except ExternalShutdownException:
+    except (ExternalShutdownException, KeyboardInterrupt):
         pass
     finally:
         if rclpy.ok():
