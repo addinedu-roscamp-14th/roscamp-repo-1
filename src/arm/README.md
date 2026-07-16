@@ -55,8 +55,13 @@ arm/
 ```bash
 /usr/bin/python3 -m pip install --user --break-system-packages pymycobot
 ```
+``` bash
+sudo apt update
+sudo apt install ros-jazzy-v4l2-camera
+```
 
-`easy_handeye2`는 Jazzy 바이너리 패키지가 없으므로 소스로 추가합니다.
+
+easy_handeye2`는 Jazzy 바이너리 패키지가 없으므로 소스로 추가합니다.
 
 ```bash
 cd ~/poter_ws/src
@@ -191,71 +196,6 @@ ros2 run tf2_ros tf2_echo \
 
 로봇팔, 마커와 주변 장비가 충돌하지 않도록 낮은 속도로 이동합니다. `manual_jog`와
 `hardware_joint_state_publisher`는 `/dev/ttyUSB0`을 동시에 열면 안 됩니다.
-
-### 라즈베리파이와 노트북 분산 ChArUco 보정
-
-로봇팔과 그리퍼 카메라가 라즈베리파이에 연결된 경우 하드웨어 노드는 라즈베리파이에서,
-보정 GUI는 노트북에서 실행합니다. 두 컴퓨터의 `ROS_DOMAIN_ID`를 동일하게 설정하고
-`ROS_LOCALHOST_ONLY=0`을 사용합니다.
-
-라즈베리파이 터미널 1에서 로봇팔 포트를 지정해 수동 조작을 실행합니다. 이 노드가
-`/arm/joint_states`도 발행합니다.
-
-```bash
-cd ~/poter_ws
-source install/setup.bash
-export ROS_DOMAIN_ID=10
-export ROS_LOCALHOST_ONLY=0
-
-ros2 run arm manual_jog --ros-args \
-  -p serial_port:=/dev/ttyUSB0 \
-  -p baud_rate:=1000000 \
-  -p speed:=10
-```
-
-라즈베리파이 터미널 2에서 실제 카메라 포트를 지정합니다.
-
-```bash
-cd ~/poter_ws
-source install/setup.bash
-export ROS_DOMAIN_ID=10
-export ROS_LOCALHOST_ONLY=0
-
-ros2 launch arm gripper_charuco.launch.py \
-  video_device:=/dev/video4 \
-  camera_info_url:=config/arm/gripper_camera_info.yaml \
-  dictionary:=DICT_5X5_50 \
-  squares_x:=5 \
-  squares_y:=7 \
-  square_length_m:=0.025 \
-  marker_length_m:=0.018
-```
-
-`/dev/ttyUSB0`과 `/dev/video4`는 고정값이 아닙니다. 라즈베리파이에서 확인한 장치
-경로로 각각 `serial_port`와 `video_device`만 바꾸면 됩니다.
-
-노트북에서는 카메라나 시리얼 장치를 열지 않는 GUI 전용 launch를 실행합니다.
-
-```bash
-cd ~/poter_ws
-source install/setup.bash
-export ROS_DOMAIN_ID=10
-export ROS_LOCALHOST_ONLY=0
-
-ros2 launch arm handeye_charuco_gui.launch.py \
-  name:=jetcobot_eye_in_hand_charuco \
-  calibration_directory:=config/arm
-```
-
-GUI에서 샘플을 찍기 전에 노트북에서 원격 데이터가 수신되는지 확인합니다.
-
-```bash
-ros2 topic echo /arm/joint_states --once
-ros2 topic hz /arm/gripper_camera/charuco_pose
-ros2 run tf2_ros tf2_echo arm/base_link arm/TCP
-ros2 run tf2_ros tf2_echo \
-  arm/gripper_camera_optical_frame arm/handeye_target
-```
 
 ## 4. 저장한 Hand-Eye TF 사용
 
@@ -452,7 +392,7 @@ ros2 launch arm container_pick_moveit.launch.py \
 
 이 launch는 다음을 한 번에 실행합니다.
 
-```text
+```texttext
 MoveIt move_group + RViz
 JetCobot FollowJointTrajectory bridge
 실제 /joint_states 발행
@@ -460,6 +400,67 @@ JetCobot FollowJointTrajectory bridge
 그리퍼 카메라와 ArUco
 저장된 Hand-Eye TF
 container_pick_coordinator (motion_backend=moveit)
+```
+
+### 라즈베리파이 하드웨어와 노트북 MoveIt 분산 실행
+
+로봇팔과 그리퍼 카메라가 라즈베리파이에 연결되어 있으면 위 일체형 launch 대신
+하드웨어와 계획 노드를 나눠 실행합니다. 두 컴퓨터에서 같은 `ROS_DOMAIN_ID`를 사용하고
+`ROS_LOCALHOST_ONLY=0`으로 설정합니다.
+
+라즈베리파이에서 실제 장치 포트를 지정해 실행합니다.
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+export ROS_DOMAIN_ID=10
+export ROS_LOCALHOST_ONLY=0
+
+ros2 launch arm container_pick_hardware.launch.py \
+  camera_info_url:=config/arm/gripper_camera_info.yaml \
+  video_device:=/dev/video4 \
+  marker_id:=0 \
+  marker_size_m:=0.015 \
+  serial_port:=/dev/ttyUSB0 \
+  baud_rate:=1000000 \
+  trajectory_speed:=100 \
+  goal_correction_speed:=100 \
+  goal_tolerance_deg:=2.5 \
+  goal_timeout_sec:=15.0
+```
+
+노트북에서는 로컬 카메라와 시리얼 포트를 열지 않는 원격 MoveIt launch를 실행합니다.
+Hand-Eye 보정 파일과 `container_pick.yaml`은 노트북의 `config/arm`에 있어야 합니다.
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+export ROS_DOMAIN_ID=10
+export ROS_LOCALHOST_ONLY=0
+
+ros2 launch arm container_pick_remote.launch.py \
+  calibration_name:=jetcobot_eye_in_hand_charuco \
+  calibration_directory:=config/arm \
+  params_file:=config/arm/container_pick.yaml \
+  use_rviz:=true
+```
+
+서비스 호출도 노트북에서 그대로 실행합니다.
+
+```bash
+ros2 service call /arm/preview_pregrasp std_srvs/srv/Trigger '{}'
+ros2 service call /arm/move_to_pregrasp std_srvs/srv/Trigger '{}'
+ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
+ros2 service call /arm/stop_pick std_srvs/srv/Trigger '{}'
+```
+
+실행 전에 노트북에서 원격 하드웨어 인터페이스가 보이는지 확인합니다.
+
+```bash
+ros2 topic echo /joint_states --once
+ros2 action info /arm_group_controller/follow_joint_trajectory
+ros2 service type /arm/gripper/open
+ros2 topic hz /arm/gripper_camera/aruco_pose
 ```
 
 이동 없는 목표 확인, pregrasp 단독 이동을 차례로 검증한 후 전체 Pick을 호출합니다.
