@@ -12,6 +12,7 @@ launch/localization_launch.xml       # map server와 AMCL
 launch/navigation_launch.xml         # planner, controller와 Nav2 서버
 launch/nav2_view.launch.xml          # Nav2 RViz 화면
 launch/target_map_pose_nav.launch.xml # 중앙 목표를 Nav2 action으로 전달
+launch/target_waypoints_nav.launch.xml # 여러 중앙 목표를 Nav2 through-poses action으로 전달
 params/nav2_params.yaml              # AMCL, costmap, planner/controller 설정
 behavior_trees/                      # NavigateToPose Behavior Tree
 rviz/                                # RViz 설정
@@ -29,6 +30,19 @@ rviz/                                # RViz 설정
 ```
 
 새 목표가 들어오면 진행 중인 이전 목표를 취소하고 새 목표를 전송합니다.
+
+### `target_waypoints_to_nav_goal`
+
+중앙에서 발행한 map 기준 여러 목표 위치를 Nav2 `NavigateThroughPoses` goal로 전달합니다.
+
+```text
+입력: /central/target_map_poses (geometry_msgs/PoseArray)
+입력: /central/target_map_path (nav_msgs/Path)
+출력: navigate_through_poses (nav2_msgs/action/NavigateThroughPoses)
+```
+
+두 입력 중 하나만 발행하면 됩니다. 새 waypoint 묶음이 들어오면 진행 중인 이전 waypoint
+goal을 취소하고 새 묶음을 전송합니다.
 
 ### `send_nav_goal`
 
@@ -68,6 +82,12 @@ source ~/poter_ws/install/setup.bash
 ros2 launch pinky bringup_robot.launch.xml
 ```
 
+`~/.bashrc`에 `bringup` alias를 등록한 노트북 환경에서는 SSH로 차량 bringup을 실행할 수 있습니다.
+
+```bash
+bringup
+```
+
 ### 2. 노트북에서 Nav2 실행
 
 기본 지도는 `~/poter_ws/config/SLAM/current_map.yaml`입니다.
@@ -77,10 +97,22 @@ ros2 launch drive bringup_launch.xml \
   map:=$HOME/poter_ws/config/SLAM/current_map.yaml
 ```
 
+`~/.bashrc`에 `nav` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
+
+```bash
+nav
+```
+
 ### 3. 노트북에서 RViz 실행
 
 ```bash
 ros2 launch drive nav2_view.launch.xml
+```
+
+`~/.bashrc`에 `nav_map` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
+
+```bash
+nav_map
 ```
 
 RViz의 RobotModel mesh는 기본적으로 로컬 `~/pinky_pro/install/pinky_description`에서 찾습니다.
@@ -110,6 +142,21 @@ ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
 
 중앙 노트북에서 `/central/target_map_pose`가 발행되면 Nav2가 경로를 생성하고 `/cmd_vel`을
 발행합니다. 같은 ROS domain의 차량 bringup이 이 속도 명령을 받아 모터를 제어합니다.
+
+여러 지점을 한 번에 보내려면 waypoint 브릿지를 실행합니다.
+
+```bash
+ros2 launch drive target_waypoints_nav.launch.xml
+```
+
+`~/.bashrc`에 `waypoint` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
+
+```bash
+waypoint
+```
+
+중앙 노트북에서 `/central/target_map_poses` 또는 `/central/target_map_path`를 발행하면
+Nav2가 지점 순서대로 통과하는 경로를 생성합니다.
 
 ## 한 번에 실행
 
