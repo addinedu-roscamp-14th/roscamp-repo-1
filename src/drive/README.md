@@ -82,26 +82,17 @@ source ~/poter_ws/install/setup.bash
 ros2 launch pinky bringup_robot.launch.xml
 ```
 
-`~/.bashrc`에 `bringup` alias를 등록한 노트북 환경에서는 SSH로 차량 bringup을 실행할 수 있습니다.
-
-```bash
-bringup
-```
-
 ### 2. 노트북에서 Nav2 실행
 
-기본 지도는 `~/poter_ws/config/SLAM/current_map.yaml`입니다.
+기본 지도는 `~/poter_ws/config/SLAM/current_map.yaml`입니다. 워크스페이스 위치가 다르면
+`workspace:=/path/to/workspace` 또는 `map:=...`으로 지정합니다.
 
 ```bash
 ros2 launch drive bringup_launch.xml \
-  map:=$HOME/poter_ws/config/SLAM/current_map.yaml
+  workspace:=$HOME/poter_ws
 ```
 
-`~/.bashrc`에 `nav` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
-
-```bash
-nav
-```
+지도 파일만 별도로 지정하려면 `map:=...`과 `keepout_mask:=...`를 사용합니다.
 
 ### 3. 노트북에서 RViz 실행
 
@@ -109,19 +100,13 @@ nav
 ros2 launch drive nav2_view.launch.xml
 ```
 
-`~/.bashrc`에 `nav_map` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
-
-```bash
-nav_map
-```
-
-RViz의 RobotModel mesh는 기본적으로 로컬 `~/pinky_pro/install/pinky_description`에서 찾습니다.
+RViz의 RobotModel mesh는 기본적으로 현재 워크스페이스의 `~/poter_ws/install/pinky`에서 찾습니다.
 이 mesh lookup 환경은 `drive` 패키지의 `nav2_view.launch.xml`에서 RViz 프로세스에 직접 적용합니다.
-다른 위치를 쓰는 경우:
+워크스페이스 위치가 다르면:
 
 ```bash
 ros2 launch drive nav2_view.launch.xml \
-  pinky_description_prefix:=$HOME/pinky_pro/install/pinky_description
+  workspace:=/path/to/poter_ws
 ```
 
 RViz 상단의 `2D Pose Estimate`를 선택하고 실제 차량 위치와 방향을 map 위에 지정합니다.
@@ -149,12 +134,6 @@ ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
 ros2 launch drive target_waypoints_nav.launch.xml
 ```
 
-`~/.bashrc`에 `waypoint` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
-
-```bash
-waypoint
-```
-
 중앙 노트북에서 `/central/target_map_poses` 또는 `/central/target_map_path`를 발행하면
 Nav2가 지점 순서대로 통과하는 경로를 생성합니다.
 
@@ -165,7 +144,7 @@ Nav2가 지점 순서대로 통과하는 경로를 생성합니다.
 ```bash
 ros2 launch drive target_map_pose_nav.launch.xml \
   start_nav2:=true \
-  map:=$HOME/poter_ws/config/SLAM/current_map.yaml
+  workspace:=$HOME/poter_ws
 ```
 
 RViz는 별도 터미널에서 실행합니다.
