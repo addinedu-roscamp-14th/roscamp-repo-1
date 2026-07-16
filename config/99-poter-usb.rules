@@ -1,0 +1,5 @@
+# Gripper USB camera: create the alias only for its video-capture node.
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="6340", ENV{ID_V4L_CAPABILITIES}=="*:capture:*", SYMLINK+="arm_camera", GROUP="video", MODE="0660"
+
+# JetCobot CH340 USB-to-serial adapter.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="jetcobot", GROUP="dialout", MODE="0660"

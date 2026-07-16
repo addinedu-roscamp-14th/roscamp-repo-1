@@ -73,6 +73,7 @@
     <disable_collisions link1="1_Link" link2="base_link" reason="Adjacent"/>
     <disable_collisions link1="2_Link" link2="3_Link" reason="Adjacent"/>
     <disable_collisions link1="2_Link" link2="4_Link" reason="Never"/>
+    <disable_collisions link1="2_Link" link2="jetcocam" reason="UserValidated"/>
     <disable_collisions link1="3_Link" link2="4_Link" reason="Adjacent"/>
     <disable_collisions link1="3_Link" link2="5_Link" reason="Never"/>
     <disable_collisions link1="4_Link" link2="5_Link" reason="Adjacent"/>

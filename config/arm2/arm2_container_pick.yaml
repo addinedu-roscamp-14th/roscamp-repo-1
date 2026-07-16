@@ -1,0 +1,191 @@
+/arm2/container_pick_coordinator:
+  ros__parameters:
+    base_frame: arm2/base_link
+    marker_frame: arm2/container_marker
+
+    # Motion requires the explicit execute_motion launch override.
+    execute_motion: false
+    motion_backend: direct
+    allow_full_pick: true
+    offsets_configured: true
+    use_marker_rotation_for_grasp: false
+    grasp_orientation_mode: marker_yaw
+
+    # Current robot measurement: the marker center is physically at base
+    # Z=0.125 m while TF reports about Z=-0.0653 m. Compensate the measured
+    # +190.3 mm base-frame bias without weakening workspace safety limits.
+    marker_translation_correction_xyz_m: [0.0, 0.0, 0.1903]
+
+    # The container reference surface is 20 mm below the ArUco center on Z.
+    container_offset_xyz_m: [0.0, 0.0, -0.020000]
+
+    # Taught on the current robot with the TCP centered over the container.
+    # Z is relative to the container reference above; together the container
+    # and TCP offsets preserve the measured marker-to-TCP -29.3 mm geometry.
+    # TCP=[0.149,-0.116,0.087] m and marker=[0.1003,-0.131,-0.069] m.
+    # Z includes the 190.3 mm marker correction and the 5 mm final depth.
+    grasp_offset_xyz_m: [0.048667, 0.015000, -0.009300]
+    grasp_offset_rpy_deg: [-174.150, -6.055, 96.360]
+    # Marker yaw at the taught aligned-container pose.
+    reference_marker_yaw_deg: -74.24
+
+    # Automatically choose the nearest of the three physically taught stack
+    # heights using the raw base-frame ArUco Z measurement.
+    auto_layer_selection_enabled: true
+    layer_max_z_error_m: 0.025
+    layer1_marker_z_m: -0.12570
+    layer1_grasp_offset_xyz_m: [-0.001072, -0.012137, -0.035785]
+    layer1_grasp_offset_rpy_deg: [179.187, 5.391, 90.479]
+    layer1_reference_marker_yaw_deg: -71.204
+    # Layer-1 hand-guided measurements over one 180deg gripper period.
+    layer1_multi_angle_enabled: true
+    layer1_calibration_yaws_deg: [-71.204, -29.303, 16.023, 53.459]
+    layer1_calibration_offsets_xyz_m: [
+      -0.001072, -0.012137, -0.035785,
+      -0.025689,  0.018434, -0.038719,
+      -0.007627, -0.008404, -0.034520,
+      -0.012846, -0.002539, -0.035025
+    ]
+    layer2_marker_z_m: -0.08777
+    layer2_grasp_offset_xyz_m: [-0.001260, 0.026693, -0.038555]
+    layer2_grasp_offset_rpy_deg: [-171.599, -1.234, 91.426]
+    layer2_reference_marker_yaw_deg: -74.240
+    # Layer-2 hand-guided measurements over one 180deg gripper period.
+    layer2_multi_angle_enabled: true
+    layer2_calibration_yaws_deg: [-74.240, -34.974, 14.990, 59.127]
+    layer2_calibration_offsets_xyz_m: [
+      -0.001260, 0.026693, -0.038555,
+      -0.032863, 0.020951, -0.041122,
+       0.007442, -0.009582, -0.033860,
+      -0.024255, 0.009476, -0.039587
+    ]
+    layer3_marker_z_m: -0.04898
+    # Original hand-guided Layer-3 reference. No additional red-axis shift.
+    layer3_grasp_offset_xyz_m: [-0.030007, 0.049219, -0.039386]
+    layer3_grasp_offset_rpy_deg: [-175.416, -4.593, 94.967]
+    layer3_reference_marker_yaw_deg: -71.240
+    # Second hand-guided Layer-3 calibration with the container rotated about
+    # 90 degrees.  Interpolate this with the base profile over a 180deg cycle.
+    layer3_angle90_enabled: true
+    layer3_angle90_grasp_offset_xyz_m: [-0.036924, 0.009053, -0.052728]
+    layer3_angle90_reference_marker_yaw_deg: 15.181
+    # Four hand-guided measurements spanning one 180deg parallel-gripper
+    # period. Offsets are flattened as [x0,y0,z0, x1,y1,z1, ...].
+    layer3_multi_angle_enabled: true
+    layer3_calibration_yaws_deg: [-71.240, -23.211, 15.181, 65.932]
+    layer3_calibration_offsets_xyz_m: [
+      -0.030007, 0.049219, -0.039386,
+      -0.036358, 0.040855, -0.046035,
+      -0.036924, 0.009053, -0.052728,
+      -0.044190, 0.042745, -0.047956
+    ]
+    # Accept every container direction. MoveIt and the Cartesian planner still
+    # reject orientations that are physically unreachable or unsafe.
+    max_yaw_spread_deg: 30.0
+    max_container_yaw_delta_deg: 180.0
+    # A parallel gripper has the same grasp axis after a 180-degree turn.
+    # Keep the marker-relative XY target exact, but choose the nearest
+    # equivalent wrist yaw so reversed containers remain reachable.
+    gripper_yaw_symmetry_deg: 180.0
+    # The ArUco is centered on the container.  Layer offsets are base-frame
+    # hand-teach/calibration corrections, so reversing the marker must rotate
+    # only the gripper yaw, not swing the corrected grasp point around it.
+    rotate_grasp_xy_with_marker: false
+    # Always approach with the gripper axis vertical.  Only yaw follows the
+    # marker, so small roll/pitch errors from hand teaching cannot tilt jaws.
+    force_vertical_gripper: true
+    vertical_gripper_roll_deg: 180.0
+    vertical_gripper_pitch_deg: 0.0
+    pregrasp_lift_m: 0.08
+    # Keep the visual pregrasp unchanged and descend 5 mm deeper only for grasp.
+    grasp_extra_depth_m: 0.005
+    # After a successful grasp and vertical lift, carry the container back to
+    # the same camera-ready startup joint pose through MoveIt.
+    return_to_start_after_pick: true
+    return_joint_angles_deg: [0.0, 45.0, -85.0, -25.0, 0.0, 45.0]
+    # All grasp calibrations were measured from this historical camera pose.
+    # Move here before the one-time two-second marker sampling so Hand-Eye and
+    # IK conditions match calibration, then return to the newly taught pose.
+    approach_via_safe_joint_pose: true
+    safe_approach_joint_angles_deg: [0.0, 45.0, -85.0, -25.0, 0.0, 45.0]
+    # Observe the fixed container from both the newly taught startup pose and
+    # the historical calibration pose. Fuse only closely agreeing positions;
+    # prefer the calibrated view for moderate differences and reject large
+    # discrepancies instead of commanding a bad grasp.
+    dual_view_marker_sampling_enabled: false
+    dual_view_fuse_translation_threshold_m: 0.005
+    dual_view_reject_translation_threshold_m: 0.015
+    dual_view_fuse_yaw_threshold_deg: 3.0
+    dual_view_reject_yaw_threshold_deg: 10.0
+    dual_view_new_pose_weight: 0.25
+    # Reobserve at the safe pregrasp height, correct XY there, then descend
+    # vertically. This compensates hand-eye/TCP error accumulated during the
+    # long move from the calibration camera pose.
+    refresh_marker_before_descent: true
+    marker_refresh_timeout_sec: 2.0
+    # Do not descend on a stale target when close-range marker tracking fails.
+    marker_refresh_fallback_to_locked: false
+    # Use the taught grasp orientation directly. Holding an arbitrary current
+    # orientation near the workspace edge can select an unstable IK branch.
+    pregrasp_test_keep_current_orientation: false
+    # Lift 18 cm after closing: previous 8 cm plus 10 cm clearance.
+    lift_after_pick_m: 0.18
+    # Reversed-marker wrist configurations can have only about 27 mm of
+    # straight-up IK range.  Lift at least 20 mm vertically, then let the
+    # collision-checked startup return carry the container away.
+    minimum_lift_after_pick_m: 0.02
+    lift_search_step_m: 0.02
+
+    minimum_stable_samples: 5
+    # Lock one target from every valid sample received during the initial
+    # two-second observation (about 20 samples at 10 FPS). No later remeasure.
+    initial_marker_sampling_sec: 2.0
+    use_all_stable_marker_samples: true
+    max_translation_std_m: 0.005
+    max_rotation_spread_deg: 15.0
+    dry_run_max_rotation_spread_deg: 30.0
+    max_marker_age_sec: 3.0
+    stabilization_timeout_sec: 8.0
+
+    # Relaxed software workspace for the physical JetCobot. URDF joint limits
+    # and MoveIt collision checking remain enabled as the final safeguards.
+    workspace_min_xyz_m: [-0.40, -0.40, -0.050]
+    workspace_max_xyz_m: [0.40, 0.40, 0.45]
+    # Permit any single motion branch change up to a half turn. Absolute
+    # per-joint URDF/hardware limits remain enforced below this software gate.
+    max_joint_delta_deg: 180.0
+
+    serial_port: /dev/ttyUSB0
+    baud_rate: 1000000
+    speed: 5
+    motion_timeout_sec: 30.0
+    gripper_open_value: 100
+    gripper_closed_value: 20
+    # Fully open before approach; the open command runs concurrently with the
+    # pregrasp motion and continues to the physical open limit.
+    gripper_speed: 100
+
+    moveit_group: arm_group
+    moveit_ee_link: TCP
+    moveit_position_tolerance_m: 0.010
+    moveit_orientation_tolerance_deg: 30.0
+    moveit_planning_time_sec: 2.0
+    moveit_planning_attempts: 10
+    moveit_velocity_scale: 0.9
+    # Keep high cruise speed but soften acceleration to reduce servo lag.
+    moveit_acceleration_scale: 0.7
+
+    # Pregrasp is planned normally. Grasp descent and lift are Cartesian Z
+    # paths with collision checking and joint-jump rejection.
+    # Use dense samples near the low-Z workspace boundary. A 5 mm step could
+    # produce a large joint change near the grasp.
+    cartesian_max_step_m: 0.002
+    cartesian_min_fraction: 0.90
+    cartesian_max_speed_mps: 0.12
+    # Allow larger wrist/elbow changes for arbitrary marker yaw while still
+    # rejecting a full IK branch flip during a straight Cartesian segment.
+    cartesian_max_joint_jump_deg: 90.0
+    # Allow the measured /joint_states and MoveIt planning scene to catch up
+    # after the physical bridge's final joint correction.  Too short a delay
+    # makes the Cartesian descent start from the stale pre-correction pose.
+    moveit_state_settle_sec: 0.5

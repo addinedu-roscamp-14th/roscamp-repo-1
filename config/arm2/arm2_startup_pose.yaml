@@ -1,0 +1,6 @@
+/arm2/jetcobot_trajectory_bridge:
+  ros__parameters:
+    startup_angles_deg: [0.52, -0.43, -10.105, -67.805, 0.08, 45.79]
+/arm2/container_pick_coordinator:
+  ros__parameters:
+    return_joint_angles_deg: [0.52, -0.43, -10.105, -67.805, 0.08, 45.79]

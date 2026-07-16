@@ -1,0 +1,26 @@
+image_width: 640
+image_height: 480
+camera_name: USB2_0Camera_USBCamera___SB__PCI0_GP17_XHC0_RHUB_PRT2_2_3_1_0_0c45_6340_640x480
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [1019.78682,    0.     ,  309.2411 ,
+            0.     , 1025.18414,  338.3168 ,
+            0.     ,    0.     ,    1.     ]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.430112, 0.209304, -0.005674, 0.001793, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1., 0., 0.,
+         0., 1., 0.,
+         0., 0., 1.]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [973.32886,   0.     , 308.38838,   0.     ,
+           0.     , 989.13171, 340.81997,   0.     ,
+           0.     ,   0.     ,   1.     ,   0.     ]
