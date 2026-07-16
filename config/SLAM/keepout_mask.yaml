@@ -1,4 +1,4 @@
-image: current_map.pgm
+image: keepout_mask.pgm
 mode: trinary
 resolution: 0.010
 origin: [-0.562, -0.226, 0]

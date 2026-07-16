@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+
+from geometry_msgs.msg import PoseArray, PoseStamped
+from nav2_msgs.action import NavigateThroughPoses
+from nav_msgs.msg import Path
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+
+
+class TargetWaypointsToNavGoal(Node):
+    def __init__(self):
+        super().__init__('target_waypoints_to_nav_goal')
+
+        self.declare_parameter('pose_array_topic', '/central/target_map_poses')
+        self.declare_parameter('path_topic', '/central/target_map_path')
+        self.declare_parameter('action_name', 'navigate_through_poses')
+        self.declare_parameter('default_frame_id', 'map')
+        self.declare_parameter('wait_for_server_timeout_sec', 10.0)
+        self.declare_parameter('ignore_empty_frame_id', False)
+
+        self.pose_array_topic = str(self.get_parameter('pose_array_topic').value)
+        self.path_topic = str(self.get_parameter('path_topic').value)
+        self.action_name = str(self.get_parameter('action_name').value)
+        self.default_frame_id = str(self.get_parameter('default_frame_id').value)
+        self.wait_timeout = float(self.get_parameter('wait_for_server_timeout_sec').value)
+        self.ignore_empty_frame_id = bool(self.get_parameter('ignore_empty_frame_id').value)
+
+        self.client = ActionClient(self, NavigateThroughPoses, self.action_name)
+        self.active_goal = None
+        self.received_count = 0
+
+        self.create_subscription(PoseArray, self.pose_array_topic, self.on_pose_array, 10)
+        self.create_subscription(Path, self.path_topic, self.on_path, 10)
+        self.create_timer(5.0, self.log_waiting_status)
+
+        self.get_logger().info(
+            f'Subscribing waypoint PoseArray: {self.pose_array_topic}; '
+            f'Path: {self.path_topic}; '
+            f'sending Nav2 goals to action: {self.action_name}'
+        )
+
+    def on_pose_array(self, msg):
+        poses = []
+        for pose in msg.poses:
+            pose_stamped = PoseStamped()
+            pose_stamped.header = msg.header
+            pose_stamped.pose = pose
+            poses.append(pose_stamped)
+
+        self.send_waypoints(poses, 'PoseArray')
+
+    def on_path(self, msg):
+        self.send_waypoints(list(msg.poses), 'Path')
+
+    def send_waypoints(self, poses, source_type):
+        self.received_count += 1
+
+        if not poses:
+            self.get_logger().warning(f'Ignored empty waypoint {source_type}')
+            return
+
+        now = self.get_clock().now().to_msg()
+        normalized_poses = []
+        for index, pose in enumerate(poses):
+            normalized_pose = PoseStamped()
+            normalized_pose.header = pose.header
+            normalized_pose.pose = pose.pose
+
+            if not normalized_pose.header.frame_id:
+                if self.ignore_empty_frame_id:
+                    self.get_logger().warning(
+                        f'Ignored waypoint {source_type} with empty frame_id at index {index}'
+                    )
+                    return
+                normalized_pose.header.frame_id = self.default_frame_id
+
+            if normalized_pose.header.stamp.sec == 0 and normalized_pose.header.stamp.nanosec == 0:
+                normalized_pose.header.stamp = now
+
+            normalized_poses.append(normalized_pose)
+
+        if not self.client.wait_for_server(timeout_sec=self.wait_timeout):
+            self.get_logger().error(
+                f'Nav2 action server is not available: {self.action_name}'
+            )
+            return
+
+        if self.active_goal is not None:
+            self.get_logger().info('Canceling previous waypoint navigation goal')
+            self.active_goal.cancel_goal_async()
+            self.active_goal = None
+
+        goal = NavigateThroughPoses.Goal()
+        goal.poses = normalized_poses
+
+        future = self.client.send_goal_async(goal)
+        future.add_done_callback(self.on_goal_response)
+
+        first = normalized_poses[0].pose.position
+        last = normalized_poses[-1].pose.position
+        self.get_logger().info(
+            f'Sent Nav2 waypoint goal from {source_type}: '
+            f'count={len(normalized_poses)}, '
+            f'first=({first.x:.6f}, {first.y:.6f}), '
+            f'last=({last.x:.6f}, {last.y:.6f})'
+        )
+
+    def log_waiting_status(self):
+        if self.received_count > 0:
+            return
+
+        self.get_logger().info(
+            'Waiting for waypoint goals: '
+            f'pose_array_topic={self.pose_array_topic}, '
+            f'pose_array_publishers={self.count_publishers(self.pose_array_topic)}, '
+            f'path_topic={self.path_topic}, '
+            f'path_publishers={self.count_publishers(self.path_topic)}, '
+            f'action={self.action_name}, '
+            f'action_server_ready={self.client.server_is_ready()}'
+        )
+
+    def on_goal_response(self, future):
+        goal_handle = future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().warning('Waypoint navigation goal was rejected')
+            return
+
+        self.active_goal = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.on_goal_result)
+
+    def on_goal_result(self, future):
+        result = future.result()
+        self.active_goal = None
+        self.get_logger().info(
+            'Waypoint navigation finished: '
+            f'status={result.status}, '
+            f'error_code={result.result.error_code}, '
+            f'error_msg={result.result.error_msg!r}'
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TargetWaypointsToNavGoal()
+
+    try:
+        rclpy.spin(node)
+    except ExternalShutdownException:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

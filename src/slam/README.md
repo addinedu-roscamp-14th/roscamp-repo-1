@@ -41,10 +41,22 @@ RViz 없이 SLAM만 실행하려면:
 ros2 launch slam map_building.launch.xml
 ```
 
+`~/.bashrc`에 `slam` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
+
+```bash
+slam
+```
+
 RViz만 별도로 실행하려면:
 
 ```bash
 ros2 launch slam map_view.launch.xml
+```
+
+`~/.bashrc`에 `map` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
+
+```bash
+map
 ```
 
 ## 필요한 토픽과 TF
@@ -73,7 +85,13 @@ scan_topic: /scan
 
 ```bash
 ros2 run nav2_map_server map_saver_cli \
-  -f /home/jio/poter_ws/config/SLAM/current_map
+  -f $HOME/poter_ws/config/SLAM/current_map
+```
+
+`~/.bashrc`에 `save` alias를 등록한 환경에서는 다음처럼 저장할 수 있습니다.
+
+```bash
+save
 ```
 
 기존 파일을 덮어쓰기 전 필요한 지도인지 확인해야 합니다. 저장 후 calibration에서 사용하는
