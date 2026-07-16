@@ -4,7 +4,11 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    SetEnvironmentVariable,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 
@@ -15,6 +19,13 @@ def generate_launch_description():
     name_argument = DeclareLaunchArgument(
         'name', default_value='jetcobot_eye_in_hand'
     )
+    directory_argument = DeclareLaunchArgument(
+        'calibration_directory', default_value='config/arm'
+    )
+    use_project_calibrations = SetEnvironmentVariable(
+        'EASY_HANDEYE2_CALIBRATIONS_DIRECTORY',
+        LaunchConfiguration('calibration_directory'),
+    )
     publisher = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             str(handeye_share / 'launch' / 'publish.launch.py')
@@ -23,4 +34,9 @@ def generate_launch_description():
             'name': LaunchConfiguration('name'),
         }.items(),
     )
-    return LaunchDescription([name_argument, publisher])
+    return LaunchDescription([
+        name_argument,
+        directory_argument,
+        use_project_calibrations,
+        publisher,
+    ])

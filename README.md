@@ -264,7 +264,7 @@ ros2 launch arm container_pick_moveit.launch.py \
   serial_port:=/dev/ttyUSB0 \
   trajectory_speed:=100 \
   goal_correction_speed:=50 \
-  goal_tolerance_deg:=3.0 \
+  goal_tolerance_deg:=2.5 \
   goal_timeout_sec:=15.0 \
   use_rviz:=true
 ```

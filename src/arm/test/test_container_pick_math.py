@@ -2,9 +2,11 @@
 
 from arm.container_pick_coordinator import (
     apply_vertical_pick_offsets,
+    cartesian_path_acceptable,
     compose_fixed_base_pose,
     compose_pose,
     compose_yaw_follow_pose,
+    inverted_l_workspace_contains,
     lift_distance_candidates,
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
@@ -98,3 +100,24 @@ def test_lift_candidates_descend_to_exact_minimum():
         lift_distance_candidates(0.18, 0.05, 0.02),
         [0.18, 0.16, 0.14, 0.12, 0.10, 0.08, 0.06, 0.05],
     )
+
+
+def test_cartesian_shortfall_is_bounded_in_metres():
+    """A lower fraction is accepted only for a small absolute residual."""
+    assert cartesian_path_acceptable(0.955, 0.08, 0.97, 0.90, 0.005)
+    assert not cartesian_path_acceptable(0.955, 0.18, 0.97, 0.90, 0.005)
+    assert not cartesian_path_acceptable(0.89, 0.01, 0.97, 0.90, 0.005)
+
+
+def test_inverted_l_workspace_excludes_upper_left_quadrant():
+    """The configured bottom/right L rejects only its upper-left cutout."""
+    bounds = (
+        np.array([-0.28, -0.28]),
+        np.array([0.28, 0.0]),
+        np.array([0.0, -0.28]),
+        np.array([0.28, 0.28]),
+    )
+    assert inverted_l_workspace_contains([0.20, 0.20], *bounds)
+    assert inverted_l_workspace_contains([-0.20, -0.20], *bounds)
+    assert inverted_l_workspace_contains([0.20, -0.20], *bounds)
+    assert not inverted_l_workspace_contains([-0.20, 0.20], *bounds)

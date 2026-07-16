@@ -181,6 +181,40 @@ def lift_distance_candidates(requested, minimum, step):
     return candidates
 
 
+def cartesian_path_acceptable(
+    fraction,
+    requested_distance,
+    preferred_fraction,
+    absolute_min_fraction,
+    max_shortfall,
+):
+    """Accept a nearly complete path only when its residual is bounded."""
+    if fraction >= preferred_fraction:
+        return True
+    if requested_distance is None or fraction < absolute_min_fraction:
+        return False
+    shortfall = max(0.0, requested_distance * (1.0 - fraction))
+    return shortfall <= max_shortfall
+
+
+def inverted_l_workspace_contains(
+    xy,
+    horizontal_min,
+    horizontal_max,
+    vertical_min,
+    vertical_max,
+):
+    """Return whether XY is inside either bar of a right-side bottom L."""
+    point = np.asarray(xy, dtype=np.float64)
+    horizontal = np.all(point >= horizontal_min) and np.all(
+        point <= horizontal_max
+    )
+    vertical = np.all(point >= vertical_min) and np.all(
+        point <= vertical_max
+    )
+    return bool(horizontal or vertical)
+
+
 class ContainerPickCoordinator(Node):
     """Filter marker poses, publish grasp targets, and gate robot execution."""
 
@@ -217,6 +251,11 @@ class ContainerPickCoordinator(Node):
         self.max_yaw_delta = float(
             self.get_parameter('max_container_yaw_delta_deg').value
         )
+        self.grasp_yaw_fallback_scales = [
+            float(value) for value in self.get_parameter(
+                'grasp_yaw_fallback_scales'
+            ).value
+        ]
         self.pregrasp_lift = float(
             self.get_parameter('pregrasp_lift_m').value
         )
@@ -257,6 +296,21 @@ class ContainerPickCoordinator(Node):
         )
         self.workspace_min = self._vector_parameter('workspace_min_xyz_m', 3)
         self.workspace_max = self._vector_parameter('workspace_max_xyz_m', 3)
+        self.workspace_xy_shape = str(
+            self.get_parameter('workspace_xy_shape').value
+        )
+        self.workspace_horizontal_min = self._vector_parameter(
+            'workspace_horizontal_min_xy_m', 2
+        )
+        self.workspace_horizontal_max = self._vector_parameter(
+            'workspace_horizontal_max_xy_m', 2
+        )
+        self.workspace_vertical_min = self._vector_parameter(
+            'workspace_vertical_min_xy_m', 2
+        )
+        self.workspace_vertical_max = self._vector_parameter(
+            'workspace_vertical_max_xy_m', 2
+        )
         self.speed = int(self.get_parameter('speed').value)
         self.motion_timeout = float(
             self.get_parameter('motion_timeout_sec').value
@@ -295,6 +349,12 @@ class ContainerPickCoordinator(Node):
         self.cartesian_min_fraction = float(
             self.get_parameter('cartesian_min_fraction').value
         )
+        self.cartesian_absolute_min_fraction = float(
+            self.get_parameter('cartesian_absolute_min_fraction').value
+        )
+        self.cartesian_max_shortfall = float(
+            self.get_parameter('cartesian_max_shortfall_m').value
+        )
         self.cartesian_max_speed = float(
             self.get_parameter('cartesian_max_speed_mps').value
         )
@@ -309,6 +369,14 @@ class ContainerPickCoordinator(Node):
             raise ValueError('minimum_stable_samples must be at least 3')
         if np.any(self.workspace_min >= self.workspace_max):
             raise ValueError('workspace minimum must be below maximum')
+        if self.workspace_xy_shape not in ('box', 'inverted_l'):
+            raise ValueError('workspace_xy_shape must be box or inverted_l')
+        if np.any(
+            self.workspace_horizontal_min >= self.workspace_horizontal_max
+        ):
+            raise ValueError('horizontal workspace minimum must be below maximum')
+        if np.any(self.workspace_vertical_min >= self.workspace_vertical_max):
+            raise ValueError('vertical workspace minimum must be below maximum')
         if self.motion_backend not in ('direct', 'moveit'):
             raise ValueError('motion_backend must be direct or moveit')
         if self.grasp_orientation_mode not in (
@@ -320,6 +388,23 @@ class ContainerPickCoordinator(Node):
             )
         if self.grasp_extra_depth < 0.0:
             raise ValueError('grasp_extra_depth_m must be non-negative')
+        if not (
+            0.0 <= self.cartesian_absolute_min_fraction
+            <= self.cartesian_min_fraction <= 1.0
+        ):
+            raise ValueError(
+                'Cartesian path fractions must satisfy '
+                '0 <= absolute <= preferred <= 1'
+            )
+        if self.cartesian_max_shortfall < 0.0:
+            raise ValueError('cartesian_max_shortfall_m must be non-negative')
+        if any(
+            scale < 0.0 or scale >= 1.0
+            for scale in self.grasp_yaw_fallback_scales
+        ):
+            raise ValueError(
+                'grasp_yaw_fallback_scales values must be within [0, 1)'
+            )
         lift_distance_candidates(
             self.lift_after_pick,
             self.minimum_lift_after_pick,
@@ -400,6 +485,9 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
         self.declare_parameter('max_yaw_spread_deg', 8.0)
         self.declare_parameter('max_container_yaw_delta_deg', 90.0)
+        self.declare_parameter(
+            'grasp_yaw_fallback_scales', [0.75, 0.5, 0.25, 0.0]
+        )
         self.declare_parameter('pregrasp_lift_m', 0.08)
         self.declare_parameter('grasp_extra_depth_m', 0.0)
         self.declare_parameter('refresh_marker_before_descent', True)
@@ -416,6 +504,19 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('max_marker_age_sec', 2.0)
         self.declare_parameter('workspace_min_xyz_m', [-0.28, -0.28, 0.02])
         self.declare_parameter('workspace_max_xyz_m', [0.28, 0.28, 0.30])
+        self.declare_parameter('workspace_xy_shape', 'box')
+        self.declare_parameter(
+            'workspace_horizontal_min_xy_m', [-0.28, -0.28]
+        )
+        self.declare_parameter(
+            'workspace_horizontal_max_xy_m', [0.28, 0.0]
+        )
+        self.declare_parameter(
+            'workspace_vertical_min_xy_m', [0.0, -0.28]
+        )
+        self.declare_parameter(
+            'workspace_vertical_max_xy_m', [0.28, 0.28]
+        )
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
         self.declare_parameter('baud_rate', 1000000)
         self.declare_parameter('speed', 10)
@@ -424,20 +525,22 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('max_joint_delta_deg', 60.0)
         self.declare_parameter('gripper_open_value', 100)
         self.declare_parameter('gripper_closed_value', 20)
-        self.declare_parameter('gripper_speed', 30)
+        self.declare_parameter('gripper_speed', 50)
         self.declare_parameter('moveit_group', 'arm_group')
         self.declare_parameter('moveit_ee_link', 'TCP')
         self.declare_parameter('moveit_position_tolerance_m', 0.005)
         self.declare_parameter('moveit_orientation_tolerance_deg', 5.0)
         self.declare_parameter('moveit_planning_time_sec', 5.0)
         self.declare_parameter('moveit_planning_attempts', 10)
-        self.declare_parameter('moveit_velocity_scale', 0.1)
-        self.declare_parameter('moveit_acceleration_scale', 0.1)
+        self.declare_parameter('moveit_velocity_scale', 0.35)
+        self.declare_parameter('moveit_acceleration_scale', 0.25)
         self.declare_parameter('cartesian_max_step_m', 0.005)
-        self.declare_parameter('cartesian_min_fraction', 0.98)
-        self.declare_parameter('cartesian_max_speed_mps', 0.02)
+        self.declare_parameter('cartesian_min_fraction', 0.97)
+        self.declare_parameter('cartesian_absolute_min_fraction', 0.90)
+        self.declare_parameter('cartesian_max_shortfall_m', 0.005)
+        self.declare_parameter('cartesian_max_speed_mps', 0.04)
         self.declare_parameter('cartesian_max_joint_jump_deg', 10.0)
-        self.declare_parameter('moveit_state_settle_sec', 0.3)
+        self.declare_parameter('moveit_state_settle_sec', 0.2)
 
     def _vector_parameter(self, name, length):
         values = np.asarray(self.get_parameter(name).value, dtype=np.float64)
@@ -675,9 +778,20 @@ class ContainerPickCoordinator(Node):
         return None, f'marker did not stabilize: {reason}'
 
     def in_workspace(self, translation):
-        return bool(np.all(translation >= self.workspace_min) and np.all(
-            translation <= self.workspace_max
-        ))
+        if not (
+            np.all(translation >= self.workspace_min)
+            and np.all(translation <= self.workspace_max)
+        ):
+            return False
+        if self.workspace_xy_shape == 'box':
+            return True
+        return inverted_l_workspace_contains(
+            translation[:2],
+            self.workspace_horizontal_min,
+            self.workspace_horizontal_max,
+            self.workspace_vertical_min,
+            self.workspace_vertical_max,
+        )
 
     def make_pose(self, translation, rotation, stamp):
         message = PoseStamped()
@@ -867,13 +981,18 @@ class ContainerPickCoordinator(Node):
                     raise RuntimeError(
                         f'failed to refresh marker pose: {reason}'
                     )
-                grasp, _pregrasp = refreshed
+                grasp, pregrasp = refreshed
             else:
                 self.publish_status(
                     'PICK: marker refresh skipped; using locked base target'
                 )
             self.publish_status('PICK: descending to grasp pose')
-            self.move_cartesian_to_pose(grasp)
+            try:
+                self.move_cartesian_to_pose(grasp)
+            except CartesianPlanningError as initial_error:
+                grasp = self.move_with_yaw_fallbacks(
+                    grasp, pregrasp, initial_error
+                )
             self.publish_status('PICK: closing gripper')
             self.command_gripper(open_gripper=False)
             self.publish_status('PICK: finding vertical lift path')
@@ -885,6 +1004,52 @@ class ContainerPickCoordinator(Node):
             self.publish_status(f'PICK FAILED: {exc}')
         finally:
             self.motion_lock.release()
+
+    def move_with_yaw_fallbacks(self, grasp, pregrasp, initial_error):
+        """Retry descent with progressively reduced marker-yaw following."""
+        if (
+            self.grasp_orientation_mode != 'marker_yaw'
+            or not self.grasp_yaw_fallback_scales
+        ):
+            raise initial_error
+        target_rpy = quaternion_to_rpy_degrees([
+            grasp.pose.orientation.x,
+            grasp.pose.orientation.y,
+            grasp.pose.orientation.z,
+            grasp.pose.orientation.w,
+        ])
+        yaw_delta = wrap_degrees(target_rpy[2] - self.grasp_rpy[2])
+        failures = [f'full yaw: {initial_error}']
+        for scale in self.grasp_yaw_fallback_scales:
+            candidate_yaw = self.grasp_rpy[2] + yaw_delta * scale
+            candidate_rotation = quaternion_from_rpy_degrees(
+                self.grasp_rpy[0], self.grasp_rpy[1], candidate_yaw
+            )
+            candidate_grasp = copy.deepcopy(grasp)
+            candidate_pregrasp = copy.deepcopy(pregrasp)
+            for pose in (candidate_grasp, candidate_pregrasp):
+                pose.pose.orientation.x = float(candidate_rotation[0])
+                pose.pose.orientation.y = float(candidate_rotation[1])
+                pose.pose.orientation.z = float(candidate_rotation[2])
+                pose.pose.orientation.w = float(candidate_rotation[3])
+            self.publish_status(
+                'PICK: retrying descent with '
+                f'{scale * 100.0:.0f}% container yaw '
+                f'(target={candidate_yaw:.2f}deg)'
+            )
+            try:
+                self.move_to_pose(candidate_pregrasp)
+                self.move_cartesian_to_pose(candidate_grasp)
+                self.publish_status(
+                    'PICK: descent succeeded with '
+                    f'{scale * 100.0:.0f}% container yaw'
+                )
+                return candidate_grasp
+            except (CartesianPlanningError, RuntimeError) as exc:
+                failures.append(f'{scale:.2f}: {exc}')
+        raise RuntimeError(
+            'No reachable grasp-yaw fallback: ' + '; '.join(failures)
+        )
 
     def execute_pregrasp_test(self, pregrasp):
         if not self.motion_lock.acquire(blocking=False):
@@ -1004,6 +1169,10 @@ class ContainerPickCoordinator(Node):
         if not self.move_group_client.wait_for_server(timeout_sec=5.0):
             raise RuntimeError('MoveIt /move_action server is unavailable')
 
+        target = copy.deepcopy(target)
+        # The target is already expressed in base_frame. Plan against the
+        # latest TF tree instead of the old marker observation timestamp.
+        target.header.stamp = Time().to_msg()
         goal = MoveGroup.Goal()
         request = goal.request
         request.group_name = self.moveit_group
@@ -1149,8 +1318,10 @@ class ContainerPickCoordinator(Node):
                 'MoveIt /compute_cartesian_path service is unavailable'
             )
 
+        requested_distance = self._cartesian_request_distance(target)
         request = GetCartesianPath.Request()
-        request.header = target.header
+        request.header = copy.deepcopy(target.header)
+        request.header.stamp = Time().to_msg()
         request.start_state.is_diff = True
         request.group_name = self.moveit_group
         request.link_name = self.moveit_ee_link
@@ -1167,9 +1338,7 @@ class ContainerPickCoordinator(Node):
         request.cartesian_speed_limited_link = self.moveit_ee_link
         request.max_cartesian_speed = self.cartesian_max_speed
 
-        path_future = self.cartesian_path_client.call_async(request)
-        self._wait_future(path_future, self.moveit_planning_time + 5.0)
-        response = path_future.result()
+        response = self._compute_cartesian_path(request)
         if response is None:
             raise CartesianPlanningError(
                 'MoveIt returned no Cartesian path response'
@@ -1180,11 +1349,37 @@ class ContainerPickCoordinator(Node):
                 'Cartesian planning failed: '
                 f'code={response.error_code.val}, message={detail}'
             )
-        if response.fraction < self.cartesian_min_fraction:
+        if not cartesian_path_acceptable(
+            response.fraction,
+            requested_distance,
+            self.cartesian_min_fraction,
+            self.cartesian_absolute_min_fraction,
+            self.cartesian_max_shortfall,
+        ):
+            diagnostics = self._diagnose_cartesian_limits(request)
+            distance_detail = ''
+            if requested_distance is not None:
+                shortfall_mm = (
+                    requested_distance * (1.0 - response.fraction) * 1000.0
+                )
+                distance_detail = (
+                    f', shortfall={shortfall_mm:.1f}mm exceeds '
+                    f'{self.cartesian_max_shortfall * 1000.0:.1f}mm'
+                )
             raise CartesianPlanningError(
                 'Cartesian path rejected: '
                 f'fraction={response.fraction:.3f} is below '
-                f'{self.cartesian_min_fraction:.3f}'
+                f'{self.cartesian_min_fraction:.3f}{distance_detail}; '
+                f'{diagnostics}'
+            )
+        if response.fraction < self.cartesian_min_fraction:
+            shortfall_mm = (
+                requested_distance * (1.0 - response.fraction) * 1000.0
+            )
+            self.publish_status(
+                'PICK: accepting bounded Cartesian shortfall: '
+                f'fraction={response.fraction:.3f}, '
+                f'shortfall={shortfall_mm:.1f}mm'
             )
         if not response.solution.joint_trajectory.points:
             raise CartesianPlanningError(
@@ -1228,6 +1423,64 @@ class ContainerPickCoordinator(Node):
         finally:
             with self.moveit_goal_lock:
                 self.current_moveit_goal = None
+
+    def _cartesian_request_distance(self, target):
+        """Return current TCP-to-target distance, or None if TF is absent."""
+        try:
+            current = self.buffer.lookup_transform(
+                target.header.frame_id,
+                self.moveit_ee_link,
+                Time(),
+            )
+        except TransformException as exc:
+            self.get_logger().warning(
+                f'Cannot bound Cartesian shortfall without TCP TF: {exc}'
+            )
+            return None
+        current_xyz = np.array([
+            current.transform.translation.x,
+            current.transform.translation.y,
+            current.transform.translation.z,
+        ])
+        target_xyz = np.array([
+            target.pose.position.x,
+            target.pose.position.y,
+            target.pose.position.z,
+        ])
+        return float(np.linalg.norm(target_xyz - current_xyz))
+
+    def _compute_cartesian_path(self, request):
+        """Call MoveIt's Cartesian planner and return its response."""
+        path_future = self.cartesian_path_client.call_async(request)
+        self._wait_future(path_future, self.moveit_planning_time + 5.0)
+        return path_future.result()
+
+    def _diagnose_cartesian_limits(self, safe_request):
+        """Plan unsafe diagnostic variants without executing any of them."""
+        variants = (
+            ('no_collision', False, self.cartesian_joint_jump),
+            ('no_joint_jump', True, 0.0),
+            ('ik_only', False, 0.0),
+        )
+        results = []
+        for name, avoid_collisions, joint_jump in variants:
+            request = copy.deepcopy(safe_request)
+            request.avoid_collisions = avoid_collisions
+            request.revolute_jump_threshold = joint_jump
+            try:
+                response = self._compute_cartesian_path(request)
+            except Exception as exc:
+                results.append(f'{name}=error({exc})')
+                continue
+            if response is None:
+                results.append(f'{name}=no_response')
+            elif response.error_code.val != MoveItErrorCodes.SUCCESS:
+                results.append(
+                    f'{name}=error_code({response.error_code.val})'
+                )
+            else:
+                results.append(f'{name}={response.fraction:.3f}')
+        return 'diagnostic plan-only fractions: ' + ', '.join(results)
 
     def move_adaptive_cartesian_lift(self, grasp):
         """Execute the largest fully feasible vertical lift."""

@@ -36,7 +36,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'goal_correction_speed', default_value='50'
         ),
-        DeclareLaunchArgument('goal_tolerance_deg', default_value='3.0'),
+        DeclareLaunchArgument('goal_tolerance_deg', default_value='2.5'),
         DeclareLaunchArgument('goal_timeout_sec', default_value='15.0'),
         DeclareLaunchArgument('use_rviz', default_value='true'),
     ]
@@ -81,6 +81,7 @@ def generate_launch_description():
                 LaunchConfiguration('goal_correction_speed'), value_type=int
             ),
             'goal_correction_period_sec': 1.0,
+            'gripper_speed': 50,
         }],
     )
     camera = IncludeLaunchDescription(

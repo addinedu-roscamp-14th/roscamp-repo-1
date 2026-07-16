@@ -1,4 +1,4 @@
-"""Launch JetCobot model TF, gripper ArUco tracking and easy_handeye2."""
+"""Launch manual Eye-in-Hand calibration with a ChArUco board."""
 
 from pathlib import Path
 
@@ -14,20 +14,29 @@ from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
-    """Create the manual Eye-in-Hand calibration graph."""
+    """Create the robot, ChArUco tracker and easy_handeye2 graph."""
     arm_share = Path(get_package_share_directory('arm'))
     handeye_share = Path(get_package_share_directory('easy_handeye2'))
-
     arguments = [
         DeclareLaunchArgument('video_device', default_value='/dev/video4'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm/gripper_camera_info.yaml',
         ),
-        DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.02'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
-        DeclareLaunchArgument('name', default_value='jetcobot_eye_in_hand'),
+        DeclareLaunchArgument('squares_x', default_value='5'),
+        DeclareLaunchArgument('squares_y', default_value='7'),
+        DeclareLaunchArgument('square_length_m', default_value='0.025'),
+        DeclareLaunchArgument('marker_length_m', default_value='0.018'),
+        DeclareLaunchArgument(
+            'minimum_charuco_corners', default_value='8'
+        ),
+        DeclareLaunchArgument(
+            'max_reprojection_error_px', default_value='1.0'
+        ),
+        DeclareLaunchArgument(
+            'name', default_value='jetcobot_eye_in_hand_charuco'
+        ),
         DeclareLaunchArgument(
             'calibration_directory', default_value='config/arm'
         ),
@@ -41,7 +50,6 @@ def generate_launch_description():
             'tracking_marker_frame', default_value='arm/handeye_target'
         ),
     ]
-
     robot_model = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             str(arm_share / 'launch' / 'robot_tf.launch.py')
@@ -50,18 +58,26 @@ def generate_launch_description():
             'start_hardware_joint_publisher': 'false',
         }.items(),
     )
-    gripper_aruco = IncludeLaunchDescription(
+    gripper_charuco = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            str(arm_share / 'launch' / 'gripper_aruco.launch.py')
+            str(arm_share / 'launch' / 'gripper_charuco.launch.py')
         ),
         launch_arguments={
             'video_device': LaunchConfiguration('video_device'),
             'camera_info_url': LaunchConfiguration('camera_info_url'),
             'camera_frame_id': LaunchConfiguration('tracking_base_frame'),
-            'marker_frame_id': LaunchConfiguration('tracking_marker_frame'),
-            'marker_id': LaunchConfiguration('marker_id'),
-            'marker_size_m': LaunchConfiguration('marker_size_m'),
+            'board_frame_id': LaunchConfiguration('tracking_marker_frame'),
             'dictionary': LaunchConfiguration('dictionary'),
+            'squares_x': LaunchConfiguration('squares_x'),
+            'squares_y': LaunchConfiguration('squares_y'),
+            'square_length_m': LaunchConfiguration('square_length_m'),
+            'marker_length_m': LaunchConfiguration('marker_length_m'),
+            'minimum_charuco_corners': LaunchConfiguration(
+                'minimum_charuco_corners'
+            ),
+            'max_reprojection_error_px': LaunchConfiguration(
+                'max_reprojection_error_px'
+            ),
         }.items(),
     )
     easy_handeye = IncludeLaunchDescription(
@@ -81,21 +97,15 @@ def generate_launch_description():
             ),
         }.items(),
     )
-
-    use_system_opencv = SetEnvironmentVariable(
-        'PYTHONNOUSERSITE', '1'
-    )
+    use_system_opencv = SetEnvironmentVariable('PYTHONNOUSERSITE', '1')
     use_project_calibrations = SetEnvironmentVariable(
         'EASY_HANDEYE2_CALIBRATIONS_DIRECTORY',
         LaunchConfiguration('calibration_directory'),
     )
-
-    return LaunchDescription(
-        arguments + [
-            use_system_opencv,
-            use_project_calibrations,
-            robot_model,
-            gripper_aruco,
-            easy_handeye,
-        ]
-    )
+    return LaunchDescription(arguments + [
+        use_system_opencv,
+        use_project_calibrations,
+        robot_model,
+        gripper_charuco,
+        easy_handeye,
+    ])
