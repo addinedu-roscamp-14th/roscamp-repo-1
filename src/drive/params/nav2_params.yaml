@@ -27,14 +27,14 @@ amcl:
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
-    sigma_hit: 0.2
+    sigma_hit: 0.15
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.05
-    update_min_d: 0.05
-    z_hit: 0.5
+    update_min_a: 0.10
+    update_min_d: 0.10
+    z_hit: 0.7
     z_max: 0.05
-    z_rand: 0.5
+    z_rand: 0.3
     z_short: 0.05
     scan_topic: scan
     set_initial_pose: true
@@ -182,11 +182,11 @@ local_costmap:
       height: 3
       resolution: 0.01
       #robot_radius: 0.22
-      footprint: '[[0.172, 0.069], [0.172, -0.069], [-0.04, -0.069], [-0.04, 0.069]]'
+      footprint: '[[0.274, 0.069], [0.274, -0.069], [-0.04, -0.069], [-0.04, 0.069]]'
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 10.0
+        cost_scaling_factor: 5.0
         inflation_radius: 1.0
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
@@ -222,7 +222,7 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_footprint
       #robot_radius: 0.22
-      footprint: '[[0.172, 0.069], [0.172, -0.069], [-0.04, -0.069], [-0.04, 0.069]]'
+      footprint: '[[0.274, 0.069], [0.274, -0.069], [-0.04, -0.069], [-0.04, 0.069]]'
       resolution: 0.01
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -251,7 +251,7 @@ global_costmap:
         transform_tolerance: 0.2
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 20.0
+        cost_scaling_factor: 5.0
         inflation_radius: 1.0
       always_send_full_costmap: True
 
