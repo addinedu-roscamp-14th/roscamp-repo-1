@@ -4,7 +4,9 @@
 
     <arg name="namespace" default=""/>
     <arg name="yaml_filename" default=""/>
-    <arg name="map" default="$(env HOME)/poter_ws/config/SLAM/current_map.yaml"/>
+    <arg name="workspace" default="$(env HOME)/poter_ws"/>
+    <arg name="map" default="$(var workspace)/config/SLAM/current_map.yaml"/>
+    <arg name="keepout_mask" default="$(var workspace)/config/SLAM/keepout_mask.yaml"/>
     <arg name="use_sim_time" default="false"/>
     <arg name="params_file" default="$(find-pkg-share drive)/params/nav2_params.yaml"/>
     <arg name="autostart" default="true"/>
@@ -12,13 +14,30 @@
     <arg name="use_composition" default="False"/>
     <arg name="use_respawn" default="False"/>
     <arg name="log_level" default="info"/>
-    <arg name="lifecycle_nodes" default="['map_server', 'amcl']"/>
+    <arg name="lifecycle_nodes" default="['map_server', 'filter_mask_server', 'costmap_filter_info_server', 'amcl']"/>
 
     <load_composable_node target="$(var container_name)" if="$(var use_composition)">    
         <composable_node pkg="nav2_map_server" plugin="nav2_map_server::MapServer" name="map_server">            
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
             <param name='yaml_filename' value="$(var map)"/>
+
+            <remap from="/tf" to="tf"/>
+            <remap from="/tf_static" to="tf_static"/>
+        </composable_node>
+
+        <composable_node pkg="nav2_map_server" plugin="nav2_map_server::MapServer" name="filter_mask_server">
+            <param from="$(var params_file)"/>
+            <param name='yaml_filename' value="$(var keepout_mask)"/>
+            <param name='use_sim_time' value="$(var use_sim_time)"/>
+
+            <remap from="/tf" to="tf"/>
+            <remap from="/tf_static" to="tf_static"/>
+        </composable_node>
+
+        <composable_node pkg="nav2_map_server" plugin="nav2_map_server::CostmapFilterInfoServer" name="costmap_filter_info_server">
+            <param from="$(var params_file)"/>
+            <param name='use_sim_time' value="$(var use_sim_time)"/>
 
             <remap from="/tf" to="tf"/>
             <remap from="/tf_static" to="tf_static"/>
@@ -49,6 +68,29 @@
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
             
+
+            <remap from="/tf" to="tf"/>
+            <remap from="/tf_static" to="tf_static"/>
+        </node>
+
+        <node pkg="nav2_map_server" exec="map_server" name='filter_mask_server' output="screen">
+            <param from="$(var params_file)"/>
+            <param name='yaml_filename' value="$(var keepout_mask)"/>
+            <param name='respawn' value="$(var use_respawn)"/>
+            <param name='respawn_delay' value="2.0"/>
+            <param name='log_level' value="$(var log_level)"/>
+            <param name='use_sim_time' value="$(var use_sim_time)"/>
+
+            <remap from="/tf" to="tf"/>
+            <remap from="/tf_static" to="tf_static"/>
+        </node>
+
+        <node pkg="nav2_map_server" exec="costmap_filter_info_server" name='costmap_filter_info_server' output="screen">
+            <param from="$(var params_file)"/>
+            <param name='respawn' value="$(var use_respawn)"/>
+            <param name='respawn_delay' value="2.0"/>
+            <param name='log_level' value="$(var log_level)"/>
+            <param name='use_sim_time' value="$(var use_sim_time)"/>
 
             <remap from="/tf" to="tf"/>
             <remap from="/tf_static" to="tf_static"/>

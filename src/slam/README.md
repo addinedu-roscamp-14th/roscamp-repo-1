@@ -70,10 +70,11 @@ scan_topic: /scan
 ## 지도 저장
 
 워크스페이스의 `config/SLAM/current_map.yaml`과 `current_map.pgm`으로 저장합니다.
+워크스페이스 위치가 다르면 `$HOME/poter_ws` 대신 실제 경로를 사용합니다.
 
 ```bash
 ros2 run nav2_map_server map_saver_cli \
-  -f /home/jio/poter_ws/config/SLAM/current_map
+  -f $HOME/poter_ws/config/SLAM/current_map
 ```
 
 기존 파일을 덮어쓰기 전 필요한 지도인지 확인해야 합니다. 저장 후 calibration에서 사용하는

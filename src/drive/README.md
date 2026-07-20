@@ -12,7 +12,7 @@ launch/localization_launch.xml       # map server와 AMCL
 launch/navigation_launch.xml         # planner, controller와 Nav2 서버
 launch/nav2_view.launch.xml          # Nav2 RViz 화면
 launch/target_map_pose_nav.launch.xml # 중앙 목표를 Nav2 action으로 전달
-launch/target_map_waypoints_nav.launch.xml # 중앙 웨이포인트를 순서대로 전달
+launch/target_waypoints_nav.launch.xml # 여러 중앙 목표를 Nav2 through-poses action으로 전달
 params/nav2_params.yaml              # AMCL, costmap, planner/controller 설정
 behavior_trees/                      # NavigateToPose Behavior Tree
 rviz/                                # RViz 설정
@@ -31,16 +31,18 @@ rviz/                                # RViz 설정
 
 새 목표가 들어오면 진행 중인 이전 목표를 취소하고 새 목표를 전송합니다.
 
-### `target_map_waypoints_to_nav_goal`
+### `target_waypoints_to_nav_goal`
 
-중앙에서 확정한 여러 map 자세를 Nav2 `NavigateThroughPoses` goal로 전달합니다. 중간
-웨이포인트는 다음 지점을 향하는 자동 헤딩을 사용하고 최종 목적지만 사용자가 지정한
-헤딩을 사용합니다.
+중앙에서 발행한 map 기준 여러 목표 위치를 Nav2 `NavigateThroughPoses` goal로 전달합니다.
 
 ```text
-입력: /central/target_map_waypoints (nav_msgs/Path)
+입력: /central/target_map_poses (geometry_msgs/PoseArray)
+입력: /central/target_map_path (nav_msgs/Path)
 출력: navigate_through_poses (nav2_msgs/action/NavigateThroughPoses)
 ```
+
+두 입력 중 하나만 발행하면 됩니다. 새 waypoint 묶음이 들어오면 진행 중인 이전 waypoint
+goal을 취소하고 새 묶음을 전송합니다.
 
 ### `send_nav_goal`
 
@@ -82,12 +84,15 @@ ros2 launch pinky bringup_robot.launch.xml
 
 ### 2. 노트북에서 Nav2 실행
 
-기본 지도는 `~/poter_ws/config/SLAM/current_map.yaml`입니다.
+기본 지도는 `~/poter_ws/config/SLAM/current_map.yaml`입니다. 워크스페이스 위치가 다르면
+`workspace:=/path/to/workspace` 또는 `map:=...`으로 지정합니다.
 
 ```bash
 ros2 launch drive bringup_launch.xml \
-  map:=$HOME/poter_ws/config/SLAM/current_map.yaml
+  workspace:=$HOME/poter_ws
 ```
+
+지도 파일만 별도로 지정하려면 `map:=...`과 `keepout_mask:=...`를 사용합니다.
 
 ### 3. 노트북에서 RViz 실행
 
@@ -95,13 +100,13 @@ ros2 launch drive bringup_launch.xml \
 ros2 launch drive nav2_view.launch.xml
 ```
 
-RViz의 RobotModel mesh는 기본적으로 로컬 `~/pinky_pro/install/pinky_description`에서 찾습니다.
+RViz의 RobotModel mesh는 기본적으로 현재 워크스페이스의 `~/poter_ws/install/pinky`에서 찾습니다.
 이 mesh lookup 환경은 `drive` 패키지의 `nav2_view.launch.xml`에서 RViz 프로세스에 직접 적용합니다.
-다른 위치를 쓰는 경우:
+워크스페이스 위치가 다르면:
 
 ```bash
 ros2 launch drive nav2_view.launch.xml \
-  pinky_description_prefix:=$HOME/pinky_pro/install/pinky_description
+  workspace:=/path/to/poter_ws
 ```
 
 RViz 상단의 `2D Pose Estimate`를 선택하고 실제 차량 위치와 방향을 map 위에 지정합니다.
@@ -123,14 +128,14 @@ ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
 중앙 노트북에서 `/central/target_map_pose`가 발행되면 Nav2가 경로를 생성하고 `/cmd_vel`을
 발행합니다. 같은 ROS domain의 차량 bringup이 이 속도 명령을 받아 모터를 제어합니다.
 
-여러 웨이포인트를 순서대로 주행할 때는 단일 목표 브릿지 대신 다음 launch를 실행합니다.
+여러 지점을 한 번에 보내려면 waypoint 브릿지를 실행합니다.
 
 ```bash
-ros2 launch drive target_map_waypoints_nav.launch.xml start_nav2:=false
+ros2 launch drive target_waypoints_nav.launch.xml
 ```
 
-중앙의 `/central/target_map_waypoints`가 발행되면 Nav2
-`navigate_through_poses` 액션으로 전체 목록을 전달합니다.
+중앙 노트북에서 `/central/target_map_poses` 또는 `/central/target_map_path`를 발행하면
+Nav2가 지점 순서대로 통과하는 경로를 생성합니다.
 
 ## 한 번에 실행
 
@@ -139,7 +144,7 @@ ros2 launch drive target_map_waypoints_nav.launch.xml start_nav2:=false
 ```bash
 ros2 launch drive target_map_pose_nav.launch.xml \
   start_nav2:=true \
-  map:=$HOME/poter_ws/config/SLAM/current_map.yaml
+  workspace:=$HOME/poter_ws
 ```
 
 RViz는 별도 터미널에서 실행합니다.
@@ -171,8 +176,6 @@ ros2 run drive send_nav_goal \
 ## 중요 사항
 
 - `/central/target_map_pose`는 이미 `map` 좌표계의 `PoseStamped`이므로 다시 픽셀 변환하면 안 됩니다.
-- `/central/target_map_waypoints`도 이미 `map` 좌표계의 `Path`이므로 다시 픽셀 변환하면 안 됩니다.
-- 단일 목표 브릿지와 웨이포인트 브릿지는 필요한 것 하나만 실행합니다.
 - Nav2 지도와 카메라 calibration에 사용한 지도는 동일해야 합니다.
 - 노트북의 `/cmd_vel`을 차량 bringup이 구독하는지 확인해야 합니다.
 - 차량과 노트북에서 Nav2를 동시에 실행하면 노드, action과 `/cmd_vel`이 충돌합니다.

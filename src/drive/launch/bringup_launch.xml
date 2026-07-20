@@ -3,7 +3,9 @@
     <set_env name="RCUTILS_LOGGING_BUFFERED_STREAM" value="1"/>
 
     <arg name="namespace" default=""/>
-    <arg name="map" default="$(env HOME)/poter_ws/config/SLAM/current_map.yaml"/>
+    <arg name="workspace" default="$(env HOME)/poter_ws"/>
+    <arg name="map" default="$(var workspace)/config/SLAM/current_map.yaml"/>
+    <arg name="keepout_mask" default="$(var workspace)/config/SLAM/keepout_mask.yaml"/>
     <arg name="use_sim_time" default="False"/>
     <arg name="params_file" default="$(find-pkg-share drive)/params/nav2_params.yaml"/>
     <arg name="default_nav_to_pose_bt_xml" default="$(find-pkg-share drive)/behavior_trees/navigate_to_pose_w_replanning_and_recovery_45deg.xml"/>
@@ -12,7 +14,7 @@
     <arg name="use_composition" default="True"/>
     <arg name="use_respawn" default="False"/>
     <arg name="log_level" default="info"/>
-    <arg name="lifecycle_nodes_local" default="['map_server', 'amcl']"/>
+    <arg name="lifecycle_nodes_local" default="['map_server', 'filter_mask_server', 'costmap_filter_info_server', 'amcl']"/>
     <arg name="lifecycle_nodes_nav" default="['controller_server', 'smoother_server', 'planner_server', 'behavior_server', 'bt_navigator', 'waypoint_follower', 'velocity_smoother']"/>
 
     <group>
@@ -28,8 +30,10 @@
         </node>
 
         <include file="$(find-pkg-share drive)/launch/localization_launch.xml">
+            <arg name="workspace" value="$(var workspace)"/>
             <arg name="params_file" value="$(var params_file)"/>
             <arg name="map" value="$(var map)"/>
+            <arg name="keepout_mask" value="$(var keepout_mask)"/>
             <arg name="use_sim_time" value="$(var use_sim_time)"/>
             <arg name="autostart" value="$(var autostart)"/>
             <arg name="use_composition" value="$(var use_composition)"/>
