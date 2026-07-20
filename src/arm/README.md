@@ -55,8 +55,13 @@ arm/
 ```bash
 /usr/bin/python3 -m pip install --user --break-system-packages pymycobot
 ```
+``` bash
+sudo apt update
+sudo apt install ros-jazzy-v4l2-camera
+```
 
-`easy_handeye2`는 Jazzy 바이너리 패키지가 없으므로 소스로 추가합니다.
+
+easy_handeye2`는 Jazzy 바이너리 패키지가 없으므로 소스로 추가합니다.
 
 ```bash
 cd ~/poter_ws/src
@@ -192,11 +197,56 @@ ros2 run tf2_ros tf2_echo \
 로봇팔, 마커와 주변 장비가 충돌하지 않도록 낮은 속도로 이동합니다. `manual_jog`와
 `hardware_joint_state_publisher`는 `/dev/ttyUSB0`을 동시에 열면 안 됩니다.
 
+### ChArUco Board Hand-Eye 보정
+
+현재 보정 보드는 `DICT_4X4_50`, 11x8 squares, checker 15 mm, marker 11 mm이며,
+짝수 행 구형 배열에 맞춰 `legacy_pattern:=true`를 사용합니다.
+노트북에 로봇팔과 그리퍼 카메라를 직접 연결하고 다음을 실행합니다.
+
+```bash
+ros2 launch arm handeye_charuco_calibration.launch.py \
+  video_device:=/dev/video2 \
+  camera_info_url:=config/arm/gripper_camera_info.yaml \
+  dictionary:=DICT_4X4_50 \
+  squares_x:=11 \
+  squares_y:=8 \
+  square_length_m:=0.015 \
+  marker_length_m:=0.011 \
+  legacy_pattern:=true \
+  detection_rate_hz:=5.0 \
+  opencv_num_threads:=1 \
+  minimum_charuco_corners:=6 \
+  max_reprojection_error_px:=3.0 \
+  use_node_time_for_pose:=true \
+  name:=jetcobot_eye_in_hand_charuco \
+  calibration_directory:=config/arm
+```
+
+검출 영상은 `/arm/gripper_camera/charuco_annotated`, pose는
+`/arm/gripper_camera/charuco_pose`에서 확인합니다. 보드를 고정한 상태에서 서로 다른
+위치와 Roll/Pitch/Yaw 자세를 20~30개 수집한 뒤 계산하고 저장합니다. 컨테이너 추적에는
+이 보드 설정이 아니라 기존 `DICT_5X5_50`, ID 0, 15 mm 단일 마커를 계속 사용합니다.
+annotated 영상의 `DETECT markers=N corners=N`과 `POSE OK`로 상태를 확인합니다.
+마커는 검출되지만 `corners=0`이면 출력 보드와 `legacy_pattern` 설정이 서로 다른지
+확인합니다. CPU 부하가 크면 `detection_rate_hz:=3.0`으로 낮춰도 샘플 수집에는
+충분합니다.
+이 launch는 ChArUco 검출 노드에는 사용자 OpenCV 5를 사용하고,
+`calibrateHandEye()`를 실행하는 easy_handeye2 서버에는 시스템 OpenCV 4.6을
+자동으로 사용합니다. 세 번째 샘플부터 보정값을 계산하며, `Take Sample` 서비스와
+TF 상태 확인은 GUI가 멈추지 않도록 비동기로 처리됩니다.
+
 ## 4. 저장한 Hand-Eye TF 사용
 
 ```bash
 ros2 launch arm handeye_publish.launch.py \
-  name:=jetcobot_eye_in_hand
+  name:=jetcobot_eye_in_hand_charuco \
+  calibration_directory:=config/arm
+```
+발행 확인:
+
+```bash
+ros2 run tf2_ros tf2_echo \
+  arm/TCP arm/gripper_camera_optical_frame
 ```
 
 저장된 결과가 발행되면 다음 TF 연결이 완성됩니다.
@@ -371,13 +421,15 @@ launch를 실행합니다.
 ```bash
 ros2 launch arm container_pick_moveit.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
-  video_device:=/dev/video4 \
+  video_device:=/dev/video2 \
+  calibration_name:=jetcobot_eye_in_hand_charuco \
+  use_node_time_for_pose:=true \
   marker_id:=0 \
   marker_size_m:=0.015 \
   serial_port:=/dev/ttyUSB0 \
   trajectory_speed:=100 \
   goal_correction_speed:=100 \
-  goal_tolerance_deg:=3.0 \
+  goal_tolerance_deg:=2.5 \
   goal_timeout_sec:=15.0 \
   use_rviz:=true
 ```
@@ -387,7 +439,7 @@ ros2 launch arm container_pick_moveit.launch.py \
 
 이 launch는 다음을 한 번에 실행합니다.
 
-```text
+```texttext
 MoveIt move_group + RViz
 JetCobot FollowJointTrajectory bridge
 실제 /joint_states 발행
@@ -395,6 +447,71 @@ JetCobot FollowJointTrajectory bridge
 그리퍼 카메라와 ArUco
 저장된 Hand-Eye TF
 container_pick_coordinator (motion_backend=moveit)
+```
+
+### 라즈베리파이 하드웨어와 노트북 MoveIt 분산 실행
+
+로봇팔과 그리퍼 카메라가 라즈베리파이에 연결되어 있으면 위 일체형 launch 대신
+하드웨어와 계획 노드를 나눠 실행합니다. 두 컴퓨터에서 같은 `ROS_DOMAIN_ID`를 사용하고
+`ROS_LOCALHOST_ONLY=0`으로 설정합니다.
+
+라즈베리파이에서 실제 장치 포트를 지정해 실행합니다.
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+export ROS_DOMAIN_ID=10
+export ROS_LOCALHOST_ONLY=0
+
+ros2 launch arm container_pick_hardware.launch.py \
+  camera_info_url:=config/arm/gripper_camera_info.yaml \
+  video_device:=/dev/video4 \
+  use_node_time_for_pose:=true \
+  marker_id:=0 \
+  marker_size_m:=0.015 \
+  serial_port:=/dev/ttyUSB0 \
+  baud_rate:=1000000 \
+  trajectory_speed:=100 \
+  goal_correction_speed:=100 \
+  goal_tolerance_deg:=2.5 \
+  goal_timeout_sec:=15.0
+```
+
+노트북에서는 로컬 카메라와 시리얼 포트를 열지 않는 원격 MoveIt launch를 실행합니다.
+Hand-Eye 보정 파일과 `container_pick.yaml`은 노트북의 `config/arm`에 있어야 합니다.
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+export ROS_DOMAIN_ID=10
+export ROS_LOCALHOST_ONLY=0
+
+ros2 launch arm container_pick_remote.launch.py \
+  calibration_name:=jetcobot_eye_in_hand_charuco \
+  calibration_directory:=config/arm \
+  params_file:=config/arm/container_pick.yaml \
+  use_rviz:=true
+```
+
+지정한 이름의 `.calib` 파일이 없으면 Hand-Eye TF가 끊어져 마커를 검출해도 안정화
+샘플은 수집되지 않습니다.
+
+서비스 호출도 노트북에서 그대로 실행합니다.
+
+```bash
+ros2 service call /arm/preview_pregrasp std_srvs/srv/Trigger '{}'
+ros2 service call /arm/move_to_pregrasp std_srvs/srv/Trigger '{}'
+ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
+ros2 service call /arm/stop_pick std_srvs/srv/Trigger '{}'
+```
+
+실행 전에 노트북에서 원격 하드웨어 인터페이스가 보이는지 확인합니다.
+
+```bash
+ros2 topic echo /joint_states --once
+ros2 action info /arm_group_controller/follow_joint_trajectory
+ros2 service type /arm/gripper/open
+ros2 topic hz /arm/gripper_camera/aruco_pose
 ```
 
 이동 없는 목표 확인, pregrasp 단독 이동을 차례로 검증한 후 전체 Pick을 호출합니다.
@@ -414,11 +531,11 @@ ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
 완화된 실행 조건은 다음과 같습니다.
 
 ```text
-마커 yaw spread: 30도 (전체 회전 spread: 15도)
+마커 yaw spread: 12도 (전체 회전 spread: 10도)
 컨테이너 기준 yaw 변화: 180도 (모든 방향 허용)
-MoveIt 자세 허용오차: 10도
-Cartesian 관절 점프: 20도
-실기기 목표 관절 오차: 3도
+MoveIt 자세 허용오차: 5도
+Cartesian 관절 점프: 15도
+실기기 목표 관절 오차: 2.5도
 실기기 최종 수렴 대기: 15초
 MoveIt 실행 여유: 계획 시간 x 2 + 20초
 ```

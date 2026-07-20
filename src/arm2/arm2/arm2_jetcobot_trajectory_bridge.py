@@ -15,7 +15,7 @@ from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from ._joint_limits import JOINT_LIMITS_DEG
+from .arm2_joint_limits import JOINT_LIMITS_DEG
 
 
 JOINT_NAMES = [f'{index}_Joint' for index in range(1, 7)]
@@ -55,7 +55,7 @@ class JetCobotTrajectoryBridge(Node):
     """Own the robot serial port and expose a trajectory action controller."""
 
     def __init__(self):
-        super().__init__('jetcobot_trajectory_bridge')
+        super().__init__('arm2_jetcobot_trajectory_bridge')
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
         self.declare_parameter('baud_rate', 1000000)
         self.declare_parameter('speed', 10)
@@ -69,6 +69,11 @@ class JetCobotTrajectoryBridge(Node):
         self.declare_parameter('gripper_open_value', 100)
         self.declare_parameter('gripper_closed_value', 20)
         self.declare_parameter('gripper_speed', 50)
+        self.declare_parameter('joint_states_topic', '/arm2/joint_states')
+        self.declare_parameter(
+            'follow_joint_trajectory_action',
+            '/arm2/arm_group_controller/follow_joint_trajectory',
+        )
 
         serial_port = str(self.get_parameter('serial_port').value)
         baud_rate = int(self.get_parameter('baud_rate').value)
@@ -90,6 +95,12 @@ class JetCobotTrajectoryBridge(Node):
         )
         self.goal_correction_period = float(
             self.get_parameter('goal_correction_period_sec').value
+        )
+        self.joint_states_topic = str(
+            self.get_parameter('joint_states_topic').value
+        )
+        self.follow_joint_trajectory_action = str(
+            self.get_parameter('follow_joint_trajectory_action').value
         )
         if not 1 <= self.goal_correction_speed <= 100:
             raise ValueError('goal_correction_speed must be within 1..100')
@@ -113,12 +124,12 @@ class JetCobotTrajectoryBridge(Node):
 
         callback_group = ReentrantCallbackGroup()
         self.joint_state_publisher = self.create_publisher(
-            JointState, '/joint_states', 10
+            JointState, self.joint_states_topic, 10
         )
         self.action_server = ActionServer(
             self,
             FollowJointTrajectory,
-            '/arm_group_controller/follow_joint_trajectory',
+            self.follow_joint_trajectory_action,
             execute_callback=self.execute_trajectory,
             goal_callback=self.accept_goal,
             cancel_callback=self.cancel_goal,
@@ -126,19 +137,19 @@ class JetCobotTrajectoryBridge(Node):
         )
         self.create_service(
             Trigger,
-            '/arm/gripper/open',
+            '/arm2/gripper/open',
             self.open_gripper,
             callback_group=callback_group,
         )
         self.create_service(
             Trigger,
-            '/arm/gripper/close',
+            '/arm2/gripper/close',
             self.close_gripper,
             callback_group=callback_group,
         )
         self.create_service(
             Trigger,
-            '/arm/stop_robot',
+            '/arm2/stop_robot',
             self.stop_robot,
             callback_group=callback_group,
         )
@@ -150,7 +161,8 @@ class JetCobotTrajectoryBridge(Node):
         )
         self.get_logger().info(
             'JetCobot trajectory bridge ready: action='
-            '/arm_group_controller/follow_joint_trajectory, '
+            f'{self.follow_joint_trajectory_action}, '
+            f'joint_states={self.joint_states_topic}, '
             f'port={serial_port}, speed={self.speed}'
         )
 

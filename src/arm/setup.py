@@ -31,6 +31,10 @@ setup(
             'arm.hardware_joint_state_publisher:main',
             'manual_jog = arm.manual_jog:main',
             'aruco_pose_publisher = arm.aruco_pose_publisher:main',
+            'charuco_pose_publisher = '
+            'arm.charuco_pose_publisher:main',
+            'generate_charuco_board = '
+            'arm.charuco_board_generator:main',
             'container_pick_coordinator = '
             'arm.container_pick_coordinator:main',
             'jetcobot_trajectory_bridge = '

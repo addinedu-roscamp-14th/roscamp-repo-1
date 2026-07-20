@@ -1,13 +1,15 @@
-/arm/container_pick_coordinator:
+/arm2/arm2_container_pick_coordinator:
   ros__parameters:
-    base_frame: arm/base_link
-    marker_frame: arm/container_marker
+    base_frame: arm2/base_link
+    marker_frame: arm2/container_marker
 
     # Motion requires the explicit execute_motion launch override.
     execute_motion: false
     motion_backend: direct
     allow_full_pick: true
-    offsets_configured: true
+    # Keep physical motion locked until arm2 Hand-Eye and grasp offsets are
+    # measured on the second robot.
+    offsets_configured: false
     use_marker_rotation_for_grasp: false
     grasp_orientation_mode: marker_yaw
 
@@ -69,7 +71,10 @@
     gripper_speed: 50
 
     moveit_group: arm_group
-    moveit_ee_link: TCP
+    moveit_ee_link: arm2/TCP
+    move_group_action: /arm2/move_action
+    execute_trajectory_action: /arm2/execute_trajectory
+    compute_cartesian_path_service: /arm2/compute_cartesian_path
     moveit_position_tolerance_m: 0.005
     moveit_orientation_tolerance_deg: 5.0
     moveit_planning_time_sec: 10.0
