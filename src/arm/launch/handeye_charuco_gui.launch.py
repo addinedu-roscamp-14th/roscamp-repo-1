@@ -1,4 +1,4 @@
-"""Launch JetCobot model TF, gripper ArUco tracking and easy_handeye2."""
+"""Launch the laptop side of distributed ChArUco Hand-Eye calibration."""
 
 from pathlib import Path
 
@@ -14,20 +14,13 @@ from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
-    """Create the manual Eye-in-Hand calibration graph."""
+    """Start robot TF and easy_handeye2 without opening remote hardware."""
     arm_share = Path(get_package_share_directory('arm'))
     handeye_share = Path(get_package_share_directory('easy_handeye2'))
-
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
         DeclareLaunchArgument(
-            'camera_info_url',
-            default_value='config/arm/gripper_camera_info.yaml',
+            'name', default_value='jetcobot_eye_in_hand_charuco'
         ),
-        DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.02'),
-        DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
-        DeclareLaunchArgument('name', default_value='jetcobot_eye_in_hand'),
         DeclareLaunchArgument(
             'calibration_directory', default_value='config/arm'
         ),
@@ -41,27 +34,12 @@ def generate_launch_description():
             'tracking_marker_frame', default_value='arm/handeye_target'
         ),
     ]
-
     robot_model = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             str(arm_share / 'launch' / 'robot_tf.launch.py')
         ),
         launch_arguments={
             'start_hardware_joint_publisher': 'false',
-        }.items(),
-    )
-    gripper_aruco = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            str(arm_share / 'launch' / 'gripper_aruco.launch.py')
-        ),
-        launch_arguments={
-            'video_device': LaunchConfiguration('video_device'),
-            'camera_info_url': LaunchConfiguration('camera_info_url'),
-            'camera_frame_id': LaunchConfiguration('tracking_base_frame'),
-            'marker_frame_id': LaunchConfiguration('tracking_marker_frame'),
-            'marker_id': LaunchConfiguration('marker_id'),
-            'marker_size_m': LaunchConfiguration('marker_size_m'),
-            'dictionary': LaunchConfiguration('dictionary'),
         }.items(),
     )
     easy_handeye = IncludeLaunchDescription(
@@ -81,21 +59,12 @@ def generate_launch_description():
             ),
         }.items(),
     )
-
-    use_system_opencv = SetEnvironmentVariable(
-        'PYTHONNOUSERSITE', '1'
-    )
-    use_project_calibrations = SetEnvironmentVariable(
-        'EASY_HANDEYE2_CALIBRATIONS_DIRECTORY',
-        LaunchConfiguration('calibration_directory'),
-    )
-
-    return LaunchDescription(
-        arguments + [
-            use_system_opencv,
-            use_project_calibrations,
-            robot_model,
-            gripper_aruco,
-            easy_handeye,
-        ]
-    )
+    return LaunchDescription(arguments + [
+        SetEnvironmentVariable('PYTHONNOUSERSITE', '1'),
+        SetEnvironmentVariable(
+            'EASY_HANDEYE2_CALIBRATIONS_DIRECTORY',
+            LaunchConfiguration('calibration_directory'),
+        ),
+        robot_model,
+        easy_handeye,
+    ])

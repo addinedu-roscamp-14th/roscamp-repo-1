@@ -63,22 +63,22 @@ class ArucoPosePublisher(Node):
     """Estimate a configured marker pose using calibrated camera intrinsics."""
 
     def __init__(self):
-        super().__init__('aruco_pose_publisher')
+        super().__init__('arm2_aruco_pose_publisher')
 
         self.declare_parameter(
-            'image_topic', '/arm/gripper_camera/image_raw'
+            'image_topic', '/arm2/gripper_camera/image_raw'
         )
         self.declare_parameter(
-            'camera_info_topic', '/arm/gripper_camera/camera_info'
+            'camera_info_topic', '/arm2/gripper_camera/camera_info'
         )
         self.declare_parameter(
-            'annotated_topic', '/arm/gripper_camera/aruco_annotated'
+            'annotated_topic', '/arm2/gripper_camera/aruco_annotated'
         )
         self.declare_parameter(
-            'pose_topic', '/arm/gripper_camera/aruco_pose'
+            'pose_topic', '/arm2/gripper_camera/aruco_pose'
         )
         self.declare_parameter('camera_frame_id', '')
-        self.declare_parameter('marker_frame_id', 'arm/container_marker')
+        self.declare_parameter('marker_frame_id', 'arm2/container_marker')
         self.declare_parameter('marker_id', 0)
         self.declare_parameter('marker_size_m', 0.015)
         self.declare_parameter('dictionary', 'DICT_5X5_50')

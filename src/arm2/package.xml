@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>arm</name>
+  <name>arm2</name>
   <version>0.0.0</version>
-  <description>ArUco and MoveIt based container picking for JetCobot</description>
+  <description>Second JetCobot ArUco and MoveIt container picking package</description>
   <maintainer email="jio@todo.todo">jio</maintainer>
   <license>Apache-2.0</license>
 
@@ -20,6 +20,7 @@
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>jetcobot_description</exec_depend>
   <exec_depend>jetcobot_moveit_config</exec_depend>
+  <exec_depend>moveit_configs_utils</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>

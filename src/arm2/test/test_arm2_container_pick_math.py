@@ -1,6 +1,6 @@
 """Tests for container pick transform calculations."""
 
-from arm.container_pick_coordinator import (
+from arm2.arm2_container_pick_coordinator import (
     apply_vertical_pick_offsets,
     cartesian_path_acceptable,
     compose_fixed_base_pose,
