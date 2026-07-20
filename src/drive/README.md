@@ -14,6 +14,8 @@ launch/nav2_view.launch.xml          # Nav2 RViz 화면
 launch/target_map_pose_nav.launch.xml # 중앙 목표를 Nav2 action으로 전달
 launch/target_waypoints_nav.launch.xml # 여러 중앙 목표를 Nav2 through-poses action으로 전달
 params/nav2_params.yaml              # AMCL, costmap, planner/controller 설정
+params/parking_spots.yaml            # 지정 주차 접근 경로와 최종 주차 자세
+action/ParkInSpot.action             # 지정 주차 action 인터페이스
 behavior_trees/                      # NavigateToPose Behavior Tree
 rviz/                                # RViz 설정
 ```
@@ -43,6 +45,23 @@ rviz/                                # RViz 설정
 
 두 입력 중 하나만 발행하면 됩니다. 새 waypoint 묶음이 들어오면 진행 중인 이전 waypoint
 goal을 취소하고 새 묶음을 전송합니다.
+
+### `parking_action_server`
+
+지정한 주차 ID를 읽어 접근 경로를 Nav2 `NavigateToPose` goal로 순차 실행한 뒤, 마지막
+구간은 `/cmd_vel` 후진 제어로 `parked` 위치까지 진입합니다.
+
+```text
+입력: /park_in_spot (drive/action/ParkInSpot)
+입력: /amcl_pose (geometry_msgs/PoseWithCovarianceStamped)
+출력: navigate_to_pose (nav2_msgs/action/NavigateToPose)
+출력: /cmd_vel (geometry_msgs/Twist)
+설정: params/parking_spots.yaml
+```
+
+`approach_path`가 있으면 중간 지점은 yaw 허용 오차를 크게 열고 위치 위주로 통과하며,
+마지막 `approach` 지점에서는 yaw 허용 오차를 다시 좁힙니다. `approach`에서 `parked`
+방향과 크게 어긋나면 후진하지 않고 실패 처리합니다.
 
 ### `send_nav_goal`
 
@@ -136,6 +155,37 @@ ros2 launch drive target_waypoints_nav.launch.xml
 
 중앙 노트북에서 `/central/target_map_poses` 또는 `/central/target_map_path`를 발행하면
 Nav2가 지점 순서대로 통과하는 경로를 생성합니다.
+
+## 지정 주차 실행
+
+Nav2와 AMCL 초기 위치 설정이 끝난 뒤 별도 터미널에서 실행합니다.
+
+```bash
+ros2 run drive parking_action_server
+```
+
+기본 주차 설정 파일은 `src/drive/params/parking_spots.yaml`입니다. 다른 파일을 쓰려면:
+
+```bash
+ros2 run drive parking_action_server --ros-args \
+  -p parking_spots_yaml:=/absolute/path/to/parking_spots.yaml
+```
+
+주차 action 전송:
+
+```bash
+ros2 action send_goal /park_in_spot drive/action/ParkInSpot \
+  "{spot_id: park_red}" --feedback
+```
+
+주요 파라미터:
+
+```text
+reverse_speed: 0.0525              # [m/s] 마지막 후진 속도
+parked_xy_tolerance: 0.035         # [m] parked 도착 판정
+approach_xy_tolerance: 0.05        # [m] approach 위치 확인
+strict_yaw_goal_tolerance: 0.05    # [rad] 최종 approach yaw 허용 오차
+```
 
 ## 한 번에 실행
 
