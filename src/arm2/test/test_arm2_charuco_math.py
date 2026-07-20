@@ -1,6 +1,6 @@
 """Tests for ChArUco board geometry helpers."""
 
-from arm.charuco_pose_publisher import (
+from arm2.arm2_charuco_pose_publisher import (
     board_chessboard_corners,
     charuco_drawing_arrays,
     create_charuco_board,

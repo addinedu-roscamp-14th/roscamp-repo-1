@@ -15,13 +15,13 @@ from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
     """Create the robot, ChArUco tracker and easy_handeye2 graph."""
-    arm_share = Path(get_package_share_directory('arm'))
+    arm_share = Path(get_package_share_directory('arm2'))
     handeye_share = Path(get_package_share_directory('easy_handeye2'))
     arguments = [
         DeclareLaunchArgument('video_device', default_value='/dev/video4'),
         DeclareLaunchArgument(
             'camera_info_url',
-            default_value='config/arm/gripper_camera_info.yaml',
+            default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('dictionary', default_value='DICT_4X4_50'),
         DeclareLaunchArgument('squares_x', default_value='11'),
@@ -41,24 +41,24 @@ def generate_launch_description():
             'use_node_time_for_pose', default_value='true'
         ),
         DeclareLaunchArgument(
-            'name', default_value='jetcobot_eye_in_hand_charuco'
+            'name', default_value='arm2_jetcobot_eye_in_hand_charuco'
         ),
         DeclareLaunchArgument(
-            'calibration_directory', default_value='config/arm'
+            'calibration_directory', default_value='config/arm2'
         ),
-        DeclareLaunchArgument('robot_base_frame', default_value='arm/base_link'),
-        DeclareLaunchArgument('robot_effector_frame', default_value='arm/TCP'),
+        DeclareLaunchArgument('robot_base_frame', default_value='arm2/base_link'),
+        DeclareLaunchArgument('robot_effector_frame', default_value='arm2/TCP'),
         DeclareLaunchArgument(
             'tracking_base_frame',
-            default_value='arm/gripper_camera_optical_frame',
+            default_value='arm2/gripper_camera_optical_frame',
         ),
         DeclareLaunchArgument(
-            'tracking_marker_frame', default_value='arm/handeye_target'
+            'tracking_marker_frame', default_value='arm2/handeye_target'
         ),
     ]
     robot_model = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            str(arm_share / 'launch' / 'robot_tf.launch.py')
+            str(arm_share / 'launch' / 'arm2_robot_tf.launch.py')
         ),
         launch_arguments={
             'start_hardware_joint_publisher': 'false',
@@ -66,7 +66,7 @@ def generate_launch_description():
     )
     gripper_charuco = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            str(arm_share / 'launch' / 'gripper_charuco.launch.py')
+            str(arm_share / 'launch' / 'arm2_gripper_charuco.launch.py')
         ),
         launch_arguments={
             'video_device': LaunchConfiguration('video_device'),

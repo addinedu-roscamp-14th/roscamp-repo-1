@@ -27,14 +27,14 @@ def generate_launch_description():
         DeclareLaunchArgument('video_device', default_value='/dev/video4'),
         DeclareLaunchArgument(
             'camera_info_url',
-            default_value='config/arm/gripper_camera_info.yaml',
+            default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument(
             'camera_frame_id',
-            default_value='arm/gripper_camera_optical_frame',
+            default_value='arm2/gripper_camera_optical_frame',
         ),
         DeclareLaunchArgument(
-            'board_frame_id', default_value='arm/handeye_target'
+            'board_frame_id', default_value='arm2/handeye_target'
         ),
         DeclareLaunchArgument('dictionary', default_value='DICT_4X4_50'),
         DeclareLaunchArgument('squares_x', default_value='11'),
@@ -58,7 +58,7 @@ def generate_launch_description():
     camera = Node(
         package='v4l2_camera',
         executable='v4l2_camera_node',
-        namespace='arm/gripper_camera',
+        namespace='arm2/gripper_camera',
         name='camera',
         output='screen',
         parameters=[{
@@ -74,10 +74,10 @@ def generate_launch_description():
         }],
     )
     detector = Node(
-        package='arm',
-        executable='charuco_pose_publisher',
-        name='charuco_pose_publisher',
-        namespace='arm',
+        package='arm2',
+        executable='arm2_charuco_pose_publisher',
+        name='arm2_charuco_pose_publisher',
+        namespace='arm2',
         output='screen',
         parameters=[{
             'camera_frame_id': LaunchConfiguration('camera_frame_id'),

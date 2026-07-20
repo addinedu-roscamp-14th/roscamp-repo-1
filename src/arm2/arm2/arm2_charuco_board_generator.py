@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from .charuco_pose_publisher import create_charuco_board
+from .arm2_charuco_pose_publisher import create_charuco_board
 
 
 def generate_board_image(board, board_size_px, margin_px):
@@ -33,7 +33,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--output',
-        default='config/arm/charuco_11x8_15mm_11mm.png',
+        default='config/arm2/arm2_charuco_11x8_15mm_11mm.png',
     )
     parser.add_argument('--dictionary', default='DICT_4X4_50')
     parser.add_argument('--squares-x', type=int, default=11)

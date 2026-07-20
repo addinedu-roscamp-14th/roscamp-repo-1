@@ -13,7 +13,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import TransformBroadcaster
 
-from .aruco_pose_publisher import (
+from .arm2_aruco_pose_publisher import (
     ArucoPosePublisher,
     rotation_matrix_to_quaternion,
 )
@@ -113,21 +113,21 @@ class CharucoPosePublisher(Node):
     """Estimate a ChArUco board pose using calibrated camera intrinsics."""
 
     def __init__(self):
-        super().__init__('charuco_pose_publisher')
+        super().__init__('arm2_charuco_pose_publisher')
         self.declare_parameter(
-            'image_topic', '/arm/gripper_camera/image_raw'
+            'image_topic', '/arm2/gripper_camera/image_raw'
         )
         self.declare_parameter(
-            'camera_info_topic', '/arm/gripper_camera/camera_info'
+            'camera_info_topic', '/arm2/gripper_camera/camera_info'
         )
         self.declare_parameter(
-            'annotated_topic', '/arm/gripper_camera/charuco_annotated'
+            'annotated_topic', '/arm2/gripper_camera/charuco_annotated'
         )
         self.declare_parameter(
-            'pose_topic', '/arm/gripper_camera/charuco_pose'
+            'pose_topic', '/arm2/gripper_camera/charuco_pose'
         )
         self.declare_parameter('camera_frame_id', '')
-        self.declare_parameter('board_frame_id', 'arm/handeye_target')
+        self.declare_parameter('board_frame_id', 'arm2/handeye_target')
         self.declare_parameter('dictionary', 'DICT_4X4_50')
         self.declare_parameter('squares_x', 11)
         self.declare_parameter('squares_y', 8)

@@ -197,11 +197,56 @@ ros2 run tf2_ros tf2_echo \
 로봇팔, 마커와 주변 장비가 충돌하지 않도록 낮은 속도로 이동합니다. `manual_jog`와
 `hardware_joint_state_publisher`는 `/dev/ttyUSB0`을 동시에 열면 안 됩니다.
 
+### ChArUco Board Hand-Eye 보정
+
+현재 보정 보드는 `DICT_4X4_50`, 11x8 squares, checker 15 mm, marker 11 mm이며,
+짝수 행 구형 배열에 맞춰 `legacy_pattern:=true`를 사용합니다.
+노트북에 로봇팔과 그리퍼 카메라를 직접 연결하고 다음을 실행합니다.
+
+```bash
+ros2 launch arm handeye_charuco_calibration.launch.py \
+  video_device:=/dev/video2 \
+  camera_info_url:=config/arm/gripper_camera_info.yaml \
+  dictionary:=DICT_4X4_50 \
+  squares_x:=11 \
+  squares_y:=8 \
+  square_length_m:=0.015 \
+  marker_length_m:=0.011 \
+  legacy_pattern:=true \
+  detection_rate_hz:=5.0 \
+  opencv_num_threads:=1 \
+  minimum_charuco_corners:=6 \
+  max_reprojection_error_px:=3.0 \
+  use_node_time_for_pose:=true \
+  name:=jetcobot_eye_in_hand_charuco \
+  calibration_directory:=config/arm
+```
+
+검출 영상은 `/arm/gripper_camera/charuco_annotated`, pose는
+`/arm/gripper_camera/charuco_pose`에서 확인합니다. 보드를 고정한 상태에서 서로 다른
+위치와 Roll/Pitch/Yaw 자세를 20~30개 수집한 뒤 계산하고 저장합니다. 컨테이너 추적에는
+이 보드 설정이 아니라 기존 `DICT_5X5_50`, ID 0, 15 mm 단일 마커를 계속 사용합니다.
+annotated 영상의 `DETECT markers=N corners=N`과 `POSE OK`로 상태를 확인합니다.
+마커는 검출되지만 `corners=0`이면 출력 보드와 `legacy_pattern` 설정이 서로 다른지
+확인합니다. CPU 부하가 크면 `detection_rate_hz:=3.0`으로 낮춰도 샘플 수집에는
+충분합니다.
+이 launch는 ChArUco 검출 노드에는 사용자 OpenCV 5를 사용하고,
+`calibrateHandEye()`를 실행하는 easy_handeye2 서버에는 시스템 OpenCV 4.6을
+자동으로 사용합니다. 세 번째 샘플부터 보정값을 계산하며, `Take Sample` 서비스와
+TF 상태 확인은 GUI가 멈추지 않도록 비동기로 처리됩니다.
+
 ## 4. 저장한 Hand-Eye TF 사용
 
 ```bash
 ros2 launch arm handeye_publish.launch.py \
-  name:=jetcobot_eye_in_hand
+  name:=jetcobot_eye_in_hand_charuco \
+  calibration_directory:=config/arm
+```
+발행 확인:
+
+```bash
+ros2 run tf2_ros tf2_echo \
+  arm/TCP arm/gripper_camera_optical_frame
 ```
 
 저장된 결과가 발행되면 다음 TF 연결이 완성됩니다.
@@ -376,7 +421,9 @@ launch를 실행합니다.
 ```bash
 ros2 launch arm container_pick_moveit.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
-  video_device:=/dev/video4 \
+  video_device:=/dev/video2 \
+  calibration_name:=jetcobot_eye_in_hand_charuco \
+  use_node_time_for_pose:=true \
   marker_id:=0 \
   marker_size_m:=0.015 \
   serial_port:=/dev/ttyUSB0 \
@@ -440,15 +487,14 @@ export ROS_DOMAIN_ID=10
 export ROS_LOCALHOST_ONLY=0
 
 ros2 launch arm container_pick_remote.launch.py \
-  calibration_name:=jetcobot_eye_in_hand \
+  calibration_name:=jetcobot_eye_in_hand_charuco \
   calibration_directory:=config/arm \
   params_file:=config/arm/container_pick.yaml \
   use_rviz:=true
 ```
 
-ChArUco 보정을 저장한 이후에만 `calibration_name`을
-`jetcobot_eye_in_hand_charuco`로 변경합니다. 지정한 이름의 `.calib` 파일이 없으면
-Hand-Eye TF가 끊어져 마커를 검출해도 안정화 샘플은 수집되지 않습니다.
+지정한 이름의 `.calib` 파일이 없으면 Hand-Eye TF가 끊어져 마커를 검출해도 안정화
+샘플은 수집되지 않습니다.
 
 서비스 호출도 노트북에서 그대로 실행합니다.
 
