@@ -24,7 +24,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
-from ._joint_limits import JOINT_LIMITS_DEG
+from .arm2_joint_limits import JOINT_LIMITS_DEG
 
 try:
     from moveit_msgs.action import ExecuteTrajectory, MoveGroup
@@ -219,7 +219,7 @@ class ContainerPickCoordinator(Node):
     """Filter marker poses, publish grasp targets, and gate robot execution."""
 
     def __init__(self):
-        super().__init__('container_pick_coordinator')
+        super().__init__('arm2_container_pick_coordinator')
         self._declare_parameters()
         self.base_frame = str(self.get_parameter('base_frame').value)
         self.marker_frame = str(self.get_parameter('marker_frame').value)
@@ -324,6 +324,15 @@ class ContainerPickCoordinator(Node):
         self.moveit_group = str(self.get_parameter('moveit_group').value)
         self.moveit_ee_link = str(
             self.get_parameter('moveit_ee_link').value
+        )
+        self.move_group_action = str(
+            self.get_parameter('move_group_action').value
+        )
+        self.execute_trajectory_action = str(
+            self.get_parameter('execute_trajectory_action').value
+        )
+        self.compute_cartesian_path_service = str(
+            self.get_parameter('compute_cartesian_path_service').value
         )
         self.moveit_position_tolerance = float(
             self.get_parameter('moveit_position_tolerance_m').value
@@ -434,10 +443,10 @@ class ContainerPickCoordinator(Node):
         self.last_status_text = ''
 
         self.status_publisher = self.create_publisher(
-            String, '/arm/container_pick/status', 10
+            String, '/arm2/container_pick/status', 10
         )
         self.marker_pose_publisher = self.create_publisher(
-            PoseStamped, '/arm/container_pick/marker_pose', 10
+            PoseStamped, '/arm2/container_pick/marker_pose', 10
         )
         target_qos = QoSProfile(
             depth=1,
@@ -445,19 +454,19 @@ class ContainerPickCoordinator(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.grasp_pose_publisher = self.create_publisher(
-            PoseStamped, '/arm/container_pick/grasp_pose', target_qos
+            PoseStamped, '/arm2/container_pick/grasp_pose', target_qos
         )
         self.pregrasp_pose_publisher = self.create_publisher(
-            PoseStamped, '/arm/container_pick/pregrasp_pose', target_qos
+            PoseStamped, '/arm2/container_pick/pregrasp_pose', target_qos
         )
-        self.create_service(Trigger, '/arm/pick_container', self.start_pick)
+        self.create_service(Trigger, '/arm2/pick_container', self.start_pick)
         self.create_service(
-            Trigger, '/arm/preview_pregrasp', self.preview_pregrasp
+            Trigger, '/arm2/preview_pregrasp', self.preview_pregrasp
         )
         self.create_service(
-            Trigger, '/arm/move_to_pregrasp', self.start_pregrasp_test
+            Trigger, '/arm2/move_to_pregrasp', self.start_pregrasp_test
         )
-        self.create_service(Trigger, '/arm/stop_pick', self.stop_pick)
+        self.create_service(Trigger, '/arm2/stop_pick', self.stop_pick)
         self.create_timer(0.1, self.update_tracking)
         self.create_timer(1.0, self._republish_status)
 
@@ -474,8 +483,8 @@ class ContainerPickCoordinator(Node):
         )
 
     def _declare_parameters(self):
-        self.declare_parameter('base_frame', 'arm/base_link')
-        self.declare_parameter('marker_frame', 'arm/container_marker')
+        self.declare_parameter('base_frame', 'arm2/base_link')
+        self.declare_parameter('marker_frame', 'arm2/container_marker')
         self.declare_parameter('execute_motion', False)
         self.declare_parameter('motion_backend', 'direct')
         self.declare_parameter('allow_full_pick', False)
@@ -529,7 +538,15 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('gripper_closed_value', 20)
         self.declare_parameter('gripper_speed', 50)
         self.declare_parameter('moveit_group', 'arm_group')
-        self.declare_parameter('moveit_ee_link', 'TCP')
+        self.declare_parameter('moveit_ee_link', 'arm2/TCP')
+        self.declare_parameter('move_group_action', '/arm2/move_action')
+        self.declare_parameter(
+            'execute_trajectory_action', '/arm2/execute_trajectory'
+        )
+        self.declare_parameter(
+            'compute_cartesian_path_service',
+            '/arm2/compute_cartesian_path',
+        )
         self.declare_parameter('moveit_position_tolerance_m', 0.005)
         self.declare_parameter('moveit_orientation_tolerance_deg', 5.0)
         self.declare_parameter('moveit_planning_time_sec', 5.0)
@@ -570,22 +587,22 @@ class ContainerPickCoordinator(Node):
                 'moveit_msgs is unavailable; install ros-jazzy-moveit'
             )
         self.move_group_client = ActionClient(
-            self, MoveGroup, '/move_action'
+            self, MoveGroup, self.move_group_action
         )
         self.execute_trajectory_client = ActionClient(
-            self, ExecuteTrajectory, '/execute_trajectory'
+            self, ExecuteTrajectory, self.execute_trajectory_action
         )
         self.cartesian_path_client = self.create_client(
-            GetCartesianPath, '/compute_cartesian_path'
+            GetCartesianPath, self.compute_cartesian_path_service
         )
         self.gripper_open_client = self.create_client(
-            Trigger, '/arm/gripper/open'
+            Trigger, '/arm2/gripper/open'
         )
         self.gripper_close_client = self.create_client(
-            Trigger, '/arm/gripper/close'
+            Trigger, '/arm2/gripper/close'
         )
         self.stop_robot_client = self.create_client(
-            Trigger, '/arm/stop_robot'
+            Trigger, '/arm2/stop_robot'
         )
 
     def publish_status(self, text):
@@ -825,7 +842,7 @@ class ContainerPickCoordinator(Node):
         if self.execute_motion and not self.allow_full_pick:
             response.success = False
             response.message = (
-                'Full pick is locked; use /arm/move_to_pregrasp'
+                'Full pick is locked; use /arm2/move_to_pregrasp'
             )
             return response
         if self.execute_motion and not self.offsets_configured:
@@ -1181,7 +1198,9 @@ class ContainerPickCoordinator(Node):
 
     def _execute_moveit_pose_goal(self, target):
         if not self.move_group_client.wait_for_server(timeout_sec=5.0):
-            raise RuntimeError('MoveIt /move_action server is unavailable')
+            raise RuntimeError(
+                f'MoveIt {self.move_group_action} server is unavailable'
+            )
 
         target = copy.deepcopy(target)
         # The target is already expressed in base_frame. Plan against the
@@ -1329,7 +1348,8 @@ class ContainerPickCoordinator(Node):
             )
         if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
             raise CartesianPlanningError(
-                'MoveIt /compute_cartesian_path service is unavailable'
+                'MoveIt Cartesian service is unavailable: '
+                f'{self.compute_cartesian_path_service}'
             )
 
         requested_distance = self._cartesian_request_distance(target)
@@ -1404,7 +1424,8 @@ class ContainerPickCoordinator(Node):
             timeout_sec=5.0
         ):
             raise RuntimeError(
-                'MoveIt /execute_trajectory action is unavailable'
+                'MoveIt trajectory action is unavailable: '
+                f'{self.execute_trajectory_action}'
             )
         goal = ExecuteTrajectory.Goal()
         goal.trajectory = response.solution
@@ -1579,7 +1600,7 @@ class ContainerPickCoordinator(Node):
     def joint_state_publisher(self):
         if not hasattr(self, '_joint_state_publisher'):
             self._joint_state_publisher = self.create_publisher(
-                JointState, '/arm/joint_states', 10
+                JointState, '/arm2/joint_states', 10
             )
         return self._joint_state_publisher
 

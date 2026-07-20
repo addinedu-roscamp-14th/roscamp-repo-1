@@ -31,6 +31,10 @@ setup(
             'arm2.hardware_joint_state_publisher:main',
             'arm2_manual_jog = arm2.manual_jog:main',
             'arm2_aruco_pose_publisher = arm2.aruco_pose_publisher:main',
+            'arm2_charuco_pose_publisher = '
+            'arm2.arm2_charuco_pose_publisher:main',
+            'arm2_generate_charuco_board = '
+            'arm2.arm2_charuco_board_generator:main',
             'arm2_container_pick_coordinator = '
             'arm2.container_pick_coordinator:main',
             'arm2_jetcobot_trajectory_bridge = '

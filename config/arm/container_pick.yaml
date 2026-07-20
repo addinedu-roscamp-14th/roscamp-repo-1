@@ -13,23 +13,29 @@
 
     # Fixed-base grasp taught with an aligned container. The 15 mm marker
     # supplies XYZ only because its planar rotation estimate is unstable.
-    grasp_offset_xyz_m: [-0.014261, -0.010785, -0.042962]
+    # Stop 10 mm above the previous grasp target.
+    grasp_offset_xyz_m: [-0.014261, -0.010785, -0.032462]
     grasp_offset_rpy_deg: [-170.530, 8.370, 129.248]
     # Aligned-container marker yaw measured in base_link on 2026-07-15.
     reference_marker_yaw_deg: 29.4
     # Accept every container direction. MoveIt and the Cartesian planner still
     # reject orientations that are physically unreachable or unsafe.
-    max_yaw_spread_deg: 30.0
+    max_yaw_spread_deg: 12.0
     max_container_yaw_delta_deg: 180.0
+    # If full container-yaw following cannot reach the final Z, retain as much
+    # yaw as possible while testing reachable fallback orientations.
+    grasp_yaw_fallback_scales: [0.75, 0.5, 0.25, 0.0]
     pregrasp_lift_m: 0.08
-    # Keep the visual pregrasp unchanged and descend 5 mm deeper only for grasp.
-    grasp_extra_depth_m: 0.005
+    # Use the calibrated nominal grasp depth. Additional descent pushed the
+    # recalibrated target below the base-frame workspace floor.
+    grasp_extra_depth_m: 0.0
     # The wrist camera loses the top marker near grasp. This is safe only while
     # the container remains fixed after its base-frame target is locked.
     refresh_marker_before_descent: false
-    # Use the taught grasp orientation directly. Holding an arbitrary current
-    # orientation near the workspace edge can select an unstable IK branch.
-    pregrasp_test_keep_current_orientation: false
+    # Reach pregrasp XYZ with the current wrist attitude first, then align to
+    # the grasp attitude at the same XYZ. This avoids the straight-arm IK branch
+    # that immediately enters self-collision during vertical descent.
+    pregrasp_test_keep_current_orientation: true
     # Lift 18 cm after closing: previous 8 cm plus 10 cm clearance.
     lift_after_pick_m: 0.18
     minimum_lift_after_pick_m: 0.05
@@ -37,15 +43,21 @@
 
     minimum_stable_samples: 5
     max_translation_std_m: 0.005
-    max_rotation_spread_deg: 15.0
+    max_rotation_spread_deg: 10.0
     dry_run_max_rotation_spread_deg: 30.0
     max_marker_age_sec: 3.0
     stabilization_timeout_sec: 20.0
 
-    # The manually taught grasp TCP is at base Z=0.011 m. With 5 mm extra
-    # depth the requested minimum is approximately 0.006 m.
+    # Never plan a TCP target below this base-frame floor.
     workspace_min_xyz_m: [-0.28, -0.28, 0.005]
     workspace_max_xyz_m: [0.28, 0.28, 0.30]
+    # XY workspace is a bottom/right inverted L: a horizontal bar in
+    # Y <= 0 plus a vertical bar in X >= 0. Bounds are in base_link metres.
+    workspace_xy_shape: inverted_l
+    workspace_horizontal_min_xy_m: [-0.28, -0.28]
+    workspace_horizontal_max_xy_m: [0.28, 0.0]
+    workspace_vertical_min_xy_m: [0.0, -0.28]
+    workspace_vertical_max_xy_m: [0.28, 0.28]
     max_joint_delta_deg: 60.0
 
     serial_port: /dev/ttyUSB0
@@ -54,23 +66,27 @@
     motion_timeout_sec: 30.0
     gripper_open_value: 100
     gripper_closed_value: 20
-    gripper_speed: 30
+    gripper_speed: 50
 
     moveit_group: arm_group
     moveit_ee_link: TCP
     moveit_position_tolerance_m: 0.005
-    moveit_orientation_tolerance_deg: 10.0
+    moveit_orientation_tolerance_deg: 5.0
     moveit_planning_time_sec: 10.0
     moveit_planning_attempts: 20
-    moveit_velocity_scale: 0.1
-    moveit_acceleration_scale: 0.1
+    moveit_velocity_scale: 0.35
+    moveit_acceleration_scale: 0.25
 
     # Pregrasp is planned normally. Grasp descent and lift are Cartesian Z
     # paths with collision checking and joint-jump rejection.
     # Use dense samples near the low-Z workspace boundary. A 5 mm step could
     # produce a large joint change near the grasp.
-    cartesian_max_step_m: 0.002
-    cartesian_min_fraction: 0.98
-    cartesian_max_speed_mps: 0.02
-    cartesian_max_joint_jump_deg: 20.0
-    moveit_state_settle_sec: 0.5
+    cartesian_max_step_m: 0.001
+    # Prefer 97% completion. A path down to 90% is accepted only when the
+    # measured TCP-to-target residual is at most 5 mm.
+    cartesian_min_fraction: 0.97
+    cartesian_absolute_min_fraction: 0.90
+    cartesian_max_shortfall_m: 0.005
+    cartesian_max_speed_mps: 0.04
+    cartesian_max_joint_jump_deg: 15.0
+    moveit_state_settle_sec: 0.2

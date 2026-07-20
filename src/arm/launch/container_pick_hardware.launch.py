@@ -1,4 +1,4 @@
-"""Launch MoveIt-based ArUco container picking on physical JetCobot."""
+"""Launch remote JetCobot hardware and gripper-camera marker tracking."""
 
 from pathlib import Path
 
@@ -12,13 +12,8 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
-    """Create the physical MoveIt pick graph without fake controllers."""
+    """Expose Raspberry Pi camera and robot ports as launch arguments."""
     arm_share = Path(get_package_share_directory('arm'))
-    moveit_share = Path(
-        get_package_share_directory('jetcobot_moveit_config')
-    )
-    default_params = 'config/arm/container_pick.yaml'
-
     arguments = [
         DeclareLaunchArgument('video_device', default_value='/dev/video4'),
         DeclareLaunchArgument(
@@ -27,42 +22,18 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
         DeclareLaunchArgument('marker_size_m', default_value='0.015'),
-        DeclareLaunchArgument(
-            'use_node_time_for_pose', default_value='true'
-        ),
-        DeclareLaunchArgument(
-            'calibration_name', default_value='jetcobot_eye_in_hand'
-        ),
-        DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
+        DeclareLaunchArgument('baud_rate', default_value='1000000'),
         DeclareLaunchArgument('trajectory_speed', default_value='100'),
         DeclareLaunchArgument(
-            'goal_correction_speed', default_value='50'
+            'goal_correction_speed', default_value='100'
         ),
         DeclareLaunchArgument('goal_tolerance_deg', default_value='2.5'),
         DeclareLaunchArgument('goal_timeout_sec', default_value='15.0'),
-        DeclareLaunchArgument('use_rviz', default_value='true'),
-    ]
-
-    moveit = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            str(moveit_share / 'launch' / 'real_planning.launch.py')
+        DeclareLaunchArgument(
+            'use_node_time_for_pose', default_value='true'
         ),
-        launch_arguments={
-            'use_rviz': LaunchConfiguration('use_rviz'),
-        }.items(),
-    )
-    tcp_alias = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='moveit_tcp_to_arm_tcp',
-        arguments=[
-            '--x', '0', '--y', '0', '--z', '0',
-            '--roll', '0', '--pitch', '0', '--yaw', '0',
-            '--frame-id', 'TCP', '--child-frame-id', 'arm/TCP',
-        ],
-        output='screen',
-    )
+    ]
     bridge = Node(
         package='arm',
         executable='jetcobot_trajectory_bridge',
@@ -71,6 +42,9 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'serial_port': LaunchConfiguration('serial_port'),
+            'baud_rate': ParameterValue(
+                LaunchConfiguration('baud_rate'), value_type=int
+            ),
             'speed': ParameterValue(
                 LaunchConfiguration('trajectory_speed'), value_type=int
             ),
@@ -102,35 +76,4 @@ def generate_launch_description():
             ),
         }.items(),
     )
-    handeye = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            str(arm_share / 'launch' / 'handeye_publish.launch.py')
-        ),
-        launch_arguments={
-            'name': LaunchConfiguration('calibration_name'),
-        }.items(),
-    )
-    coordinator = Node(
-        package='arm',
-        executable='container_pick_coordinator',
-        name='container_pick_coordinator',
-        namespace='arm',
-        output='screen',
-        parameters=[
-            LaunchConfiguration('params_file'),
-            {
-                'base_frame': 'base_link',
-                'execute_motion': True,
-                'motion_backend': 'moveit',
-            },
-        ],
-    )
-
-    return LaunchDescription(arguments + [
-        moveit,
-        tcp_alias,
-        bridge,
-        camera,
-        handeye,
-        coordinator,
-    ])
+    return LaunchDescription(arguments + [bridge, camera])
