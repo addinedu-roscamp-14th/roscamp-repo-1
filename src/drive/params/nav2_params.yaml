@@ -29,7 +29,7 @@ amcl:
     save_pose_rate: 0.5
     sigma_hit: 0.15
     tf_broadcast: true
-    transform_tolerance: 0.5
+    transform_tolerance: 1.5
     update_min_a: 0.20
     update_min_d: 0.10
     z_hit: 0.7
@@ -117,7 +117,7 @@ controller_server:
       use_collision_detection: true          # 현재 위치부터 주시점(Lookahead)까지 충돌 여부 미리 검사
       max_allowed_time_to_collision_up_to_carrot: 0.5 # 주시점(Carrot)까지 가는 도중 충돌까지 허용되는 최대 시간
       max_robot_pose_search_dist: 1.4875     # [m] 전역 경로 상에서 로봇과 가장 가까운 점을 찾을 때 최대 탐색 거리
-      transform_tolerance: 0.5               # [s] TF(좌표계 변환) 데이터 최대 허용 지연 시간
+      transform_tolerance: 1.5               # [s] TF(좌표계 변환) 데이터 최대 허용 지연 시간
 
       # 취소/종료 시 동작
       use_cancel_deceleration: false         # 내비게이션 취소 명령이 들어왔을 때 팍 멈추지 않고 부드럽게 감속할지
@@ -248,7 +248,7 @@ global_costmap:
         plugin: "nav2_costmap_2d::KeepoutFilter"
         enabled: True
         filter_info_topic: "/costmap_filter_info"
-        transform_tolerance: 0.2
+        transform_tolerance: 1.5
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 5.0
@@ -324,7 +324,7 @@ behavior_server:
     local_frame: odom
     global_frame: map
     robot_base_frame: base_footprint
-    transform_tolerance: 0.1
+    transform_tolerance: 1.5
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
     min_rotational_vel: 0.3

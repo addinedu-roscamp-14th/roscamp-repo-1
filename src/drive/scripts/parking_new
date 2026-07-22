@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import math
+import os
 from pathlib import Path
 import time
 
@@ -66,7 +67,7 @@ def format_pose_target(pose_config):
 
 class ParkingActionServer(Node):
     def __init__(self):
-        super().__init__('parking_action_server')
+        super().__init__('parking_new')
 
         self.declare_parameter('parking_spots_yaml', 'params/parking_spots.yaml')
         self.declare_parameter('nav_action_name', 'navigate_to_pose')
@@ -75,7 +76,8 @@ class ParkingActionServer(Node):
         self.declare_parameter('frame_id', 'map')
         self.declare_parameter('wait_for_nav_timeout_sec', 10.0)
         self.declare_parameter('approach_result_timeout_sec', 120.0)
-        self.declare_parameter('reverse_speed', 0.0525)
+        self.declare_parameter('reverse_speed', 0.095344)
+        self.declare_parameter('reverse_distance_m', 0.476720)
         self.declare_parameter('reverse_control_rate_hz', 10.0)
         self.declare_parameter('reverse_timeout_sec', 20.0)
         self.declare_parameter('parked_xy_tolerance', 0.035)
@@ -83,6 +85,9 @@ class ParkingActionServer(Node):
         self.declare_parameter('waypoint_xy_tolerance', 0.05)
         self.declare_parameter('start_yaw_tolerance', 0.25)
         self.declare_parameter('final_yaw_tolerance', 0.25)
+        self.declare_parameter('auto_pre_approach_distance_m', 0.208096)
+        self.declare_parameter('auto_pre_approach_min_gap_m', 0.05)
+        self.declare_parameter('auto_pre_approach_angle_offset_deg', -35.916590)
         self.declare_parameter('controller_server_name', 'controller_server')
         self.declare_parameter('goal_checker_id', 'general_goal_checker')
         self.declare_parameter('strict_yaw_goal_tolerance', 0.05)
@@ -102,6 +107,10 @@ class ParkingActionServer(Node):
             self.get_parameter('approach_result_timeout_sec').value
         )
         self.reverse_speed = abs(float(self.get_parameter('reverse_speed').value))
+        self.reverse_distance = max(
+            0.0,
+            float(self.get_parameter('reverse_distance_m').value),
+        )
         self.reverse_control_rate = float(
             self.get_parameter('reverse_control_rate_hz').value
         )
@@ -120,6 +129,17 @@ class ParkingActionServer(Node):
         )
         self.final_yaw_tolerance = float(
             self.get_parameter('final_yaw_tolerance').value
+        )
+        self.auto_pre_approach_distance = max(
+            0.0,
+            float(self.get_parameter('auto_pre_approach_distance_m').value),
+        )
+        self.auto_pre_approach_min_gap = max(
+            0.0,
+            float(self.get_parameter('auto_pre_approach_min_gap_m').value),
+        )
+        self.auto_pre_approach_angle_offset = math.radians(
+            float(self.get_parameter('auto_pre_approach_angle_offset_deg').value)
         )
         self.controller_server_name = str(
             self.get_parameter('controller_server_name').value
@@ -159,7 +179,7 @@ class ParkingActionServer(Node):
         )
 
         self.get_logger().info(
-            f'Parking action server ready: /park_in_spot; '
+            f'Parking new action server ready: /park_in_spot; '
             f'spots={sorted(self.spots.keys())}; '
             f'parking_spots_yaml={self.parking_spots_yaml}'
         )
@@ -169,9 +189,14 @@ class ParkingActionServer(Node):
         if path.is_absolute():
             return path
 
+        try:
+            cwd = Path.cwd()
+        except FileNotFoundError:
+            cwd = Path(os.environ.get('HOME', '/')) / 'poter_ws'
+
         candidates = [
-            Path.cwd() / path,
-            Path.cwd() / 'src' / 'drive' / path,
+            cwd / path,
+            cwd / 'src' / 'drive' / path,
             Path(__file__).resolve().parents[1] / path,
             Path(__file__).resolve().parents[2] / 'share' / 'drive' / path,
             Path(__file__).resolve().parents[3] / 'src' / 'drive' / path,
@@ -208,7 +233,6 @@ class ParkingActionServer(Node):
         try:
             approach = self.read_pose_config(spot, 'approach')
             parked = self.read_pose_config(spot, 'parked')
-            approach_path = self.read_approach_path(spot)
         except (KeyError, TypeError, ValueError) as exc:
             return self.abort(goal_handle, f'Invalid parking spot config: {exc}')
 
@@ -221,15 +245,10 @@ class ParkingActionServer(Node):
         if not self.wait_for_pose(goal_handle, timeout_sec=5.0):
             return self.abort(goal_handle, f'No pose received from {self.amcl_pose_topic}')
 
-        if approach_path:
-            reached_approach = self.navigate_approach_path(
-                goal_handle,
-                self.build_full_approach_path(approach_path, approach),
-            )
-        else:
-            if not self.set_yaw_goal_tolerance(self.strict_yaw_goal_tolerance):
-                return self.abort(goal_handle, self.last_error_message)
-            reached_approach = self.navigate_to_approach(goal_handle, approach)
+        reached_approach = self.navigate_approach_path(
+            goal_handle,
+            self.build_full_approach_path(approach),
+        )
 
         if not reached_approach:
             message = self.last_error_message or 'Failed to reach approach pose'
@@ -280,44 +299,34 @@ class ParkingActionServer(Node):
             'yaw': float(pose['yaw']),
         }
 
-    def read_approach_path(self, spot):
-        path = spot.get('approach_path', [])
-        if path is None:
-            return []
-        if not isinstance(path, list):
-            raise ValueError('approach_path must be a list')
-        return [
-            {
-                'x': float(pose['x']),
-                'y': float(pose['y']),
-                'yaw': float(pose['yaw']),
-            }
-            for pose in path
-        ]
+    def build_full_approach_path(self, approach):
+        full_path = []
+        pre_approach = self.build_auto_pre_approach(approach)
+        if pre_approach is not None:
+            full_path.append(pre_approach)
 
-    def build_full_approach_path(self, approach_path, approach):
-        full_path = list(approach_path)
-        if not full_path:
-            return [approach]
-
-        last = full_path[-1]
-        distance_to_approach = math.hypot(
-            last['x'] - approach['x'],
-            last['y'] - approach['y'],
-        )
-        if distance_to_approach > 0.01:
-            full_path.append(approach)
-        else:
-            full_path[-1] = approach
+        full_path.append(approach)
         return full_path
 
-    def navigate_to_approach(self, goal_handle, approach):
-        return self.navigate_to_pose(
-            goal_handle,
-            approach,
-            'approach',
-            self.approach_result_timeout,
+    def build_auto_pre_approach(self, approach):
+        if self.auto_pre_approach_distance <= 0.0:
+            return None
+
+        distance = max(
+            self.auto_pre_approach_distance,
+            self.auto_pre_approach_min_gap,
         )
+        pre_approach_yaw = (
+            approach['yaw'] + math.pi + self.auto_pre_approach_angle_offset
+        )
+        return {
+            'x': approach['x'] + math.cos(pre_approach_yaw) * distance,
+            'y': approach['y'] + math.sin(pre_approach_yaw) * distance,
+            'yaw': approach['yaw'],
+        }
+
+    def pose_distance(self, first, second):
+        return math.hypot(first['x'] - second['x'], first['y'] - second['y'])
 
     def navigate_to_pose(self, goal_handle, pose_config, phase, timeout_sec):
         self.publish_feedback(
@@ -493,6 +502,13 @@ class ParkingActionServer(Node):
         self.publish_feedback(goal_handle, 'reversing', 0.65, target_pose=parked)
         start_time = time.monotonic()
         period = 1.0 / max(self.reverse_control_rate, 1.0)
+        reverse_duration = self.reverse_distance / max(self.reverse_speed, 1e-6)
+        timeout_sec = min(self.reverse_timeout, reverse_duration + period)
+
+        self.get_logger().info(
+            f'Reversing by distance: distance={self.reverse_distance:.3f} m, '
+            f'speed={self.reverse_speed:.4f} m/s, duration={reverse_duration:.2f} s'
+        )
 
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -500,12 +516,12 @@ class ParkingActionServer(Node):
                 goal_handle.canceled()
                 return False
 
-            if self.latest_pose is None:
-                time.sleep(period)
-                continue
+            elapsed = time.monotonic() - start_time
+            if elapsed >= reverse_duration:
+                self.stop_robot()
+                return True
 
-            distance = self.distance_to_parked(parked)
-            progress = max(0.65, min(0.98, 1.0 - distance / 0.35))
+            progress = 0.65 + 0.33 * min(elapsed / max(reverse_duration, 1e-6), 1.0)
             self.publish_feedback(
                 goal_handle,
                 'reversing',
@@ -513,14 +529,11 @@ class ParkingActionServer(Node):
                 target_pose=parked,
             )
 
-            if distance <= self.parked_xy_tolerance:
-                self.stop_robot()
-                return True
-
-            if time.monotonic() - start_time > self.reverse_timeout:
+            if elapsed > timeout_sec:
                 self.stop_robot()
                 self.get_logger().error(
-                    f'Reverse timeout: distance_to_parked={distance:.3f} m'
+                    f'Reverse timeout while driving fixed distance: '
+                    f'elapsed={elapsed:.2f} s, target_duration={reverse_duration:.2f} s'
                 )
                 return False
 
@@ -580,7 +593,13 @@ class ParkingActionServer(Node):
         goal_handle.publish_feedback(feedback)
 
     def stop_robot(self):
-        self.cmd_vel_pub.publish(Twist())
+        if not rclpy.ok():
+            return
+        try:
+            self.cmd_vel_pub.publish(Twist())
+        except Exception as exc:
+            if rclpy.ok():
+                self.get_logger().warning(f'Failed to publish stop command: {exc}')
 
     def abort(self, goal_handle, message):
         self.stop_robot()
