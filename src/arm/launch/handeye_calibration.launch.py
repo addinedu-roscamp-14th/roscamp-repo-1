@@ -19,11 +19,7 @@ def generate_launch_description():
     handeye_share = Path(get_package_share_directory('easy_handeye2'))
 
     arguments = [
-<<<<<<< Updated upstream
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
-=======
         DeclareLaunchArgument('video_device', default_value='/dev/video2'),
->>>>>>> Stashed changes
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm/gripper_camera_info.yaml',

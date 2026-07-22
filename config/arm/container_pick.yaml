@@ -14,13 +14,8 @@
     # Fixed-base grasp taught with an aligned container. The 15 mm marker
     # supplies XYZ only because its planar rotation estimate is unstable.
     # Stop 10 mm above the previous grasp target.
-<<<<<<< Updated upstream
-    grasp_offset_xyz_m: [-0.014261, -0.010785, -0.032462]
-    grasp_offset_rpy_deg: [-170.530, 8.370, 129.248]
-=======
     grasp_offset_xyz_m: [-0.018261, -0.010785, -0.012462]
     grasp_offset_rpy_deg: [-176.75, 2.24, 129.248]
->>>>>>> Stashed changes
     # Aligned-container marker yaw measured in base_link on 2026-07-15.
     reference_marker_yaw_deg: 29.4
     # Accept every container direction. MoveIt and the Cartesian planner still
@@ -33,11 +28,7 @@
     pregrasp_lift_m: 0.08
     # Use the calibrated nominal grasp depth. Additional descent pushed the
     # recalibrated target below the base-frame workspace floor.
-<<<<<<< Updated upstream
-    grasp_extra_depth_m: 0.0
-=======
     grasp_extra_depth_m: 0.015
->>>>>>> Stashed changes
     # The wrist camera loses the top marker near grasp. This is safe only while
     # the container remains fixed after its base-frame target is locked.
     refresh_marker_before_descent: false

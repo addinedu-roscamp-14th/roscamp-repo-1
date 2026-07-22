@@ -266,15 +266,9 @@ class CharucoPosePublisher(Node):
 
     @staticmethod
     def _create_detector_parameters():
-<<<<<<< Updated upstream
-        if hasattr(cv2.aruco, 'DetectorParameters'):
-            return cv2.aruco.DetectorParameters()
-        return cv2.aruco.DetectorParameters_create()
-=======
         if hasattr(cv2.aruco, 'DetectorParameters_create'):
             return cv2.aruco.DetectorParameters_create()
         return cv2.aruco.DetectorParameters()
->>>>>>> Stashed changes
 
     def _configure_detectors(self):
         if hasattr(cv2.aruco, 'CharucoDetector'):

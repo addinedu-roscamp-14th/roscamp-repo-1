@@ -7,10 +7,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     OpaqueFunction,
     SetLaunchConfiguration,
-<<<<<<< Updated upstream
-=======
     TimerAction,
->>>>>>> Stashed changes
 )
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -89,9 +86,5 @@ def generate_launch_description():
     return LaunchDescription(arguments + [
         OpaqueFunction(function=resolve_camera_info_url),
         camera,
-<<<<<<< Updated upstream
-        detector,
-=======
         TimerAction(period=1.5, actions=[detector]),
->>>>>>> Stashed changes
     ])

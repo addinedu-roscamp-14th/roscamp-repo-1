@@ -485,11 +485,7 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('grasp_offset_xyz_m', [0.0, 0.0, 0.0])
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
-<<<<<<< Updated upstream
-        self.declare_parameter('max_yaw_spread_deg', 8.0)
-=======
         self.declare_parameter('max_yaw_spread_deg', 5.0)
->>>>>>> Stashed changes
         self.declare_parameter('max_container_yaw_delta_deg', 90.0)
         self.declare_parameter(
             'grasp_yaw_fallback_scales', [0.75, 0.5, 0.25, 0.0]

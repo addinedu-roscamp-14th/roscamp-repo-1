@@ -61,11 +61,8 @@ class JetCobotTrajectoryBridge(Node):
         self.declare_parameter('speed', 10)
         self.declare_parameter('command_rate_hz', 10.0)
         self.declare_parameter('joint_state_rate_hz', 10.0)
-<<<<<<< Updated upstream
-=======
         self.declare_parameter('joint_states_topic', '/joint_states')
         self.declare_parameter('additional_joint_states_topic', '')
->>>>>>> Stashed changes
         self.declare_parameter('max_start_error_deg', 15.0)
         self.declare_parameter('goal_tolerance_deg', 2.5)
         self.declare_parameter('goal_timeout_sec', 15.0)
@@ -96,15 +93,12 @@ class JetCobotTrajectoryBridge(Node):
         self.goal_correction_period = float(
             self.get_parameter('goal_correction_period_sec').value
         )
-<<<<<<< Updated upstream
-=======
         joint_states_topic = str(
             self.get_parameter('joint_states_topic').value
         )
         additional_joint_states_topic = str(
             self.get_parameter('additional_joint_states_topic').value
         )
->>>>>>> Stashed changes
         if not 1 <= self.goal_correction_speed <= 100:
             raise ValueError('goal_correction_speed must be within 1..100')
         if self.goal_correction_period <= 0.0:
@@ -126,11 +120,6 @@ class JetCobotTrajectoryBridge(Node):
             raise RuntimeError('JetCobot servos are not enabled')
 
         callback_group = ReentrantCallbackGroup()
-<<<<<<< Updated upstream
-        self.joint_state_publisher = self.create_publisher(
-            JointState, '/joint_states', 10
-        )
-=======
         joint_state_topics = [joint_states_topic]
         if (
             additional_joint_states_topic
@@ -142,7 +131,6 @@ class JetCobotTrajectoryBridge(Node):
             for topic in joint_state_topics
         ]
         self.joint_state_publisher = self.joint_state_publishers[0]
->>>>>>> Stashed changes
         self.action_server = ActionServer(
             self,
             FollowJointTrajectory,
@@ -179,12 +167,8 @@ class JetCobotTrajectoryBridge(Node):
         self.get_logger().info(
             'JetCobot trajectory bridge ready: action='
             '/arm_group_controller/follow_joint_trajectory, '
-<<<<<<< Updated upstream
-            f'port={serial_port}, speed={self.speed}'
-=======
             f'port={serial_port}, speed={self.speed}, '
             f'joint_states={joint_state_topics}'
->>>>>>> Stashed changes
         )
 
     def accept_goal(self, goal_request):
@@ -420,12 +404,8 @@ class JetCobotTrajectoryBridge(Node):
         message.position = [math.radians(value) for value in angles]
         message.velocity = [0.0] * len(JOINT_NAMES)
         message.effort = [0.0] * len(JOINT_NAMES)
-<<<<<<< Updated upstream
-        self.joint_state_publisher.publish(message)
-=======
         for publisher in self.joint_state_publishers:
             publisher.publish(message)
->>>>>>> Stashed changes
 
     def open_gripper(self, _request, response):
         return self._set_gripper(True, response)

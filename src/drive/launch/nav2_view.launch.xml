@@ -1,8 +1,11 @@
 <?xml version='1.0' ?>
 
 <launch>
+    <arg name="workspace" default="$(env HOME)/poter_ws"/>
     <arg name="rviz_config_file" default="$(find-pkg-share drive)/rviz/nav2_view.rviz"/>
+    <arg name="pinky_description_prefix" default="$(var workspace)/install/pinky"/>
 
     <node pkg="rviz2" exec="rviz2" output="screen" args="-d $(var rviz_config_file)">
+        <env name="AMENT_PREFIX_PATH" value="$(var pinky_description_prefix):$(env AMENT_PREFIX_PATH)"/>
     </node>
 </launch>    
