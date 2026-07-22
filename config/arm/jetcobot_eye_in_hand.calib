@@ -1,0 +1,20 @@
+parameters:
+  name: jetcobot_eye_in_hand
+  calibration_type: eye_in_hand
+  robot_base_frame: arm/base_link
+  robot_effector_frame: arm/TCP
+  tracking_base_frame: arm/gripper_camera_optical_frame
+  tracking_marker_frame: arm/handeye_target
+  freehand_robot_movement: true
+  move_group_namespace: /
+  move_group: manipulator
+transform:
+  translation:
+    x: 0.00240505
+    y: -0.03810688
+    z: -0.0651153
+  rotation:
+    x: -0.01418806
+    y: -0.00450969
+    z: 0.04197163
+    w: 0.99900788

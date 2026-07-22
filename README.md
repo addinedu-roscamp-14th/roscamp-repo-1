@@ -264,7 +264,7 @@ ros2 launch arm container_pick_moveit.launch.py \
   serial_port:=/dev/ttyUSB0 \
   trajectory_speed:=100 \
   goal_correction_speed:=50 \
-  goal_tolerance_deg:=3.0 \
+  goal_tolerance_deg:=2.5 \
   goal_timeout_sec:=15.0 \
   use_rviz:=true
 ```
@@ -289,6 +289,7 @@ poter_ws/
 │   ├── SLAM/                 # SLAM map yaml/pgm
 │   ├── central/              # calibration 결과 yaml
 │   ├── arm/                  # 그리퍼 카메라 내부 보정
+│   ├── arm2/                 # 두 번째 로봇팔 전용 보정/파지 설정
 │   ├── main_camera/          # camera_info, calibration yaml
 │   └── weights/              # YOLO weight
 │
@@ -300,6 +301,7 @@ poter_ws/
     ├── drive/                # 노트북 Nav2 실행/차량 goal 브릿지
     ├── slam/                 # LiDAR SLAM 지도 작성/저장
     ├── arm/                  # 로봇팔 ArUco 추적/파지 동작 조정
+    ├── arm2/                 # 두 번째 로봇팔용 분리 노드와 launch
     ├── jetcobot_description/ # JetCobot URDF와 mesh
     └── jetcobot_moveit_config/ # MoveIt2 IK/경로 계획 설정
 ```
@@ -315,6 +317,7 @@ poter_ws/
 | `drive` | 단일 목표와 웨이포인트 목록을 차량 Nav2 action으로 전달 | `target_map_pose_to_nav_goal`, `target_map_waypoints_to_nav_goal` |
 | `slam` | 차량의 `/scan`, `/odom`, TF를 사용해 노트북에서 SLAM 지도를 작성 | `slam_toolbox`, mapping RViz |
 | `arm` | ArUco XYZ/yaw 추적, Eye-in-Hand, MoveIt2 정렬, Cartesian 파지와 적응형 상승 | `container_pick_coordinator`, `jetcobot_trajectory_bridge` |
+| `arm2` | 두 번째 JetCobot용 `/arm2` 토픽, TF, 캘리브레이션과 파지 제어 | `arm2_container_pick_coordinator`, `arm2_jetcobot_trajectory_bridge` |
 | `jetcobot_description` | JetCobot의 관절·링크 구조와 시각/충돌 mesh 제공 | `jetcobot.urdf` |
 | `jetcobot_moveit_config` | JetCobot용 KDL IK, 충돌 검사, 경로 계획과 controller action 연결 | `real_planning.launch.py` |
 

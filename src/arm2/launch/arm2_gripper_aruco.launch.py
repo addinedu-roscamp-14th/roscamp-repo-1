@@ -27,17 +27,17 @@ def generate_launch_description():
         DeclareLaunchArgument('video_device', default_value='/dev/video4'),
         DeclareLaunchArgument(
             'camera_info_url',
-            default_value='config/arm/gripper_camera_info.yaml',
+            default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument(
             'camera_frame_id',
-            default_value='arm/gripper_camera_optical_frame',
+            default_value='arm2/gripper_camera_optical_frame',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
         DeclareLaunchArgument('marker_size_m', default_value='0.015'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
-            'marker_frame_id', default_value='arm/container_marker'
+            'marker_frame_id', default_value='arm2/container_marker'
         ),
         DeclareLaunchArgument(
             'use_node_time_for_pose', default_value='true'
@@ -47,7 +47,7 @@ def generate_launch_description():
     camera = Node(
         package='v4l2_camera',
         executable='v4l2_camera_node',
-        namespace='arm/gripper_camera',
+        namespace='arm2/gripper_camera',
         name='camera',
         output='screen',
         parameters=[{
@@ -64,10 +64,10 @@ def generate_launch_description():
     )
 
     detector = Node(
-        package='arm',
-        executable='aruco_pose_publisher',
-        name='aruco_pose_publisher',
-        namespace='arm',
+        package='arm2',
+        executable='arm2_aruco_pose_publisher',
+        name='arm2_aruco_pose_publisher',
+        namespace='arm2',
         output='screen',
         parameters=[{
             'camera_frame_id': LaunchConfiguration('camera_frame_id'),

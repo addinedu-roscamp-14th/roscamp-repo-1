@@ -17,10 +17,10 @@ def generate_launch_description():
     """Include the easy_handeye2 calibration publisher."""
     handeye_share = Path(get_package_share_directory('easy_handeye2'))
     name_argument = DeclareLaunchArgument(
-        'name', default_value='jetcobot_eye_in_hand'
+        'name', default_value='arm2_jetcobot_eye_in_hand'
     )
     directory_argument = DeclareLaunchArgument(
-        'calibration_directory', default_value='config/arm'
+        'calibration_directory', default_value='config/arm2'
     )
     use_project_calibrations = SetEnvironmentVariable(
         'EASY_HANDEYE2_CALIBRATIONS_DIRECTORY',

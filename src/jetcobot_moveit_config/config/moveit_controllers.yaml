@@ -6,7 +6,7 @@ trajectory_execution:
   # The physical bridge may need up to 15 seconds after the nominal trajectory
   # duration for the measured joints to enter the goal tolerance. Include that
   # convergence window so MoveIt does not cancel a robot that is still settling.
-  allowed_start_tolerance: 0.08
+  allowed_start_tolerance: 0.05
   allowed_execution_duration_scaling: 2.0
   allowed_goal_duration_margin: 20.0
 
