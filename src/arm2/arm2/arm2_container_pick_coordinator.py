@@ -48,6 +48,15 @@ class CartesianPlanningError(RuntimeError):
     """A Cartesian request failed before any physical execution started."""
 
 
+class TcpVerificationError(RuntimeError):
+    """Measured TCP pose did not stably reach its requested target."""
+
+    def __init__(self, detail, position_error=None, orientation_error=None):
+        super().__init__(f'TCP target verification failed: {detail}')
+        self.position_error = position_error
+        self.orientation_error = orientation_error
+
+
 def normalize_quaternion(values):
     """Return a normalized XYZW quaternion."""
     quaternion = np.asarray(values, dtype=np.float64)
@@ -124,33 +133,49 @@ def wrap_degrees(angle):
     return (float(angle) + 180.0) % 360.0 - 180.0
 
 
+def wrap_parallel_gripper_degrees(angle):
+    """Choose the shortest equivalent yaw for a 180-degree symmetric jaw."""
+    return (float(angle) + 90.0) % 180.0 - 90.0
+
+
 def compose_yaw_follow_pose(
     marker_translation,
     reference_offset,
     fixed_rpy_degrees,
     marker_yaw_degrees,
     reference_marker_yaw_degrees,
+    rotate_translation_offset=True,
 ):
     """Follow marker yaw while retaining the taught vertical roll/pitch."""
-    yaw_delta = wrap_degrees(
+    object_yaw_delta = wrap_degrees(
         marker_yaw_degrees - reference_marker_yaw_degrees
     )
-    angle = math.radians(yaw_delta)
+    # The marker-to-TCP translation follows the full object rotation. Parallel
+    # jaws have the same gripping axis after 180 degrees, so the wrist uses
+    # the shortest equivalent yaw instead of making an unnecessary half-turn.
+    gripper_yaw_delta = wrap_parallel_gripper_degrees(object_yaw_delta)
+    angle = math.radians(object_yaw_delta)
     cosine, sine = math.cos(angle), math.sin(angle)
     offset = np.asarray(reference_offset, dtype=np.float64)
-    rotated_offset = np.array([
-        cosine * offset[0] - sine * offset[1],
-        sine * offset[0] + cosine * offset[1],
-        offset[2],
-    ])
+    if rotate_translation_offset:
+        rotated_offset = np.array([
+            cosine * offset[0] - sine * offset[1],
+            sine * offset[0] + cosine * offset[1],
+            offset[2],
+        ])
+    else:
+        # A centered top marker has no geometric marker-to-grasp XY lever arm.
+        # Its measured XY offset is a base-frame hand-eye/mechanical bias and
+        # must not rotate when only the container/gripper yaw changes.
+        rotated_offset = offset
     translation = np.asarray(marker_translation) + rotated_offset
     roll, pitch, reference_grasp_yaw = fixed_rpy_degrees
     rotation = quaternion_from_rpy_degrees(
         roll,
         pitch,
-        reference_grasp_yaw + yaw_delta,
+        reference_grasp_yaw + gripper_yaw_delta,
     )
-    return translation, rotation, yaw_delta
+    return translation, rotation, gripper_yaw_delta
 
 
 def apply_vertical_pick_offsets(nominal_grasp, pregrasp_lift, extra_depth):
@@ -245,6 +270,11 @@ class ContainerPickCoordinator(Node):
         self.reference_marker_yaw = float(
             self.get_parameter('reference_marker_yaw_deg').value
         )
+        self.rotate_grasp_xy_offset = bool(
+            self.get_parameter(
+                'rotate_grasp_xy_offset_with_marker'
+            ).value
+        )
         self.max_yaw_spread = float(
             self.get_parameter('max_yaw_spread_deg').value
         )
@@ -265,6 +295,12 @@ class ContainerPickCoordinator(Node):
         self.refresh_marker_before_descent = bool(
             self.get_parameter('refresh_marker_before_descent').value
         )
+        self.visual_refine_max_xy = float(
+            self.get_parameter('visual_refine_max_xy_m').value
+        )
+        self.visual_refine_max_yaw = math.radians(float(
+            self.get_parameter('visual_refine_max_yaw_deg').value
+        ))
         self.pregrasp_test_keep_orientation = bool(
             self.get_parameter(
                 'pregrasp_test_keep_current_orientation'
@@ -373,6 +409,70 @@ class ContainerPickCoordinator(Node):
         self.moveit_state_settle = float(
             self.get_parameter('moveit_state_settle_sec').value
         )
+        self.motion_position_check_tolerance = float(
+            self.get_parameter('motion_position_check_tolerance_m').value
+        )
+        self.pregrasp_position_check_tolerance = float(
+            self.get_parameter(
+                'pregrasp_position_check_tolerance_m'
+            ).value
+        )
+        self.pregrasp_orientation_check_tolerance = math.radians(float(
+            self.get_parameter(
+                'pregrasp_orientation_check_tolerance_deg'
+            ).value
+        ))
+        self.motion_orientation_check_tolerance = math.radians(float(
+            self.get_parameter(
+                'motion_orientation_check_tolerance_deg'
+            ).value
+        ))
+        self.motion_correction_attempts = int(
+            self.get_parameter('motion_correction_attempts').value
+        )
+        self.tcp_verification_samples = int(
+            self.get_parameter('tcp_verification_samples').value
+        )
+        self.tcp_verification_max_spread = float(
+            self.get_parameter('tcp_verification_max_spread_m').value
+        )
+        self.final_grasp_retry_attempts = int(
+            self.get_parameter('final_grasp_retry_attempts').value
+        )
+        self.final_grasp_retry_max_position_error = float(
+            self.get_parameter(
+                'final_grasp_retry_max_position_error_m'
+            ).value
+        )
+        self.final_grasp_retry_max_orientation_error = math.radians(float(
+            self.get_parameter(
+                'final_grasp_retry_max_orientation_error_deg'
+            ).value
+        ))
+        self.initial_pose_xyz = self._vector_parameter(
+            'initial_pose_xyz_m', 3
+        )
+        self.initial_pose_rpy = self._vector_parameter(
+            'initial_pose_rpy_deg', 3
+        )
+        self.initial_pose_rotation = quaternion_from_rpy_degrees(
+            *self.initial_pose_rpy
+        )
+        self.auto_return_after_pick = bool(
+            self.get_parameter('auto_return_after_pick').value
+        )
+        self.auto_return_after_failure = bool(
+            self.get_parameter('auto_return_after_failure').value
+        )
+        self.auto_return_after_pregrasp_test = bool(
+            self.get_parameter('auto_return_after_pregrasp_test').value
+        )
+        self.auto_return_on_startup = bool(
+            self.get_parameter('auto_return_on_startup').value
+        )
+        self.startup_return_poll = float(
+            self.get_parameter('startup_return_poll_sec').value
+        )
 
         if self.minimum_samples < 3:
             raise ValueError('minimum_stable_samples must be at least 3')
@@ -388,6 +488,30 @@ class ContainerPickCoordinator(Node):
             raise ValueError('vertical workspace minimum must be below maximum')
         if self.motion_backend not in ('direct', 'moveit'):
             raise ValueError('motion_backend must be direct or moveit')
+        if self.motion_correction_attempts < 0:
+            raise ValueError('motion_correction_attempts cannot be negative')
+        if self.tcp_verification_samples < 3:
+            raise ValueError('tcp_verification_samples must be at least 3')
+        if self.tcp_verification_max_spread <= 0.0:
+            raise ValueError('tcp_verification_max_spread_m must be positive')
+        if self.pregrasp_orientation_check_tolerance <= 0.0:
+            raise ValueError(
+                'pregrasp_orientation_check_tolerance_deg must be positive'
+            )
+        if self.final_grasp_retry_attempts < 0:
+            raise ValueError('final_grasp_retry_attempts cannot be negative')
+        if self.final_grasp_retry_max_position_error <= 0.0:
+            raise ValueError(
+                'final_grasp_retry_max_position_error_m must be positive'
+            )
+        if self.final_grasp_retry_max_orientation_error <= 0.0:
+            raise ValueError(
+                'final_grasp_retry_max_orientation_error_deg must be positive'
+            )
+        if self.visual_refine_max_xy < 0.0:
+            raise ValueError('visual_refine_max_xy_m cannot be negative')
+        if self.visual_refine_max_yaw < 0.0:
+            raise ValueError('visual_refine_max_yaw_deg cannot be negative')
         if self.grasp_orientation_mode not in (
             'fixed', 'marker_yaw', 'marker_full'
         ):
@@ -431,6 +555,11 @@ class ContainerPickCoordinator(Node):
         self.serial_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.motion_thread = None
+        # Marker samples are only useful while acquiring a target.  Once a
+        # motion starts the wrist camera commonly loses sight of the marker;
+        # repeatedly composing that stale marker stamp with a moving robot TF
+        # produces noisy "extrapolation into the past" warnings.
+        self.target_locked = False
         self.robot = None
         self.move_group_client = None
         self.cartesian_path_client = None
@@ -438,6 +567,8 @@ class ContainerPickCoordinator(Node):
         self.gripper_open_client = None
         self.gripper_close_client = None
         self.stop_robot_client = None
+        self.return_robot_initial_client = None
+        self.return_robot_initial_holding_client = None
         self.current_moveit_goal = None
         self.moveit_goal_lock = threading.Lock()
         self.last_status_text = ''
@@ -466,6 +597,9 @@ class ContainerPickCoordinator(Node):
         self.create_service(
             Trigger, '/arm2/move_to_pregrasp', self.start_pregrasp_test
         )
+        self.create_service(
+            Trigger, '/arm2/return_to_initial', self.start_return_to_initial
+        )
         self.create_service(Trigger, '/arm2/stop_pick', self.stop_pick)
         self.create_timer(0.1, self.update_tracking)
         self.create_timer(1.0, self._republish_status)
@@ -475,6 +609,13 @@ class ContainerPickCoordinator(Node):
             self.create_timer(0.1, self.publish_joint_states)
         elif self.execute_motion:
             self._initialize_moveit_clients()
+
+        self.startup_return_timer = None
+        if self.execute_motion and self.auto_return_on_startup:
+            self.startup_return_timer = self.create_timer(
+                self.startup_return_poll,
+                self._start_startup_return,
+            )
 
         mode = 'EXECUTE' if self.execute_motion else 'DRY-RUN'
         self.publish_status(
@@ -494,6 +635,9 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('grasp_offset_xyz_m', [0.0, 0.0, 0.0])
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
+        self.declare_parameter(
+            'rotate_grasp_xy_offset_with_marker', True
+        )
         self.declare_parameter('max_yaw_spread_deg', 8.0)
         self.declare_parameter('max_container_yaw_delta_deg', 90.0)
         self.declare_parameter(
@@ -502,13 +646,15 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('pregrasp_lift_m', 0.08)
         self.declare_parameter('grasp_extra_depth_m', 0.0)
         self.declare_parameter('refresh_marker_before_descent', True)
+        self.declare_parameter('visual_refine_max_xy_m', 0.020)
+        self.declare_parameter('visual_refine_max_yaw_deg', 15.0)
         self.declare_parameter(
             'pregrasp_test_keep_current_orientation', True
         )
         self.declare_parameter('lift_after_pick_m', 0.08)
         self.declare_parameter('minimum_lift_after_pick_m', 0.05)
         self.declare_parameter('lift_search_step_m', 0.02)
-        self.declare_parameter('minimum_stable_samples', 5)
+        self.declare_parameter('minimum_stable_samples', 20)
         self.declare_parameter('max_translation_std_m', 0.005)
         self.declare_parameter('max_rotation_spread_deg', 5.0)
         self.declare_parameter('dry_run_max_rotation_spread_deg', 25.0)
@@ -528,7 +674,7 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter(
             'workspace_vertical_max_xy_m', [0.28, 0.28]
         )
-        self.declare_parameter('serial_port', '/dev/ttyUSB0')
+        self.declare_parameter('serial_port', '/dev/jetcobot')
         self.declare_parameter('baud_rate', 1000000)
         self.declare_parameter('speed', 10)
         self.declare_parameter('motion_timeout_sec', 15.0)
@@ -560,6 +706,33 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('cartesian_max_speed_mps', 0.04)
         self.declare_parameter('cartesian_max_joint_jump_deg', 10.0)
         self.declare_parameter('moveit_state_settle_sec', 0.2)
+        self.declare_parameter('motion_position_check_tolerance_m', 0.010)
+        self.declare_parameter(
+            'pregrasp_position_check_tolerance_m', 0.015
+        )
+        self.declare_parameter(
+            'pregrasp_orientation_check_tolerance_deg', 10.0
+        )
+        self.declare_parameter('motion_orientation_check_tolerance_deg', 8.0)
+        self.declare_parameter('motion_correction_attempts', 0)
+        self.declare_parameter('tcp_verification_samples', 5)
+        self.declare_parameter('tcp_verification_max_spread_m', 0.0025)
+        self.declare_parameter('final_grasp_retry_attempts', 1)
+        self.declare_parameter(
+            'final_grasp_retry_max_position_error_m', 0.025
+        )
+        self.declare_parameter(
+            'final_grasp_retry_max_orientation_error_deg', 12.0
+        )
+        self.declare_parameter('initial_pose_xyz_m', [0.17, -0.07, 0.18])
+        self.declare_parameter(
+            'initial_pose_rpy_deg', [-180.0, 0.0, 180.0]
+        )
+        self.declare_parameter('auto_return_after_pick', True)
+        self.declare_parameter('auto_return_after_failure', True)
+        self.declare_parameter('auto_return_after_pregrasp_test', True)
+        self.declare_parameter('auto_return_on_startup', True)
+        self.declare_parameter('startup_return_poll_sec', 0.5)
 
     def _vector_parameter(self, name, length):
         values = np.asarray(self.get_parameter(name).value, dtype=np.float64)
@@ -604,6 +777,12 @@ class ContainerPickCoordinator(Node):
         self.stop_robot_client = self.create_client(
             Trigger, '/arm2/stop_robot'
         )
+        self.return_robot_initial_client = self.create_client(
+            Trigger, '/arm2/return_robot_initial'
+        )
+        self.return_robot_initial_holding_client = self.create_client(
+            Trigger, '/arm2/return_robot_initial_holding'
+        )
 
     def publish_status(self, text):
         self.last_status_text = text
@@ -619,6 +798,8 @@ class ContainerPickCoordinator(Node):
             self.status_publisher.publish(message)
 
     def update_tracking(self):
+        if self.target_locked:
+            return
         try:
             transform = self.buffer.lookup_transform(
                 self.base_frame, self.marker_frame, Time()
@@ -626,10 +807,10 @@ class ContainerPickCoordinator(Node):
         except TransformException as exc:
             error = str(exc)
             now = time.monotonic()
-            if (
-                error != self.last_tracking_error
-                or now - self.last_tracking_error_time >= 5.0
-            ):
+            # TF2 includes the continuously changing "earliest data" time in
+            # this exception, so comparing the complete text made every
+            # 10-Hz lookup look like a new error.  Throttle by time only.
+            if now - self.last_tracking_error_time >= 5.0:
                 self.get_logger().warning(
                     'Cannot collect marker sample: '
                     f'{self.base_frame} -> {self.marker_frame}: {error}'
@@ -754,6 +935,7 @@ class ContainerPickCoordinator(Node):
                     self.grasp_rpy,
                     marker_yaw,
                     self.reference_marker_yaw,
+                    self.rotate_grasp_xy_offset,
                 )
             )
             if abs(yaw_delta) > self.max_yaw_delta:
@@ -786,27 +968,33 @@ class ContainerPickCoordinator(Node):
         return (grasp, pregrasp), 'targets valid'
 
     def wait_for_new_stable_targets(self):
+        was_locked = self.target_locked
+        self.target_locked = False
+        self.last_transform_stamp = None
         with self.history_lock:
             self.history.clear()
         deadline = time.monotonic() + self.stabilization_timeout
         reason = 'no new marker samples'
         last_report_time = 0.0
         last_report_reason = ''
-        while time.monotonic() < deadline:
-            if self.stop_event.wait(0.2):
-                return None, 'pick stopped'
-            targets, reason = self.calculate_targets()
-            if targets is not None:
-                return targets, reason
-            now = time.monotonic()
-            if (
-                reason != last_report_reason
-                or now - last_report_time >= 1.0
-            ):
-                self.publish_status(f'PICK: waiting for marker: {reason}')
-                last_report_reason = reason
-                last_report_time = now
-        return None, f'marker did not stabilize: {reason}'
+        try:
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.2):
+                    return None, 'pick stopped'
+                targets, reason = self.calculate_targets()
+                if targets is not None:
+                    return targets, reason
+                now = time.monotonic()
+                if (
+                    reason != last_report_reason
+                    or now - last_report_time >= 1.0
+                ):
+                    self.publish_status(f'PICK: waiting for marker: {reason}')
+                    last_report_reason = reason
+                    last_report_time = now
+            return None, f'marker did not stabilize: {reason}'
+        finally:
+            self.target_locked = was_locked
 
     def in_workspace(self, translation):
         if not (
@@ -885,7 +1073,11 @@ class ContainerPickCoordinator(Node):
             self.publish_status(f'PICK FAILED: {reason}')
             return
         self.publish_status('PICK: fresh marker target locked')
-        self.execute_pick(targets)
+        self.target_locked = True
+        try:
+            self.execute_pick(targets)
+        finally:
+            self.target_locked = False
 
     def start_pregrasp_test(self, _request, response):
         if not self.execute_motion:
@@ -927,6 +1119,101 @@ class ContainerPickCoordinator(Node):
         response.success = True
         response.message = 'Pregrasp-only motion accepted'
         return response
+
+    def start_return_to_initial(self, _request, response):
+        """Start a guarded return to the configured floor-facing pose."""
+        if not self.execute_motion:
+            response.success = False
+            response.message = 'Start launch with execute_motion:=true'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_return_to_initial,
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = 'Return-to-initial accepted'
+        return response
+
+    def _start_startup_return(self):
+        """Return as soon as MoveIt, hardware and current TCP TF are ready."""
+        if self.motion_backend == 'moveit':
+            if not self.move_group_client.server_is_ready():
+                return
+            if not self.stop_robot_client.service_is_ready():
+                return
+            if not self.return_robot_initial_client.service_is_ready():
+                return
+            try:
+                self.buffer.lookup_transform(
+                    self.base_frame, self.moveit_ee_link, Time()
+                )
+            except TransformException:
+                return
+        if self.startup_return_timer is not None:
+            self.startup_return_timer.cancel()
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            self.publish_status('STARTUP RETURN: skipped; motion already active')
+            return
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_return_to_initial,
+            daemon=True,
+        )
+        self.motion_thread.start()
+
+    def initial_pose(self):
+        return self.make_pose(
+            self.initial_pose_xyz,
+            self.initial_pose_rotation,
+            self.get_clock().now().to_msg(),
+        )
+
+    def execute_return_to_initial(self):
+        if not self.motion_lock.acquire(blocking=False):
+            return
+        try:
+            self._command_return_to_initial()
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(f'RETURN FAILED: {exc}')
+        finally:
+            self.motion_lock.release()
+
+    def _command_return_to_initial(self, hold_gripper=False):
+        """Return through the hardware bridge while the caller owns motion_lock."""
+        self.publish_status('RETURN: moving to restored startup joint pose')
+        if self.motion_backend == 'moveit':
+            return_client = (
+                self.return_robot_initial_holding_client
+                if hold_gripper else self.return_robot_initial_client
+            )
+            if not return_client.wait_for_service(
+                timeout_sec=5.0
+            ):
+                raise RuntimeError(
+                    'JetCobot initial-return service is unavailable'
+                )
+            future = return_client.call_async(
+                Trigger.Request()
+            )
+            self._wait_future(future, self.motion_timeout + 5.0)
+            result = future.result()
+            if result is None or not result.success:
+                detail = 'no response' if result is None else result.message
+                raise RuntimeError(f'initial return failed: {detail}')
+        else:
+            with self.serial_lock:
+                self.robot.send_angles([0.0] * 6, 50)
+                if not hold_gripper:
+                    self.robot.set_gripper_value(100, 50)
+        self.publish_status('RETURN: file-defined initial pose reached')
 
     def preview_pregrasp(self, _request, response):
         if not self.offsets_configured:
@@ -1002,37 +1289,144 @@ class ContainerPickCoordinator(Node):
                 keep_current_orientation=(
                     self.pregrasp_test_keep_orientation
                 ),
+                position_check_tolerance=(
+                    self.pregrasp_position_check_tolerance
+                ),
             )
             if self.pregrasp_test_keep_orientation:
                 self.publish_status('PICK: aligning at pregrasp')
-                self.move_to_pose(pregrasp)
+                self.move_to_pose(
+                    pregrasp,
+                    position_check_tolerance=(
+                        self.pregrasp_position_check_tolerance
+                    ),
+                    orientation_check_tolerance=(
+                        self.pregrasp_orientation_check_tolerance
+                    ),
+                )
             if self.refresh_marker_before_descent:
+                self.publish_status(
+                    'PICK: stationary visual refinement: collecting '
+                    f'{self.minimum_samples} fresh samples'
+                )
                 refreshed, reason = self.wait_for_new_stable_targets()
                 if refreshed is None:
                     raise RuntimeError(
                         f'failed to refresh marker pose: {reason}'
                     )
-                grasp, pregrasp = refreshed
+                refreshed_grasp, refreshed_pregrasp = refreshed
+                xy_delta = np.array([
+                    refreshed_pregrasp.pose.position.x
+                    - pregrasp.pose.position.x,
+                    refreshed_pregrasp.pose.position.y
+                    - pregrasp.pose.position.y,
+                ])
+                xy_error = float(np.linalg.norm(xy_delta))
+                original_q = normalize_quaternion([
+                    pregrasp.pose.orientation.x,
+                    pregrasp.pose.orientation.y,
+                    pregrasp.pose.orientation.z,
+                    pregrasp.pose.orientation.w,
+                ])
+                refreshed_q = normalize_quaternion([
+                    refreshed_pregrasp.pose.orientation.x,
+                    refreshed_pregrasp.pose.orientation.y,
+                    refreshed_pregrasp.pose.orientation.z,
+                    refreshed_pregrasp.pose.orientation.w,
+                ])
+                yaw_error = 2.0 * math.acos(min(
+                    1.0, abs(float(np.dot(original_q, refreshed_q)))
+                ))
+                if xy_error > self.visual_refine_max_xy:
+                    raise RuntimeError(
+                        'visual XY refinement rejected: '
+                        f'{xy_error * 1000.0:.1f}mm exceeds '
+                        f'{self.visual_refine_max_xy * 1000.0:.1f}mm'
+                    )
+                if yaw_error > self.visual_refine_max_yaw:
+                    raise RuntimeError(
+                        'visual yaw refinement rejected: '
+                        f'{math.degrees(yaw_error):.1f}deg exceeds '
+                        f'{math.degrees(self.visual_refine_max_yaw):.1f}deg'
+                    )
+
+                # Apply only the freshly observed XY and yaw. Preserve both
+                # taught Z levels so noisy near-field depth cannot lower the
+                # grasp unexpectedly.
+                refined_grasp = copy.deepcopy(grasp)
+                refined_pregrasp = copy.deepcopy(pregrasp)
+                for refined, observed in (
+                    (refined_grasp, refreshed_grasp),
+                    (refined_pregrasp, refreshed_pregrasp),
+                ):
+                    refined.pose.position.x = observed.pose.position.x
+                    refined.pose.position.y = observed.pose.position.y
+                    refined.pose.orientation = copy.deepcopy(
+                        observed.pose.orientation
+                    )
+                self.publish_status(
+                    'PICK: visual refinement accepted: '
+                    f'xy={xy_error * 1000.0:.1f}mm, '
+                    f'yaw={math.degrees(yaw_error):.1f}deg; '
+                    're-aligning above target'
+                )
+                self.move_to_pose(
+                    refined_pregrasp,
+                    position_check_tolerance=(
+                        self.pregrasp_position_check_tolerance
+                    ),
+                    orientation_check_tolerance=(
+                        self.pregrasp_orientation_check_tolerance
+                    ),
+                )
+                grasp, pregrasp = refined_grasp, refined_pregrasp
             else:
                 self.publish_status(
                     'PICK: marker refresh skipped; using locked base target'
                 )
-            self.publish_status('PICK: descending to grasp pose')
-            try:
-                self.move_cartesian_to_pose(grasp)
-            except CartesianPlanningError as initial_error:
-                grasp = self.move_with_yaw_fallbacks(
-                    grasp, pregrasp, initial_error
+            if self.pregrasp_lift <= 1e-6:
+                self.publish_status(
+                    'PICK: direct-to-grasp mode; vertical descent skipped'
                 )
+            else:
+                self.publish_status('PICK: descending to grasp pose')
+                try:
+                    self.move_cartesian_to_pose(grasp)
+                except CartesianPlanningError as initial_error:
+                    grasp = self.move_with_yaw_fallbacks(
+                        grasp, pregrasp, initial_error
+                    )
+            self._verify_and_retry_final_grasp(grasp)
             self.publish_status('PICK: closing gripper')
             self.command_gripper(open_gripper=False)
-            self.publish_status('PICK: finding vertical lift path')
-            self.move_adaptive_cartesian_lift(grasp)
+            if self.auto_return_after_pick:
+                self.publish_status(
+                    'PICK: returning directly to initial pose'
+                )
+                self._command_return_to_initial(hold_gripper=True)
             self.publish_status('PICK: completed')
         except Exception as exc:
+            manually_stopped = self.stop_event.is_set()
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'PICK FAILED: {exc}')
+            if self.auto_return_after_failure and not manually_stopped:
+                try:
+                    self.stop_event.clear()
+                    self.publish_status(
+                        'PICK RECOVERY: opening gripper and returning'
+                    )
+                    self.command_gripper(open_gripper=True)
+                    self._command_return_to_initial()
+                    self.publish_status(
+                        'PICK FAILED: recovery return completed'
+                    )
+                except Exception as recovery_exc:
+                    self.stop_event.set()
+                    self._stop_active_motion()
+                    self.publish_status(
+                        f'PICK RECOVERY FAILED: {recovery_exc}'
+                    )
         finally:
             self.motion_lock.release()
 
@@ -1069,7 +1463,15 @@ class ContainerPickCoordinator(Node):
                 f'(target={candidate_yaw:.2f}deg)'
             )
             try:
-                self.move_to_pose(candidate_pregrasp)
+                self.move_to_pose(
+                    candidate_pregrasp,
+                    position_check_tolerance=(
+                        self.pregrasp_position_check_tolerance
+                    ),
+                    orientation_check_tolerance=(
+                        self.pregrasp_orientation_check_tolerance
+                    ),
+                )
                 self.move_cartesian_to_pose(candidate_grasp)
                 self.publish_status(
                     'PICK: descent succeeded with '
@@ -1093,6 +1495,9 @@ class ContainerPickCoordinator(Node):
                     self.pregrasp_test_keep_orientation
                 ),
             )
+            if self.auto_return_after_pregrasp_test:
+                self.publish_status('PREGRASP TEST: returning to initial pose')
+                self._command_return_to_initial()
             self.publish_status('PREGRASP TEST: target reached; stopped')
         except Exception as exc:
             self.stop_event.set()
@@ -1101,7 +1506,13 @@ class ContainerPickCoordinator(Node):
         finally:
             self.motion_lock.release()
 
-    def move_to_pose(self, pose, keep_current_orientation=False):
+    def move_to_pose(
+        self,
+        pose,
+        keep_current_orientation=False,
+        position_check_tolerance=None,
+        orientation_check_tolerance=None,
+    ):
         if self.stop_event.is_set():
             raise RuntimeError('pick stopped')
         translation = np.array([
@@ -1112,7 +1523,12 @@ class ContainerPickCoordinator(Node):
         if not self.in_workspace(translation):
             raise RuntimeError(f'motion target outside workspace: {translation}')
         if self.motion_backend == 'moveit':
-            self._move_to_pose_moveit(pose, keep_current_orientation)
+            self._move_to_pose_moveit(
+                pose,
+                keep_current_orientation,
+                position_check_tolerance,
+                orientation_check_tolerance,
+            )
             return
         rpy = quaternion_to_rpy_degrees([
             pose.pose.orientation.x,
@@ -1172,7 +1588,13 @@ class ContainerPickCoordinator(Node):
                     return
         raise RuntimeError('robot motion timed out')
 
-    def _move_to_pose_moveit(self, pose, keep_current_orientation):
+    def _move_to_pose_moveit(
+        self,
+        pose,
+        keep_current_orientation,
+        position_check_tolerance=None,
+        orientation_check_tolerance=None,
+    ):
         target = copy.deepcopy(pose)
         if keep_current_orientation:
             try:
@@ -1186,6 +1608,14 @@ class ContainerPickCoordinator(Node):
             target.pose.orientation = current.transform.rotation
             try:
                 self._execute_moveit_pose_goal(target)
+                # This first stage intentionally preserves the current wrist
+                # attitude.  Only XYZ matters here; the following explicit
+                # pregrasp-alignment move verifies the taught orientation.
+                self._verify_tcp_position(
+                    target,
+                    check_orientation=False,
+                    position_tolerance=position_check_tolerance,
+                )
                 return
             except RuntimeError as exc:
                 if self.stop_event.is_set():
@@ -1195,6 +1625,280 @@ class ContainerPickCoordinator(Node):
                     f'the taught grasp orientation: {exc}'
                 )
         self._execute_moveit_pose_goal(pose)
+        last_error = None
+        for correction_attempt in range(self.motion_correction_attempts + 1):
+            try:
+                # Always verify against the original physical target, not a
+                # deliberately over-commanded compensation target.
+                self._verify_tcp_position(
+                    pose,
+                    position_tolerance=position_check_tolerance,
+                    orientation_tolerance=orientation_check_tolerance,
+                )
+                return
+            except RuntimeError as exc:
+                last_error = exc
+                if (
+                    self.stop_event.is_set()
+                    or correction_attempt >= self.motion_correction_attempts
+                ):
+                    raise
+                compensated = self._compensated_pose_target(pose)
+                self.get_logger().warning(
+                    'Measured TCP missed the planned pose; applying '
+                    f'closed-loop Cartesian correction '
+                    f'{correction_attempt + 1}/'
+                    f'{self.motion_correction_attempts}: {exc}'
+                )
+                self._execute_moveit_pose_goal(compensated)
+        raise last_error
+
+    def _compensated_pose_target(self, target):
+        """Over-command a bounded pose error to counter servo/backlash bias."""
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'cannot calculate TCP correction: {exc}'
+            ) from exc
+        target_xyz = np.array([
+            target.pose.position.x,
+            target.pose.position.y,
+            target.pose.position.z,
+        ])
+        actual_xyz = np.array([
+            current.transform.translation.x,
+            current.transform.translation.y,
+            current.transform.translation.z,
+        ])
+        translation_error = target_xyz - actual_xyz
+        error_norm = float(np.linalg.norm(translation_error))
+        if error_norm > 0.03:
+            raise RuntimeError(
+                'TCP correction rejected: measured position error '
+                f'{error_norm * 1000.0:.1f}mm exceeds 30mm safety bound'
+            )
+        # Do not disturb translation once it is already inside the accepted
+        # TCP tolerance.  Correcting an in-tolerance component made the small
+        # JetCobot alternate between position and orientation errors.
+        if error_norm <= self.motion_position_check_tolerance:
+            translation_error = np.zeros(3, dtype=np.float64)
+
+        target_q = normalize_quaternion([
+            target.pose.orientation.x,
+            target.pose.orientation.y,
+            target.pose.orientation.z,
+            target.pose.orientation.w,
+        ])
+        actual_q = normalize_quaternion([
+            current.transform.rotation.x,
+            current.transform.rotation.y,
+            current.transform.rotation.z,
+            current.transform.rotation.w,
+        ])
+        actual_inverse = np.array([
+            -actual_q[0], -actual_q[1], -actual_q[2], actual_q[3]
+        ])
+        rotation_error = quaternion_multiply(target_q, actual_inverse)
+        rotation_error_angle = 2.0 * math.acos(
+            min(1.0, abs(float(rotation_error[3])))
+        )
+        if rotation_error_angle > math.radians(15.0):
+            raise RuntimeError(
+                'TCP correction rejected: measured orientation error '
+                f'{math.degrees(rotation_error_angle):.1f}deg exceeds '
+                '15deg safety bound'
+            )
+        # Likewise, preserve an already acceptable wrist attitude while
+        # correcting position only.  Applying both corrections together can
+        # amplify backlash in J3/J4/J6 and undo the component that was good.
+        if rotation_error_angle <= self.motion_orientation_check_tolerance:
+            compensated_q = target_q
+        else:
+            compensated_q = quaternion_multiply(rotation_error, target_q)
+        compensated = copy.deepcopy(target)
+        compensated_xyz = target_xyz + translation_error
+        compensated.pose.position.x = float(compensated_xyz[0])
+        compensated.pose.position.y = float(compensated_xyz[1])
+        compensated.pose.position.z = float(compensated_xyz[2])
+        compensated.pose.orientation.x = float(compensated_q[0])
+        compensated.pose.orientation.y = float(compensated_q[1])
+        compensated.pose.orientation.z = float(compensated_q[2])
+        compensated.pose.orientation.w = float(compensated_q[3])
+        return compensated
+
+    def _verify_tcp_position(
+        self,
+        target,
+        check_orientation=True,
+        position_tolerance=None,
+        orientation_tolerance=None,
+    ):
+        """Verify a target from a stable multi-sample measured TCP pose."""
+        if position_tolerance is None:
+            position_tolerance = self.motion_position_check_tolerance
+        if orientation_tolerance is None:
+            orientation_tolerance = self.motion_orientation_check_tolerance
+        target_xyz = np.array([
+            target.pose.position.x,
+            target.pose.position.y,
+            target.pose.position.z,
+        ])
+        target_quaternion = normalize_quaternion([
+            target.pose.orientation.x,
+            target.pose.orientation.y,
+            target.pose.orientation.z,
+            target.pose.orientation.w,
+        ])
+        # Only accept distinct TF updates. Re-reading one stale transform five
+        # times must not be mistaken for a stable physical arrival.
+        deadline = time.monotonic() + max(
+            1.5, 0.25 * self.tcp_verification_samples
+        )
+        xyz_samples = []
+        quaternion_samples = []
+        seen_stamps = set()
+        last_error = None
+        last_angle_error = None
+        while time.monotonic() < deadline:
+            try:
+                current = self.buffer.lookup_transform(
+                    self.base_frame, self.moveit_ee_link, Time()
+                )
+                stamp = (
+                    int(current.header.stamp.sec),
+                    int(current.header.stamp.nanosec),
+                )
+                if stamp in seen_stamps:
+                    if self.stop_event.wait(0.05):
+                        raise RuntimeError('pick stopped')
+                    continue
+                seen_stamps.add(stamp)
+                xyz_samples.append(np.array([
+                    current.transform.translation.x,
+                    current.transform.translation.y,
+                    current.transform.translation.z,
+                ]))
+                quaternion_samples.append(normalize_quaternion([
+                    current.transform.rotation.x,
+                    current.transform.rotation.y,
+                    current.transform.rotation.z,
+                    current.transform.rotation.w,
+                ]))
+                if len(xyz_samples) < self.tcp_verification_samples:
+                    if self.stop_event.wait(0.05):
+                        raise RuntimeError('pick stopped')
+                    continue
+
+                recent_xyz = np.asarray(
+                    xyz_samples[-self.tcp_verification_samples:]
+                )
+                actual_xyz = np.median(recent_xyz, axis=0)
+                spread = float(np.max(np.linalg.norm(
+                    recent_xyz - actual_xyz, axis=1
+                )))
+                recent_quaternions = quaternion_samples[
+                    -self.tcp_verification_samples:
+                ]
+                reference_q = recent_quaternions[0]
+                aligned_quaternions = np.asarray([
+                    value if float(np.dot(value, reference_q)) >= 0.0
+                    else -value
+                    for value in recent_quaternions
+                ])
+                actual_quaternion = normalize_quaternion(
+                    np.mean(aligned_quaternions, axis=0)
+                )
+                error_xyz = actual_xyz - target_xyz
+                last_error = float(np.linalg.norm(error_xyz))
+                dot = min(1.0, abs(float(np.dot(
+                    actual_quaternion, target_quaternion
+                ))))
+                last_angle_error = 2.0 * math.acos(dot)
+                orientation_ok = (
+                    not check_orientation
+                    or last_angle_error
+                    <= orientation_tolerance
+                )
+                if (
+                    last_error <= position_tolerance
+                    and orientation_ok
+                    and spread <= self.tcp_verification_max_spread
+                ):
+                    self.get_logger().info(
+                        'Stable TCP verification passed: '
+                        f'error_xyz_mm='
+                        f'{np.round(error_xyz * 1000.0, 1).tolist()}, '
+                        f'position_error={last_error * 1000.0:.1f}mm, '
+                        f'orientation_error='
+                        f'{math.degrees(last_angle_error):.1f}deg, '
+                        f'spread={spread * 1000.0:.1f}mm, '
+                        f'samples={self.tcp_verification_samples}'
+                    )
+                    return {
+                        'position_error': last_error,
+                        'orientation_error': last_angle_error,
+                        'error_xyz': error_xyz,
+                        'spread': spread,
+                    }
+            except TransformException:
+                pass
+            if self.stop_event.wait(0.1):
+                raise RuntimeError('pick stopped')
+        if last_error is None:
+            detail = (
+                'insufficient distinct TCP TF samples: '
+                f'{len(xyz_samples)}/{self.tcp_verification_samples}'
+            )
+        else:
+            detail = (
+                f'error_xyz_mm='
+                f'{np.round(error_xyz * 1000.0, 1).tolist()}, '
+                f'position_error={last_error * 1000.0:.1f}mm '
+                f'(limit={position_tolerance * 1000.0:.1f}mm), '
+                f'spread={spread * 1000.0:.1f}mm '
+                f'(limit={self.tcp_verification_max_spread * 1000.0:.1f}mm)'
+            )
+            if check_orientation:
+                detail += (
+                    f', orientation_error={math.degrees(last_angle_error):.1f}deg '
+                    f'(limit={math.degrees(orientation_tolerance):.1f}deg)'
+                )
+        raise TcpVerificationError(
+            detail,
+            position_error=last_error,
+            orientation_error=last_angle_error,
+        )
+
+    def _verify_and_retry_final_grasp(self, target):
+        """Close only after a stable grasp pose, with one exact-target retry."""
+        for attempt in range(self.final_grasp_retry_attempts + 1):
+            try:
+                self._verify_tcp_position(target)
+                return
+            except TcpVerificationError as exc:
+                if attempt >= self.final_grasp_retry_attempts:
+                    raise
+                if (
+                    exc.position_error is None
+                    or exc.orientation_error is None
+                    or exc.position_error
+                    > self.final_grasp_retry_max_position_error
+                    or exc.orientation_error
+                    > self.final_grasp_retry_max_orientation_error
+                ):
+                    raise
+                self.publish_status(
+                    'PICK: final TCP outside tolerance; retrying the exact '
+                    f'grasp target {attempt + 1}/'
+                    f'{self.final_grasp_retry_attempts}: {exc}'
+                )
+                # Deliberately do not over-command by the measured error. A
+                # fresh Cartesian plan to the original target is bounded and
+                # cannot accumulate a noisy hand-eye/TCP correction.
+                self.move_cartesian_to_pose(target)
 
     def _execute_moveit_pose_goal(self, target):
         if not self.move_group_client.wait_for_server(timeout_sec=5.0):

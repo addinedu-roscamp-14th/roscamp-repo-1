@@ -10,6 +10,7 @@ from arm2.arm2_container_pick_coordinator import (
     lift_distance_candidates,
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
+    wrap_parallel_gripper_degrees,
 )
 import numpy as np
 
@@ -92,6 +93,52 @@ def test_yaw_follow_rotates_grasp_and_xy_offset_only():
          0.01],
     )
     assert np.allclose(rpy, [-170.0, 8.0, 150.0], atol=1e-9)
+
+
+def test_yaw_follow_can_keep_centered_marker_bias_in_base_frame():
+    """A centered marker's hand-eye XY bias must not rotate with object yaw."""
+    translation, rotation, yaw_delta = compose_yaw_follow_pose(
+        [0.10, 0.20, 0.05],
+        [-0.0034515, 0.0072995, -0.090439],
+        [-180.0, -5.0, 178.208716],
+        marker_yaw_degrees=155.0927595,
+        reference_marker_yaw_degrees=65.0927595,
+        rotate_translation_offset=False,
+    )
+
+    assert yaw_delta == -90.0
+    assert np.allclose(
+        translation,
+        [0.0965485, 0.2072995, -0.040439],
+        atol=1e-9,
+    )
+    assert np.allclose(
+        quaternion_to_rpy_degrees(rotation),
+        [-180.0, -5.0, 88.208716],
+        atol=1e-9,
+    )
+
+
+
+
+def test_parallel_gripper_uses_equivalent_short_yaw():
+    """A 180-degree object turn needs no parallel-jaw wrist rotation."""
+    assert wrap_parallel_gripper_degrees(180.0) == 0.0
+    assert wrap_parallel_gripper_degrees(270.0) == -90.0
+    assert wrap_parallel_gripper_degrees(-180.0) == 0.0
+
+    translation, rotation, yaw_delta = compose_yaw_follow_pose(
+        [0.10, 0.20, 0.05],
+        [0.02, 0.0, -0.04],
+        [-170.0, 8.0, 120.0],
+        marker_yaw_degrees=210.0,
+        reference_marker_yaw_degrees=30.0,
+    )
+    rpy = quaternion_to_rpy_degrees(rotation)
+
+    assert yaw_delta == 0.0
+    assert np.allclose(translation, [0.08, 0.20, 0.01], atol=1e-9)
+    assert np.allclose(rpy, [-170.0, 8.0, 120.0], atol=1e-9)
 
 
 def test_lift_candidates_descend_to_exact_minimum():

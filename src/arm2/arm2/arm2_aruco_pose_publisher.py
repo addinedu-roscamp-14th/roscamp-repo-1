@@ -80,7 +80,7 @@ class ArucoPosePublisher(Node):
         self.declare_parameter('camera_frame_id', '')
         self.declare_parameter('marker_frame_id', 'arm2/container_marker')
         self.declare_parameter('marker_id', 0)
-        self.declare_parameter('marker_size_m', 0.015)
+        self.declare_parameter('marker_size_m', 0.026)
         self.declare_parameter('dictionary', 'DICT_5X5_50')
         self.declare_parameter('max_reprojection_error_px', 3.0)
         self.declare_parameter('publish_annotated', True)

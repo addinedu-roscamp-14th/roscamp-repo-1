@@ -1,0 +1,26 @@
+calibration: arm2_jetcobot_eye_in_hand_charuco
+evaluated_at: '2026-07-21'
+source_samples: /home/rsj/.ros2/easy_handeye2/samples/arm2_jetcobot_eye_in_hand_charuco.samples
+sample_count: 30
+unique_sample_count: 28
+duplicate_sample_indices_zero_based:
+  - 2
+  - 23
+method: OpenCV/Tsai-Lenz
+residual_definition: spread of base_T_effector * effector_T_camera * camera_T_target
+position:
+  rms_mm: 14.6174
+  max_mm: 26.1844
+orientation:
+  rms_deg: 8.1652
+  max_deg: 18.5000
+comparison:
+  best_full_set_method: OpenCV/Horaud
+  best_full_set_position_rms_mm: 14.0647
+  best_full_set_orientation_rms_deg: 7.7106
+  applied: false
+  reason: >-
+    The small residual improvement requires a roughly 15 degree change in the
+    calibrated camera rotation. That change is not safe to apply without an
+    independent validation set, and trimmed fits increased held-out errors.
+status: recalibration_required

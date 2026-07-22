@@ -34,13 +34,26 @@ def test_interpolate_positions_clamps_after_finish():
     assert interpolate_positions(points, 3.0) == [2.0]
 
 
-def test_j2_limit_matches_urdf_not_old_135_degree_guard():
+def test_j2_limit_uses_documented_maximum_range():
     positions = [0.0] * 6
     positions[1] = math.radians(-136.2)
     JetCobotTrajectoryBridge._validate_joint_limits(positions)
 
     positions[1] = math.radians(-167.0)
     with pytest.raises(RuntimeError, match='J2 target'):
+        JetCobotTrajectoryBridge._validate_joint_limits(positions)
+
+
+def test_j3_limit_uses_documented_maximum_range():
+    positions = [0.0] * 6
+    positions[2] = math.radians(-150.46)
+    JetCobotTrajectoryBridge._validate_joint_limits(positions)
+
+    positions[2] = math.radians(-164.0)
+    JetCobotTrajectoryBridge._validate_joint_limits(positions)
+
+    positions[2] = math.radians(-166.0)
+    with pytest.raises(RuntimeError, match='J3 target'):
         JetCobotTrajectoryBridge._validate_joint_limits(positions)
 
 

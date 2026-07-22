@@ -19,15 +19,20 @@ def generate_launch_description():
     handeye_share = Path(get_package_share_directory('easy_handeye2'))
 
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/arm_camera'),
+        DeclareLaunchArgument('video_device', default_value='auto'),
         DeclareLaunchArgument(
             'camera_info_url',
-            default_value='config/arm2/arm2_arm_camera_info.yaml',
+            default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.026'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.02'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
-        DeclareLaunchArgument('name', default_value='arm2_jetcobot_eye_in_hand'),
+        DeclareLaunchArgument(
+            'name', default_value='arm2_jetcobot_eye_in_hand'
+        ),
+        DeclareLaunchArgument(
+            'calibration_directory', default_value='config/arm2'
+        ),
         DeclareLaunchArgument('robot_base_frame', default_value='arm2/base_link'),
         DeclareLaunchArgument('robot_effector_frame', default_value='arm2/TCP'),
         DeclareLaunchArgument(
@@ -82,10 +87,15 @@ def generate_launch_description():
     use_system_opencv = SetEnvironmentVariable(
         'PYTHONNOUSERSITE', '1'
     )
+    use_project_calibrations = SetEnvironmentVariable(
+        'EASY_HANDEYE2_CALIBRATIONS_DIRECTORY',
+        LaunchConfiguration('calibration_directory'),
+    )
 
     return LaunchDescription(
         arguments + [
             use_system_opencv,
+            use_project_calibrations,
             robot_model,
             gripper_aruco,
             easy_handeye,

@@ -35,6 +35,8 @@ setup(
             'arm2.arm2_charuco_pose_publisher:main',
             'arm2_generate_charuco_board = '
             'arm2.arm2_charuco_board_generator:main',
+            'arm2_single_aruco_calibrator = '
+            'arm2.arm2_single_aruco_calibrator:main',
             'arm2_container_pick_coordinator = '
             'arm2.container_pick_coordinator:main',
             'arm2_jetcobot_trajectory_bridge = '
