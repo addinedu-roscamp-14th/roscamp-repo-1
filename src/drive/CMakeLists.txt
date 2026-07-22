@@ -6,6 +6,7 @@ find_package(ament_cmake REQUIRED)
 install(
   PROGRAMS
     scripts/send_nav_goal
+    scripts/reverse_parking
     scripts/target_map_pose_to_nav_goal
     scripts/target_waypoints_to_nav_goal
   DESTINATION lib/${PROJECT_NAME}

@@ -56,6 +56,33 @@ ros2 run drive send_nav_goal --world -0.5 -1.0 --yaw 1.5708
 `--world`를 생략하면 입력 `x`, `y`를 720x720 map canvas 픽셀로 해석하므로, map 좌표를
 시험할 때는 반드시 `--world`를 사용합니다.
 
+### `reverse_parking`
+
+AMCL의 `/amcl_pose`를 사용해 실행 시점의 현재 자세를 기록합니다. 어느 위치에서 실행해도
+먼저 Nav2 `navigate_to_pose` action으로 준비 자세 `(1.365431, 0.176245)`까지 자율주행한 뒤,
+목표 자세 `(1.635464, 0.168810)`까지 **후진만**으로 이동합니다. 후진 단계의 선형 속도는
+항상 음수(`/cmd_vel.linear.x < 0`)이며, 목표점이 차량 앞쪽으로 판단되면 전진하지 않고
+즉시 정지합니다.
+
+주차 순서는 `목표점이 로봇 뒤쪽이 되도록 제자리 회전 → 후진 이동 → 목표 방향 미세 보정`입니다.
+회전 완료 판정은 기본 5도이며 필요하면 다음처럼 조정할 수 있습니다.
+
+```bash
+ros2 run drive reverse_parking --ros-args -p reverse_yaw_tolerance:=0.05
+```
+
+```bash
+ros2 run drive reverse_parking
+```
+
+준비 위치 이동에는 Nav2가 필요합니다. Nav2 목표 완료 뒤 이 노드가 `/cmd_vel`을 직접
+제어하므로, teleop 등 별도의 `/cmd_vel` 발행 노드는 중지해야 합니다. 처음 시험할 때에는
+더 낮은 속도를 권장합니다.
+
+```bash
+ros2 run drive reverse_parking --ros-args -p max_reverse_speed:=0.03
+```
+
 ## 빌드
 
 노트북의 워크스페이스에서 실행합니다.

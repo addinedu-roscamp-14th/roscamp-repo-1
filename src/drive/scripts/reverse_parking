@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Navigate to a preparation pose, then reverse into a fixed parking pose.
+
+This node intentionally commands /cmd_vel directly.  Do not run it at the
+same time as Nav2 or another /cmd_vel publisher.
+"""
+
+import math
+import sys
+
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from nav2_msgs.action import NavigateToPose
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+
+
+PREP_X = 1.3654310509404668
+PREP_Y = 0.17624451234213756
+PREP_YAW = -3.136509010914669
+GOAL_X = 1.635463773844374
+GOAL_Y = 0.16880950610511666
+GOAL_YAW = -3.098529967767224
+
+
+def clamp(value, lower, upper):
+    return max(lower, min(value, upper))
+
+
+def normalize_angle(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def yaw_from_quaternion(quaternion):
+    return math.atan2(
+        2.0 * (quaternion.w * quaternion.z + quaternion.x * quaternion.y),
+        1.0 - 2.0 * (quaternion.y * quaternion.y + quaternion.z * quaternion.z),
+    )
+
+
+class ReverseParking(Node):
+    def __init__(self):
+        super().__init__('reverse_parking')
+
+        self.declare_parameter('pose_topic', '/amcl_pose')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('nav2_action_name', 'navigate_to_pose')
+        self.declare_parameter('prep_x', PREP_X)
+        self.declare_parameter('prep_y', PREP_Y)
+        self.declare_parameter('prep_yaw', PREP_YAW)
+        self.declare_parameter('goal_x', GOAL_X)
+        self.declare_parameter('goal_y', GOAL_Y)
+        self.declare_parameter('goal_yaw', GOAL_YAW)
+        self.declare_parameter('position_tolerance', 0.02)
+        self.declare_parameter('yaw_tolerance', math.radians(2.0))
+        self.declare_parameter('reverse_yaw_tolerance', math.radians(5.0))
+        self.declare_parameter('max_reverse_speed', 0.06)
+        self.declare_parameter('max_angular_speed', 0.35)
+
+        self.prep_x = float(self.get_parameter('prep_x').value)
+        self.prep_y = float(self.get_parameter('prep_y').value)
+        self.prep_yaw = float(self.get_parameter('prep_yaw').value)
+        self.goal_x = float(self.get_parameter('goal_x').value)
+        self.goal_y = float(self.get_parameter('goal_y').value)
+        self.goal_yaw = float(self.get_parameter('goal_yaw').value)
+        self.position_tolerance = float(self.get_parameter('position_tolerance').value)
+        self.yaw_tolerance = float(self.get_parameter('yaw_tolerance').value)
+        self.reverse_yaw_tolerance = float(
+            self.get_parameter('reverse_yaw_tolerance').value
+        )
+        self.max_reverse_speed = abs(float(self.get_parameter('max_reverse_speed').value))
+        self.max_angular_speed = abs(float(self.get_parameter('max_angular_speed').value))
+
+        self.pose = None
+        self.start_pose = None
+        self.started = False
+        self.phase = 'SEND_PREP_GOAL'
+        self.done = False
+        self.nav_server_waiting_logged = False
+        self.publisher = self.create_publisher(
+            Twist, str(self.get_parameter('cmd_vel_topic').value), 10
+        )
+        amcl_qos = QoSProfile(depth=10)
+        amcl_qos.reliability = ReliabilityPolicy.RELIABLE
+        amcl_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            str(self.get_parameter('pose_topic').value),
+            self.pose_callback,
+            amcl_qos,
+        )
+        self.nav_client = ActionClient(
+            self, NavigateToPose, str(self.get_parameter('nav2_action_name').value)
+        )
+        self.timer = self.create_timer(0.05, self.control_loop)
+
+        self.get_logger().info(
+            'Waiting for AMCL pose; the first pose received becomes the run start. '
+            f'Preparation pose: ({self.prep_x:.3f}, {self.prep_y:.3f}), '
+            f'reverse parking target: ({self.goal_x:.3f}, {self.goal_y:.3f})'
+        )
+
+    def pose_callback(self, message):
+        self.pose = message.pose.pose
+
+    def stop(self):
+        self.publisher.publish(Twist())
+
+    def send_preparation_goal(self):
+        if not self.nav_client.wait_for_server(timeout_sec=0.0):
+            if not self.nav_server_waiting_logged:
+                self.get_logger().info('Waiting for Nav2 navigate_to_pose action server...')
+                self.nav_server_waiting_logged = True
+            return
+
+        self.nav_server_waiting_logged = False
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = self.prep_x
+        goal.pose.pose.position.y = self.prep_y
+        goal.pose.pose.orientation.z = math.sin(self.prep_yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(self.prep_yaw / 2.0)
+
+        self.phase = 'WAIT_FOR_PREP_RESULT'
+        future = self.nav_client.send_goal_async(goal)
+        future.add_done_callback(self.preparation_goal_response)
+        self.get_logger().info('Sending Nav2 goal to the parking preparation pose.')
+
+    def preparation_goal_response(self, future):
+        try:
+            handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'Preparation goal request failed: {exc}')
+            self.done = True
+            return
+
+        if handle is None or not handle.accepted:
+            self.get_logger().error('Nav2 rejected the parking preparation goal.')
+            self.done = True
+            return
+
+        result_future = handle.get_result_async()
+        result_future.add_done_callback(self.preparation_goal_result)
+
+    def preparation_goal_result(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'Preparation navigation failed: {exc}')
+            self.done = True
+            return
+
+        if result.status != 4:  # action_msgs/GoalStatus.STATUS_SUCCEEDED
+            self.get_logger().error(
+                f'Preparation navigation did not succeed (status={result.status}).'
+            )
+            self.done = True
+            return
+
+        self.phase = 'ALIGN_FOR_REVERSE'
+        self.get_logger().info(
+            'Preparation pose reached. Aligning so the final target is behind the robot.'
+        )
+
+    def control_loop(self):
+        if self.done or self.pose is None:
+            return
+
+        x = self.pose.position.x
+        y = self.pose.position.y
+        yaw = yaw_from_quaternion(self.pose.orientation)
+
+        if not self.started:
+            self.start_pose = (x, y, yaw)
+            self.started = True
+            self.get_logger().info(
+                'Start pose recorded: (%.3f, %.3f, yaw=%.3f). '
+                'Navigating to the parking preparation pose.' % self.start_pose
+            )
+
+        if self.phase == 'SEND_PREP_GOAL':
+            self.send_preparation_goal()
+            return
+        if self.phase == 'WAIT_FOR_PREP_RESULT':
+            return
+
+        dx = self.goal_x - x
+        dy = self.goal_y - y
+        distance = math.hypot(dx, dy)
+        cmd = Twist()
+
+        if distance <= self.position_tolerance:
+            self.phase = 'FINAL_ALIGN'
+
+        if self.phase == 'FINAL_ALIGN':
+            yaw_error = normalize_angle(self.goal_yaw - yaw)
+            if abs(yaw_error) <= self.yaw_tolerance:
+                self.stop()
+                self.done = True
+                self.get_logger().info('Reverse parking complete.')
+                return
+            cmd.angular.z = clamp(1.2 * yaw_error, -self.max_angular_speed, self.max_angular_speed)
+        elif self.phase == 'ALIGN_FOR_REVERSE':
+            # Face away from the goal, which makes it lie behind base_link.
+            # The robot must finish this rotation before it is allowed to reverse.
+            reverse_yaw = normalize_angle(math.atan2(dy, dx) + math.pi)
+            yaw_error = normalize_angle(reverse_yaw - yaw)
+            if abs(yaw_error) <= self.reverse_yaw_tolerance:
+                self.phase = 'REVERSE'
+                self.get_logger().info('Target is behind the robot; starting reverse motion.')
+                self.publisher.publish(cmd)  # stop the last rotation command before reversing
+                return
+            cmd.angular.z = clamp(1.2 * yaw_error, -self.max_angular_speed, self.max_angular_speed)
+        else:  # REVERSE
+            # Transform the map-frame goal to base_link coordinates.  At this
+            # phase the target must stay behind the robot, so local_x is negative.
+            local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
+            local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
+
+            # Do not drive forward: a goal in front is treated as a stop.
+            if local_x >= 0.0:
+                self.stop()
+                self.get_logger().error('Goal is no longer behind the robot; stopping.')
+                self.done = True
+                return
+
+            # Slow down near the target; linear.x remains negative (reverse).
+            cmd.linear.x = clamp(0.8 * local_x, -self.max_reverse_speed, -0.02)
+            cmd.angular.z = clamp(-1.8 * local_y, -self.max_angular_speed, self.max_angular_speed)
+
+        self.publisher.publish(cmd)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ReverseParking()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    sys.exit(main())
