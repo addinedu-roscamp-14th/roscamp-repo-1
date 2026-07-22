@@ -18,7 +18,13 @@ def generate_launch_description():
     arm_share = Path(get_package_share_directory('arm2'))
     handeye_share = Path(get_package_share_directory('easy_handeye2'))
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
+        DeclareLaunchArgument('video_device', default_value='auto'),
+        DeclareLaunchArgument('serial_port', default_value='/dev/jetcobot'),
+        DeclareLaunchArgument('baud_rate', default_value='1000000'),
+        DeclareLaunchArgument('joint_publish_rate', default_value='10.0'),
+        DeclareLaunchArgument(
+            'start_hardware_joint_publisher', default_value='true'
+        ),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
@@ -29,16 +35,16 @@ def generate_launch_description():
         DeclareLaunchArgument('square_length_m', default_value='0.015'),
         DeclareLaunchArgument('marker_length_m', default_value='0.011'),
         DeclareLaunchArgument('legacy_pattern', default_value='true'),
-        DeclareLaunchArgument('detection_rate_hz', default_value='5.0'),
+        DeclareLaunchArgument('detection_rate_hz', default_value='10.0'),
         DeclareLaunchArgument('opencv_num_threads', default_value='1'),
         DeclareLaunchArgument(
-            'minimum_charuco_corners', default_value='6'
+            'minimum_charuco_corners', default_value='24'
         ),
         DeclareLaunchArgument(
-            'max_reprojection_error_px', default_value='3.0'
+            'max_reprojection_error_px', default_value='1.0'
         ),
         DeclareLaunchArgument(
-            'use_node_time_for_pose', default_value='true'
+            'use_node_time_for_pose', default_value='false'
         ),
         DeclareLaunchArgument(
             'name', default_value='arm2_jetcobot_eye_in_hand_charuco'
@@ -61,7 +67,12 @@ def generate_launch_description():
             str(arm_share / 'launch' / 'arm2_robot_tf.launch.py')
         ),
         launch_arguments={
-            'start_hardware_joint_publisher': 'false',
+            'start_hardware_joint_publisher': LaunchConfiguration(
+                'start_hardware_joint_publisher'
+            ),
+            'serial_port': LaunchConfiguration('serial_port'),
+            'baud_rate': LaunchConfiguration('baud_rate'),
+            'publish_rate': LaunchConfiguration('joint_publish_rate'),
         }.items(),
     )
     gripper_charuco = IncludeLaunchDescription(

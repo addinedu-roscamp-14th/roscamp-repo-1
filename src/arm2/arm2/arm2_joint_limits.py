@@ -3,14 +3,15 @@
 import math
 
 
-# Keep these values synchronized with jetcobot_description/urdf/jetcobot.urdf.
+# Expanded working range without narrowing the model's previously validated
+# J1/J2 limits. Keep synchronized with description and MoveIt configuration.
 JOINT_LIMITS_RAD = (
     (-3.14, 3.14),
     (-2.9, 2.9),
-    (-2.3, 2.3),
-    (-2.6, 2.6),
-    (-2.5, 2.5),
-    (-2.84, 2.84),
+    (-math.radians(165.0), math.radians(165.0)),
+    (-math.radians(165.0), math.radians(165.0)),
+    (-math.radians(165.0), math.radians(165.0)),
+    (-math.radians(175.0), math.radians(175.0)),
 )
 JOINT_LIMITS_DEG = tuple(
     tuple(math.degrees(value) for value in limits)

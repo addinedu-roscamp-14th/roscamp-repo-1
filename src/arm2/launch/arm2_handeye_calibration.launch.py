@@ -19,7 +19,7 @@ def generate_launch_description():
     handeye_share = Path(get_package_share_directory('easy_handeye2'))
 
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
+        DeclareLaunchArgument('video_device', default_value='auto'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm2/arm2_gripper_camera_info.yaml',

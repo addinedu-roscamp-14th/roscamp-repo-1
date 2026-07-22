@@ -21,10 +21,52 @@ def resolve_camera_info_url(context):
     return [SetLaunchConfiguration('resolved_camera_info_url', value)]
 
 
+def resolve_video_device(context):
+    """Resolve the USB camera independently of its /dev/video number."""
+    value = LaunchConfiguration('video_device').perform(context)
+    if value != 'auto':
+        return [SetLaunchConfiguration('resolved_video_device', value)]
+
+    by_id = Path('/dev/v4l/by-id')
+    stable = sorted(by_id.glob('*-video-index0')) if by_id.exists() else []
+    if len(stable) == 1:
+        return [SetLaunchConfiguration(
+            'resolved_video_device', str(stable[0])
+        )]
+
+    candidates = []
+    preferred = []
+    for sysfs_device in sorted(Path('/sys/class/video4linux').glob('video*')):
+        device = Path('/dev') / sysfs_device.name
+        if not device.exists():
+            continue
+        try:
+            index = (sysfs_device / 'index').read_text().strip()
+            name = (sysfs_device / 'name').read_text().strip()
+        except OSError:
+            continue
+        if index != '0':
+            continue
+        candidates.append(device)
+        if 'USB 2.0 Camera' in name:
+            preferred.append(device)
+
+    selected = preferred if preferred else candidates
+    if len(selected) != 1:
+        devices = ', '.join(str(item) for item in selected) or 'none'
+        raise RuntimeError(
+            'Cannot uniquely auto-select the arm2 camera; candidates: '
+            f'{devices}. Pass video_device:=/dev/videoN explicitly.'
+        )
+    return [SetLaunchConfiguration(
+        'resolved_video_device', str(selected[0])
+    )]
+
+
 def generate_launch_description():
     """Create the gripper camera and marker tracking graph."""
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
+        DeclareLaunchArgument('video_device', default_value='auto'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
@@ -34,7 +76,7 @@ def generate_launch_description():
             default_value='arm2/gripper_camera_optical_frame',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.026'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
             'marker_frame_id', default_value='arm2/container_marker'
@@ -51,7 +93,7 @@ def generate_launch_description():
         name='camera',
         output='screen',
         parameters=[{
-            'video_device': LaunchConfiguration('video_device'),
+            'video_device': LaunchConfiguration('resolved_video_device'),
             'image_size': [640, 480],
             'time_per_frame': [1, 10],
             'pixel_format': 'YUYV',
@@ -83,6 +125,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription(arguments + [
+        OpaqueFunction(function=resolve_video_device),
         OpaqueFunction(function=resolve_camera_info_url),
         camera,
         detector,

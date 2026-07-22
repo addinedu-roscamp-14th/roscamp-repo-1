@@ -1,5 +1,6 @@
 """Detect a ChArUco board and publish its calibrated 6D camera pose."""
 
+from collections import deque
 import time
 
 import cv2
@@ -129,15 +130,20 @@ class CharucoPosePublisher(Node):
         self.declare_parameter('camera_frame_id', '')
         self.declare_parameter('board_frame_id', 'arm2/handeye_target')
         self.declare_parameter('dictionary', 'DICT_4X4_50')
+        # The printed board is labelled 8x11 as rows x columns. OpenCV uses
+        # squares_x=columns and squares_y=rows.
         self.declare_parameter('squares_x', 11)
         self.declare_parameter('squares_y', 8)
         self.declare_parameter('square_length_m', 0.015)
         self.declare_parameter('marker_length_m', 0.011)
         self.declare_parameter('legacy_pattern', True)
-        self.declare_parameter('detection_rate_hz', 5.0)
+        self.declare_parameter('detection_rate_hz', 10.0)
         self.declare_parameter('opencv_num_threads', 1)
-        self.declare_parameter('minimum_charuco_corners', 6)
-        self.declare_parameter('max_reprojection_error_px', 3.0)
+        self.declare_parameter('minimum_charuco_corners', 24)
+        self.declare_parameter('max_reprojection_error_px', 1.0)
+        self.declare_parameter('stability_window_size', 3)
+        self.declare_parameter('max_stability_translation_m', 0.008)
+        self.declare_parameter('max_stability_rotation_deg', 5.0)
         self.declare_parameter('publish_annotated', True)
         self.declare_parameter('use_node_time_for_pose', False)
 
@@ -179,6 +185,15 @@ class CharucoPosePublisher(Node):
         self.max_reprojection_error = float(
             self.get_parameter('max_reprojection_error_px').value
         )
+        self.stability_window_size = int(
+            self.get_parameter('stability_window_size').value
+        )
+        self.max_stability_translation = float(
+            self.get_parameter('max_stability_translation_m').value
+        )
+        self.max_stability_rotation_deg = float(
+            self.get_parameter('max_stability_rotation_deg').value
+        )
         self.publish_annotated = bool(
             self.get_parameter('publish_annotated').value
         )
@@ -200,6 +215,12 @@ class CharucoPosePublisher(Node):
             )
         if self.max_reprojection_error <= 0.0:
             raise ValueError('max_reprojection_error_px must be positive')
+        if self.stability_window_size < 2:
+            raise ValueError('stability_window_size must be at least 2')
+        if self.max_stability_translation <= 0.0:
+            raise ValueError('max_stability_translation_m must be positive')
+        if self.max_stability_rotation_deg <= 0.0:
+            raise ValueError('max_stability_rotation_deg must be positive')
         if self.detection_rate_hz <= 0.0:
             raise ValueError('detection_rate_hz must be positive')
         if self.opencv_num_threads < 1:
@@ -207,18 +228,18 @@ class CharucoPosePublisher(Node):
         if not hasattr(cv2.aruco, dictionary_name):
             raise ValueError(f'Unknown ArUco dictionary: {dictionary_name}')
 
-        cv2.setNumThreads(self.opencv_num_threads)
         dictionary_id = getattr(cv2.aruco, dictionary_name)
+        # OpenCV 4.6 Python bindings can invalidate a Dictionary wrapper when
+        # the same instance is retained by CharucoBoard_create and later used
+        # by detectMarkers. Keep independent wrappers for board construction
+        # and marker detection.
+        self.dictionary_id = dictionary_id
         self.dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
-        self.board = create_charuco_board(
-            self.squares_x,
-            self.squares_y,
-            self.square_length,
-            self.marker_length,
-            self.dictionary,
-            self.legacy_pattern,
-        )
-        self.board_corners = board_chessboard_corners(self.board)
+        self.board_corners = np.array([
+            [x * self.square_length, y * self.square_length, 0.0]
+            for y in range(1, self.squares_y)
+            for x in range(1, self.squares_x)
+        ], dtype=np.float64)
         self.detector_parameters = self._create_detector_parameters()
         self.marker_detector = None
         self.charuco_detector = None
@@ -234,6 +255,7 @@ class CharucoPosePublisher(Node):
         self.last_corner_count = None
         self.last_detection_time = 0.0
         self.missing_info_warning_count = 0
+        self.pose_window = deque(maxlen=self.stability_window_size)
 
         self.pose_publisher = self.create_publisher(
             PoseStamped, self.pose_topic, 10
@@ -266,19 +288,20 @@ class CharucoPosePublisher(Node):
 
     @staticmethod
     def _create_detector_parameters():
-        if hasattr(cv2.aruco, 'DetectorParameters'):
+        if hasattr(cv2.aruco, 'ArucoDetector'):
             return cv2.aruco.DetectorParameters()
         return cv2.aruco.DetectorParameters_create()
 
     def _configure_detectors(self):
         if hasattr(cv2.aruco, 'CharucoDetector'):
+            board = self._create_board()
             charuco_parameters = cv2.aruco.CharucoParameters()
             charuco_parameters.tryRefineMarkers = True
             if self.camera_matrix is not None:
                 charuco_parameters.cameraMatrix = self.camera_matrix
                 charuco_parameters.distCoeffs = self.distortion
             self.charuco_detector = cv2.aruco.CharucoDetector(
-                self.board,
+                board,
                 charuco_parameters,
                 self.detector_parameters,
             )
@@ -288,6 +311,18 @@ class CharucoPosePublisher(Node):
                 self.dictionary, self.detector_parameters
             )
             self.charuco_detector = None
+
+    def _create_board(self):
+        """Create a short-lived board to avoid an OpenCV 4.6 ownership bug."""
+        dictionary = cv2.aruco.getPredefinedDictionary(self.dictionary_id)
+        return create_charuco_board(
+            self.squares_x,
+            self.squares_y,
+            self.square_length,
+            self.marker_length,
+            dictionary,
+            self.legacy_pattern,
+        )
 
     def on_camera_info(self, message):
         matrix = np.asarray(message.k, dtype=np.float64).reshape(3, 3)
@@ -320,12 +355,13 @@ class CharucoPosePublisher(Node):
             )
         if marker_ids is None or self.camera_matrix is None:
             return None, None, marker_corners, marker_ids
+        board = self._create_board()
         _count, charuco_corners, charuco_ids = (
             cv2.aruco.interpolateCornersCharuco(
                 marker_corners,
                 marker_ids,
                 frame,
-                self.board,
+                board,
                 cameraMatrix=self.camera_matrix,
                 distCoeffs=self.distortion,
             )
@@ -343,10 +379,10 @@ class CharucoPosePublisher(Node):
             self.get_logger().error(f'Failed to convert camera image: {exc}')
             return
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         charuco_corners, charuco_ids, marker_corners, marker_ids = (
-            self._detect_board(gray)
+            self._detect_board(frame)
         )
+
         marker_count = 0 if marker_ids is None else len(marker_ids)
         corner_count = 0 if charuco_ids is None else len(charuco_ids)
         if (
@@ -371,34 +407,48 @@ class CharucoPosePublisher(Node):
                 pose = self.estimate_pose(charuco_corners, charuco_ids)
                 if pose is not None:
                     rotation, translation, error = pose
-                    self.publish_pose(message, rotation, translation, error)
-                    axis_length = self.square_length * 2.0
-                    if projected_axes_are_visible(
-                        rotation,
-                        translation,
-                        self.camera_matrix,
-                        self.distortion,
-                        axis_length,
-                        frame.shape,
-                    ):
-                        cv2.drawFrameAxes(
-                            frame,
-                            self.camera_matrix,
-                            self.distortion,
+                    stable_pose = self.stabilize_pose(rotation, translation)
+                    if stable_pose is not None:
+                        rotation, translation = stable_pose
+                        self.publish_pose(message, rotation, translation, error)
+                        axis_length = self.square_length * 2.0
+                        if projected_axes_are_visible(
                             rotation,
                             translation,
+                            self.camera_matrix,
+                            self.distortion,
                             axis_length,
+                            frame.shape,
+                        ):
+                            cv2.drawFrameAxes(
+                                frame,
+                                self.camera_matrix,
+                                self.distortion,
+                                rotation,
+                                translation,
+                                axis_length,
+                            )
+                        cv2.putText(
+                            frame,
+                            f'POSE STABLE  corners={corner_count}',
+                            (12, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            (0, 255, 0),
+                            2,
+                            cv2.LINE_AA,
                         )
-                    cv2.putText(
-                        frame,
-                        f'POSE OK  corners={corner_count}',
-                        (12, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (0, 255, 0),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                    else:
+                        cv2.putText(
+                            frame,
+                            f'POSE UNSTABLE  corners={corner_count}',
+                            (12, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            (0, 165, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
 
         if self.publish_annotated:
             cv2.putText(
@@ -429,24 +479,49 @@ class CharucoPosePublisher(Node):
         object_points, image_points = select_charuco_correspondences(
             self.board_corners, image_corners, corner_ids
         )
-        success, rotation, translation = cv2.solvePnP(
+        success, rotation, translation, inliers = cv2.solvePnPRansac(
             object_points,
             image_points,
             self.camera_matrix,
             self.distortion,
+            iterationsCount=200,
+            reprojectionError=self.max_reprojection_error,
+            confidence=0.999,
             flags=cv2.SOLVEPNP_ITERATIVE,
         )
-        if not success or float(translation[2, 0]) <= 0.0:
+        minimum_inliers = max(self.minimum_corners, 12)
+        if (
+            not success
+            or inliers is None
+            or len(inliers) < minimum_inliers
+            or len(inliers) < 0.5 * len(object_points)
+            or float(translation[2, 0]) <= 0.0
+        ):
+            return None
+        inlier_indices = np.asarray(inliers, dtype=np.int32).reshape(-1)
+        inlier_object_points = object_points[inlier_indices]
+        inlier_image_points = image_points[inlier_indices]
+        if hasattr(cv2, 'solvePnPRefineLM'):
+            rotation, translation = cv2.solvePnPRefineLM(
+                inlier_object_points,
+                inlier_image_points,
+                self.camera_matrix,
+                self.distortion,
+                rotation,
+                translation,
+            )
+        rotation_matrix, _ = cv2.Rodrigues(rotation)
+        if float(rotation_matrix[2, 2]) <= 0.0:
             return None
         projected, _ = cv2.projectPoints(
-            object_points,
+            inlier_object_points,
             rotation,
             translation,
             self.camera_matrix,
             self.distortion,
         )
         error = float(np.sqrt(np.mean(np.sum(
-            (projected.reshape(-1, 2) - image_points) ** 2,
+            (projected.reshape(-1, 2) - inlier_image_points) ** 2,
             axis=1,
         ))))
         if error > self.max_reprojection_error:
@@ -457,6 +532,51 @@ class CharucoPosePublisher(Node):
             )
             return None
         return rotation, translation, error
+
+    def stabilize_pose(self, rotation, translation):
+        """Return an averaged pose only after consecutive estimates settle."""
+        rotation_matrix, _ = cv2.Rodrigues(rotation)
+        quaternion = rotation_matrix_to_quaternion(rotation_matrix)
+        xyz = np.asarray(translation, dtype=np.float64).reshape(3)
+        self.pose_window.append((xyz, quaternion))
+        if len(self.pose_window) < self.stability_window_size:
+            return None
+
+        translations = np.asarray([item[0] for item in self.pose_window])
+        center = np.median(translations, axis=0)
+        translation_spread = np.max(
+            np.linalg.norm(translations - center, axis=1)
+        )
+
+        reference = self.pose_window[0][1]
+        quaternions = []
+        maximum_angle_deg = 0.0
+        for _, candidate in self.pose_window:
+            aligned = candidate if np.dot(reference, candidate) >= 0 else -candidate
+            quaternions.append(aligned)
+            dot = float(np.clip(abs(np.dot(reference, aligned)), 0.0, 1.0))
+            maximum_angle_deg = max(
+                maximum_angle_deg,
+                np.degrees(2.0 * np.arccos(dot)),
+            )
+
+        if (
+            translation_spread > self.max_stability_translation
+            or maximum_angle_deg > self.max_stability_rotation_deg
+        ):
+            return None
+
+        mean_quaternion = np.mean(np.asarray(quaternions), axis=0)
+        mean_quaternion /= np.linalg.norm(mean_quaternion)
+        x, y, z, w = mean_quaternion
+        mean_rotation_matrix = np.array([
+            [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
+            [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
+            [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)],
+        ], dtype=np.float64)
+        mean_rotation, _ = cv2.Rodrigues(mean_rotation_matrix)
+        mean_translation = np.mean(translations, axis=0).reshape(3, 1)
+        return mean_rotation, mean_translation
 
     def publish_pose(self, image_message, rotation, translation, error):
         camera_frame = (

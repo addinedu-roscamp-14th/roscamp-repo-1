@@ -33,9 +33,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--output',
-        default='config/arm2/arm2_charuco_11x8_15mm_11mm.png',
+        default='config/arm2/arm2_charuco_8x11_15mm_11mm.png',
     )
     parser.add_argument('--dictionary', default='DICT_4X4_50')
+    # The physical label uses rows x columns (8x11), while OpenCV expects
+    # squares-x=columns and squares-y=rows.
     parser.add_argument('--squares-x', type=int, default=11)
     parser.add_argument('--squares-y', type=int, default=8)
     parser.add_argument('--square-mm', type=float, default=15.0)
