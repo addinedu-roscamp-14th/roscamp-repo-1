@@ -24,7 +24,36 @@ setup(
     },
     entry_points={
         'console_scripts': [
+<<<<<<< Updated upstream
             'click_pick_place = arm.main:main',
+=======
+<<<<<<< Updated upstream
+            'hardware_joint_state_publisher = '
+            'arm.hardware_joint_state_publisher:main',
+            'manual_jog = arm.manual_jog:main',
+=======
+<<<<<<< Updated upstream
+            'click_pick_place = arm.main:main',
+=======
+            'hardware_joint_state_publisher = '
+            'arm.hardware_joint_state_publisher:main',
+            'manual_jog = arm.manual_jog:main',
+            'charuco_handeye_test = arm.charuco_handeye_test:main',
+>>>>>>> Stashed changes
+            'aruco_pose_publisher = arm.aruco_pose_publisher:main',
+            'charuco_pose_publisher = '
+            'arm.charuco_pose_publisher:main',
+            'generate_charuco_board = '
+            'arm.charuco_board_generator:main',
+            'container_pick_coordinator = '
+            'arm.container_pick_coordinator:main',
+            'jetcobot_trajectory_bridge = '
+            'arm.jetcobot_trajectory_bridge:main',
+<<<<<<< Updated upstream
+=======
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
         ],
     },
 )
