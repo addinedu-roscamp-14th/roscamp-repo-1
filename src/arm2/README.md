@@ -186,19 +186,19 @@ pregrasp가 컨테이너 중심 위의 안전한 높이에 도달하는 것을 �
 source install/setup.bash
 
 ros2 launch arm2 arm2_container_pick_moveit.launch.py \
-  camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
-  video_device:=/dev/video2 \
-  calibration_name:=arm2_jetcobot_eye_in_hand \
-  params_file:=config/arm2/arm2_container_pick.yaml \
-  use_node_time_for_pose:=true \
-  marker_id:=0 \
-  marker_size_m:=0.026 \
-  serial_port:=/dev/ttyUSB0 \
-  trajectory_speed:=100 \
-  goal_correction_speed:=100 \
-  goal_tolerance_deg:=3.5 \
-  goal_timeout_sec:=15.0 \
-  use_rviz:=true
+    camera_info_url:=config/arm2/arm2_gripper_camera_info_v2.yaml \
+    video_device:=/dev/video2 \
+    calibration_name:=arm2_jetcobot_eye_in_hand_charuco_5x5_v2 \
+    params_file:=config/arm2/arm2_container_pick.yaml \
+    use_node_time_for_pose:=true \
+    marker_id:=0 \
+    marker_size_m:=0.026 \
+    serial_port:=/dev/ttyUSB0 \
+    trajectory_speed:=100 \
+    goal_correction_speed:=100 \
+    goal_tolerance_deg:=3.5 \
+    goal_timeout_sec:=15.0 \
+    use_rviz:=true
 ```
 
 ```bash
