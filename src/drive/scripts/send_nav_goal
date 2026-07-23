@@ -4,6 +4,7 @@ import argparse
 import math
 import os
 import sys
+from pathlib import Path
 
 from nav2_msgs.action import NavigateToPose
 import rclpy
@@ -11,7 +12,35 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 
 
-DEFAULT_MAP = '/home/jio/poter_ws/config/SLAM/current_map.yaml'
+def default_workspace_root():
+    env_ws = os.environ.get('POTER_WS')
+    if env_ws:
+        return Path(env_ws).expanduser()
+
+    for prefix in os.environ.get('AMENT_PREFIX_PATH', '').split(os.pathsep):
+        if not prefix:
+            continue
+        prefix_path = Path(prefix).expanduser()
+        if prefix_path.name == 'install':
+            return prefix_path.parent
+        if prefix_path.parent.name == 'install':
+            return prefix_path.parent.parent
+
+    script_path = Path(__file__).resolve()
+    parts = script_path.parts
+    if 'src' in parts:
+        src_index = parts.index('src')
+        if src_index > 0:
+            return Path(*parts[:src_index])
+    if 'install' in parts:
+        install_index = parts.index('install')
+        if install_index > 0:
+            return Path(*parts[:install_index])
+
+    return Path.home() / 'poter_ws'
+
+
+DEFAULT_MAP = str(default_workspace_root() / 'config' / 'SLAM' / 'current_map.yaml')
 
 
 def read_map_yaml(path):

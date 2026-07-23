@@ -1,0 +1,23 @@
+# 자율주행차 제어 시스템 - 필요 패키지 목록
+# 설치: pip install -r requirements.txt
+
+# GUI
+customtkinter
+
+# 이미지/영상 처리 (cctv_view.py, pixel_to_map.py, calibrate_from_aruco.py 등)
+opencv-python
+pillow
+numpy
+
+# SLAM 지도 yaml 파싱 (slam_map_pixel_to_world.py)
+pyyaml
+
+# 엑셀 양식 생성/일괄 등록 (generate_cargo_template.py, cargo_dispatch_tool.py)
+openpyxl
+
+# 로컬 LLM 자연어 명령 해석 (llm_command_parser.py) - Ollama 프로그램 자체는
+# https://ollama.com 에서 별도로 설치해야 하며, 이 패키지는 그 파이썬 클라이언트입니다.
+ollama
+
+# 대시보드의 기상청(KMA)/해양조사원(KHOA) API 호출용 (dashboard_view.py)
+requests
