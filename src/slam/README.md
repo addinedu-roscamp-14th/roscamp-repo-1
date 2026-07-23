@@ -1,14 +1,14 @@
 # SLAM Package
 
 핑키 차량의 LiDAR와 odometry를 사용해 노트북에서 지도를 작성하는 패키지입니다.
-SLAM Toolbox 설정과 mapping용 RViz 화면만 포함합니다.
+SLAM Toolbox 기반 맵핑 도구와 차량 SLAM 토픽을 웹 API로 중계하는 실행 구성을 포함합니다.
 
 ## 구성
 
 ```text
 launch/map_building.launch.xml  # SLAM Toolbox 실행
 launch/map_view.launch.xml      # mapping용 RViz 실행
-launch/slam_bringup.launch.xml  # SLAM과 RViz 동시 실행
+launch/slam_bringup.launch.xml  # 차량 SLAM 토픽용 웹 API 서버 실행
 params/mapper_params.yaml       # frame, scan, 해상도와 loop closure 설정
 rviz/map_building.rviz          # mapping 화면
 ```
@@ -23,23 +23,34 @@ source install/setup.bash
 
 ## 실행
 
-차량에서는 하드웨어 bringup을 실행합니다.
+차량에서는 하드웨어 bringup과 SLAM Toolbox를 실행합니다.
 
 ```bash
 ros2 launch pinky bringup_robot.launch.xml
+ros2 launch slam map_building.launch.xml
 ```
 
-노트북에서는 SLAM과 RViz를 실행합니다.
+차량이 `/map`, `/scan`, `/odom`, `/tf`, `/tf_static`과 `map -> odom` TF를 발행하는
+상태에서 노트북의 API 서버를 실행합니다.
 
 ```bash
 ros2 launch slam slam_bringup.launch.xml
 ```
 
-RViz 없이 SLAM만 실행하려면:
+이 명령은 노트북에서 SLAM Toolbox, AMCL 또는 map server를 실행하지 않습니다.
+dashboard API 서버만 실행해 차량의 지도, pose와 LiDAR scan을 전송합니다.
+브라우저에서 다음 주소를 엽니다.
+
+```text
+http://localhost:8000/slam/view
+```
+
+차량에서 새 지도를 작성할 때 사용하는 명령은 다음과 같습니다.
 
 ```bash
 ros2 launch slam map_building.launch.xml
 ```
+
 
 `~/.bashrc`에 `slam` alias를 등록한 환경에서는 다음처럼 실행할 수 있습니다.
 
@@ -65,6 +76,7 @@ map
 
 ```text
 /scan
+/map
 /odom
 /tf
 /tf_static
@@ -106,6 +118,8 @@ ros2 run tf2_ros tf2_echo odom base_footprint
 ros2 topic echo /map --once
 ```
 
+`/map`은 점유 지도와 좌표 메타데이터만 포함합니다. 차량 위치·헤딩은
+`map -> odom -> base_footprint` TF에서 받고 LiDAR 점은 `/scan`에서 받습니다.
+
 차량과 노트북은 같은 네트워크와 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. Nav2와 SLAM이
-동시에 `map -> odom` TF를 발행하지 않도록 mapping 중에는 `drive bringup_launch.xml`을
-실행하지 않습니다.
+동시에 `map -> odom` TF를 발행하지 않도록 구성합니다.

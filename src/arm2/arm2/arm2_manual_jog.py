@@ -412,7 +412,7 @@ class ManualJogNode(Node):
         """Read one-key commands until Q or ESC is pressed."""
         if not sys.stdin.isatty():
             raise RuntimeError(
-                'manual_jog must run in an interactive terminal'
+                'arm2_manual_jog must run in an interactive terminal'
             )
 
         old_settings = termios.tcgetattr(sys.stdin)

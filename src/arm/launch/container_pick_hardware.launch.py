@@ -21,6 +21,7 @@ def generate_launch_description():
             default_value='config/arm/gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
+        DeclareLaunchArgument('stack_marker_id', default_value='1'),
         DeclareLaunchArgument('marker_size_m', default_value='0.015'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('baud_rate', default_value='1000000'),
@@ -69,6 +70,7 @@ def generate_launch_description():
             'video_device': LaunchConfiguration('video_device'),
             'camera_info_url': LaunchConfiguration('camera_info_url'),
             'marker_id': LaunchConfiguration('marker_id'),
+            'secondary_marker_id': LaunchConfiguration('stack_marker_id'),
             'marker_size_m': LaunchConfiguration('marker_size_m'),
             'marker_frame_id': 'arm/container_marker',
             'use_node_time_for_pose': LaunchConfiguration(

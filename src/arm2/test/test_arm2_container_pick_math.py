@@ -2,7 +2,10 @@
 
 from arm2.arm2_container_pick_coordinator import (
     apply_vertical_pick_offsets,
+    calculate_heading_aligned_stack_poses,
+    calculate_stack_poses,
     cartesian_path_acceptable,
+    cartesian_segment_executable,
     compose_fixed_base_pose,
     compose_pose,
     compose_yaw_follow_pose,
@@ -73,6 +76,66 @@ def test_extra_depth_does_not_lower_pregrasp():
     assert np.allclose(pregrasp, [0.05, -0.18, 0.091])
 
 
+def test_stop_above_raises_only_final_grasp():
+    """A stop-above adjustment preserves the verified pregrasp target."""
+    grasp, pregrasp = apply_vertical_pick_offsets(
+        [0.05, -0.18, 0.011],
+        pregrasp_lift=0.08,
+        extra_depth=0.0,
+        stop_above=0.02,
+    )
+
+    assert np.allclose(grasp, [0.05, -0.18, 0.031])
+    assert np.allclose(pregrasp, [0.05, -0.18, 0.091])
+
+
+def test_stack_pose_preserves_marker_to_tcp_offset():
+    """Stacking places the source marker one container above the target."""
+    release, approach = calculate_stack_poses(
+        source_marker=[0.08, -0.18, 0.06],
+        destination_marker=[0.16, -0.10, 0.06],
+        grasp_translation=[0.066, -0.191, 0.028],
+        container_height=0.05,
+        approach_clearance=0.08,
+        xy_offset=[0.002, -0.003],
+    )
+
+    assert np.allclose(release, [0.148, -0.114, 0.078])
+    assert np.allclose(approach, [0.148, -0.114, 0.158])
+
+
+def test_stack_release_follows_destination_heading():
+    """Release yaw and grasp offset follow the destination marker heading."""
+    release, approach, rotation, yaw_delta = (
+        calculate_heading_aligned_stack_poses(
+            destination_marker=[0.16, -0.10, 0.06],
+            grasp_offset=[-0.014, -0.010, -0.032],
+            grasp_rpy_degrees=[-170.0, 8.0, 120.0],
+            destination_yaw_degrees=60.0,
+            reference_marker_yaw_degrees=30.0,
+            container_height=0.035,
+            approach_clearance=0.08,
+            extra_depth=0.0,
+            xy_offset=[0.002, -0.003],
+        )
+    )
+
+    expected_offset = np.array([
+        -0.014 * np.cos(np.deg2rad(30.0))
+        + 0.010 * np.sin(np.deg2rad(30.0)),
+        -0.014 * np.sin(np.deg2rad(30.0))
+        - 0.010 * np.cos(np.deg2rad(30.0)),
+    ])
+    expected_xy = np.array([0.16, -0.10]) + expected_offset + [0.002, -0.003]
+    assert yaw_delta == 30.0
+    assert np.allclose(release[:2], expected_xy)
+    assert np.isclose(release[2], 0.063)
+    assert np.allclose(approach, release + [0.0, 0.0, 0.08])
+    assert np.allclose(
+        quaternion_to_rpy_degrees(rotation), [-170.0, 8.0, 150.0]
+    )
+
+
 def test_yaw_follow_rotates_grasp_and_xy_offset_only():
     """Marker yaw rotates XY and gripper yaw while retaining roll/pitch."""
     translation, rotation, yaw_delta = compose_yaw_follow_pose(
@@ -94,6 +157,26 @@ def test_yaw_follow_rotates_grasp_and_xy_offset_only():
     assert np.allclose(rpy, [-170.0, 8.0, 150.0], atol=1e-9)
 
 
+def test_yaw_follow_can_keep_base_frame_position_correction():
+    """Yaw may follow the marker while an empirical base offset stays fixed."""
+    translation, rotation, yaw_delta = compose_yaw_follow_pose(
+        [0.10, 0.20, 0.05],
+        [-0.028, -0.006, -0.001],
+        [171.0, -7.0, -87.0],
+        marker_yaw_degrees=93.0,
+        reference_marker_yaw_degrees=3.0,
+        rotate_offset=False,
+    )
+
+    assert yaw_delta == 90.0
+    assert np.allclose(translation, [0.072, 0.194, 0.049])
+    assert np.allclose(
+        quaternion_to_rpy_degrees(rotation),
+        [171.0, -7.0, 3.0],
+        atol=1e-9,
+    )
+
+
 def test_lift_candidates_descend_to_exact_minimum():
     """Adaptive lift searches downward and always tests its minimum."""
     assert np.allclose(
@@ -107,6 +190,20 @@ def test_cartesian_shortfall_is_bounded_in_metres():
     assert cartesian_path_acceptable(0.955, 0.08, 0.97, 0.90, 0.005)
     assert not cartesian_path_acceptable(0.955, 0.18, 0.97, 0.90, 0.005)
     assert not cartesian_path_acceptable(0.89, 0.01, 0.97, 0.90, 0.005)
+
+
+def test_segmented_descent_requires_safe_progress_and_attempt_budget():
+    """Partial descent executes only with substantial bounded progress."""
+    assert cartesian_segment_executable(0.651, 0.066, 0.65, 0.005, 0, 5)
+    assert not cartesian_segment_executable(
+        0.64, 0.066, 0.65, 0.005, 0, 5
+    )
+    assert not cartesian_segment_executable(
+        0.90, 0.004, 0.65, 0.005, 0, 5
+    )
+    assert not cartesian_segment_executable(
+        0.90, 0.071, 0.65, 0.005, 5, 5
+    )
 
 
 def test_inverted_l_workspace_excludes_upper_left_quadrant():

@@ -8,6 +8,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -25,6 +26,9 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'params_file', default_value='config/arm/container_pick.yaml'
+        ),
+        DeclareLaunchArgument(
+            'stack_container_height_m', default_value='0.035'
         ),
         DeclareLaunchArgument('use_rviz', default_value='true'),
     ]
@@ -70,6 +74,10 @@ def generate_launch_description():
                 'base_frame': 'base_link',
                 'execute_motion': True,
                 'motion_backend': 'moveit',
+                'stack_container_height_m': ParameterValue(
+                    LaunchConfiguration('stack_container_height_m'),
+                    value_type=float,
+                ),
             },
         ],
     )

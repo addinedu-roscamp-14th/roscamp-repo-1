@@ -23,7 +23,11 @@ def generate_launch_description():
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
+        DeclareLaunchArgument('stack_marker_id', default_value='1'),
         DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument(
+            'stack_container_height_m', default_value='0.035'
+        ),
         DeclareLaunchArgument(
             'use_node_time_for_pose', default_value='true'
         ),
@@ -81,6 +85,7 @@ def generate_launch_description():
             'video_device': LaunchConfiguration('video_device'),
             'camera_info_url': LaunchConfiguration('camera_info_url'),
             'marker_id': LaunchConfiguration('marker_id'),
+            'secondary_marker_id': LaunchConfiguration('stack_marker_id'),
             'marker_size_m': LaunchConfiguration('marker_size_m'),
             'marker_frame_id': 'arm2/container_marker',
             'use_node_time_for_pose': LaunchConfiguration(
@@ -109,6 +114,10 @@ def generate_launch_description():
                 'moveit_ee_link': 'arm2/TCP',
                 'execute_motion': True,
                 'motion_backend': 'moveit',
+                'stack_container_height_m': ParameterValue(
+                    LaunchConfiguration('stack_container_height_m'),
+                    value_type=float,
+                ),
             },
         ],
     )
