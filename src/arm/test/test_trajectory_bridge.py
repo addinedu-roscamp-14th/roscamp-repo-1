@@ -48,3 +48,14 @@ def test_joint_errors_report_target_minus_actual():
     assert joint_errors_degrees(
         [10.0, -20.0, 30.0], [12.5, -21.0, 30.0]
     ) == [2.5, -1.0, 0.0]
+
+
+def test_joint_limit_allows_only_small_numerical_boundary_error():
+    """MoveIt rounding may cross a URDF joint limit by under 0.1 degree."""
+    positions = [0.0] * 6
+    positions[2] = -2.301
+    JetCobotTrajectoryBridge._validate_joint_limits(positions)
+
+    positions[2] = -2.303
+    with pytest.raises(RuntimeError, match='J3 target'):
+        JetCobotTrajectoryBridge._validate_joint_limits(positions)

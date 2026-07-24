@@ -15,10 +15,11 @@ from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from ._joint_limits import JOINT_LIMITS_DEG
+from ._joint_limits import JOINT_LIMITS_DEG, JOINT_LIMITS_RAD
 
 
 JOINT_NAMES = [f'{index}_Joint' for index in range(1, 7)]
+JOINT_LIMIT_NUMERICAL_TOLERANCE_DEG = 0.1
 
 
 def duration_seconds(duration):
@@ -327,7 +328,16 @@ class JetCobotTrajectoryBridge(Node):
         ordered = []
         for source in trajectory.points:
             point = JointTrajectoryPoint()
-            point.positions = [source.positions[index] for index in order]
+            ordered_positions = [
+                float(source.positions[index]) for index in order
+            ]
+            self._validate_joint_limits(ordered_positions)
+            point.positions = [
+                min(max(value, limits[0]), limits[1])
+                for value, limits in zip(
+                    ordered_positions, JOINT_LIMITS_RAD
+                )
+            ]
             point.velocities = (
                 [source.velocities[index] for index in order]
                 if len(source.velocities) == len(order) else []
@@ -342,7 +352,11 @@ class JetCobotTrajectoryBridge(Node):
             zip(positions, JOINT_LIMITS_DEG)
         ):
             degrees = math.degrees(float(radians))
-            if not limits[0] <= degrees <= limits[1]:
+            if not (
+                limits[0] - JOINT_LIMIT_NUMERICAL_TOLERANCE_DEG
+                <= degrees
+                <= limits[1] + JOINT_LIMIT_NUMERICAL_TOLERANCE_DEG
+            ):
                 raise RuntimeError(
                     f'J{index + 1} target {degrees:.1f}deg outside limits'
                 )

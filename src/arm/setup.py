@@ -36,8 +36,12 @@ setup(
             'arm.charuco_pose_publisher:main',
             'generate_charuco_board = '
             'arm.charuco_board_generator:main',
+            'dual_aruco_pose_publisher = '
+            'arm.dual_aruco_pose_publisher:main',
             'container_pick_coordinator = '
             'arm.container_pick_coordinator:main',
+            'container_pick_place_coordinator = '
+            'arm.container_pick_place_coordinator:main',
             'jetcobot_trajectory_bridge = '
             'arm.jetcobot_trajectory_bridge:main',
         ],
