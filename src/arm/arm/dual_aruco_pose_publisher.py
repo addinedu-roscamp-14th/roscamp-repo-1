@@ -1,4 +1,4 @@
-"""Detect pick and place ArUco markers in one camera image."""
+"""Detect two target ArUco IDs independently across camera images."""
 
 import math
 
@@ -65,7 +65,7 @@ def rotation_matrix_to_quaternion(matrix):
 
 
 class DualArucoPosePublisher(Node):
-    """Publish independent TF frames for configured pick/place IDs."""
+    """Publish TF frames assigning one configured ID to pick and one to place."""
 
     def __init__(self):
         super().__init__('dual_aruco_pose_publisher')

@@ -272,6 +272,7 @@ ros2 launch arm container_pick_moveit.launch.py \
 ```bash
 ros2 service call /arm/preview_pregrasp std_srvs/srv/Trigger '{}'
 ros2 service call /arm/move_to_pregrasp std_srvs/srv/Trigger '{}'
+ros2 service call /arm/move_to_symmetric_pregrasp std_srvs/srv/Trigger '{}'
 ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
 ```
 

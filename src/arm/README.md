@@ -315,6 +315,7 @@ ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
 서비스: /arm/pick_container (std_srvs/Trigger)
 서비스: /arm/preview_pregrasp (std_srvs/Trigger)
 서비스: /arm/move_to_pregrasp (std_srvs/Trigger)
+서비스: /arm/move_to_symmetric_pregrasp (std_srvs/Trigger)
 서비스: /arm/stop_pick (std_srvs/Trigger)
 출력: /arm/container_pick/status (std_msgs/String)
 출력: /arm/container_pick/marker_pose (geometry_msgs/PoseStamped)
@@ -380,6 +381,19 @@ ros2 service call /arm/move_to_pregrasp std_srvs/srv/Trigger '{}'
 
 현재 TCP 자세로 pregrasp IK를 구할 수 없으면 수동으로 가르친 고정 파지 방향으로
 한 번 더 IK를 계산합니다. 두 자세가 모두 실패하면 모터 명령 없이 중단합니다.
+
+평행 그리퍼의 180도 대칭 자세를 비교하는 별도 테스트 서비스:
+
+```bash
+ros2 service call /arm/move_to_symmetric_pregrasp \
+  std_srvs/srv/Trigger '{}'
+```
+
+이 서비스는 마커 yaw 전체를 사용해 동일한 pregrasp 위치를 계산하고, 그리퍼 yaw만
+180도 차이 나는 두 후보를 MoveIt plan-only로 검사합니다. 도달 가능한 후보 중 현재
+관절에서 종점까지의 이동량, 전체 관절 경로 길이, planning time 순으로 선택한 궤적
+하나만 실행합니다. 그리퍼 개폐와 grasp 하강은 실행하지 않습니다. 선택 과정은
+`/arm/container_pick/status`에 발행됩니다.
 
 ```bash
 ros2 service call /arm/stop_pick std_srvs/srv/Trigger '{}'
@@ -543,6 +557,20 @@ MoveIt 실행 여유: 계획 시간 x 2 + 20초
 물리 관절 한계, 작업공간, 충돌 검사, 위치 안정성 5 mm와 Cartesian 경로 완성도
 98% 조건은 완화하지 않습니다.
 
+Cartesian 경로가 충돌 검사에서 중단되면 코디네이터는 충돌 검사를 끈 경로를
+실행하지 않고 진단에만 사용합니다. `/check_state_validity`로 해당 경로를 검사하여
+최초 무효 상태, 충돌 링크/물체 쌍, 접촉 위치와 침투 깊이를 실패 로그에 출력합니다.
+이 결과를 기준으로 URDF collision geometry나 접근 자세를 수정하며 목표 하강 깊이와
+전체 충돌 검사를 우회하지 않습니다.
+
+Place 수직 하강에서 자기 충돌이 검출되면 `/compute_ik`에 서로 다른 관절 seed를
+전달하여 동일한 TCP XYZ, orientation과 최종 깊이에 대한 대체 IK branch를 찾습니다.
+각 후보는 가상 preplace 상태에서 최종 place까지의 Cartesian 경로를 충돌 검사하고,
+`place_branch_min_fraction` 이상인 후보만 현재 자세에서 접근 계획을 세워 실행합니다.
+실제 preplace 도착 후에는 현재 관절 상태로 수직 경로를 다시 검사하며, 검사를 다시
+통과한 경우에만 하강합니다. `place_ik_branch_attempts`는 seed 개수,
+`place_ik_timeout_sec`는 후보 하나의 IK 제한 시간입니다.
+
 즉시 정지:
 
 ```bash
@@ -558,6 +586,66 @@ Service: /arm/gripper/open
 Service: /arm/gripper/close
 Service: /arm/stop_robot
 ```
+
+## 두 위치 순차 ArUco Pick & Place
+
+`container_pick_place_moveit.launch.py`는 pick/place 마커가 한 화면에 같이 보일 필요가
+없는 순차 인식 방식입니다. `pick_marker_id`로 지정한 ID가 pick이고,
+`place_marker_id`는 나머지 place 마커입니다. 첫 촬영 위치에서는 두 ID 중 현재
+안정적으로 검출되는 하나를 base 좌표로 저장합니다. 그다음 설정된 두 번째 촬영
+자세로 이동하고, 반대 ID의 새 영상 샘플을 다시 안정화한 뒤 기존 MoveIt pick/place를
+실행합니다. 첫 화면에 두 마커가 우연히 함께 보여도 하나를 먼저 저장하고 두 번째
+촬영 자세에서 나머지를 다시 측정합니다.
+
+실제 장비에서 안전한 두 촬영 자세의 J1~J6 관절각(degree)을 측정해
+`config/arm/container_pick_place.yaml`에 입력해야 합니다.
+
+```yaml
+first_observation_pose_configured: true
+first_observation_joint_angles_deg: [J1, J2, J3, J4, J5, J6]
+second_observation_pose_configured: true
+second_observation_joint_angles_deg: [J1, J2, J3, J4, J5, J6]
+observation_joint_tolerance_deg: 1.0
+startup_joint_state_timeout_sec: 20.0
+```
+
+두 `*_configured` 값 중 하나라도 `false`이면 로봇 이동 서비스가 거부됩니다.
+launch만 실행했을 때는 로봇이 움직이지 않습니다. `/arm/pick_and_place` 서비스를
+호출하면 완전한 `/joint_states`를 기다린 다음, MoveIt이 관절 목표 경로의 관절
+한계와 충돌을 검사하고 `first_observation_joint_angles_deg`로 이동합니다.
+
+```bash
+ros2 launch arm container_pick_place_moveit.launch.py \
+  pick_marker_id:=1 \
+  place_marker_id:=0 \
+  params_file:=config/arm/container_pick_place.yaml
+
+ros2 service call /arm/pick_and_place std_srvs/srv/Trigger '{}'
+```
+
+동작 순서는 다음과 같습니다.
+
+```text
+launch 시작 → 이동 없이 서비스 대기
+→ /arm/pick_and_place 호출
+→ first_observation_joint_angles_deg로 이동
+→ 첫 위치에서 ID 1 또는 ID 0 안정화
+→ 해당 base-frame 목표 좌표 저장
+→ second_observation_joint_angles_deg로 이동
+→ 반대 ID의 새 좌표 안정화
+→ pick_marker_id 좌표에서 집기
+→ 다른 ID 좌표에 놓기
+```
+
+각 촬영 단계에서는 마커 검출과 자세 안정성만 판단합니다. 두 마커를 모두 저장한 뒤
+pick, pregrasp, place, preplace 목표 전체의 작업공간을 검사하고, 하나라도 범위를
+벗어나면 실제 Pick & Place 이동 전에 중단합니다.
+
+`target_radial_offset_m`는 marker-yaw와 XYZ offset 계산이 끝난 Pick/Place 목표를
+base origin 기준 XY 반경 방향으로 이동합니다. `0.020`이면 방향과 Z를 유지하면서
+Pick과 Place 목표를 각각 base origin에서 정확히 20 mm 더 멀리 배치합니다.
+
+상태는 `/arm/container_pick/status`, 즉시 정지는 `/arm/stop_pick`을 사용합니다.
 
 ## 수동 TCP Jog
 

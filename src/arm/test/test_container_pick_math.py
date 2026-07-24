@@ -1,17 +1,25 @@
 """Tests for container pick transform calculations."""
 
+from types import SimpleNamespace
+
 from arm.container_pick_coordinator import (
+    ContainerPickCoordinator,
     apply_vertical_pick_offsets,
     cartesian_path_acceptable,
     compose_fixed_base_pose,
     compose_pose,
+    compose_symmetric_yaw_follow_poses,
     compose_yaw_follow_pose,
     inverted_l_workspace_contains,
+    joint_trajectory_metrics,
     lift_distance_candidates,
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
 )
+
 import numpy as np
+
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
 def test_compose_pose_rotates_marker_offset():
@@ -94,6 +102,47 @@ def test_yaw_follow_rotates_grasp_and_xy_offset_only():
     assert np.allclose(rpy, [-170.0, 8.0, 150.0], atol=1e-9)
 
 
+def test_symmetric_yaw_keeps_position_and_adds_180_degree_candidate():
+    """Both gripper branches share the full-yaw-rotated grasp position."""
+    translation, rotations, yaws, yaw_delta = (
+        compose_symmetric_yaw_follow_poses(
+            [0.10, 0.20, 0.05],
+            [0.02, 0.0, -0.04],
+            [-170.0, 8.0, 120.0],
+            marker_yaw_degrees=170.0,
+            reference_marker_yaw_degrees=30.0,
+        )
+    )
+
+    assert yaw_delta == 140.0
+    assert np.allclose(
+        translation,
+        [0.10 + 0.02 * np.cos(np.deg2rad(140.0)),
+         0.20 + 0.02 * np.sin(np.deg2rad(140.0)),
+         0.01],
+    )
+    assert np.allclose(yaws, [-100.0, 80.0])
+    assert np.allclose(
+        [quaternion_to_rpy_degrees(rotation)[2] for rotation in rotations],
+        yaws,
+        atol=1e-9,
+    )
+
+
+def test_joint_trajectory_metrics_prioritize_endpoint_then_path():
+    """Trajectory metrics measure net joint travel and total route length."""
+    points = [
+        SimpleNamespace(positions=[0.0, 0.0]),
+        SimpleNamespace(positions=[0.5, -0.25]),
+        SimpleNamespace(positions=[0.25, -0.5]),
+    ]
+
+    endpoint_travel, path_length = joint_trajectory_metrics(points)
+
+    assert endpoint_travel == 0.75
+    assert path_length == 1.25
+
+
 def test_lift_candidates_descend_to_exact_minimum():
     """Adaptive lift searches downward and always tests its minimum."""
     assert np.allclose(
@@ -121,3 +170,50 @@ def test_inverted_l_workspace_excludes_upper_left_quadrant():
     assert inverted_l_workspace_contains([-0.20, -0.20], *bounds)
     assert inverted_l_workspace_contains([0.20, -0.20], *bounds)
     assert not inverted_l_workspace_contains([-0.20, 0.20], *bounds)
+
+
+def test_collision_diagnostic_reports_first_contact_pair():
+    """Unsafe IK samples expose the first colliding MoveIt body pair."""
+    contact = SimpleNamespace(
+        contact_body_1='3_Link',
+        contact_body_2='gripper_link',
+        position=SimpleNamespace(x=0.1, y=-0.2, z=0.03),
+        depth=0.0015,
+    )
+
+    class Future:
+        def __init__(self, response):
+            self._response = response
+
+        def result(self):
+            return self._response
+
+    class Client:
+        @staticmethod
+        def wait_for_service(timeout_sec):
+            return timeout_sec > 0.0
+
+        @staticmethod
+        def call_async(request):
+            colliding = request.robot_state.joint_state.position[0] >= 0.6
+            return Future(SimpleNamespace(
+                valid=not colliding,
+                contacts=[contact] if colliding else [],
+            ))
+
+    trajectory = JointTrajectory()
+    trajectory.joint_names = ['1_Joint']
+    trajectory.points = [
+        JointTrajectoryPoint(positions=[position])
+        for position in (0.0, 0.3, 0.6, 0.9)
+    ]
+    coordinator = object.__new__(ContainerPickCoordinator)
+    coordinator.state_validity_client = Client()
+    coordinator.moveit_group = 'arm_group'
+    coordinator._wait_future = lambda future, timeout: None
+
+    detail = coordinator._diagnose_collision_contacts(trajectory, 0.5)
+
+    assert 'first invalid state=3/4' in detail
+    assert '3_Link<->gripper_link' in detail
+    assert 'depth=1.50mm' in detail

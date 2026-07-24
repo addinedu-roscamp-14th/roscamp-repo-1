@@ -13,12 +13,15 @@
     place_orientation_mode: marker_yaw
 
     # Initial test values: place uses the exact same calibration as pick.
-    grasp_offset_xyz_m: [-0.014261, -0.010785, -0.012462]
+    grasp_offset_xyz_m: [0.0, 0.01, -0.012462]
     grasp_offset_rpy_deg: [-176.75, 2.24, 129.248]
     reference_marker_yaw_deg: 29.4
-    place_offset_xyz_m: [-0.014261, -0.010785, -0.012462]
+    place_offset_xyz_m: [0.0, 0.0, -0.012462]
     place_offset_rpy_deg: [-176.75, 2.24, 129.248]
     place_reference_marker_yaw_deg: 29.4
+    # Applied after marker-yaw/XYZ composition. Positive values move both
+    # final Pick and Place targets farther from the base origin in XY.
+    target_radial_offset_m: 0.020
 
     max_yaw_spread_deg: 12.0
     max_container_yaw_delta_deg: 180.0
@@ -27,10 +30,28 @@
     pregrasp_lift_m: 0.08
     grasp_extra_depth_m: 0.020
     place_pregrasp_lift_m: 0.08
-    place_extra_depth_m: 0.020
+    place_extra_depth_m: 0.005
     refresh_marker_before_descent: false
-    pregrasp_test_keep_current_orientation: true
-    place_keep_current_orientation_on_approach: true
+    pregrasp_test_keep_current_orientation: false
+    pregrasp_position_only_approach: true
+    place_keep_current_orientation_on_approach: false
+    place_position_only_approach: true
+    # If the live vertical place path self-collides, search other joint
+    # branches without changing the requested TCP XYZ, orientation, or depth.
+    place_ik_branch_attempts: 24
+    place_ik_timeout_sec: 0.2
+    place_branch_min_fraction: 0.999
+
+    # Sequential observation joint poses (J1..J6, degrees).
+    # /arm/pick_and_place moves to the first pose. After one marker is locked,
+    # MoveIt plans to the second pose and observes the other marker.
+    # Enter measured safe joint values before enabling each guard.
+    first_observation_pose_configured: true
+    first_observation_joint_angles_deg: [-4.0, 72.0, -70.0, -58.0, 21.0, -50.0]
+    second_observation_pose_configured: true
+    second_observation_joint_angles_deg: [-91.0, 64.0, -71.0, -50.0, 13.0, -50.0]
+    observation_joint_tolerance_deg: 1.0
+    startup_joint_state_timeout_sec: 20.0
 
     lift_after_pick_m: 0.18
     minimum_lift_after_pick_m: 0.05
@@ -45,7 +66,7 @@
     max_marker_age_sec: 3.0
     stabilization_timeout_sec: 20.0
 
-    workspace_min_xyz_m: [-0.28, -0.28, 0.005]
+    workspace_min_xyz_m: [-0.28, -0.28, -0.05]
     workspace_max_xyz_m: [0.28, 0.28, 0.30]
     workspace_xy_shape: inverted_l
     workspace_horizontal_min_xy_m: [-0.28, -0.28]

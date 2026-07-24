@@ -30,14 +30,22 @@ try:
     from moveit_msgs.action import ExecuteTrajectory, MoveGroup
     from moveit_msgs.msg import (
         Constraints,
+        JointConstraint,
         MoveItErrorCodes,
         OrientationConstraint,
         PositionConstraint,
     )
-    from moveit_msgs.srv import GetCartesianPath
+    from moveit_msgs.srv import (
+        GetCartesianPath,
+        GetPositionIK,
+        GetStateValidity,
+    )
 except ImportError:
     ExecuteTrajectory = None
     GetCartesianPath = None
+    GetPositionIK = None
+    GetStateValidity = None
+    JointConstraint = None
     MoveGroup = None
 
 
@@ -119,6 +127,27 @@ def compose_fixed_base_pose(marker_translation, base_offset, base_rotation):
     return translation, normalize_quaternion(base_rotation)
 
 
+def apply_radial_xy_offset(translation, radial_offset):
+    """Move a base-frame target radially relative to the base origin."""
+    result = np.asarray(translation, dtype=np.float64).copy()
+    offset = float(radial_offset)
+    if not math.isfinite(offset):
+        raise ValueError('target_radial_offset_m must be finite')
+    if abs(offset) < 1e-12:
+        return result
+    radius = float(np.linalg.norm(result[:2]))
+    if radius < 1e-9:
+        raise ValueError(
+            'cannot apply radial offset to target at the base origin'
+        )
+    if radius + offset <= 0.0:
+        raise ValueError(
+            'target_radial_offset_m would cross the base origin'
+        )
+    result[:2] *= (radius + offset) / radius
+    return result
+
+
 def wrap_degrees(angle):
     """Wrap an angle to [-180, 180)."""
     return (float(angle) + 180.0) % 360.0 - 180.0
@@ -151,6 +180,51 @@ def compose_yaw_follow_pose(
         reference_grasp_yaw + yaw_delta,
     )
     return translation, rotation, yaw_delta
+
+
+def compose_symmetric_yaw_follow_poses(
+    marker_translation,
+    reference_offset,
+    fixed_rpy_degrees,
+    marker_yaw_degrees,
+    reference_marker_yaw_degrees,
+):
+    """Return two equivalent parallel-gripper attitudes 180 degrees apart."""
+    translation, first_rotation, yaw_delta = compose_yaw_follow_pose(
+        marker_translation,
+        reference_offset,
+        fixed_rpy_degrees,
+        marker_yaw_degrees,
+        reference_marker_yaw_degrees,
+    )
+    roll, pitch, reference_grasp_yaw = fixed_rpy_degrees
+    first_yaw = wrap_degrees(reference_grasp_yaw + yaw_delta)
+    second_yaw = wrap_degrees(first_yaw + 180.0)
+    second_rotation = quaternion_from_rpy_degrees(
+        roll, pitch, second_yaw
+    )
+    return (
+        translation,
+        (first_rotation, second_rotation),
+        (first_yaw, second_yaw),
+        yaw_delta,
+    )
+
+
+def joint_trajectory_metrics(points):
+    """Return endpoint travel and total L1 path length in joint radians."""
+    if not points:
+        raise ValueError('joint trajectory contains no points')
+    positions = np.asarray(
+        [point.positions for point in points], dtype=np.float64
+    )
+    if positions.ndim != 2 or positions.shape[1] == 0:
+        raise ValueError('joint trajectory points have invalid positions')
+    endpoint_travel = float(np.sum(np.abs(positions[-1] - positions[0])))
+    if len(positions) == 1:
+        return endpoint_travel, 0.0
+    path_length = float(np.sum(np.abs(np.diff(positions, axis=0))))
+    return endpoint_travel, path_length
 
 
 def apply_vertical_pick_offsets(nominal_grasp, pregrasp_lift, extra_depth):
@@ -242,6 +316,11 @@ class ContainerPickCoordinator(Node):
         self.grasp_offset = self._vector_parameter('grasp_offset_xyz_m', 3)
         self.grasp_rpy = self._vector_parameter('grasp_offset_rpy_deg', 3)
         self.grasp_rotation = quaternion_from_rpy_degrees(*self.grasp_rpy)
+        self.target_radial_offset = float(
+            self.get_parameter('target_radial_offset_m').value
+        )
+        if not math.isfinite(self.target_radial_offset):
+            raise ValueError('target_radial_offset_m must be finite')
         self.reference_marker_yaw = float(
             self.get_parameter('reference_marker_yaw_deg').value
         )
@@ -425,6 +504,8 @@ class ContainerPickCoordinator(Node):
         self.robot = None
         self.move_group_client = None
         self.cartesian_path_client = None
+        self.position_ik_client = None
+        self.state_validity_client = None
         self.execute_trajectory_client = None
         self.gripper_open_client = None
         self.gripper_close_client = None
@@ -457,6 +538,11 @@ class ContainerPickCoordinator(Node):
         self.create_service(
             Trigger, '/arm/move_to_pregrasp', self.start_pregrasp_test
         )
+        self.create_service(
+            Trigger,
+            '/arm/move_to_symmetric_pregrasp',
+            self.start_symmetric_pregrasp_test,
+        )
         self.create_service(Trigger, '/arm/stop_pick', self.stop_pick)
         self.create_timer(0.1, self.update_tracking)
         self.create_timer(1.0, self._republish_status)
@@ -484,6 +570,7 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('grasp_orientation_mode', 'fixed')
         self.declare_parameter('grasp_offset_xyz_m', [0.0, 0.0, 0.0])
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
+        self.declare_parameter('target_radial_offset_m', 0.0)
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
         self.declare_parameter('max_yaw_spread_deg', 5.0)
         self.declare_parameter('max_container_yaw_delta_deg', 90.0)
@@ -577,6 +664,12 @@ class ContainerPickCoordinator(Node):
         )
         self.cartesian_path_client = self.create_client(
             GetCartesianPath, '/compute_cartesian_path'
+        )
+        self.position_ik_client = self.create_client(
+            GetPositionIK, '/compute_ik'
+        )
+        self.state_validity_client = self.create_client(
+            GetStateValidity, '/check_state_validity'
         )
         self.gripper_open_client = self.create_client(
             Trigger, '/arm/gripper/open'
@@ -749,6 +842,9 @@ class ContainerPickCoordinator(Node):
                 self.grasp_offset,
                 self.grasp_rotation,
             )
+        grasp_translation = apply_radial_xy_offset(
+            grasp_translation, self.target_radial_offset
+        )
         grasp_translation, pregrasp_translation = apply_vertical_pick_offsets(
             grasp_translation,
             self.pregrasp_lift,
@@ -767,6 +863,58 @@ class ContainerPickCoordinator(Node):
         self.grasp_pose_publisher.publish(grasp)
         self.pregrasp_pose_publisher.publish(pregrasp)
         return (grasp, pregrasp), 'targets valid'
+
+    def calculate_symmetric_pregrasp_candidates(self):
+        """Build both 180-degree-equivalent marker-yaw pregrasp poses."""
+        marker_pose, reason = self.stable_marker_pose(yaw_only=True)
+        if marker_pose is None:
+            return None, reason
+        marker_translation, marker_rotation = marker_pose
+        marker_yaw = quaternion_to_rpy_degrees(marker_rotation)[2]
+        (
+            nominal_grasp,
+            rotations,
+            yaws,
+            yaw_delta,
+        ) = compose_symmetric_yaw_follow_poses(
+            marker_translation,
+            self.grasp_offset,
+            self.grasp_rpy,
+            marker_yaw,
+            self.reference_marker_yaw,
+        )
+        if abs(yaw_delta) > self.max_yaw_delta:
+            return None, (
+                f'container yaw delta {yaw_delta:.2f}deg exceeds limit'
+            )
+        _grasp_translation, pregrasp_translation = (
+            apply_vertical_pick_offsets(
+                nominal_grasp,
+                self.pregrasp_lift,
+                self.grasp_extra_depth,
+            )
+        )
+        if not self.in_workspace(pregrasp_translation):
+            return None, (
+                'symmetric pregrasp target outside workspace: '
+                f'{pregrasp_translation}'
+            )
+        stamp = self.get_clock().now().to_msg()
+        candidates = []
+        for branch, (rotation, yaw) in enumerate(
+            zip(rotations, yaws), start=1
+        ):
+            candidates.append({
+                'branch': branch,
+                'yaw': yaw,
+                'pose': self.make_pose(
+                    pregrasp_translation, rotation, stamp
+                ),
+            })
+        return candidates, (
+            f'marker_yaw={marker_yaw:.2f}deg, '
+            f'yaw_delta={yaw_delta:.2f}deg'
+        )
 
     def wait_for_new_stable_targets(self):
         with self.history_lock:
@@ -909,6 +1057,44 @@ class ContainerPickCoordinator(Node):
         self.motion_thread.start()
         response.success = True
         response.message = 'Pregrasp-only motion accepted'
+        return response
+
+    def start_symmetric_pregrasp_test(self, _request, response):
+        """Plan both symmetric attitudes and execute only the best plan."""
+        if not self.execute_motion:
+            response.success = False
+            response.message = 'Start launch with execute_motion:=true'
+            return response
+        if self.motion_backend != 'moveit':
+            response.success = False
+            response.message = (
+                'Symmetric pregrasp test requires motion_backend=moveit'
+            )
+            return response
+        if not self.offsets_configured:
+            response.success = False
+            response.message = 'Grasp offsets are not configured'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        candidates, reason = self.calculate_symmetric_pregrasp_candidates()
+        if candidates is None:
+            response.success = False
+            response.message = reason
+            return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_symmetric_pregrasp_test,
+            args=(candidates, reason),
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = (
+            'Symmetric pregrasp test accepted; planning both yaw branches'
+        )
         return response
 
     def preview_pregrasp(self, _request, response):
@@ -1084,6 +1270,82 @@ class ContainerPickCoordinator(Node):
         finally:
             self.motion_lock.release()
 
+    def execute_symmetric_pregrasp_test(self, candidates, marker_detail):
+        """Choose the least-moving reachable symmetric plan and execute it."""
+        if not self.motion_lock.acquire(blocking=False):
+            return
+        try:
+            self.publish_status(
+                'SYMMETRIC PREGRASP: planning two branches; '
+                f'{marker_detail}'
+            )
+            feasible = []
+            failures = []
+            for candidate in candidates:
+                branch = candidate['branch']
+                yaw = candidate['yaw']
+                try:
+                    trajectory, planning_time = (
+                        self._plan_moveit_pose_goal(candidate['pose'])
+                    )
+                    endpoint_travel, path_length = (
+                        joint_trajectory_metrics(
+                            trajectory.joint_trajectory.points
+                        )
+                    )
+                    candidate.update({
+                        'trajectory': trajectory,
+                        'planning_time': planning_time,
+                        'endpoint_travel': endpoint_travel,
+                        'path_length': path_length,
+                    })
+                    feasible.append(candidate)
+                    self.publish_status(
+                        'SYMMETRIC PREGRASP: '
+                        f'branch={branch}, yaw={yaw:.2f}deg reachable, '
+                        f'endpoint_travel={math.degrees(endpoint_travel):.1f}'
+                        'deg, '
+                        f'path_cost={math.degrees(path_length):.1f}deg, '
+                        f'planning_time={planning_time:.3f}s'
+                    )
+                except RuntimeError as exc:
+                    failures.append(
+                        f'branch={branch}, yaw={yaw:.2f}deg: {exc}'
+                    )
+                    self.publish_status(
+                        'SYMMETRIC PREGRASP: '
+                        f'branch={branch}, yaw={yaw:.2f}deg unreachable'
+                    )
+            if not feasible:
+                raise RuntimeError(
+                    'neither symmetric pregrasp is reachable: '
+                    + '; '.join(failures)
+                )
+            selected = min(
+                feasible,
+                key=lambda item: (
+                    item['endpoint_travel'],
+                    item['path_length'],
+                    item['planning_time'],
+                ),
+            )
+            self.pregrasp_pose_publisher.publish(selected['pose'])
+            self.publish_status(
+                'SYMMETRIC PREGRASP: selected '
+                f"branch={selected['branch']}, "
+                f"yaw={selected['yaw']:.2f}deg; executing planned trajectory"
+            )
+            self._execute_moveit_trajectory(selected['trajectory'])
+            self.publish_status(
+                'SYMMETRIC PREGRASP: selected target reached; stopped'
+            )
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(f'SYMMETRIC PREGRASP FAILED: {exc}')
+        finally:
+            self.motion_lock.release()
+
     def move_to_pose(self, pose, keep_current_orientation=False):
         if self.stop_event.is_set():
             raise RuntimeError('pick stopped')
@@ -1178,6 +1440,262 @@ class ContainerPickCoordinator(Node):
                     f'the taught grasp orientation: {exc}'
                 )
         self._execute_moveit_pose_goal(pose)
+
+    def _plan_moveit_pose_goal(self, target):
+        """Plan one pose without executing and return its trajectory."""
+        if not self.move_group_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /move_action server is unavailable')
+
+        target = copy.deepcopy(target)
+        target.header.stamp = Time().to_msg()
+        goal = MoveGroup.Goal()
+        request = goal.request
+        request.group_name = self.moveit_group
+        request.num_planning_attempts = self.moveit_planning_attempts
+        request.allowed_planning_time = self.moveit_planning_time
+        request.max_velocity_scaling_factor = self.moveit_velocity_scale
+        request.max_acceleration_scaling_factor = (
+            self.moveit_acceleration_scale
+        )
+        request.start_state.is_diff = True
+        request.workspace_parameters.header.frame_id = self.base_frame
+        request.workspace_parameters.min_corner.x = float(
+            self.workspace_min[0]
+        )
+        request.workspace_parameters.min_corner.y = float(
+            self.workspace_min[1]
+        )
+        request.workspace_parameters.min_corner.z = float(
+            self.workspace_min[2]
+        )
+        request.workspace_parameters.max_corner.x = float(
+            self.workspace_max[0]
+        )
+        request.workspace_parameters.max_corner.y = float(
+            self.workspace_max[1]
+        )
+        request.workspace_parameters.max_corner.z = float(
+            self.workspace_max[2]
+        )
+        request.goal_constraints = [self._moveit_pose_constraints(target)]
+
+        goal.planning_options.plan_only = True
+        goal.planning_options.look_around = False
+        goal.planning_options.replan = False
+        goal.planning_options.planning_scene_diff.is_diff = True
+        goal.planning_options.planning_scene_diff.robot_state.is_diff = True
+
+        goal_future = self.move_group_client.send_goal_async(goal)
+        self._wait_future(goal_future, self.moveit_planning_time + 5.0)
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError('MoveIt rejected the plan-only pose goal')
+        with self.moveit_goal_lock:
+            self.current_moveit_goal = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            self._wait_future(
+                result_future,
+                self.moveit_planning_time + 10.0,
+                goal_handle,
+            )
+            wrapped_result = result_future.result()
+            if wrapped_result is None:
+                raise RuntimeError('MoveIt returned no plan-only result')
+            result = wrapped_result.result
+            if result.error_code.val != MoveItErrorCodes.SUCCESS:
+                detail = result.error_code.message or 'no detail'
+                raise RuntimeError(
+                    'MoveIt plan-only failed: '
+                    f'code={result.error_code.val}, message={detail}'
+                )
+            if not result.planned_trajectory.joint_trajectory.points:
+                raise RuntimeError('MoveIt plan-only trajectory is empty')
+            return result.planned_trajectory, float(result.planning_time)
+        finally:
+            with self.moveit_goal_lock:
+                self.current_moveit_goal = None
+
+    def _plan_moveit_joint_goal(
+        self, joint_names, joint_positions, tolerance=1e-3
+    ):
+        """Plan a collision-checked joint target without executing it."""
+        if not self.move_group_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /move_action server is unavailable')
+        if JointConstraint is None:
+            raise RuntimeError('moveit_msgs JointConstraint is unavailable')
+        if len(joint_names) != len(joint_positions):
+            raise ValueError('joint target names and positions differ')
+
+        constraints = Constraints()
+        for name, position in zip(joint_names, joint_positions):
+            joint = JointConstraint()
+            joint.joint_name = str(name)
+            joint.position = float(position)
+            joint.tolerance_above = float(tolerance)
+            joint.tolerance_below = float(tolerance)
+            joint.weight = 1.0
+            constraints.joint_constraints.append(joint)
+
+        goal = MoveGroup.Goal()
+        request = goal.request
+        request.group_name = self.moveit_group
+        request.num_planning_attempts = self.moveit_planning_attempts
+        request.allowed_planning_time = self.moveit_planning_time
+        request.max_velocity_scaling_factor = self.moveit_velocity_scale
+        request.max_acceleration_scaling_factor = (
+            self.moveit_acceleration_scale
+        )
+        request.start_state.is_diff = True
+        request.goal_constraints = [constraints]
+        goal.planning_options.plan_only = True
+        goal.planning_options.look_around = False
+        goal.planning_options.replan = False
+        goal.planning_options.planning_scene_diff.is_diff = True
+        goal.planning_options.planning_scene_diff.robot_state.is_diff = True
+
+        goal_future = self.move_group_client.send_goal_async(goal)
+        self._wait_future(goal_future, self.moveit_planning_time + 5.0)
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError('MoveIt rejected the plan-only joint goal')
+        with self.moveit_goal_lock:
+            self.current_moveit_goal = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            self._wait_future(
+                result_future,
+                self.moveit_planning_time + 10.0,
+                goal_handle,
+            )
+            wrapped_result = result_future.result()
+            if wrapped_result is None:
+                raise RuntimeError('MoveIt returned no joint plan result')
+            result = wrapped_result.result
+            if result.error_code.val != MoveItErrorCodes.SUCCESS:
+                detail = result.error_code.message or 'no detail'
+                raise RuntimeError(
+                    'MoveIt joint plan failed: '
+                    f'code={result.error_code.val}, message={detail}'
+                )
+            if not result.planned_trajectory.joint_trajectory.points:
+                raise RuntimeError('MoveIt joint plan trajectory is empty')
+            return result.planned_trajectory, float(result.planning_time)
+        finally:
+            with self.moveit_goal_lock:
+                self.current_moveit_goal = None
+
+    def solve_collision_free_ik(self, target, seed_positions, timeout=0.2):
+        """Return a collision-free IK result for an exact TCP target."""
+        client = self.position_ik_client
+        if client is None or not client.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError('MoveIt /compute_ik service is unavailable')
+        request = GetPositionIK.Request()
+        ik = request.ik_request
+        ik.group_name = self.moveit_group
+        ik.robot_state.is_diff = True
+        ik.robot_state.joint_state.name = list(JOINT_NAMES)
+        ik.robot_state.joint_state.position = [
+            float(value) for value in seed_positions
+        ]
+        ik.avoid_collisions = True
+        ik.ik_link_name = self.moveit_ee_link
+        ik.pose_stamped = copy.deepcopy(target)
+        ik.pose_stamped.header.stamp = Time().to_msg()
+        ik.timeout.sec = int(timeout)
+        ik.timeout.nanosec = int((timeout % 1.0) * 1e9)
+
+        future = client.call_async(request)
+        self._wait_future(future, timeout + 2.0)
+        response = future.result()
+        if response is None:
+            return None
+        if response.error_code.val != MoveItErrorCodes.SUCCESS:
+            return None
+        positions_by_name = dict(zip(
+            response.solution.joint_state.name,
+            response.solution.joint_state.position,
+        ))
+        if not all(name in positions_by_name for name in JOINT_NAMES):
+            return None
+        return np.asarray(
+            [positions_by_name[name] for name in JOINT_NAMES],
+            dtype=np.float64,
+        )
+
+    def plan_cartesian_from_joint_state(
+        self, target, joint_positions
+    ):
+        """Plan, but never execute, a Cartesian path from a joint state."""
+        if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(
+                'MoveIt /compute_cartesian_path service is unavailable'
+            )
+        request = GetCartesianPath.Request()
+        request.header = copy.deepcopy(target.header)
+        request.header.stamp = Time().to_msg()
+        request.start_state.is_diff = True
+        request.start_state.joint_state.name = list(JOINT_NAMES)
+        request.start_state.joint_state.position = [
+            float(value) for value in joint_positions
+        ]
+        request.group_name = self.moveit_group
+        request.link_name = self.moveit_ee_link
+        request.waypoints = [copy.deepcopy(target.pose)]
+        request.max_step = self.cartesian_max_step
+        request.jump_threshold = 0.0
+        request.prismatic_jump_threshold = 0.0
+        request.revolute_jump_threshold = self.cartesian_joint_jump
+        request.avoid_collisions = True
+        request.max_velocity_scaling_factor = self.moveit_velocity_scale
+        request.max_acceleration_scaling_factor = (
+            self.moveit_acceleration_scale
+        )
+        request.cartesian_speed_limited_link = self.moveit_ee_link
+        request.max_cartesian_speed = self.cartesian_max_speed
+        return self._compute_cartesian_path(request)
+
+    def _execute_moveit_trajectory(self, trajectory):
+        """Execute a previously collision-checked MoveIt trajectory."""
+        if not trajectory.joint_trajectory.points:
+            raise RuntimeError('MoveIt trajectory is empty')
+        if not self.execute_trajectory_client.wait_for_server(
+            timeout_sec=5.0
+        ):
+            raise RuntimeError(
+                'MoveIt /execute_trajectory action is unavailable'
+            )
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = trajectory
+        goal_future = self.execute_trajectory_client.send_goal_async(goal)
+        self._wait_future(goal_future, 5.0)
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError('MoveIt rejected the selected trajectory')
+        with self.moveit_goal_lock:
+            self.current_moveit_goal = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            self._wait_future(
+                result_future,
+                self.motion_timeout + 30.0,
+                goal_handle,
+            )
+            wrapped_result = result_future.result()
+            if wrapped_result is None:
+                raise RuntimeError('MoveIt execution returned no result')
+            error = wrapped_result.result.error_code
+            if error.val != MoveItErrorCodes.SUCCESS:
+                detail = error.message or 'no detail'
+                raise RuntimeError(
+                    'MoveIt execution failed: '
+                    f'code={error.val}, message={detail}'
+                )
+            if self.stop_event.wait(self.moveit_state_settle):
+                raise RuntimeError('pick stopped')
+        finally:
+            with self.moveit_goal_lock:
+                self.current_moveit_goal = None
 
     def _execute_moveit_pose_goal(self, target):
         if not self.move_group_client.wait_for_server(timeout_sec=5.0):
@@ -1370,7 +1888,9 @@ class ContainerPickCoordinator(Node):
             self.cartesian_absolute_min_fraction,
             self.cartesian_max_shortfall,
         ):
-            diagnostics = self._diagnose_cartesian_limits(request)
+            diagnostics = self._diagnose_cartesian_limits(
+                request, response.fraction
+            )
             distance_detail = ''
             if requested_distance is not None:
                 shortfall_mm = (
@@ -1469,7 +1989,7 @@ class ContainerPickCoordinator(Node):
         self._wait_future(path_future, self.moveit_planning_time + 5.0)
         return path_future.result()
 
-    def _diagnose_cartesian_limits(self, safe_request):
+    def _diagnose_cartesian_limits(self, safe_request, collision_fraction):
         """Plan unsafe diagnostic variants without executing any of them."""
         variants = (
             ('no_collision', False, self.cartesian_joint_jump),
@@ -1477,6 +1997,7 @@ class ContainerPickCoordinator(Node):
             ('ik_only', False, 0.0),
         )
         results = []
+        no_collision_response = None
         for name, avoid_collisions, joint_jump in variants:
             request = copy.deepcopy(safe_request)
             request.avoid_collisions = avoid_collisions
@@ -1494,7 +2015,91 @@ class ContainerPickCoordinator(Node):
                 )
             else:
                 results.append(f'{name}={response.fraction:.3f}')
-        return 'diagnostic plan-only fractions: ' + ', '.join(results)
+                if name == 'no_collision':
+                    no_collision_response = response
+        summary = 'diagnostic plan-only fractions: ' + ', '.join(results)
+        if (
+            no_collision_response is not None
+            and no_collision_response.solution.joint_trajectory.points
+        ):
+            contact_detail = self._diagnose_collision_contacts(
+                no_collision_response.solution.joint_trajectory,
+                collision_fraction,
+            )
+            summary += f'; {contact_detail}'
+        return summary
+
+    def _diagnose_collision_contacts(self, trajectory, collision_fraction):
+        """Find the first colliding state on a non-executed IK trajectory."""
+        client = self.state_validity_client
+        if client is None or not client.wait_for_service(timeout_sec=1.0):
+            return 'collision contacts unavailable (/check_state_validity)'
+
+        points = trajectory.points
+        point_count = len(points)
+        estimated_index = int(
+            math.floor(float(collision_fraction) * max(0, point_count - 1))
+        )
+        start_index = max(0, estimated_index - 3)
+        for index in range(start_index, point_count):
+            request = GetStateValidity.Request()
+            request.group_name = self.moveit_group
+            request.robot_state.is_diff = True
+            request.robot_state.joint_state.header = copy.deepcopy(
+                trajectory.header
+            )
+            request.robot_state.joint_state.name = list(
+                trajectory.joint_names
+            )
+            request.robot_state.joint_state.position = list(
+                points[index].positions
+            )
+            try:
+                future = client.call_async(request)
+                self._wait_future(future, 2.0)
+                response = future.result()
+            except Exception as exc:
+                return f'collision contact query failed: {exc}'
+            if response is None:
+                return 'collision contact query returned no response'
+            if response.valid:
+                continue
+
+            progress = (
+                index / (point_count - 1)
+                if point_count > 1 else 1.0
+            )
+            if not response.contacts:
+                return (
+                    f'first invalid state={index + 1}/{point_count} '
+                    f'({progress:.3f}), but MoveIt returned no contacts'
+                )
+            contacts = []
+            seen_pairs = set()
+            for contact in response.contacts:
+                pair = tuple(sorted((
+                    contact.contact_body_1,
+                    contact.contact_body_2,
+                )))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                contacts.append(
+                    f'{contact.contact_body_1}<->{contact.contact_body_2} '
+                    f'at [{contact.position.x:.4f}, '
+                    f'{contact.position.y:.4f}, '
+                    f'{contact.position.z:.4f}]m, '
+                    f'depth={contact.depth * 1000.0:.2f}mm'
+                )
+            return (
+                f'first invalid state={index + 1}/{point_count} '
+                f'({progress:.3f}); collision contacts: '
+                + ' | '.join(contacts)
+            )
+        return (
+            'no invalid sampled state found on the non-executed IK path; '
+            'collision may occur between sampled trajectory points'
+        )
 
     def move_adaptive_cartesian_lift(self, grasp):
         """Execute the largest fully feasible vertical lift."""
