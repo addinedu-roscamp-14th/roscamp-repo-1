@@ -396,6 +396,27 @@ ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
 통과하지 못하면 이동하지 않습니다. 탑다운 카메라를 이용한 사전 접근은 아직 이 launch에
 연결하지 않았습니다.
 
+### ID 0 컨테이너를 ID 1 위에 적재
+
+`container_pick_moveit.launch.py`가 실행 중이고 카메라에서 ID 0과 ID 1 마커가 모두
+인식된 상태에서 다음 순서로 실행합니다. ID 0은 옮길 컨테이너이고 ID 1은 아래에 놓일
+컨테이너입니다.
+
+```bash
+source install/setup.bash
+
+ros2 service call /arm/preview_stack std_srvs/srv/Trigger '{}'
+ros2 service call /arm/stack_container std_srvs/srv/Trigger '{}'
+```
+
+`/arm/stack_container`는 ID 0을 파지한 뒤 ID 1 위에 적재하는 전체 동작을 실행합니다.
+동작 상태는 별도 터미널에서 확인합니다.
+
+```bash
+source install/setup.bash
+ros2 topic echo /arm/container_pick/status
+```
+
 ## MoveIt2 기반 실행
 
 직접 `pymycobot.solve_inv_kinematics()`를 호출하는 기존 launch 대신 MoveIt2의 KDL IK,
@@ -422,7 +443,7 @@ launch를 실행합니다.
 ros2 launch arm container_pick_moveit.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   video_device:=/dev/video2 \
-  calibration_name:=jetcobot_eye_in_hand_charuco \
+  calibration_name:=jetcobot_eye_in_hand \
   use_node_time_for_pose:=true \
   marker_id:=0 \
   marker_size_m:=0.015 \
@@ -433,6 +454,20 @@ ros2 launch arm container_pick_moveit.launch.py \
   goal_timeout_sec:=15.0 \
   use_rviz:=true
 ```
+
+``` bash
+ros2 launch arm container_pick_moveit.launch.py \
+  camera_info_url:=config/arm/gripper_camera_info.yaml \
+  video_device:=/dev/video4 \
+  calibration_name:=jetcobot_eye_in_hand_charuco \
+  marker_id:=0 \
+  stack_marker_id:=1 \
+  marker_size_m:=0.015 \
+  stack_container_height_m:=0.035 \
+  serial_port:=/dev/ttyUSB0 \
+  trajectory_speed:=100 \
+  use_rviz:=true
+  ```
 
 `trajectory_speed`는 JetCobot 내부 위치 제어기가 MoveIt의 시간 기반 중간 목표를
 따라가는 속도입니다. 전체 이동 속도는 MoveIt의 velocity scaling으로 제한합니다.

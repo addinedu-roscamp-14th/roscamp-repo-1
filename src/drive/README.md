@@ -29,7 +29,19 @@ rviz/                                # RViz 설정
 출력: navigate_to_pose (nav2_msgs/action/NavigateToPose)
 ```
 
-새 목표가 들어오면 진행 중인 이전 목표를 취소하고 새 목표를 전송합니다.
+새 목표가 들어오면 `/bt_navigator/get_state`를 확인합니다. Nav2가 아직
+`active(3)`가 아니면 최신 목표 한 개를 보관하고 lifecycle 활성화 후 자동으로
+전송합니다. 진행 중인 이전 목표가 있으면 취소하고 새 목표를 전송합니다.
+
+상태 확인:
+
+```bash
+ros2 lifecycle get /bt_navigator
+ros2 lifecycle get /planner_server
+ros2 lifecycle get /controller_server
+```
+
+모두 `active [3]`이어야 경로 계획과 주행이 시작됩니다.
 
 ### `target_waypoints_to_nav_goal`
 

@@ -15,10 +15,16 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import PushRosNamespace
 
 
-def _include(launch_directory, filename, condition=None):
+def _include(
+    launch_directory,
+    filename,
+    condition=None,
+    launch_arguments=None,
+):
     return IncludeLaunchDescription(
         PythonLaunchDescriptionSource(str(launch_directory / filename)),
         condition=condition,
+        launch_arguments=(launch_arguments or {}).items(),
     )
 
 
@@ -39,6 +45,13 @@ def generate_launch_description():
             launch_directory,
             'arm2_moveit_rviz.launch.py',
             condition=IfCondition(use_rviz),
+            launch_arguments={
+                'rviz_config': str(
+                    Path(get_package_share_directory('arm2'))
+                    / 'rviz'
+                    / 'arm2_moveit.rviz'
+                ),
+            },
         ),
     ])
     return LaunchDescription([

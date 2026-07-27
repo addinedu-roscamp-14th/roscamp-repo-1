@@ -80,6 +80,13 @@ class ArucoPosePublisher(Node):
         self.declare_parameter('camera_frame_id', '')
         self.declare_parameter('marker_frame_id', 'arm/container_marker')
         self.declare_parameter('marker_id', 0)
+        self.declare_parameter('secondary_marker_id', -1)
+        self.declare_parameter(
+            'secondary_marker_frame_id', 'arm/stack_target_marker'
+        )
+        self.declare_parameter(
+            'secondary_pose_topic', '/arm/gripper_camera/stack_target_pose'
+        )
         self.declare_parameter('marker_size_m', 0.015)
         self.declare_parameter('dictionary', 'DICT_5X5_50')
         self.declare_parameter('max_reprojection_error_px', 3.0)
@@ -101,6 +108,12 @@ class ArucoPosePublisher(Node):
             self.get_parameter('marker_frame_id').value
         )
         self.marker_id = int(self.get_parameter('marker_id').value)
+        self.secondary_marker_id = int(
+            self.get_parameter('secondary_marker_id').value
+        )
+        self.secondary_marker_frame_id = str(
+            self.get_parameter('secondary_marker_frame_id').value
+        )
         self.marker_size = float(
             self.get_parameter('marker_size_m').value
         )
@@ -155,6 +168,14 @@ class ArucoPosePublisher(Node):
         self.pose_publisher = self.create_publisher(
             PoseStamped, self.pose_topic, 10
         )
+        self.secondary_pose_publisher = None
+        if self.secondary_marker_id >= 0:
+            secondary_topic = str(
+                self.get_parameter('secondary_pose_topic').value
+            )
+            self.secondary_pose_publisher = self.create_publisher(
+                PoseStamped, secondary_topic, 10
+            )
         self.annotated_publisher = self.create_publisher(
             Image, self.annotated_topic, 10
         )
@@ -175,6 +196,12 @@ class ArucoPosePublisher(Node):
         self.get_logger().info(
             f'Publishing marker TF: camera -> {self.marker_frame_id}'
         )
+        if self.secondary_marker_id >= 0:
+            self.get_logger().info(
+                'Also detecting ArUco '
+                f'id={self.secondary_marker_id}: camera -> '
+                f'{self.secondary_marker_frame_id}'
+            )
         if self.use_node_time_for_pose:
             self.get_logger().info(
                 'Marker pose timestamp source: detector node clock'
@@ -223,11 +250,13 @@ class ArucoPosePublisher(Node):
             self.last_detected_ids = detected_ids
 
         selected_corners = None
+        secondary_corners = None
         if ids is not None:
             for index, detected_id in enumerate(ids.flatten()):
                 if int(detected_id) == self.marker_id:
                     selected_corners = corners[index].reshape(4, 2)
-                    break
+                if int(detected_id) == self.secondary_marker_id:
+                    secondary_corners = corners[index].reshape(4, 2)
 
         if selected_corners is not None and self.camera_matrix is None:
             self.missing_info_warning_count += 1
@@ -247,6 +276,29 @@ class ArucoPosePublisher(Node):
                     rotation_vector,
                     translation_vector,
                     reprojection_error,
+                    self.marker_frame_id,
+                    self.pose_publisher,
+                )
+                cv2.drawFrameAxes(
+                    frame,
+                    self.camera_matrix,
+                    self.distortion,
+                    rotation_vector,
+                    translation_vector,
+                    self.marker_size * 0.5,
+                )
+
+        if secondary_corners is not None and self.camera_matrix is not None:
+            pose = self.estimate_pose(secondary_corners)
+            if pose is not None:
+                rotation_vector, translation_vector, reprojection_error = pose
+                self.publish_pose(
+                    message,
+                    rotation_vector,
+                    translation_vector,
+                    reprojection_error,
+                    self.secondary_marker_frame_id,
+                    self.secondary_pose_publisher,
                 )
                 cv2.drawFrameAxes(
                     frame,
@@ -312,6 +364,8 @@ class ArucoPosePublisher(Node):
         rotation_vector,
         translation_vector,
         reprojection_error,
+        marker_frame_id,
+        pose_publisher,
     ):
         camera_frame = (
             self.camera_frame_id
@@ -335,7 +389,7 @@ class ArucoPosePublisher(Node):
             else image_message.header.stamp
         )
         transform.header.frame_id = camera_frame
-        transform.child_frame_id = self.marker_frame_id
+        transform.child_frame_id = marker_frame_id
         transform.transform.translation.x = float(translation[0])
         transform.transform.translation.y = float(translation[1])
         transform.transform.translation.z = float(translation[2])
@@ -351,7 +405,7 @@ class ArucoPosePublisher(Node):
         pose.pose.position.y = transform.transform.translation.y
         pose.pose.position.z = transform.transform.translation.z
         pose.pose.orientation = transform.transform.rotation
-        self.pose_publisher.publish(pose)
+        pose_publisher.publish(pose)
 
         if not self.detected_once:
             self.detected_once = True

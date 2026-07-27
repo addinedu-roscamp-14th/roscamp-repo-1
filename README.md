@@ -10,6 +10,20 @@
 차량과 노트북은 같은 네트워크와 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. 아래 노트북
 명령은 각각 새 터미널에서 실행하며, 모든 터미널에서 먼저 다음 환경을 불러옵니다.
 
+
+## 중앙관제 런치
+
+```bash
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+ros2 launch porter_bringup central_laptop.launch.py   control_host:=0.0.0.0
+```
+
+``` bash
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+ros2 launch porter_bringup dashboard_laptop.launch.py   central_ip:=192.168.0.60   ollama_host:=http://agent.sds.codes   llm_model:=gemma4:31b
+```
 ### 0. 최초 빌드
 
 노트북:
@@ -125,6 +139,42 @@ ros2 run yolo yolo_node --ros-args \
 ```bash
 ros2 topic hz /central/yolo/image_annotated
 ```
+
+### 5-1. 카메라·SLAM API 서버 실행
+
+추가 터미널:
+
+```bash
+source install/setup.bash
+ros2 launch slam slam_bringup.launch.xml
+```
+
+차량에서 실행되는 SLAM Toolbox의 `/map`, `/scan`, `/odom`, `/tf`, `/tf_static`을
+노트북 API 서버가 받아 지도, 차량 pose와 LiDAR 데이터를 중계합니다. 노트북에서는
+SLAM Toolbox, AMCL 또는 map server를 실행하지 않습니다.
+
+로컬 또는 같은 네트워크의 다른 장치에서 접속합니다.
+
+```text
+http://localhost:8000/video
+http://<노트북-IP>:8000/video
+http://localhost:8000/slam/view
+http://<노트북-IP>:8000/slam/view
+http://localhost:8000/slam/video
+http://<노트북-IP>:8000/slam/video
+http://localhost:8000/slam/map.png
+http://<노트북-IP>:8000/slam/map.png
+```
+
+상태 확인:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/slam/health
+```
+
+`/slam/video`는 지도, 차량 위치·헤딩과 LiDAR를 서버에서 합성한 HTTP MJPEG
+스트림입니다. `/slam/view`는 이 스트림을 브라우저에서 보여줍니다.
 
 ### 6. 카메라 클릭 좌표를 map 좌표로 변환
 
@@ -290,6 +340,7 @@ poter_ws/
 │   ├── central/              # calibration 결과 yaml
 │   ├── arm/                  # 그리퍼 카메라 내부 보정
 │   ├── arm2/                 # 두 번째 로봇팔 전용 보정/파지 설정
+│   ├── dashboard/            # 영상 API 설정
 │   ├── main_camera/          # camera_info, calibration yaml
 │   └── weights/              # YOLO weight
 │
@@ -298,6 +349,7 @@ poter_ws/
     ├── yolo/                 # YOLO 인식/시각화
     ├── calibration/          # 카메라 픽셀 ↔ SLAM map 캘리브레이션
     ├── central/              # 중앙 좌표 변환/차량 전달용 출력
+    ├── dashboard/            # YOLO 영상과 SLAM 지도의 FastAPI 전송
     ├── drive/                # 노트북 Nav2 실행/차량 goal 브릿지
     ├── slam/                 # LiDAR SLAM 지도 작성/저장
     ├── arm/                  # 로봇팔 ArUco 추적/파지 동작 조정
@@ -314,8 +366,9 @@ poter_ws/
 | `yolo` | 카메라 이미지에서 객체/영역을 인식하고 annotated image와 detection JSON 발행 | `yolo_node` |
 | `calibration` | `/image_rect/compressed` 픽셀 좌표와 SLAM `/map` 좌표를 homography로 캘리브레이션 | `direct_calibrator`, `calibration_verifier` |
 | `central` | 카메라 픽셀을 `/map` 좌표로 변환하고 단일 Pose 또는 웨이포인트 Path 발행 | `camera_to_map_bridge` |
+| `dashboard` | YOLO 영상과 지도·차량·LiDAR 합성 화면을 HTTP MJPEG로 제공 | `dashboard_stream_node` |
 | `drive` | 단일 목표와 웨이포인트 목록을 차량 Nav2 action으로 전달 | `target_map_pose_to_nav_goal`, `target_map_waypoints_to_nav_goal` |
-| `slam` | 차량의 `/scan`, `/odom`, TF를 사용해 노트북에서 SLAM 지도를 작성 | `slam_toolbox`, mapping RViz |
+| `slam` | 차량의 `/scan`, `/odom`, TF로 지도를 만들고 dashboard API로 중계 | `slam_toolbox`, `slam_bringup.launch.xml` |
 | `arm` | ArUco XYZ/yaw 추적, Eye-in-Hand, MoveIt2 정렬, Cartesian 파지와 적응형 상승 | `container_pick_coordinator`, `jetcobot_trajectory_bridge` |
 | `arm2` | 두 번째 JetCobot용 `/arm2` 토픽, TF, 캘리브레이션과 파지 제어 | `arm2_container_pick_coordinator`, `arm2_jetcobot_trajectory_bridge` |
 | `jetcobot_description` | JetCobot의 관절·링크 구조와 시각/충돌 mesh 제공 | `jetcobot.urdf` |
