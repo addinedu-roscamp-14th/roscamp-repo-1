@@ -57,6 +57,7 @@ from emergency_control_view import EmergencyControlView
 from stream_view import StreamView
 from slam_stream_processor import SlamStreamProcessor
 from settings_view import SettingsView
+from ros_control_bridge import RosControlBridge
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -69,6 +70,8 @@ class AGVControlCenter(ctk.CTk):
         self.title("스마트 항만 통합 관제 시스템")
         self.geometry("1400x900")
         self.configure(fg_color="#131314")
+        self.ros_bridge = RosControlBridge.get_instance()
+        self.ros_bridge.start()
 
         # 전체 창을 [좌: 사이드바(고정폭) | 우: 내용 영역(가변폭)] 2열 그리드로 구성
         self.grid_rowconfigure(0, weight=1)
@@ -97,6 +100,13 @@ class AGVControlCenter(ctk.CTk):
         
         user_info = ctk.CTkFrame(self.header, fg_color="transparent")
         user_info.pack(side="right", padx=24)
+        self.ros_status_label = ctk.CTkLabel(
+            user_info,
+            text="ROS 연결 중",
+            font=ctk.CTkFont(family="Inter", size=12),
+            text_color="#f0ad4e",
+        )
+        self.ros_status_label.pack(side="left", padx=8)
         ctk.CTkLabel(user_info, text="Operator OP-084", font=ctk.CTkFont(family="Inter", size=13, weight="normal"), text_color="#c4c4c5").pack(side="left", padx=16)
         avatar = ctk.CTkFrame(user_info, width=32, height=32, corner_radius=16, fg_color="#39393a", border_width=1, border_color="#39393a")
         avatar.pack(side="left")
@@ -109,6 +119,7 @@ class AGVControlCenter(ctk.CTk):
 
         self.current_view = None
         self.show_view("dashboard")
+        self.after(500, self._update_ros_status)
 
     def setup_sidebar(self) -> None:
         self.sidebar = ctk.CTkFrame(self, width=280, fg_color="#1b1b1c", corner_radius=0)
@@ -161,7 +172,36 @@ class AGVControlCenter(ctk.CTk):
 
         ctk.CTkButton(action_frame, text="EMERGENCY STOP", font=ctk.CTkFont(family="Inter", size=14, weight="bold"), 
                      fg_color="#e74c3c", hover_color="#c0392b", text_color="white", corner_radius=8,
-                     command=self.simulate_emergency, height=48).pack(fill="x")
+                     command=self.activate_emergency_stop, height=48).pack(fill="x")
+
+    def _update_ros_status(self) -> None:
+        if not self.winfo_exists():
+            return
+        snapshot = self.ros_bridge.snapshot()
+        if snapshot.ready:
+            text = "ROS 비상정지" if snapshot.emergency_active else "ROS 연결됨"
+            color = "#ff6b6b" if snapshot.emergency_active else "#61de8a"
+        elif snapshot.error:
+            text = "ROS 연결 실패"
+            color = "#ff6b6b"
+        else:
+            text = "ROS 연결 중"
+            color = "#f0ad4e"
+        self.ros_status_label.configure(text=text, text_color=color)
+        self.after(500, self._update_ros_status)
+
+    def activate_emergency_stop(self) -> None:
+        """Latch a local ROS cmd_vel stop and show the operator alert."""
+        if self.ros_bridge.emergency_stop():
+            self.show_emergency_popup(
+                "EMERGENCY_STOP",
+                "중앙관제에서 /cmd_vel 비상 정지를 활성화했습니다.",
+            )
+            return
+        self.show_emergency_popup(
+            "ROS_OFFLINE",
+            "ROS 브리지가 연결되지 않아 정지 명령을 발행하지 못했습니다.",
+        )
 
     def show_view(self, view_key: str) -> None:
         for key, btn in self.nav_buttons.items():
@@ -254,6 +294,10 @@ if __name__ == "__main__":
             pass
         try:
             CCTVMonitorView.stop_capture()
+        except Exception:
+            pass
+        try:
+            RosControlBridge.get_instance().stop()
         except Exception:
             pass
         if hasattr(app, 'current_view') and app.current_view is not None:

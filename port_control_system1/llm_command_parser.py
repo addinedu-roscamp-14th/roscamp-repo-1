@@ -41,6 +41,7 @@ _SYSTEM_PROMPT_TEMPLATE = """당신은 항만 자율주행 로봇 시스템의 �
 등록된 화물명: {items}
 등록된 위치명: {locations}
 등록된 화물종류: {cargo_types}
+현재 탑다운 영상 크기: {image_width}x{image_height}
 
 사용자 문장을 분석해서 반드시 아래 형식으로만 응답하세요. 설명, 인사, 코드블록(```) 등
 JSON 이외의 텍스트는 절대 포함하지 마세요.
@@ -50,7 +51,7 @@ JSON 이외의 텍스트는 절대 포함하지 마세요.
 한 문장에 지시가 하나면 actions 배열에 1개만 넣고, 지시가 여러 개면(예: "A는 B로,
 C는 D로") 각각을 별도 action으로 배열에 전부 넣으세요.
 
-각 action은 아래 5가지 형식 중 하나입니다:
+각 action은 아래 7가지 형식 중 하나입니다:
 
 1) 화물 하나를 특정 위치로 옮기는 경우:
 {{"type": "cargo_single", "item": "<화물명>", "destination": "<등록된 위치명>"}}
@@ -67,7 +68,36 @@ C는 D로") 각각을 별도 action으로 배열에 전부 넣으세요.
 4) 화물 언급 없이 순수 위치 이동만 하는 경우 (여러 지점 경유 가능, 언급 순서대로):
 {{"type": "travel", "stops": ["<등록된 위치명>", "..."]}}
 
-5) 위 어느 것에도 해당하지 않는 경우:
+5) 사용자가 YOLO로 검출된 객체에 접근하라고 지시하는 경우:
+{{"type": "visual_navigation",
+  "detection_index": <검출 JSON의 detection_index>,
+  "approach_side": "<left|right|top|bottom>"}}
+
+검출 객체를 지칭한 경우 좌표를 직접 추측하지 말고 반드시 visual_navigation을
+사용하세요. approach_side는 영상에서 장애물이 적고 접근 공간이 충분한 쪽을 고르세요.
+검출 JSON에 없는 객체를 만들어내지 마세요.
+단, "B-1 차를 보내줘", "A 차량을 이동시켜"처럼 검출된 차량 자체를 이동시키라고
+했지만 목적지가 없는 명령은 그 차량으로 접근하라는 뜻이 아닙니다. 목적지가 없으므로
+unknown을 반환하세요. visual_navigation은 "B-1 근처로 가", "B-1의 아래쪽으로 접근해"
+같이 현재 제어 차량이 검출 객체 근처로 이동한다는 뜻이 명확할 때만 사용하세요.
+`B-1`은 항구 상차·하차 전용 주차 구역입니다. "B-1로 차를 보내줘"처럼 B-1을
+목적지로 지정하면 반드시 B-1 검출의 detection_index를 사용한 visual_navigation을
+반환하세요. B-1의 실제 주차 좌표와 방향은 제어 코드가 결정하므로 approach_side는
+어느 값을 반환해도 무시됩니다.
+
+6) 사용자가 객체가 아닌 현재 영상의 빈 공간을 목표로 지정하는 경우:
+{{"type": "pixel_navigation",
+  "target": {{"x": <목표 픽셀 x>, "y": <목표 픽셀 y>}},
+  "heading": {{"x": <방향 픽셀 x>, "y": <방향 픽셀 y>}}}}
+
+target은 차량 중심이 최종적으로 도착할 이미지 픽셀입니다.
+heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 이미지 픽셀입니다.
+두 점은 최소 30픽셀 이상 떨어뜨리고 모두 영상 범위 안에 두세요.
+벽, 컨테이너, 사람, 다른 차량 위를 목표로 선택하지 마세요.
+영상이 없거나 목표를 안전하게 특정할 수 없으면 좌표를 추측하지 말고 unknown을
+반환하세요.
+
+7) 위 어느 것에도 해당하지 않는 경우:
 {{"type": "unknown", "reason": "<간단한 이유>"}}
 
 주의:
@@ -79,6 +109,10 @@ C는 D로") 각각을 별도 action으로 배열에 전부 넣으세요.
   actions 배열에 각각 나눠서 넣으세요.
 - 하역장(창고 하역장, 항구 하역장 등)을 거치는 복잡한 로직은 시스템 내부에서 알아서 처리합니다.
   따라서 명령에 하역장 등 중간 경로가 언급되더라도, 당신은 화물의 "최종 목적지"(예: "항구", "창고 A")만 destination으로 지정하면 됩니다.
+- 현재 영상의 빈 공간이나 특정 영상 지점을 지정한 명령은 등록 위치명으로 억지로
+  바꾸지 말고 pixel_navigation을 사용하세요.
+- 현재 영상의 검출 객체를 언급하면 visual_navigation을 사용하고, 객체가 아닌
+  빈 바닥이나 특정 영상 지점일 때만 pixel_navigation을 사용하세요.
 
 예시:
 사용자: "컨테이너 화물은 항구로, 팔레트 화물은 대기장소로 이동"
@@ -101,11 +135,15 @@ def parse_command_with_llm(
     model: Optional[str] = None,
     host: Optional[str] = None,
     timeout: float = 90.0,
+    image_jpeg: Optional[bytes] = None,
+    image_width: int = 640,
+    image_height: int = 480,
+    yolo_detections: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     자연어 명령을 로컬 Ollama 모델로 해석해서 구조화된 dict로 반환합니다.
     반환 형식은 항상 {"actions": [action, ...]} 이며, 각 action은
-    _SYSTEM_PROMPT_TEMPLATE에 정의된 5가지 type 중 하나입니다.
+    _SYSTEM_PROMPT_TEMPLATE에 정의된 6가지 type 중 하나입니다.
     (한 문장에 지시가 여러 개 섞여 있으면 actions에 여러 개가 들어옵니다)
 
     실패(패키지 미설치, Ollama 서버 미실행, 모델 미설치, JSON 파싱 실패 등) 시
@@ -125,14 +163,29 @@ def parse_command_with_llm(
         items=", ".join(known_items) if known_items else "(등록된 화물 없음)",
         locations=", ".join(known_locations) if known_locations else "(등록된 위치 없음)",
         cargo_types=", ".join(known_cargo_types) if known_cargo_types else "(등록된 화물종류 없음)",
+        image_width=image_width,
+        image_height=image_height,
     )
 
     client = ollama.Client(host=host or OLLAMA_HOST, timeout=timeout)
+    detection_context = json.dumps(
+        yolo_detections or [],
+        ensure_ascii=False,
+        separators=(',', ':'),
+    )
+    user_content = (
+        f'사용자 명령:\n{command}\n\n'
+        '현재 프레임 YOLO 검출 JSON:\n'
+        f'{detection_context}'
+    )
+    user_message = {"role": "user", "content": user_content}
+    if image_jpeg:
+        user_message["images"] = [image_jpeg]
     chat_kwargs = dict(
         model=model or MODEL_NAME,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": command},
+            user_message,
         ],
         format="json",   # Ollama가 유효한 JSON만 내놓도록 강제 (지원하는 모델 기준)
         options={"temperature": 0},  # 항상 같은 해석이 나오도록 (일관성 우선)

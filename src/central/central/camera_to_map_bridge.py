@@ -19,6 +19,86 @@ from std_srvs.srv import Trigger
 import yaml
 
 
+def read_pgm_size(pgm_path):
+    with open(pgm_path, 'rb') as stream:
+        if stream.readline().strip() not in (b'P2', b'P5'):
+            raise ValueError(f'Unsupported PGM format: {pgm_path}')
+
+        tokens = []
+        while len(tokens) < 2:
+            line = stream.readline()
+            if not line:
+                break
+            tokens.extend(line.split(b'#', 1)[0].split())
+
+    if len(tokens) < 2:
+        raise ValueError(f'Invalid PGM header: {pgm_path}')
+    return int(tokens[0]), int(tokens[1])
+
+
+def validate_calibration_map(calibration, calibration_yaml_path):
+    map_metadata = calibration.get('map')
+    if not isinstance(map_metadata, dict):
+        raise ValueError('Calibration yaml does not contain map metadata')
+
+    configured_map_yaml = map_metadata.get('yaml')
+    if not configured_map_yaml:
+        raise ValueError('Calibration yaml does not contain map.yaml')
+
+    map_yaml_path = Path(configured_map_yaml)
+    if not map_yaml_path.is_absolute():
+        map_yaml_path = calibration_yaml_path.parent / map_yaml_path
+    map_yaml_path = map_yaml_path.resolve()
+    if not map_yaml_path.exists():
+        raise FileNotFoundError(f'Calibrated map yaml not found: {map_yaml_path}')
+
+    with open(map_yaml_path, 'r') as stream:
+        current_map = yaml.safe_load(stream) or {}
+
+    image_path = Path(str(current_map.get('image', '')))
+    if not image_path.is_absolute():
+        image_path = map_yaml_path.parent / image_path
+    image_path = image_path.resolve()
+    if not image_path.exists():
+        raise FileNotFoundError(f'Current map image not found: {image_path}')
+
+    current_width, current_height = read_pgm_size(image_path)
+    expected_width = int(map_metadata.get('width', -1))
+    expected_height = int(map_metadata.get('height', -1))
+    expected_resolution = float(map_metadata.get('resolution', float('nan')))
+    expected_origin = np.asarray(map_metadata.get('origin', []), dtype=np.float64)
+    current_resolution = float(current_map.get('resolution', float('nan')))
+    current_origin = np.asarray(current_map.get('origin', []), dtype=np.float64)
+
+    mismatches = []
+    if (expected_width, expected_height) != (current_width, current_height):
+        mismatches.append(
+            f'size calibrated={expected_width}x{expected_height}, '
+            f'current={current_width}x{current_height}'
+        )
+    if not np.isclose(expected_resolution, current_resolution, atol=1e-9):
+        mismatches.append(
+            f'resolution calibrated={expected_resolution}, '
+            f'current={current_resolution}'
+        )
+    if (
+        expected_origin.shape != current_origin.shape
+        or not np.allclose(expected_origin, current_origin, atol=1e-9)
+    ):
+        mismatches.append(
+            f'origin calibrated={expected_origin.tolist()}, '
+            f'current={current_origin.tolist()}'
+        )
+
+    if mismatches:
+        raise ValueError(
+            'Camera-map calibration does not match the current SLAM map: '
+            + '; '.join(mismatches)
+            + '. Run direct_calibrator again with the current map before '
+            'publishing navigation goals.'
+        )
+
+
 class CameraToMapBridge(Node):
     def __init__(self):
         super().__init__('camera_to_map_bridge')
@@ -30,6 +110,9 @@ class CameraToMapBridge(Node):
         self.declare_parameter('target_id', 'target')
         self.declare_parameter('frame_id', 'map')
         self.declare_parameter('minimum_direction_distance', 0.02)
+        self.declare_parameter('validate_calibration_map', True)
+        self.declare_parameter('b1_camera_left_offset_m', 0.15)
+        self.declare_parameter('b1_camera_down_offset_m', 0.03)
         self.declare_parameter('waypoint_mode', False)
         self.declare_parameter('enable_spacebar_commit', True)
         self.declare_parameter(
@@ -57,6 +140,19 @@ class CameraToMapBridge(Node):
         self.minimum_direction_distance = float(
             self.get_parameter('minimum_direction_distance').value
         )
+        self.validate_calibration_map = bool(
+            self.get_parameter('validate_calibration_map').value
+        )
+        self.b1_camera_left_offset_m = float(
+            self.get_parameter('b1_camera_left_offset_m').value
+        )
+        if self.b1_camera_left_offset_m < 0.0:
+            raise ValueError('b1_camera_left_offset_m must not be negative')
+        self.b1_camera_down_offset_m = float(
+            self.get_parameter('b1_camera_down_offset_m').value
+        )
+        if self.b1_camera_down_offset_m < 0.0:
+            raise ValueError('b1_camera_down_offset_m must not be negative')
         self.waypoint_mode = bool(self.get_parameter('waypoint_mode').value)
         self.enable_spacebar_commit = bool(
             self.get_parameter('enable_spacebar_commit').value
@@ -139,6 +235,9 @@ class CameraToMapBridge(Node):
         with open(calibration_yaml_path, 'r') as stream:
             calibration = yaml.safe_load(stream)
 
+        if self.validate_calibration_map:
+            validate_calibration_map(calibration, calibration_yaml_path)
+
         try:
             matrix = calibration['homography']['camera_pixel_to_map_xy']
         except KeyError as exc:
@@ -181,6 +280,27 @@ class CameraToMapBridge(Node):
 
         target = self.pending_target
         target_x, target_y = target['map_xy']
+        if self.is_b1_parking_message(target['source_msg']):
+            left_x, left_y = self.camera_left_map_offset(
+                target['camera_pixel'],
+                self.b1_camera_left_offset_m,
+            )
+            down_x, down_y = self.camera_down_map_offset(
+                target['camera_pixel'],
+                self.b1_camera_down_offset_m,
+            )
+            offset_x = left_x + down_x
+            offset_y = left_y + down_y
+            target_x += offset_x
+            target_y += offset_y
+            map_x += offset_x
+            map_y += offset_y
+            self.get_logger().info(
+                'Applied B-1 parking offsets: '
+                f'camera_left={self.b1_camera_left_offset_m:.3f} m, '
+                f'camera_down={self.b1_camera_down_offset_m:.3f} m, '
+                f'map_delta={[round(offset_x, 6), round(offset_y, 6)]}'
+            )
         delta_x = map_x - target_x
         delta_y = map_y - target_y
         direction_distance = float(np.hypot(delta_x, delta_y))
@@ -406,6 +526,46 @@ class CameraToMapBridge(Node):
             self.homography[1, 2]
         ) / denominator
         return float(map_x), float(map_y)
+
+    def camera_left_map_offset(self, camera_pixel, distance_m):
+        if distance_m == 0.0:
+            return 0.0, 0.0
+
+        start_x, start_y = self.camera_pixel_to_map_xy(camera_pixel)
+        left_x, left_y = self.camera_pixel_to_map_xy(
+            [camera_pixel[0] - 10.0, camera_pixel[1]]
+        )
+        delta_x = left_x - start_x
+        delta_y = left_y - start_y
+        norm = float(np.hypot(delta_x, delta_y))
+        if norm < 1e-12:
+            raise ValueError(
+                'Cannot determine camera-left direction from homography'
+            )
+        scale = distance_m / norm
+        return delta_x * scale, delta_y * scale
+
+    def camera_down_map_offset(self, camera_pixel, distance_m):
+        if distance_m == 0.0:
+            return 0.0, 0.0
+
+        start_x, start_y = self.camera_pixel_to_map_xy(camera_pixel)
+        down_x, down_y = self.camera_pixel_to_map_xy(
+            [camera_pixel[0], camera_pixel[1] + 10.0]
+        )
+        delta_x = down_x - start_x
+        delta_y = down_y - start_y
+        norm = float(np.hypot(delta_x, delta_y))
+        if norm < 1e-12:
+            raise ValueError(
+                'Cannot determine camera-down direction from homography'
+            )
+        scale = distance_m / norm
+        return delta_x * scale, delta_y * scale
+
+    @staticmethod
+    def is_b1_parking_message(message):
+        return str(message.header.frame_id).endswith('/parking_b1')
 
     def build_pose_msg(self, source_msg, map_x, map_y, yaw):
         pose_msg = PoseStamped()

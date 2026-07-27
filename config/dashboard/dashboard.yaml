@@ -1,6 +1,7 @@
 /dashboard_stream_node:
   ros__parameters:
     input_topic: /central/yolo/image_annotated
+    detection_topic: /central/yolo/detections
     host: 0.0.0.0
     port: 8000
     web_fps: 15.0

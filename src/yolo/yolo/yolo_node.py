@@ -27,6 +27,7 @@ class YoloNode(Node):
         self.declare_parameter('confidence_threshold', 0.6)
         self.declare_parameter('device', '')
         self.declare_parameter('publish_annotated_image', True)
+        self.declare_parameter('show_heading_annotation', False)
         self.declare_parameter(
             'class_names',
             [
@@ -48,6 +49,9 @@ class YoloNode(Node):
         self.confidence_threshold = float(self.get_parameter('confidence_threshold').value)
         self.device = str(self.get_parameter('device').value).strip()
         self.publish_annotated_image = bool(self.get_parameter('publish_annotated_image').value)
+        self.show_heading_annotation = bool(
+            self.get_parameter('show_heading_annotation').value
+        )
         self.expected_class_names = [str(name) for name in self.get_parameter('class_names').value]
 
         if not self.weights_path.exists():
@@ -165,7 +169,13 @@ class YoloNode(Node):
                     heading_deg = self.compute_heading_deg(polygon)
                     if heading_deg is not None:
                         detection['heading_deg'] = round(heading_deg, 2)
-                        self.draw_heading_label(annotated_frame, x1, y1, heading_deg)
+                        if self.show_heading_annotation:
+                            self.draw_heading_label(
+                                annotated_frame,
+                                x1,
+                                y1,
+                                heading_deg,
+                            )
 
                 if not self.expected_class_names or label in self.expected_class_names:
                     detections.append(detection)

@@ -21,6 +21,7 @@ SlamStreamProcessor.DETECTED_OBJECTS / SHARED_SLAM_FRAME을 읽기만 하면 됩
     processor.stop()
 """
 
+import os
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -31,7 +32,10 @@ import numpy as np
 from slam_map_pixel_to_world import SlamMap
 
 # SLAM 스트림 기본 URL
-DEFAULT_SLAM_URL = "http://192.168.0.60:8000/slam/video"
+DEFAULT_SLAM_URL = os.environ.get(
+    "PORT_CONTROL_SLAM_URL",
+    "http://192.168.0.60:8000/slam/video",
+)
 DEFAULT_SLAM_MAP_YAML = "current_map.yaml"
 
 
@@ -84,7 +88,7 @@ class SlamStreamProcessor:
         """SLAM 스트림 수신 + 탐지를 시작합니다."""
         self.stop()
 
-        import json, os
+        import json
         config_url = DEFAULT_SLAM_URL
         config_path = "stream_config.json"
         if os.path.exists(config_path):
@@ -95,6 +99,10 @@ class SlamStreamProcessor:
                         config_url = config["slam_url"]
             except Exception as e:
                 print(f"[SLAM 프로세서] 설정 로드 실패: {e}")
+        config_url = os.environ.get(
+            "PORT_CONTROL_SLAM_URL",
+            config_url,
+        )
 
         self.url = (url or config_url).strip()
         if not self.url:

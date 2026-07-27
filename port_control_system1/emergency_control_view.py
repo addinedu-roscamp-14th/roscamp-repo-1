@@ -9,6 +9,8 @@ emergency_view.py의 구성(장비 선택 드롭다운 -> 크레인/AGV 각각 �
 
 import customtkinter as ctk
 
+from ros_control_bridge import RosControlBridge
+
 DEVICE_OPTIONS = [
     "JetCobot #01 (크레인)",
     "JetCobot #02 (크레인)",
@@ -33,6 +35,7 @@ BORDER_LIGHT = "#444444"
 class EmergencyControlView(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
         super().__init__(master, fg_color=BG_MAIN, **kwargs)
+        self.ros_bridge = RosControlBridge.get_instance()
 
         self.font_title = ctk.CTkFont(family="Malgun Gothic", size=22, weight="bold")
         self.font_subtitle = ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold")
@@ -63,7 +66,17 @@ class EmergencyControlView(ctk.CTkFrame):
                      command=self.open_control_panel, height=45).pack(padx=30, pady=10, fill="x")
 
         ctk.CTkButton(menu_container, text="🚨 전체 시스템 비상 정지", font=self.font_subtitle,
-                     fg_color=ALERT_RED, hover_color=ALERT_RED_HOVER, height=50).pack(padx=30, pady=(30, 30), fill="x")
+                     fg_color=ALERT_RED, hover_color=ALERT_RED_HOVER, height=50,
+                     command=self._activate_emergency_stop).pack(padx=30, pady=(30, 8), fill="x")
+        ctk.CTkButton(
+            menu_container,
+            text="비상 정지 해제",
+            font=self.font_subtitle,
+            fg_color=BORDER_LIGHT,
+            hover_color=BORDER_COLOR,
+            height=40,
+            command=self._release_emergency_stop,
+        ).pack(padx=30, pady=(0, 30), fill="x")
 
         bottom_row = ctk.CTkFrame(self.main_menu_frame, fg_color="transparent")
         bottom_row.pack(fill="x", side="bottom", pady=15, padx=20)
@@ -188,8 +201,28 @@ class EmergencyControlView(ctk.CTkFrame):
         ctk.CTkLabel(grip_frame, text="Gripper Module", font=self.font_subtitle, text_color=TEXT_MAIN).pack(anchor="w", padx=16, pady=12)
         ctk.CTkFrame(grip_frame, height=1, fg_color=BORDER_LIGHT).pack(fill="x", padx=16)
         
-        ctk.CTkButton(grip_frame, text="✊ Engage Grip", height=50, font=self.font_subtitle, fg_color=GREEN, hover_color=GREEN_HOVER).pack(fill="x", padx=16, pady=(16, 8))
-        ctk.CTkButton(grip_frame, text="🖐 Release / Drop", height=50, font=self.font_subtitle, fg_color=BORDER_LIGHT, hover_color="#555555").pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkButton(
+            grip_frame,
+            text="컨테이너 파지",
+            height=50,
+            font=self.font_subtitle,
+            fg_color=GREEN,
+            hover_color=GREEN_HOVER,
+            command=lambda: self._call_crane_service(
+                device_name, "pick_container"
+            ),
+        ).pack(fill="x", padx=16, pady=(16, 8))
+        ctk.CTkButton(
+            grip_frame,
+            text="ID 1 위 적재",
+            height=50,
+            font=self.font_subtitle,
+            fg_color=BORDER_LIGHT,
+            hover_color="#555555",
+            command=lambda: self._call_crane_service(
+                device_name, "stack_container"
+            ),
+        ).pack(fill="x", padx=16, pady=(0, 16))
 
         load_frame = ctk.CTkFrame(grip_frame, fg_color=BG_MAIN, corner_radius=4)
         load_frame.pack(fill="x", padx=16, pady=(0, 16), ipady=4)
@@ -335,11 +368,76 @@ class EmergencyControlView(ctk.CTkFrame):
         messagebox.showinfo("제어 연결", f"{ip_address}(도메인 {domain_id})으로 자동 SSH 접속 후 Teleop 제어 노드를 실행합니다.\n터미널에 명령어가 입력된 후 방향키 제어를 사용할 수 있습니다.")
 
     def _send_teleop_cmd(self, char: str) -> None:
+        velocity_commands = {
+            'u': (0.10, 0.8),
+            'i': (0.12, 0.0),
+            'o': (0.10, -0.8),
+            'j': (0.0, 1.0),
+            'k': (0.0, 0.0),
+            'l': (0.0, -1.0),
+            'm': (-0.10, -0.8),
+            ',': (-0.12, 0.0),
+            '.': (-0.10, 0.8),
+        }
+        if char in velocity_commands and self.ros_bridge.snapshot().ready:
+            linear, angular = velocity_commands[char]
+            self.ros_bridge.send_velocity(linear, angular)
+            return
+
         import subprocess
         try:
             subprocess.Popen(["/usr/bin/tmux", "send-keys", "-t", "pinky_teleop", char], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"Failed to send command: {e}")
+
+    def _activate_emergency_stop(self) -> None:
+        from tkinter import messagebox
+
+        if self.ros_bridge.emergency_stop():
+            messagebox.showwarning(
+                "비상 정지",
+                "현재 ROS 도메인의 /cmd_vel 정지 신호를 100Hz로 유지합니다.",
+            )
+        else:
+            messagebox.showerror(
+                "비상 정지 실패",
+                "ROS 브리지가 연결되지 않았습니다.",
+            )
+
+    def _release_emergency_stop(self) -> None:
+        from tkinter import messagebox
+
+        if self.ros_bridge.release_emergency_stop():
+            messagebox.showinfo(
+                "비상 정지 해제",
+                "정지 유지 신호를 해제했습니다. 이동 전에 주변 안전을 확인하세요.",
+            )
+        else:
+            messagebox.showerror(
+                "해제 실패",
+                "ROS 브리지가 연결되지 않았습니다.",
+            )
+
+    def _call_crane_service(
+        self,
+        device_name: str,
+        operation: str,
+    ) -> None:
+        from tkinter import messagebox
+
+        namespace = "/arm2" if "#02" in device_name else "/arm"
+        service_name = f"{namespace}/{operation}"
+        if self.ros_bridge.call_trigger(service_name):
+            messagebox.showinfo(
+                "로봇팔 명령 전송",
+                f"{service_name} 요청을 전송했습니다.\n"
+                "로봇팔 상태 토픽과 실행 로그를 확인하세요.",
+            )
+        else:
+            messagebox.showerror(
+                "로봇팔 명령 실패",
+                f"{service_name} 서비스를 찾을 수 없습니다.",
+            )
 
     # ------------------------------------------------------------------
     def open_command_popup(self) -> None:

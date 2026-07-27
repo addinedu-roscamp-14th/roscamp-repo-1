@@ -2,7 +2,41 @@
 
 중앙 관제에서 카메라 픽셀 좌표를 SLAM `/map` 좌표로 변환하고, 차량/브릿지에 전달 가능한 형태로 발행하는 패키지입니다.
 
-현재 핵심 노드는 `rqt_click_to_target`와 `camera_to_map_bridge`입니다.
+현재 핵심 노드는 `rqt_click_to_target`, `camera_to_map_bridge`,
+`control_gateway`입니다.
+
+## `control_gateway`
+
+AI/LLM 서버가 계산한 탑다운 카메라 픽셀 목표를 HTTP JSON으로 받고, 기존
+`camera_to_map_bridge`가 사용하는 `/central/target_pixel`에 목표점과 방향점을
+순서대로 발행합니다. 직접 map 좌표를 생성하지 않으므로 기존 카메라-SLAM
+캘리브레이션을 그대로 거칩니다.
+
+입력 API:
+
+```text
+POST http://<관제노트북_IP>:8100/api/v1/navigation/pixel-goal
+```
+
+ROS 출력:
+
+```text
+/central/target_pixel
+geometry_msgs/PointStamped
+
+/central/control/status
+std_msgs/String
+```
+
+관제 상태 API:
+
+```text
+GET http://<관제노트북_IP>:8100/api/v1/status
+GET http://<관제노트북_IP>:8100/health
+```
+
+상태 API에는 `/battery/percent`, `/battery/voltage`, `/odom`,
+`/central/target_map_json`의 최신값과 데이터 나이가 포함됩니다.
 
 ## `rqt_click_to_target`
 
@@ -25,6 +59,16 @@ geometry_msgs/PointStamped
 ## `camera_to_map_bridge`
 
 캘리브레이션 결과 YAML을 읽어서 카메라 픽셀 좌표 `(u, v)`를 SLAM map 좌표 `(x, y)`로 변환합니다.
+
+시작할 때 캘리브레이션 YAML에 기록된 지도 크기, 해상도, 원점과 현재 map
+YAML/PGM을 비교합니다. `config/SLAM/current_map.yaml` 또는 PGM을 교체했다면 기존
+호모그래피를 재사용할 수 없으므로 현재 지도로 다시 캘리브레이션해야 합니다. 지도
+정보가 다르면 잘못된 Nav2 목표 발행을 막기 위해 노드가 시작되지 않습니다.
+
+`parking_b1` API 명령은 B-1 중심을 map 좌표로 변환한 뒤, 탑다운 카메라 영상의
+왼쪽 방향을 같은 호모그래피로 계산하여 기본 `0.15m`, 화면 아래쪽으로 기본
+`0.03m` 이동합니다. 목표와 헤딩점을 같이 이동하므로 B-1 정렬 방향은 유지됩니다.
+거리는 `b1_camera_left_offset_m`, `b1_camera_down_offset_m` 파라미터로 조정합니다.
 
 입력:
 
@@ -80,6 +124,70 @@ rqt click
 → /central/target_map_pose
 → /central/target_map_json
 ```
+
+### AI 좌표 자동 전송
+
+단일 목표 모드로 카메라-map 변환 노드와 Nav2 목표 브리지를 먼저 실행합니다.
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+ros2 run central camera_to_map_bridge
+```
+
+```bash
+ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
+```
+
+별도 터미널에서 중앙제어 API를 실행합니다. 영상/SLAM API의 기본 포트는
+`8000`, 제어 API의 기본 포트는 `8100`입니다.
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+ros2 launch central control_gateway.launch.py
+```
+
+기본값은 관제 노트북 내부의 `127.0.0.1`에서만 접속할 수 있습니다. 외부 AI
+서버가 접속해야 할 때는 토큰을 설정하고 전체 네트워크 인터페이스에 엽니다.
+
+```bash
+export PORT_CONTROL_API_TOKEN='<충분히_긴_임의의_문자열>'
+ros2 launch central control_gateway.launch.py host:=0.0.0.0
+```
+
+AI 서버는 탑다운 영상의 목표 픽셀과 차량이 바라볼 방향 픽셀을 함께 보냅니다.
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/navigation/pixel-goal \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
+  -d '{
+    "command_id": "dispatch-001",
+    "target": {"x": 320, "y": 300},
+    "heading": {"x": 380, "y": 300}
+  }'
+```
+
+`command_id`는 재시도 시 같은 명령이 두 번 실행되는 것을 막는 선택값입니다.
+같은 ID를 다시 보내면 게이트웨이는 성공 응답을 반환하지만 ROS 목표는 재발행하지
+않습니다. 좌표는 `640x480` 영상 범위 안이어야 하고 목표와 방향점은 기본 10픽셀
+이상 떨어져야 합니다.
+
+상태 확인:
+
+```bash
+curl http://127.0.0.1:8100/api/v1/status
+ros2 topic echo /central/control/status
+ros2 topic echo /central/target_map_pose
+```
+
+`camera_to_map_bridge`가 실행되지 않아 `/central/target_pixel` 구독자가 없으면
+제어 API는 명령을 버리지 않고 HTTP `503`으로 거부합니다.
+외부 접속 모드에서는 `/api/v1/*` 요청에 동일한 `X-Control-Token` 헤더가
+없으면 HTTP `401`로 거부합니다. `/health`는 프로세스 확인용으로 공개됩니다.
 
 ---
 

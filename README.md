@@ -10,6 +10,20 @@
 차량과 노트북은 같은 네트워크와 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. 아래 노트북
 명령은 각각 새 터미널에서 실행하며, 모든 터미널에서 먼저 다음 환경을 불러옵니다.
 
+
+## 중앙관제 런치
+
+```bash
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+ros2 launch porter_bringup central_laptop.launch.py   control_host:=0.0.0.0
+```
+
+``` bash
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+ros2 launch porter_bringup dashboard_laptop.launch.py   central_ip:=192.168.0.60   ollama_host:=http://agent.sds.codes   llm_model:=gemma4:31b
+```
 ### 0. 최초 빌드
 
 노트북:

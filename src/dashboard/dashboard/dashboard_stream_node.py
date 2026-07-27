@@ -2,6 +2,7 @@
 
 import asyncio
 from importlib.resources import files
+import json
 import threading
 import time
 
@@ -19,6 +20,7 @@ from rclpy.qos import (
 )
 from rclpy.time import Time
 from sensor_msgs.msg import Image, LaserScan
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from .frame_store import LatestFrameStore, LatestJpegStore
@@ -60,6 +62,9 @@ class DashboardStreamNode(Node):
         self.declare_parameter(
             'input_topic', '/central/yolo/image_annotated'
         )
+        self.declare_parameter(
+            'detection_topic', '/central/yolo/detections'
+        )
         self.declare_parameter('host', '0.0.0.0')
         self.declare_parameter('port', 8000)
         self.declare_parameter('web_fps', 15.0)
@@ -76,6 +81,9 @@ class DashboardStreamNode(Node):
         self.declare_parameter('slam_output_height', 720)
 
         self.input_topic = str(self.get_parameter('input_topic').value)
+        self.detection_topic = str(
+            self.get_parameter('detection_topic').value
+        )
         self.host = str(self.get_parameter('host').value)
         self.port = int(self.get_parameter('port').value)
         self.web_fps = float(self.get_parameter('web_fps').value)
@@ -120,6 +128,11 @@ class DashboardStreamNode(Node):
         self.slam_jpegs = LatestJpegStore()
         self.maps = LatestFrameStore()
         self.scans = LatestFrameStore()
+        self.detection_lock = threading.Lock()
+        self.latest_detection = None
+        self.detection_received_at = 0.0
+        self.detection_input_count = 0
+        self.detection_last_error = ''
         self.stop_event = threading.Event()
         self.last_error = ''
         self.slam_last_error = ''
@@ -165,6 +178,12 @@ class DashboardStreamNode(Node):
             self._on_image,
             image_qos,
         )
+        self.detection_subscription = self.create_subscription(
+            String,
+            self.detection_topic,
+            self._on_detection,
+            image_qos,
+        )
         map_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
@@ -194,6 +213,7 @@ class DashboardStreamNode(Node):
         self.slam_stream_thread.start()
         self.get_logger().info(
             f'Dashboard stream input={self.input_topic}, '
+            f'detections={self.detection_topic}, '
             f'web={self.host}:{self.port}, max_fps={self.web_fps:.1f}, '
             f'jpeg_quality={self.jpeg_quality}'
         )
@@ -224,6 +244,22 @@ class DashboardStreamNode(Node):
 
     def _on_image(self, message):
         self.frames.put(message)
+
+    def _on_detection(self, message):
+        try:
+            payload = json.loads(message.data)
+            if not isinstance(payload, dict):
+                raise ValueError('detection payload must be a JSON object')
+        except (json.JSONDecodeError, ValueError) as exc:
+            with self.detection_lock:
+                self.detection_last_error = str(exc)
+            return
+
+        with self.detection_lock:
+            self.latest_detection = payload
+            self.detection_received_at = time.monotonic()
+            self.detection_input_count += 1
+            self.detection_last_error = ''
 
     def _on_map(self, message):
         self.maps.put(message)
@@ -517,7 +553,37 @@ class DashboardStreamNode(Node):
             'max_web_fps': self.web_fps,
             'jpeg_quality': self.jpeg_quality,
             'last_error': self.last_error,
+            'detection_topic': self.detection_topic,
+            'detection_input_count': self.detection_input_count,
         }
+
+    def detection_status(self):
+        """Return the latest structured YOLO result without old-frame queues."""
+        with self.detection_lock:
+            payload = self.latest_detection
+            received_at = self.detection_received_at
+            input_count = self.detection_input_count
+            last_error = self.detection_last_error
+        if payload is None:
+            return {
+                'status': 'waiting_for_detections',
+                'topic': self.detection_topic,
+                'input_count': input_count,
+                'age_sec': None,
+                'last_error': last_error,
+                'detection_count': 0,
+                'detections': [],
+            }
+        age = max(0.0, time.monotonic() - received_at)
+        result = dict(payload)
+        result.update({
+            'status': 'ok' if age <= self.stale_timeout else 'stale',
+            'topic': self.detection_topic,
+            'input_count': input_count,
+            'age_sec': round(age, 3),
+            'last_error': last_error,
+        })
+        return result
 
     def slam_health(self):
         """Return status for the cached map and composed MJPEG stream."""
@@ -648,6 +714,10 @@ def create_app(
     @app.get('/video')
     async def video():
         return stream_response(node.jpegs, node.web_fps)
+
+    @app.get('/detections')
+    async def detections():
+        return node.detection_status()
 
     @app.get('/slam/health')
     async def slam_health():

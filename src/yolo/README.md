@@ -31,5 +31,13 @@ ros2 run yolo yolo_node --ros-args \
 - `/central/yolo/image_annotated`
 - `/central/yolo/detections`   
 
-세그멘테이션 mask가 있을 경우 annotated image에 heading 각도를 함께 표시하고,
-`/central/yolo/detections` JSON에는 `heading_deg`를 포함합니다.
+세그멘테이션 mask가 있으면 `/central/yolo/detections` JSON에 `heading_deg`를
+포함합니다. B-1 주차 정렬에 사용되므로 계산과 JSON 발행은 유지하지만 annotated
+image의 heading 텍스트 표시는 기본적으로 꺼져 있습니다.
+
+헤딩 텍스트가 필요한 경우에만 다음 파라미터로 켭니다.
+
+```bash
+ros2 run yolo yolo_node --ros-args \
+  -p show_heading_annotation:=true
+```

@@ -4,19 +4,21 @@ command_center.py
 자연어 명령을 처리하는 팝업 창입니다. 각 화면(위치 마킹, 경유지 규칙, 화물 위치/배차)
 우측 하단의 "명령" 버튼을 누르면 이 팝업이 뜹니다.
 
-1순위: llm_command_parser.py(Claude Haiku)로 해석합니다. 언어/동의어에 무관하게 이해합니다
+1순위: llm_command_parser.py(Ollama VLM)로 해석합니다. 언어/동의어에 무관하게 이해합니다
   - "cargo A를 port로 go" 처럼 영어가 섞여도, "이동"을 "go"라고 해도 인식
   - "창고에 있는 물건 전부를 항만으로 이동" 같은 위치 기반 일괄 이동도 처리
+  - 현재 탑다운 영상을 함께 보고 목표 픽셀과 헤딩 픽셀을 결정
 2순위(폴백): LLM 호출이 실패(패키지 미설치/API 키 없음/네트워크 오류/응답에 등록되지
   않은 이름 포함)하면 규칙 기반 문자열 파서로 자동 전환합니다. 오프라인에서도 기본
   기능(정확한 등록 이름을 그대로 말하는 경우)은 계속 동작합니다.
 
-처리 결과는 3가지입니다:
+처리 결과는 다음 4가지입니다:
 - 화물 단건 이동 (예: "화물A를 항구로 옮겨") -> 화물의 픽업 위치를 거쳐가는 경로 계산 후
   즉시 화물 위치를 목적지로 갱신하고 cargo_locations.json에 저장
 - 위치 기반 일괄 이동 (예: "창고에 있는 물건 전부를 항만으로 이동") -> 그 위치에 있는
   모든 화물을 찾아 각각 경로 계산 후 전부 이동 처리
 - 순수 위치 이동 (예: "항구로 이동해줘") -> 화물 데이터는 건드리지 않고 경로만 계산
+- 영상 좌표 이동 -> VLM 좌표를 중앙제어 HTTP API로 전달해 Nav2 목표 생성
 
 필요한 로직은 새로 만들지 않고 cargo_dispatch_tool.py / waypoint_rules.py에 있는 것을
 그대로 가져다 씁니다.
@@ -27,7 +29,13 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import customtkinter as ctk
+import cv2
 
+from central_control_client import (
+    CentralControlApiError,
+    CentralControlClient,
+)
+from cctv_monitor_view import CCTVMonitorView
 from waypoint_rules import expand_leg, load_waypoint_rules, resolve_travel_route
 from cargo_dispatch_tool import (
     RouteStep,
@@ -47,6 +55,17 @@ from cargo_dispatch_tool import (
     location_coord_text,
 )
 from llm_command_parser import LLMParseError, parse_command_with_llm
+from ros_control_bridge import RosControlBridge
+from visual_navigation import (
+    VisualNavigationError,
+    compact_detections,
+    resolve_detection_approach,
+    validate_pixel_navigation,
+)
+from yolo_detection_client import (
+    YoloDetectionClient,
+    YoloDetectionError,
+)
 
 PointXY = Tuple[float, float]
 
@@ -373,18 +392,35 @@ class CommandPopup(ctk.CTkToplevel):
 
         # 1순위: LLM으로 해석 시도 (언어/동의어 무관, 일괄 이동/화물종류별 이동/복합 명령까지 이해)
         llm_result = None
+        image_jpeg, image_width, image_height = self._current_vlm_image()
+        detection_summary = self._current_yolo_detections()
+        compact_detection_list = compact_detections(detection_summary)
         known_cargo_types = sorted({
             detail.get("화물종류", "") for detail in self.cargo_details.values() if detail.get("화물종류")
         })
         try:
             llm_result = parse_command_with_llm(
-                command, list(self.cargo_registry.keys()), list(self.locations.keys()), known_cargo_types
+                command,
+                list(self.cargo_registry.keys()),
+                list(self.locations.keys()),
+                known_cargo_types,
+                image_jpeg=image_jpeg,
+                image_width=image_width,
+                image_height=image_height,
+                yolo_detections=compact_detection_list,
             )
         except LLMParseError as exc:
             self._log(f"[LLM 사용 불가 - 규칙 기반으로 대체] {exc}")
 
         if llm_result is not None:
-            handled = self._handle_llm_result(command, llm_result)
+            self._log(f"[VLM 원본 응답] {llm_result}")
+            handled = self._handle_llm_result(
+                command,
+                llm_result,
+                detection_summary,
+                image_width,
+                image_height,
+            )
             if handled:
                 return
             self._log("[LLM 결과를 적용할 수 없어 규칙 기반으로 재시도]")
@@ -404,7 +440,51 @@ class CommandPopup(ctk.CTkToplevel):
         else:
             self._run_travel_command(command)
 
-    def _handle_llm_result(self, command: str, result: Dict) -> bool:
+    def _current_vlm_image(self):
+        """Encode the latest top-down dashboard frame for the local VLM."""
+        frame = CCTVMonitorView.SHARED_FRAME
+        if frame is None:
+            self._log("[VLM 영상] 현재 수신된 탑다운 프레임이 없습니다.")
+            return None, 640, 480
+        frame = frame.copy()
+        height, width = frame.shape[:2]
+        success, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 80],
+        )
+        if not success:
+            self._log("[VLM 영상] 현재 프레임 JPEG 변환에 실패했습니다.")
+            return None, width, height
+        self._log(f"[VLM 영상] 현재 프레임 {width}x{height}를 함께 전송합니다.")
+        return encoded.tobytes(), width, height
+
+    def _current_yolo_detections(self):
+        """Fetch one fresh YOLO summary paired with the current VLM request."""
+        try:
+            summary = YoloDetectionClient().get_latest()
+        except YoloDetectionError as exc:
+            self._log(f"[VLM YOLO JSON 없음] {exc}")
+            return None
+        detections = compact_detections(summary)
+        labels = [
+            f'{item["detection_index"]}:{item["label"]}'
+            for item in detections
+        ]
+        self._log(
+            f'[VLM YOLO JSON] {len(detections)}개 검출: '
+            f'{", ".join(labels) if labels else "없음"}'
+        )
+        return summary
+
+    def _handle_llm_result(
+        self,
+        command: str,
+        result: Dict,
+        detection_summary=None,
+        image_width=640,
+        image_height=480,
+    ) -> bool:
         """LLM 응답({"actions": [...]})을 검증하고 순서대로 실행합니다.
         한 문장에 지시가 여러 개 섞여 있으면 actions에 여러 개가 들어오고, 전부 실행합니다.
         하나도 실행하지 못했으면 False를 반환해서 규칙 기반 파서로 넘어가게 합니다."""
@@ -414,11 +494,27 @@ class CommandPopup(ctk.CTkToplevel):
 
         any_handled = False
         for action in actions:
-            if isinstance(action, dict) and self._handle_single_action(command, action):
+            if (
+                isinstance(action, dict)
+                and self._handle_single_action(
+                    command,
+                    action,
+                    detection_summary,
+                    image_width,
+                    image_height,
+                )
+            ):
                 any_handled = True
         return any_handled
 
-    def _handle_single_action(self, command: str, action: Dict) -> bool:
+    def _handle_single_action(
+        self,
+        command: str,
+        action: Dict,
+        detection_summary=None,
+        image_width=640,
+        image_height=480,
+    ) -> bool:
         """actions 배열 안의 액션 하나를 검증하고 실행합니다.
         검증에 실패하면 왜 실패했는지 로그에 남깁니다 - 여러 액션 중 하나가 조용히
         빠지면 사용자가 원인을 알기 어려우므로, 실패 이유를 항상 보이게 합니다."""
@@ -485,6 +581,96 @@ class CommandPopup(ctk.CTkToplevel):
                 return False
             self._log(f"[LLM 해석] '{command}' -> 위치 이동: {' → '.join(stops)}")
             self._execute_travel(stops)
+            return True
+
+        if action_type == "visual_navigation":
+            if detection_summary is None:
+                self._log(
+                    '[VLM 객체 접근 거부] 최신 YOLO 검출 JSON이 없습니다.'
+                )
+                return True
+            try:
+                target, heading, selected = resolve_detection_approach(
+                    action,
+                    detection_summary,
+                    image_width,
+                    image_height,
+                )
+                response = CentralControlClient().send_pixel_goal(
+                    target,
+                    heading,
+                    mode=(
+                        'parking_b1'
+                        if selected['label'] == 'B-1'
+                        else 'direct'
+                    ),
+                )
+            except (VisualNavigationError, CentralControlApiError) as exc:
+                self._log(f'[VLM 객체 접근 실패] {exc}')
+                self.result_label.configure(
+                    text=f'[VLM 객체 접근 실패] {exc}',
+                    text_color='#EA5455',
+                )
+                return True
+
+            command_id = response.get('command_id', 'unknown')
+            self._log(
+                '[VLM 객체 접근 좌표 계산] '
+                f'index={selected["detection_index"]}, '
+                f'label={selected["label"]}, '
+                f'mode={"parking" if selected["label"] == "B-1" else "approach"}, '
+                f'side={action.get("approach_side")}, '
+                f'target={target}, heading={heading}, '
+                f'command_id={command_id}'
+            )
+            self.result_label.configure(
+                text=(
+                    '[VLM 객체 접근 명령 전송 완료]\n'
+                    f'객체={selected["label"]}, '
+                    f'방식={"주차" if selected["label"] == "B-1" else action.get("approach_side")}\n'
+                    f'목표={target}, 방향={heading}'
+                ),
+                text_color='#28C76F',
+            )
+            return True
+
+        if action_type == "pixel_navigation":
+            target = action.get("target")
+            heading = action.get("heading")
+            try:
+                validate_pixel_navigation(
+                    target,
+                    heading,
+                    image_width,
+                    image_height,
+                    detection_summary,
+                )
+                response = CentralControlClient().send_pixel_goal(
+                    target,
+                    heading,
+                )
+            except (VisualNavigationError, CentralControlApiError) as exc:
+                self._log(f"[VLM 좌표 전송 실패] {exc}")
+                self.result_label.configure(
+                    text=f"[VLM 좌표 전송 실패] {exc}",
+                    text_color="#EA5455",
+                )
+                return True
+
+            command_id = response.get("command_id", "unknown")
+            duplicate = bool(response.get("duplicate", False))
+            self._log(
+                f"[VLM 좌표 전송] target={target}, heading={heading}, "
+                f"command_id={command_id}, duplicate={duplicate}"
+            )
+            self.result_label.configure(
+                text=(
+                    "[VLM 차량 이동 명령 전송 완료]\n"
+                    f"목표={target}, 방향={heading}\n"
+                    f"명령 ID={command_id}"
+                ),
+                text_color="#28C76F",
+            )
             return True
 
         # type == "unknown" 이거나 예상 밖의 값이면 처리 못 한 것으로 간주
@@ -694,7 +880,7 @@ class CommandPopup(ctk.CTkToplevel):
         self._execute_travel(stops)
 
     def _execute_travel(self, stops: List[str]) -> None:
-        """언급된 지점들을 순서대로 잇는 경로를 계산해서 보여줍니다 (화물 데이터는 건드리지 않음)."""
+        """Resolve a route and publish it to the central ROS navigation bridge."""
         if len(stops) == 1:
             travel_names = resolve_travel_route(stops[0], self.rules)
         else:
@@ -705,11 +891,45 @@ class CommandPopup(ctk.CTkToplevel):
             route[-1].action = "도착"
 
         self._run_route_log("AGV", route)
+        waypoint_values = []
+        missing_coordinates = []
+        for step in route:
+            entry = self.locations.get(step.location, {})
+            map_xy = entry.get("map_meters")
+            if not isinstance(map_xy, list) or len(map_xy) != 2:
+                missing_coordinates.append(step.location)
+                continue
+            waypoint_values.append((float(map_xy[0]), float(map_xy[1]), 0.0))
 
         route_text = " → ".join(
             f"{location_coord_text(step.location, self.locations)}[{step.action}]" for step in route
         )
-        self.result_label.configure(text=f"[위치 이동 완료] 경로: {route_text}", text_color="#3B82F6")
+        if missing_coordinates:
+            self.result_label.configure(
+                text=(
+                    "[전송 실패] map 좌표가 없는 위치: "
+                    f"{', '.join(missing_coordinates)}"
+                ),
+                text_color="#EA5455",
+            )
+            return
+
+        bridge = RosControlBridge.get_instance()
+        if bridge.send_waypoints(waypoint_values):
+            topic = "/central/target_map_waypoints"
+            self._log(f"[ROS 전송] {topic}에 목표를 발행했습니다.")
+            self.result_label.configure(
+                text=f"[위치 이동 전송 완료] 경로: {route_text}",
+                text_color="#28C76F",
+            )
+        else:
+            self.result_label.configure(
+                text=(
+                    "[ROS 연결 실패] 경로는 계산했지만 차량에 전송하지 못했습니다.\n"
+                    f"경로: {route_text}"
+                ),
+                text_color="#EA5455",
+            )
 
     def _run_route_log(self, label: str, route: List[RouteStep]) -> None:
         """경로의 각 구간을 로그에 순서대로 남기고, 마지막에 전체 경로를 한 문장으로 요약합니다."""

@@ -23,7 +23,10 @@ import os
 
 # 카메라 선택지 - 실제 환경에 맞게 주소를 추가/수정하세요.
 CAMERA_SOURCES = {
-    "맵 스트림 (API)": "http://192.168.0.60:8000/video",
+    "맵 스트림 (API)": os.environ.get(
+        "PORT_CONTROL_CCTV_URL",
+        "http://192.168.0.60:8000/video",
+    ),
     "Local Cam 0": 0,
 }
 
@@ -44,6 +47,10 @@ class CCTVMonitorView(ctk.CTkFrame):
     @classmethod
     def _load_source_from_config(cls):
         """stream_config.json에서 cctv_url을 읽어 CAMERA_SOURCES를 갱신합니다."""
+        environment_url = os.environ.get("PORT_CONTROL_CCTV_URL")
+        if environment_url:
+            CAMERA_SOURCES["맵 스트림 (API)"] = environment_url
+            return
         config_path = "stream_config.json"
         if os.path.exists(config_path):
             try:

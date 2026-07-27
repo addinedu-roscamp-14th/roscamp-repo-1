@@ -134,13 +134,18 @@ map_x = origin_x + pgm_x * resolution
 map_y = origin_y + (map_height - pgm_y) * resolution
 ```
 
-현재 기본 맵:
+현재 기본 맵 값은 `config/SLAM/current_map.yaml`과 PGM 헤더에서 확인합니다.
+2026-07-23에 저장된 현재 파일 기준 값은 다음과 같습니다.
 
 ```text
 resolution: 0.010
-origin: [-1.366, -1.903, 0]
-image size: 205 x 231
+origin: [-0.198, -0.517, 0]
+image size: 207 x 113
 ```
+
+지도를 다시 저장하면 이 값도 바뀌므로 기존
+`config/central/camera_map_calibration.yaml`을 재사용하지 말고 다시
+캘리브레이션해야 합니다.
 
 카메라 각도 때문에 PGM의 좌측 상단이 카메라에서는 좌측 하단처럼 보일 수 있습니다. 이 반전/회전/원근 왜곡은 클릭한 대응점들을 기반으로 homography가 흡수합니다.
 

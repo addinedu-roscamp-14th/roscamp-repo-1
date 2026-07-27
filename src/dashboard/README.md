@@ -65,6 +65,7 @@ ros2 run dashboard dashboard_stream_node --ros-args \
 ```text
 http://localhost:8000/video
 http://localhost:8000/health
+http://localhost:8000/detections
 http://localhost:8000/slam/view
 http://localhost:8000/slam/video
 http://localhost:8000/slam/map.png
@@ -96,6 +97,7 @@ sudo ufw allow 8000/tcp
 | 이름 | 기본값 | 기능 |
 | --- | --- | --- |
 | `input_topic` | `/central/yolo/image_annotated` | 입력 ROS 이미지 |
+| `detection_topic` | `/central/yolo/detections` | 최신 YOLO 검출 JSON |
 | `host` | `0.0.0.0` | API bind 주소 |
 | `port` | `8000` | API TCP 포트 |
 | `web_fps` | `15.0` | JPEG 인코딩 및 웹 전송 최대 FPS |
@@ -120,11 +122,15 @@ ros2 topic hz /central/yolo/image_annotated
 ros2 topic hz /map
 ros2 run tf2_ros tf2_echo map base_footprint
 curl http://localhost:8000/health
+curl http://localhost:8000/detections
 curl http://localhost:8000/slam/health
 ```
 
 `/health`가 `waiting_for_frame`이면 YOLO 출력 토픽을 확인합니다. `stale`이면 마지막
 JPEG가 `stale_timeout_sec`보다 오래된 상태입니다.
+
+`/detections`는 최신 YOLO JSON 하나만 반환합니다. 응답의 `status`가 `ok`이고
+`age_sec`가 작아야 VLM 객체 접근에 사용됩니다. 과거 검출 결과는 큐에 쌓지 않습니다.
 
 `/slam/health`가 `waiting_for_map`이면 `/map` 발행 여부를 확인합니다.
 `robot_visible`이 `false`이면 `tf_error`를 확인하고 `map -> base_footprint` TF 연결을

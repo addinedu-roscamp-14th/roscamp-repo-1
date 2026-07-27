@@ -18,6 +18,7 @@ from PIL import Image
 from typing import Dict, List
 
 from slam_stream_processor import SlamStreamProcessor
+from ros_control_bridge import RosControlBridge
 from cargo_dispatch_tool import (
     load_named_locations,
     load_cargo_registry,
@@ -62,6 +63,8 @@ class IntegratedRadarView(ctk.CTkFrame):
         self.vehicle_positions, _ = load_vehicle_state()
         self.vehicle_status = load_vehicle_status()
         self.map_image_size = _load_map_image_size()
+        self.ros_bridge = RosControlBridge.get_instance()
+        self._last_ros_status_signature = None
 
         self.show_locations = ctk.BooleanVar(value=True)
         self.show_vehicles = ctk.BooleanVar(value=True)
@@ -113,6 +116,7 @@ class IntegratedRadarView(ctk.CTkFrame):
         self._build_right_panel()
 
         self.after(200, self._render_loop)
+        self.after(1000, self._refresh_ros_status)
 
     # ------------------------------------------------------------------
     def _build_right_panel(self) -> None:
@@ -233,11 +237,40 @@ class IntegratedRadarView(ctk.CTkFrame):
         for i in range(len(self.vehicle_positions)):
             key = f"차량 {i + 1}"
             location = self.vehicle_positions[i]
-            status = self.vehicle_status.get(key, {})
+            status = dict(self.vehicle_status.get(key, {}))
+            subtitle = f"현재 위치: {location}"
+            if i == 0:
+                snapshot = self.ros_bridge.snapshot()
+                if snapshot.battery_percent is not None:
+                    status["battery_pct"] = round(snapshot.battery_percent, 1)
+                if snapshot.odom_xy is not None:
+                    x, y = snapshot.odom_xy
+                    yaw = snapshot.odom_yaw_deg or 0.0
+                    subtitle += (
+                        f"\nROS odom: x={x:.3f}, y={y:.3f}, yaw={yaw:.1f}°"
+                    )
             self._build_status_card(
-                key=key, subtitle=f"현재 위치: {location}", status=status,
+                key=key, subtitle=subtitle, status=status,
                 on_status_changed=self._save_vehicle_status_change,
             )
+
+    def _refresh_ros_status(self) -> None:
+        if not self.winfo_exists():
+            return
+        snapshot = self.ros_bridge.snapshot()
+        signature = (
+            snapshot.ready,
+            snapshot.battery_percent,
+            snapshot.odom_xy,
+            snapshot.odom_yaw_deg,
+        )
+        if (
+            signature != self._last_ros_status_signature
+            and self.status_tab_var.get() == "차량"
+        ):
+            self._last_ros_status_signature = signature
+            self._rebuild_vehicle_cards()
+        self.after(1000, self._refresh_ros_status)
 
     # ------------------------------------------------------------------
     # 탭 3: 로봇팔 현황 (배터리/전원, 이상 유무, 최근 작업)
