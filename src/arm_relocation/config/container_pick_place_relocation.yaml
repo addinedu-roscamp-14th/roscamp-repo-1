@@ -1,0 +1,20 @@
+/arm/container_pick_place_coordinator:
+  ros__parameters:
+    pick_marker_id: 1
+    place_marker_id: 2
+    empty_marker_id: 3
+
+    # Marker normal versus arm/base_link +Z.
+    top_face_max_angle_deg: 30.0
+    side_face_min_angle_deg: 60.0
+    require_pick_side: true
+    require_destination_top: true
+
+    observation_capture_sec: 3.0
+    # A top marker belongs to the pick stack when its base-frame XY distance
+    # from the side pick marker is within this radius.
+    stack_xy_tolerance_m: 0.08
+    stack_min_height_above_pick_m: 0.0
+    max_relocation_cycles: 3
+    # Increase this when multiple blockers are stacked at the empty marker.
+    empty_stack_step_m: 0.0
