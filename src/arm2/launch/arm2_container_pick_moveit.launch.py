@@ -4,11 +4,27 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    SetLaunchConfiguration,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+
+def resolve_params_file(context):
+    """Resolve and validate the coordinator YAML before nodes are started."""
+    configured = LaunchConfiguration('params_file').perform(context)
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f'arm2 params file not found: {path}')
+    return [SetLaunchConfiguration('resolved_params_file', str(path))]
 
 
 def generate_launch_description():
@@ -108,7 +124,7 @@ def generate_launch_description():
         namespace='arm2',
         output='screen',
         parameters=[
-            LaunchConfiguration('params_file'),
+            LaunchConfiguration('resolved_params_file'),
             {
                 'base_frame': 'arm2/base_link',
                 'moveit_ee_link': 'arm2/TCP',
@@ -123,6 +139,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription(arguments + [
+        OpaqueFunction(function=resolve_params_file),
         moveit,
         bridge,
         camera,

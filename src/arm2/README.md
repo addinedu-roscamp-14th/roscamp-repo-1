@@ -84,7 +84,7 @@ config/arm2/arm2_gripper_camera_info.yaml
 ros2 launch arm2 arm2_container_pick_hardware.launch.py \
   video_device:=/dev/video2 \
   camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
-  serial_port:=/dev/ttyUSB1 \
+  serial_port:=/dev/ttyUSB0 \
   trajectory_speed:=100
 ```
 
@@ -101,13 +101,22 @@ ros2 run arm2 arm2_manual_jog --ros-args \
 캘리브레이션해야 합니다. 기존 `config/arm/*.calib` 파일은 복사하지 않았습니다.
 
 ```bash
-ros2 launch arm2 arm2_handeye_calibration.launch.py \
+source install/setup.bash
+
+ros2 launch arm2 arm2_handeye_charuco_calibration.launch.py \
   video_device:=/dev/video2 \
-  camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
-  marker_id:=0 \
-  marker_size_m:=0.015 \
-  dictionary:=DICT_5X5_50 \
-  name:=arm2_jetcobot_eye_in_hand \
+  camera_info_url:=config/arm2/arm2_gripper_camera_info_v3.yaml \
+  dictionary:=DICT_4X4_50 \
+  squares_x:=5 \
+  squares_y:=5 \
+  square_length_m:=0.020 \
+  marker_length_m:=0.015 \
+  legacy_pattern:=true \
+  minimum_charuco_corners:=6 \
+  max_reprojection_error_px:=3.0 \
+  detection_rate_hz:=5.0 \
+  use_node_time_for_pose:=true \
+  name:=arm2_jetcobot_eye_in_hand_charuco_5x5_v4 \
   calibration_directory:=config/arm2
 ```
 
@@ -118,7 +127,7 @@ ros2 launch arm2 arm2_handeye_calibration.launch.py \
 source install/setup.bash
 
 ros2 run arm2 arm2_manual_jog --ros-args \
-  -p serial_port:=/dev/ttyUSB1 \
+  -p serial_port:=/dev/ttyUSB0 \
   -p speed:=10
 ```
 
@@ -199,6 +208,26 @@ ros2 launch arm2 arm2_container_pick_moveit.launch.py \
     goal_tolerance_deg:=3.5 \
     goal_timeout_sec:=15.0 \
     use_rviz:=true
+
+
+
+
+
+
+ros2 launch arm2 arm2_container_pick_moveit.launch.py \
+    camera_info_url:=config/arm2/arm2_gripper_camera_info_v3.yaml \
+    video_device:=/dev/video2 \
+    calibration_name:=arm2_jetcobot_eye_in_hand_charuco_5x5_v4 \
+    params_file:=config/arm2/arm2_container_pick.yaml \
+    use_node_time_for_pose:=true \
+    marker_id:=0 \
+    marker_size_m:=0.026 \
+    serial_port:=/dev/ttyUSB0 \
+    trajectory_speed:=100 \
+    goal_correction_speed:=100 \
+    goal_tolerance_deg:=3.5 \
+    goal_timeout_sec:=15.0 \
+    use_rviz:=true
 ```
 
 ```bash
@@ -212,6 +241,43 @@ ros2 service call /arm2/preview_stack std_srvs/srv/Trigger '{}'
 ros2 service call /arm2/stack_container std_srvs/srv/Trigger '{}'
 ros2 topic echo /arm2/container_pick/status
 ```
+
+### 베이스 좌표계 고정 보정
+
+`config/arm2/arm2_container_pick.yaml`에서 파지점 보정은 두 종류로 나뉩니다.
+
+```yaml
+grasp_offset_xyz_m: [0.006879, -0.002075, -0.036814]
+base_correction_xyz_m: [0.0, -0.007925, 0.0]
+```
+
+- `grasp_offset_xyz_m`: 마커 기준 자세에서 가르친 파지 오프셋입니다.
+  현재 arm2 설정은 `rotate_grasp_offset_with_marker_yaw: false`이므로 그리퍼 yaw만
+  컨테이너를 추종하고 XYZ 오프셋 방향은 `arm2/base_link`에 고정됩니다.
+- `base_correction_xyz_m`: `arm2/base_link` 축에 고정해서 마지막에 더합니다.
+  컨테이너가 어느 방향을 향해도 보정 방향은 바뀌지 않습니다.
+- `container_yaw_symmetry_deg: 180.0`: 직사각형 컨테이너의 0도와 180도를
+  동일한 파지 자세로 처리합니다. 45도와 90도 회전은 그대로 추종합니다.
+
+예를 들어 모든 컨테이너 자세에서 로봇 베이스의 `-Y` 방향으로 10 mm 보정하려면:
+
+```yaml
+base_correction_xyz_m: [0.0, -0.01, 0.0]
+```
+
+카메라 또는 ArUco 검출 프로세스가 종료되면 launch가 2초 후 자동으로 다시
+실행합니다. 카메라가 분리된 동안에는 재실행을 반복하며, 같은 `video_device`로
+다시 연결되면 영상과 마커 인식을 재개합니다.
+
+YAML을 수정했다면 launch를 완전히 종료한 뒤 다시 실행해야 합니다. launch는
+`params_file`을 절대경로로 확인하며, 시작 로그의 `Loaded grasp tuning`에서 실제
+적용값을 출력합니다.
+
+RQt Parameter Reconfigure에서 위 파라미터를 바꾸는 경우에는 로봇이 정지한
+상태에서만 즉시 적용됩니다. 실행 중인 동작이 있거나 오프셋 절댓값이 허용 범위를
+넘으면 변경을 거부합니다. RQt 변경은 YAML 파일에 저장되지 않으므로 검증이 끝난
+값은 `config/arm2/arm2_container_pick.yaml`에도 직접 반영해야 합니다.
+`allow_full_pick`과 `offsets_configured` 체크 상태도 실행 잠금에 즉시 반영됩니다.
 
 `arm2_container_pick_moveit.launch.py`는 ID 0과 ID 1을 동시에 검출합니다. 실제 동작
 전에는 `config/arm2/arm2_container_pick.yaml`에서 2번 팔의 작업공간, 파지 오프셋,

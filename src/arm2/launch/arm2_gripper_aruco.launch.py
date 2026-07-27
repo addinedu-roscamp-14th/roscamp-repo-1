@@ -55,6 +55,8 @@ def generate_launch_description():
         namespace='arm2/gripper_camera',
         name='camera',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
         parameters=[{
             'video_device': LaunchConfiguration('video_device'),
             'image_size': [640, 480],
@@ -74,6 +76,8 @@ def generate_launch_description():
         name='arm2_aruco_pose_publisher',
         namespace='arm2',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
         parameters=[{
             'camera_frame_id': LaunchConfiguration('camera_frame_id'),
             'marker_frame_id': LaunchConfiguration('marker_frame_id'),

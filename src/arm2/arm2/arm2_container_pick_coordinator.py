@@ -10,6 +10,7 @@ from geometry_msgs.msg import PoseStamped
 import numpy as np
 from pymycobot.mycobot280 import MyCobot280
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import (
@@ -123,9 +124,25 @@ def compose_fixed_base_pose(marker_translation, base_offset, base_rotation):
     return translation, normalize_quaternion(base_rotation)
 
 
+def apply_base_frame_correction(translation, correction):
+    """Apply an empirical correction without rotating it with the marker."""
+    return (
+        np.asarray(translation, dtype=np.float64)
+        + np.asarray(correction, dtype=np.float64)
+    )
+
+
 def wrap_degrees(angle):
     """Wrap an angle to [-180, 180)."""
     return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def wrap_symmetric_degrees(angle, symmetry_degrees):
+    """Wrap an angle using the rotational symmetry of the grasped object."""
+    period = float(symmetry_degrees)
+    if period <= 0.0 or period > 360.0:
+        raise ValueError('yaw symmetry must be in the range (0, 360]')
+    return (float(angle) + period / 2.0) % period - period / 2.0
 
 
 def compose_yaw_follow_pose(
@@ -135,10 +152,12 @@ def compose_yaw_follow_pose(
     marker_yaw_degrees,
     reference_marker_yaw_degrees,
     rotate_offset=True,
+    yaw_symmetry_degrees=360.0,
 ):
     """Follow marker yaw while retaining the taught vertical roll/pitch."""
-    yaw_delta = wrap_degrees(
-        marker_yaw_degrees - reference_marker_yaw_degrees
+    yaw_delta = wrap_symmetric_degrees(
+        marker_yaw_degrees - reference_marker_yaw_degrees,
+        yaw_symmetry_degrees,
     )
     angle = math.radians(yaw_delta)
     cosine, sine = math.cos(angle), math.sin(angle)
@@ -217,6 +236,7 @@ def calculate_heading_aligned_stack_poses(
     approach_clearance,
     extra_depth,
     xy_offset,
+    yaw_symmetry_degrees=360.0,
 ):
     """Place the held container with its heading aligned to the destination."""
     if container_height <= 0.0 or approach_clearance <= 0.0:
@@ -233,6 +253,7 @@ def calculate_heading_aligned_stack_poses(
         grasp_rpy_degrees,
         destination_yaw_degrees,
         reference_marker_yaw_degrees,
+        yaw_symmetry_degrees=yaw_symmetry_degrees,
     )
     release = np.asarray(release, dtype=np.float64)
     release[:2] += offset
@@ -342,10 +363,16 @@ class ContainerPickCoordinator(Node):
             ).value
         )
         self.grasp_offset = self._vector_parameter('grasp_offset_xyz_m', 3)
+        self.base_correction = self._vector_parameter(
+            'base_correction_xyz_m', 3
+        )
         self.grasp_rpy = self._vector_parameter('grasp_offset_rpy_deg', 3)
         self.grasp_rotation = quaternion_from_rpy_degrees(*self.grasp_rpy)
         self.reference_marker_yaw = float(
             self.get_parameter('reference_marker_yaw_deg').value
+        )
+        self.container_yaw_symmetry = float(
+            self.get_parameter('container_yaw_symmetry_deg').value
         )
         self.max_yaw_spread = float(
             self.get_parameter('max_yaw_spread_deg').value
@@ -610,6 +637,9 @@ class ContainerPickCoordinator(Node):
         self.current_moveit_goal = None
         self.moveit_goal_lock = threading.Lock()
         self.last_status_text = ''
+        self.add_on_set_parameters_callback(
+            self._on_tuning_parameters_changed
+        )
 
         self.status_publisher = self.create_publisher(
             String, '/arm2/container_pick/status', 10
@@ -662,6 +692,118 @@ class ContainerPickCoordinator(Node):
             f'{self.marker_frame} and {self.stack_target_frame} in '
             f'{self.base_frame}'
         )
+        self.get_logger().info(
+            'Loaded grasp tuning: '
+            f'grasp_offset={self.grasp_offset.tolist()}, '
+            f'base_correction={self.base_correction.tolist()}, '
+            f'grasp_rpy={self.grasp_rpy.tolist()}, '
+            f'reference_yaw={self.reference_marker_yaw:.3f}deg, '
+            f'yaw_symmetry={self.container_yaw_symmetry:.1f}deg'
+        )
+
+    def _on_tuning_parameters_changed(self, parameters):
+        """Apply safe RQt tuning updates to the active target calculations."""
+        tuning_names = {
+            'allow_full_pick',
+            'offsets_configured',
+            'grasp_offset_xyz_m',
+            'base_correction_xyz_m',
+            'grasp_offset_rpy_deg',
+            'reference_marker_yaw_deg',
+            'container_yaw_symmetry_deg',
+            'rotate_grasp_offset_with_marker_yaw',
+        }
+        requested = {
+            parameter.name: parameter.value
+            for parameter in parameters
+            if parameter.name in tuning_names
+        }
+        if not requested:
+            return SetParametersResult(successful=True)
+        if self.motion_lock.locked():
+            return SetParametersResult(
+                successful=False,
+                reason='grasp tuning cannot change while robot motion is active',
+            )
+
+        try:
+            grasp_offset = self.grasp_offset
+            if 'grasp_offset_xyz_m' in requested:
+                grasp_offset = self._validated_tuning_vector(
+                    'grasp_offset_xyz_m',
+                    requested['grasp_offset_xyz_m'],
+                    limit=0.5,
+                )
+
+            base_correction = self.base_correction
+            if 'base_correction_xyz_m' in requested:
+                base_correction = self._validated_tuning_vector(
+                    'base_correction_xyz_m',
+                    requested['base_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            grasp_rpy = self.grasp_rpy
+            if 'grasp_offset_rpy_deg' in requested:
+                grasp_rpy = self._validated_tuning_vector(
+                    'grasp_offset_rpy_deg',
+                    requested['grasp_offset_rpy_deg'],
+                    limit=360.0,
+                )
+
+            reference_yaw = float(requested.get(
+                'reference_marker_yaw_deg',
+                self.reference_marker_yaw,
+            ))
+            yaw_symmetry = float(requested.get(
+                'container_yaw_symmetry_deg',
+                self.container_yaw_symmetry,
+            ))
+            if not math.isfinite(reference_yaw):
+                raise ValueError('reference_marker_yaw_deg must be finite')
+            if not 0.0 < yaw_symmetry <= 360.0:
+                raise ValueError(
+                    'container_yaw_symmetry_deg must be within (0, 360]'
+                )
+        except (TypeError, ValueError) as exc:
+            return SetParametersResult(successful=False, reason=str(exc))
+
+        self.grasp_offset = grasp_offset
+        self.base_correction = base_correction
+        self.grasp_rpy = grasp_rpy
+        self.grasp_rotation = quaternion_from_rpy_degrees(*grasp_rpy)
+        self.reference_marker_yaw = reference_yaw
+        self.container_yaw_symmetry = yaw_symmetry
+        if 'allow_full_pick' in requested:
+            self.allow_full_pick = bool(requested['allow_full_pick'])
+        if 'offsets_configured' in requested:
+            self.offsets_configured = bool(requested['offsets_configured'])
+        if 'rotate_grasp_offset_with_marker_yaw' in requested:
+            self.rotate_grasp_offset_with_marker_yaw = bool(
+                requested['rotate_grasp_offset_with_marker_yaw']
+            )
+        self.get_logger().info(
+            'Applied grasp tuning: '
+            f'allow_full_pick={self.allow_full_pick}, '
+            f'offsets_configured={self.offsets_configured}, '
+            f'grasp_offset={self.grasp_offset.tolist()}, '
+            f'base_correction={self.base_correction.tolist()}, '
+            f'grasp_rpy={self.grasp_rpy.tolist()}'
+        )
+        return SetParametersResult(successful=True)
+
+    @staticmethod
+    def _validated_tuning_vector(name, values, limit):
+        vector = np.asarray(values, dtype=np.float64)
+        if vector.shape != (3,):
+            raise ValueError(f'{name} must contain exactly 3 values')
+        if not np.all(np.isfinite(vector)):
+            raise ValueError(f'{name} must contain only finite values')
+        if np.any(np.abs(vector) > limit):
+            raise ValueError(
+                f'{name} magnitude must not exceed {limit:g}'
+            )
+        return vector
 
     def _declare_parameters(self):
         self.declare_parameter('base_frame', 'arm2/base_link')
@@ -679,8 +821,10 @@ class ContainerPickCoordinator(Node):
             'rotate_grasp_offset_with_marker_yaw', True
         )
         self.declare_parameter('grasp_offset_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('base_correction_xyz_m', [0.0, 0.0, 0.0])
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
+        self.declare_parameter('container_yaw_symmetry_deg', 360.0)
         self.declare_parameter('max_yaw_spread_deg', 8.0)
         self.declare_parameter('max_container_yaw_delta_deg', 90.0)
         self.declare_parameter(
@@ -996,6 +1140,7 @@ class ContainerPickCoordinator(Node):
                     marker_yaw,
                     self.reference_marker_yaw,
                     self.rotate_grasp_offset_with_marker_yaw,
+                    self.container_yaw_symmetry,
                 )
             )
             if abs(yaw_delta) > self.max_yaw_delta:
@@ -1008,6 +1153,10 @@ class ContainerPickCoordinator(Node):
                 self.grasp_offset,
                 self.grasp_rotation,
             )
+        grasp_translation = apply_base_frame_correction(
+            grasp_translation,
+            self.base_correction,
+        )
         grasp_translation, pregrasp_translation = apply_vertical_pick_offsets(
             grasp_translation,
             self.pregrasp_lift,
@@ -1083,6 +1232,15 @@ class ContainerPickCoordinator(Node):
             self.stack_approach_clearance,
             self.grasp_extra_depth,
             self.stack_xy_offset,
+            self.container_yaw_symmetry,
+        )
+        release_translation = apply_base_frame_correction(
+            release_translation,
+            self.base_correction,
+        )
+        approach_translation = apply_base_frame_correction(
+            approach_translation,
+            self.base_correction,
         )
         if abs(destination_yaw_delta) > self.max_yaw_delta:
             return None, (
