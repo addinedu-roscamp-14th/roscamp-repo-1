@@ -27,7 +27,18 @@ class YoloNode(Node):
         self.declare_parameter('confidence_threshold', 0.6)
         self.declare_parameter('device', '')
         self.declare_parameter('publish_annotated_image', True)
-        self.declare_parameter('class_names', ['red', 'blue'])
+        self.declare_parameter(
+            'class_names',
+            [
+                'trailer',
+                'car_yellow',
+                'car_blue',
+                'A-1',
+                'A-2',
+                'A-3',
+                'B-1',
+            ],
+        )
 
         self.input_topic = str(self.get_parameter('input_topic').value)
         self.input_is_compressed = bool(self.get_parameter('input_is_compressed').value)
