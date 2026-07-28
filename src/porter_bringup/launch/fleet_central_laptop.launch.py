@@ -1,7 +1,12 @@
 """Central camera, API, and two-vehicle fleet dispatcher."""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+)
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -21,6 +26,7 @@ def generate_launch_description():
         DeclareLaunchArgument('start_camera', default_value='true'),
         DeclareLaunchArgument('start_yolo', default_value='true'),
         DeclareLaunchArgument('start_dashboard_api', default_value='true'),
+        DeclareLaunchArgument('use_rviz', default_value='true'),
         DeclareLaunchArgument('control_host', default_value='0.0.0.0'),
         DeclareLaunchArgument(
             'api_token',
@@ -29,28 +35,63 @@ def generate_launch_description():
                 default_value='',
             ),
         ),
+        GroupAction(
+            scoped=True,
+            actions=[
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        PathJoinSubstitution([
+                            FindPackageShare('porter_bringup'),
+                            'launch',
+                            'central_laptop.launch.py',
+                        ])
+                    ),
+                    launch_arguments={
+                        'workspace': workspace,
+                        'video_device': LaunchConfiguration('video_device'),
+                        'start_camera': LaunchConfiguration('start_camera'),
+                        'start_yolo': LaunchConfiguration('start_yolo'),
+                        'start_dashboard_api': LaunchConfiguration(
+                            'start_dashboard_api'
+                        ),
+                        'dashboard_slam_map_topic': '/agv1/map',
+                        'dashboard_slam_scan_topic': '/agv1/scan',
+                        'dashboard_slam_base_frame': 'agv1/base_footprint',
+                        'start_nav2': 'false',
+                        'start_navigation_control': 'false',
+                        'use_rviz': 'false',
+                    }.items(),
+                ),
+            ],
+        ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([
-                    FindPackageShare('porter_bringup'),
+                    FindPackageShare('drive'),
                     'launch',
-                    'central_laptop.launch.py',
+                    'multi_vehicle_nav.launch.py',
                 ])
             ),
             launch_arguments={
+                'vehicle_id': 'agv1',
                 'workspace': workspace,
-                'video_device': LaunchConfiguration('video_device'),
-                'start_camera': LaunchConfiguration('start_camera'),
-                'start_yolo': LaunchConfiguration('start_yolo'),
-                'start_dashboard_api': LaunchConfiguration(
-                    'start_dashboard_api'
-                ),
-                'dashboard_slam_map_topic': '/agv1/map',
-                'dashboard_slam_scan_topic': '/agv1/scan',
-                'dashboard_slam_base_frame': 'agv1/base_footprint',
-                'start_nav2': 'false',
-                'start_navigation_control': 'false',
-                'use_rviz': 'false',
+                'use_composition': 'False',
+                'start_navigation': 'False',
+            }.items(),
+        ),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution([
+                    FindPackageShare('drive'),
+                    'launch',
+                    'multi_vehicle_nav.launch.py',
+                ])
+            ),
+            launch_arguments={
+                'vehicle_id': 'agv2',
+                'workspace': workspace,
+                'use_composition': 'False',
+                'start_navigation': 'False',
             }.items(),
         ),
         Node(
@@ -90,6 +131,21 @@ def generate_launch_description():
                     'host': LaunchConfiguration('control_host'),
                     'api_token': LaunchConfiguration('api_token'),
                 },
+            ],
+        ),
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            name='fleet_rviz',
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('use_rviz')),
+            arguments=[
+                '-d',
+                PathJoinSubstitution([
+                    FindPackageShare('porter_bringup'),
+                    'rviz',
+                    'fleet_nav.rviz',
+                ]),
             ],
         ),
     ])

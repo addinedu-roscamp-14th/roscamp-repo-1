@@ -17,6 +17,11 @@
 export PORT_CONTROL_API_TOKEN='porter1234'
 
 ros2 launch porter_bringup central_laptop.launch.py   control_host:=0.0.0.0
+
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+ros2 launch porter_bringup fleet_central_laptop.launch.py \
+  control_host:=0.0.0.0
 ```
 
 ``` bash

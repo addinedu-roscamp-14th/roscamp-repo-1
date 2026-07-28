@@ -64,6 +64,8 @@ def _launch_nav2(context):
                 'container_name': f'{vehicle_id}_nav2_container',
                 'cmd_vel_output_topic': 'cmd_vel_safe_input',
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
+                'use_composition': LaunchConfiguration('use_composition'),
+                'start_navigation': LaunchConfiguration('start_navigation'),
             }.items(),
         )
     ]
@@ -103,5 +105,7 @@ def generate_launch_description():
             ]),
         ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument('use_composition', default_value='True'),
+        DeclareLaunchArgument('start_navigation', default_value='True'),
         OpaqueFunction(function=_launch_nav2),
     ])

@@ -1,7 +1,13 @@
-"""Complete hardware, localization, and Nav2 launch for one Pinky AGV."""
+"""Hardware bringup (and optionally Nav2) for one Pinky AGV.
+
+Nav2 (map_server/amcl) now runs centrally on the fleet laptop via
+fleet_central_laptop.launch.py, so 'start_nav2' defaults to false to avoid
+launching duplicate/conflicting map_server, amcl, etc. on the vehicle itself.
+"""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
@@ -39,6 +45,7 @@ def generate_launch_description():
             'motor_serial_port', default_value='/dev/ttyAMA5'
         ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument('start_nav2', default_value='false'),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([
@@ -62,6 +69,7 @@ def generate_launch_description():
                     'multi_vehicle_nav.launch.py',
                 ])
             ),
+            condition=IfCondition(LaunchConfiguration('start_nav2')),
             launch_arguments={
                 'vehicle_id': vehicle_id,
                 'workspace': workspace,

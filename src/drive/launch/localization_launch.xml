@@ -22,8 +22,6 @@
             <param name='use_sim_time' value="$(var use_sim_time)"/>
             <param name='yaml_filename' value="$(var map)"/>
 
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </composable_node>
 
         <composable_node pkg="nav2_map_server" plugin="nav2_map_server::MapServer" name="filter_mask_server">
@@ -31,24 +29,18 @@
             <param name='yaml_filename' value="$(var keepout_mask)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
 
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </composable_node>
 
         <composable_node pkg="nav2_map_server" plugin="nav2_map_server::CostmapFilterInfoServer" name="costmap_filter_info_server">
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
 
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </composable_node>
 
         <composable_node pkg="nav2_amcl" plugin="nav2_amcl::AmclNode" name="amcl">         
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
 
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </composable_node>  
 
         <composable_node pkg="nav2_lifecycle_manager" plugin="nav2_lifecycle_manager::LifecycleManager" name="lifecycle_manager_localization">            
@@ -59,7 +51,6 @@
     </load_composable_node>
 
     <group unless="$(var use_composition)">
-        <push-ros-namespace namespace="$(var namespace)"/>
         <node pkg="nav2_map_server" exec="map_server" name='map_server' output="screen">
             <param from="$(var params_file)"/>
             <param name='yaml_filename' value="$(var map)"/>
@@ -67,10 +58,8 @@
             <param name='respawn_delay' value="2.0"/>
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            
+            <param name='/bond_disable_heartbeat_timeout' value="true"/>
 
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </node>
 
         <node pkg="nav2_map_server" exec="map_server" name='filter_mask_server' output="screen">
@@ -80,9 +69,8 @@
             <param name='respawn_delay' value="2.0"/>
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
+            <param name='/bond_disable_heartbeat_timeout' value="true"/>
 
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </node>
 
         <node pkg="nav2_map_server" exec="costmap_filter_info_server" name='costmap_filter_info_server' output="screen">
@@ -91,9 +79,8 @@
             <param name='respawn_delay' value="2.0"/>
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
+            <param name='/bond_disable_heartbeat_timeout' value="true"/>
 
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </node>
 
         <node pkg="nav2_amcl" exec="amcl" name='amcl' output="screen">
@@ -102,15 +89,15 @@
             <param name='respawn_delay' value="2.0"/>
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
+            <param name='/bond_disable_heartbeat_timeout' value="true"/>
 
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </node>
 
         <node pkg="nav2_lifecycle_manager" exec="lifecycle_manager" name="lifecycle_manager_localization" output="screen">
             <param name='use_sim_time' value="$(var use_sim_time)"/>
             <param name='autostart' value="$(var autostart)"/>
             <param name='node_names' value="$(var lifecycle_nodes)"/>
+            <param name='bond_timeout' value="0.0"/>
         </node>
     </group>
 

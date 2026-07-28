@@ -39,6 +39,16 @@ export PORT_CONTROL_API_TOKEN='porter1234'
 ros2 launch porter_bringup fleet_central_laptop.launch.py
 ```
 
+이 launch는 두 차량을 한 화면에 표시하는 fleet RViz를 함께 실행합니다. 툴바의
+`AGV1 Initial Pose`로 1번 차량을, `AGV2 Initial Pose`로 2번 차량을 실제
+위치와 방향에 맞게 각각 설정합니다. 두 도구는 각각 `/agv1/initialpose`,
+`/agv2/initialpose`에 발행합니다. RViz가 필요 없으면 `use_rviz:=false`를
+추가합니다.
+
+launch가 정상적으로 시작되면 터미널은 종료되지 않고 계속 실행 상태로
+유지됩니다. RViz 창과 API 서버가 실행된 뒤에도 프롬프트로 돌아오지 않는 것이
+정상입니다.
+
 다중 차량 모드의 SLAM 웹 화면은 동일한 지도를 사용하는 `agv1`의
 `/agv1/map`, `/agv1/scan`, `agv1/base_footprint`를 기본으로 표시합니다.
 차량별 위치와 상태는 `/central/fleet/agv1/state`,
