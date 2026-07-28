@@ -265,7 +265,7 @@ ros2 run central camera_to_map_bridge --ros-args \
 터미널 9:
 
 ```bash
-ros2 launch drive target_map_waypoints_nav.launch.xml start_nav2:=false
+ros2 launch drive target_waypoints_nav.launch.xml start_nav2:=false
 ```
 
 RQT에서 중간 웨이포인트는 위치만 한 번씩 클릭합니다. 마지막에는 `최종 위치 -> 최종
@@ -289,6 +289,25 @@ ros2 service call /central/clear_waypoints std_srvs/srv/Trigger "{}"
 ```bash
 ros2 topic echo /central/target_map_waypoints_preview
 ros2 topic echo /central/target_map_waypoints
+```
+
+### 지정 주차 시퀀스 실행
+
+Nav2로 지정 주차 접근 지점까지 이동한 뒤, 마지막 구간은 `/cmd_vel` 후진 제어로 주차
+위치까지 들어갑니다. 주차 위치와 접근 경로는 `src/drive/params/parking_spots.yaml`에서
+관리합니다.
+
+터미널 9 대신 지정 주차 액션 서버를 실행합니다.
+
+```bash
+ros2 run drive parking_action_server
+```
+
+주차 명령:
+
+```bash
+ros2 action send_goal /park_in_spot drive/action/ParkInSpot \
+  "{spot_id: park_red}" --feedback
 ```
 
 ### 중요 확인
@@ -366,9 +385,8 @@ poter_ws/
 | `yolo` | 카메라 이미지에서 객체/영역을 인식하고 annotated image와 detection JSON 발행 | `yolo_node` |
 | `calibration` | `/image_rect/compressed` 픽셀 좌표와 SLAM `/map` 좌표를 homography로 캘리브레이션 | `direct_calibrator`, `calibration_verifier` |
 | `central` | 카메라 픽셀을 `/map` 좌표로 변환하고 단일 Pose 또는 웨이포인트 Path 발행 | `camera_to_map_bridge` |
-| `dashboard` | YOLO 영상과 지도·차량·LiDAR 합성 화면을 HTTP MJPEG로 제공 | `dashboard_stream_node` |
-| `drive` | 단일 목표와 웨이포인트 목록을 차량 Nav2 action으로 전달 | `target_map_pose_to_nav_goal`, `target_map_waypoints_to_nav_goal` |
-| `slam` | 차량의 `/scan`, `/odom`, TF로 지도를 만들고 dashboard API로 중계 | `slam_toolbox`, `slam_bringup.launch.xml` |
+| `drive` | 단일 목표, 웨이포인트 목록과 지정 주차 시퀀스를 차량 Nav2/action으로 전달 | `target_map_pose_to_nav_goal`, `target_waypoints_to_nav_goal`, `parking_action_server` |
+| `slam` | 차량의 `/scan`, `/odom`, TF를 사용해 노트북에서 SLAM 지도를 작성 | `slam_toolbox`, mapping RViz |
 | `arm` | ArUco XYZ/yaw 추적, Eye-in-Hand, MoveIt2 정렬, Cartesian 파지와 적응형 상승 | `container_pick_coordinator`, `jetcobot_trajectory_bridge` |
 | `arm2` | 두 번째 JetCobot용 `/arm2` 토픽, TF, 캘리브레이션과 파지 제어 | `arm2_container_pick_coordinator`, `arm2_jetcobot_trajectory_bridge` |
 | `jetcobot_description` | JetCobot의 관절·링크 구조와 시각/충돌 mesh 제공 | `jetcobot.urdf` |
