@@ -86,26 +86,26 @@
     max_marker_age_sec: 3.0
     stabilization_timeout_sec: 20.0
     workspace_min_xyz_m:
-    - -0.28
-    - -0.28
+    - -0.30
+    - -0.30
     - -0.025
     workspace_max_xyz_m:
-    - 0.28
-    - 0.28
+    - 0.30
+    - 0.30
     - 0.3
     workspace_xy_shape: inverted_l
     workspace_horizontal_min_xy_m:
-    - -0.28
-    - -0.28
+    - -0.30
+    - -0.30
     workspace_horizontal_max_xy_m:
-    - 0.28
+    - 0.30
     - 0.0
     workspace_vertical_min_xy_m:
-    - -0.03
-    - -0.28
+    - -0.06
+    - -0.30
     workspace_vertical_max_xy_m:
-    - 0.28
-    - 0.28
+    - 0.30
+    - 0.30
     max_joint_delta_deg: 60.0
     serial_port: /dev/jetcobot
     baud_rate: 1000000

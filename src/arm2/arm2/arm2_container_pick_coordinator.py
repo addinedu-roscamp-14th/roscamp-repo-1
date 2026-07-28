@@ -684,6 +684,11 @@ class ContainerPickCoordinator(Node):
         self.last_stack_target_a2_stamp = None
         self.last_stack_target_a3_stamp = None
         self.saved_destination_poses = {}
+        self.saved_destination_stack_counts = {
+            'A-1': 0,
+            'A-2': 0,
+            'A-3': 0,
+        }
         self.tracking_errors = {}
         # During scan-and-transfer, each marker becomes immutable as soon as
         # its stationary pose has been accepted.  The next scan command clears
@@ -1719,6 +1724,9 @@ class ContainerPickCoordinator(Node):
             self.saved_destination_poses = dict(zip(
                 ('A-1', 'A-2', 'A-3'), locked
             ))
+            with self.stack_level_lock:
+                for name in self.saved_destination_stack_counts:
+                    self.saved_destination_stack_counts[name] = 0
             self.publish_status(
                 'DESTINATION SCAN: A-1, A-2, A-3 saved; returning home'
             )
@@ -1731,6 +1739,7 @@ class ContainerPickCoordinator(Node):
             self.publish_status(
                 f'DESTINATION SCAN FAILED during home return: {exc}'
             )
+            self._recover_home_after_failure('DESTINATION SCAN')
             return
         self.publish_status(
             'DESTINATION SCAN COMPLETED: ID 9=A-1, ID 1=A-2, ID 4=A-3'
@@ -1753,6 +1762,17 @@ class ContainerPickCoordinator(Node):
             response.message = (
                 f'{destination_name} is not saved; call '
                 '/arm2/scan_destinations first'
+            )
+            return response
+        with self.stack_level_lock:
+            placed_count = self.saved_destination_stack_counts[
+                destination_name
+            ]
+        if placed_count >= self.max_stack_levels:
+            response.success = False
+            response.message = (
+                f'{destination_name} already has the maximum '
+                f'{self.max_stack_levels} layers'
             )
             return response
         if self.motion_thread is not None and self.motion_thread.is_alive():
@@ -1790,22 +1810,29 @@ class ContainerPickCoordinator(Node):
                     f'{destination_name} TRANSFER FAILED: '
                     f'ID 7 target: {reason}'
                 )
+                self._recover_home_after_failure(destination_name)
                 return
             destination_pose = self.saved_destination_poses[destination_name]
+            with self.stack_level_lock:
+                placed_count = self.saved_destination_stack_counts[
+                    destination_name
+                ]
             targets, reason = self.calculate_stack_targets_from_locked_poses(
                 source_targets,
                 destination_pose,
-                placed_count=0,
+                placed_count=placed_count,
             )
             if targets is None:
                 self.publish_status(
                     f'{destination_name} TRANSFER FAILED: {reason}'
                 )
+                self._recover_home_after_failure(destination_name)
                 return
             self.execute_scanned_transfer(
                 targets,
                 destination_name=destination_name,
                 count_stack=False,
+                saved_stack_name=destination_name,
             )
         except Exception as exc:
             self.stop_event.set()
@@ -1813,6 +1840,7 @@ class ContainerPickCoordinator(Node):
             self.publish_status(
                 f'{destination_name} TRANSFER FAILED: {exc}'
             )
+            self._recover_home_after_failure(destination_name)
 
     def _scan_named_markers(self, specs):
         """Sweep J1 until every named marker has a stationary locked pose."""
@@ -1958,9 +1986,15 @@ class ContainerPickCoordinator(Node):
             return response
         with self.stack_level_lock:
             self.placed_stack_count = 0
-        self.publish_status('STACK: layer counter reset; next layer is 1')
+            for name in self.saved_destination_stack_counts:
+                self.saved_destination_stack_counts[name] = 0
+        self.publish_status(
+            'STACK: all layer counters reset; next layer is 1'
+        )
         response.success = True
-        response.message = 'Stack level reset; next placement is layer 1'
+        response.message = (
+            'A-1/A-2/A-3 stack levels reset; next placement is layer 1'
+        )
         return response
 
     def execute_scan_and_transfer(self):
@@ -1979,6 +2013,7 @@ class ContainerPickCoordinator(Node):
                 self.publish_status(
                     f'SCAN TRANSFER FAILED: ID 7 target: {reason}'
                 )
+                self._recover_home_after_failure('SCAN TRANSFER')
                 return
             targets, reason = self.calculate_stack_targets_from_locked_poses(
                 source_targets,
@@ -1986,12 +2021,14 @@ class ContainerPickCoordinator(Node):
             )
             if targets is None:
                 self.publish_status(f'SCAN TRANSFER FAILED: {reason}')
+                self._recover_home_after_failure('SCAN TRANSFER')
                 return
             self.execute_scanned_transfer(targets)
         except Exception as exc:
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'SCAN TRANSFER FAILED: {exc}')
+            self._recover_home_after_failure('SCAN TRANSFER')
 
     def scan_and_lock_marker_poses(self):
         """Sweep J1 and pause at whichever required marker appears."""
@@ -2096,11 +2133,24 @@ class ContainerPickCoordinator(Node):
 
     def _return_home_after_failed_scan(self):
         """Return home when scanning cannot proceed to a transfer."""
-        self.publish_status('SCAN: failed; returning home')
-        self._call_scan_service(
-            self.return_home_client,
-            'scan failure home return',
-            timeout=self.motion_timeout + 5.0,
+        self._recover_home_after_failure('SCAN')
+
+    def _recover_home_after_failure(self, label):
+        """Stop, wait five seconds, then make a best-effort home return."""
+        self._stop_active_motion()
+        self.publish_status(
+            f'{label}: failure recovery; returning home in 5 seconds'
+        )
+        time.sleep(5.0)
+        try:
+            self.command_return_home()
+        except Exception as exc:
+            self.publish_status(
+                f'{label}: automatic failure home return failed: {exc}'
+            )
+            return
+        self.publish_status(
+            f'{label}: automatic failure home return completed'
         )
 
     def _history_sample_count(self, history):
@@ -2262,6 +2312,7 @@ class ContainerPickCoordinator(Node):
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'PICK FAILED: {exc}')
+            self._recover_home_after_failure('PICK')
         finally:
             self.motion_lock.release()
 
@@ -2393,12 +2444,17 @@ class ContainerPickCoordinator(Node):
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'STACK FAILED: {exc}')
+            self._recover_home_after_failure('STACK')
         finally:
             self.tracking_suspended.clear()
             self.motion_lock.release()
 
     def execute_scanned_transfer(
-        self, targets, destination_name='A-1', count_stack=True
+        self,
+        targets,
+        destination_name='A-1',
+        count_stack=True,
+        saved_stack_name=None,
     ):
         """Move scan-locked ID 7 to one locked destination, then go home."""
         if not self.motion_lock.acquire(blocking=False):
@@ -2447,6 +2503,18 @@ class ContainerPickCoordinator(Node):
                 self.publish_status(
                     f'TRANSFER: stack layer {completed_layer} placed'
                 )
+            elif saved_stack_name is not None:
+                with self.stack_level_lock:
+                    self.saved_destination_stack_counts[
+                        saved_stack_name
+                    ] += 1
+                    completed_layer = self.saved_destination_stack_counts[
+                        saved_stack_name
+                    ]
+                self.publish_status(
+                    f'TRANSFER: {saved_stack_name} layer '
+                    f'{completed_layer}/{self.max_stack_levels} placed'
+                )
             self.publish_status('TRANSFER: returning to final home')
             self.command_return_home()
             self.publish_status(
@@ -2456,6 +2524,7 @@ class ContainerPickCoordinator(Node):
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'TRANSFER FAILED: {exc}')
+            self._recover_home_after_failure('TRANSFER')
         finally:
             self.tracking_suspended.clear()
             self.motion_lock.release()

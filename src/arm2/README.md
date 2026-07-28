@@ -365,3 +365,12 @@ ros2 service call /arm2/transfer_to_a3 std_srvs/srv/Trigger "{}"
 로봇 동작은 한 번에 하나만 실행할 수 있으므로 A-1 작업이 끝나기 전에 A-2나
 A-3 서비스를 호출하면 요청이 거부됩니다. launch를 재시작하면 저장된 목적지
 세 곳이 초기화되므로 `/arm2/scan_destinations`를 다시 호출해야 합니다.
+
+같은 목적지 서비스를 반복 호출하면 목적지별로 최대 3층까지 쌓습니다. 컨테이너
+높이는 35mm이며, 각 목적지는 서로 독립적으로 1층, 2층(+35mm), 3층(+70mm)을
+기억합니다. 네 번째 요청은 거부됩니다. 실제 적재물을 치운 뒤 카운터만 다시
+1층으로 초기화하려면 다음 서비스를 호출합니다.
+
+```bash
+ros2 service call /arm2/reset_stack_level std_srvs/srv/Trigger "{}"
+```
