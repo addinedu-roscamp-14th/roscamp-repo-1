@@ -45,7 +45,12 @@ source install/setup.bash
 핑키에서 센서, odometry와 모터 제어만 실행합니다. 차량에서는 Nav2를 실행하지 않습니다.
 
 ```bash
-ros2 launch pinky bringup_robot.launch.xml
+# AGV1
+ros2 launch porter_bringup agv_vehicle.launch.py vehicle_id:=agv1
+
+# AGV2
+ros2 launch porter_bringup agv_vehicle.launch.py vehicle_id:=agv2
+
 ```
 
 ```bash
