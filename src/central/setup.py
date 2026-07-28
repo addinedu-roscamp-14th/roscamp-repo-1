@@ -33,6 +33,7 @@ setup(
         'console_scripts': [
             'camera_to_map_bridge = central.camera_to_map_bridge:main',
             'control_gateway = central.control_gateway:main',
+            'fleet_dispatcher = central.fleet_dispatcher:main',
             'rqt_click_to_target = central.rqt_click_to_target:main',
         ],
     },

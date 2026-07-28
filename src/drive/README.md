@@ -1,5 +1,31 @@
 # Drive Package
 
+## 2대 차량 Nav2
+
+`multi_vehicle_nav.launch.py`는 기존 `nav2_params.yaml`을 실행 시점에 복사하여
+차량별 TF 프레임으로 바꿉니다. 원본 파라미터와 단일 차량 명령은 변경하지
+않습니다.
+
+```bash
+ros2 launch drive multi_vehicle_nav.launch.py vehicle_id:=agv1
+```
+
+```bash
+ros2 launch drive multi_vehicle_nav.launch.py vehicle_id:=agv2
+```
+
+생성되는 주요 이름:
+
+```text
+/agv1/navigate_to_pose
+/agv1/navigate_through_poses
+/agv1/initialpose
+map -> agv1/odom -> agv1/base_footprint -> agv1/base_link
+```
+
+Nav2의 최종 속도는 `/<vehicle_id>/cmd_vel_safe_input`으로 전달되어 Pinky 안전
+게이트를 거칩니다.
+
 노트북에서 Nav2를 실행하고 중앙 관제의 map 목표 자세를 핑키 차량의 주행으로 연결하는
 패키지입니다. Nav2 localization/navigation launch, 파라미터, Behavior Tree와 RViz 설정을
 포함합니다.

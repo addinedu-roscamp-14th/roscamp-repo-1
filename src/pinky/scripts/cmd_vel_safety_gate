@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+from pinky_nodes.cmd_vel_safety_gate import main
+
+if __name__ == '__main__':
+    main()

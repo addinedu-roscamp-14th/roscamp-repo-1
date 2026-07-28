@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+import math
 from typing import Any, Mapping
 
 
@@ -24,6 +24,8 @@ class PixelGoal:
     """Validated target and heading pixels."""
 
     command_id: str | None
+    requested_vehicle_id: str
+    zone_id: str
     mode: str
     target: Pixel
     heading: Pixel
@@ -93,6 +95,28 @@ def validate_pixel_goal(
             'mode must be direct or parking_b1'
         )
 
+    requested_vehicle_id = payload.get('vehicle_id', '')
+    if requested_vehicle_id is None:
+        requested_vehicle_id = ''
+    if not isinstance(requested_vehicle_id, str):
+        raise CommandValidationError('vehicle_id must be a string')
+    requested_vehicle_id = requested_vehicle_id.strip().strip('/')
+    if requested_vehicle_id not in ('', 'agv1', 'agv2'):
+        raise CommandValidationError(
+            'vehicle_id must be empty, agv1, or agv2'
+        )
+
+    zone_id = payload.get('zone_id', '')
+    if zone_id is None:
+        zone_id = ''
+    if not isinstance(zone_id, str):
+        raise CommandValidationError('zone_id must be a string')
+    zone_id = zone_id.strip().upper()
+    if mode == 'parking_b1' and not zone_id:
+        zone_id = 'B-1'
+    if zone_id not in ('', 'B-1'):
+        raise CommandValidationError('zone_id must be empty or B-1')
+
     target = _pixel(
         payload.get('target'),
         'target',
@@ -117,6 +141,8 @@ def validate_pixel_goal(
 
     return PixelGoal(
         command_id=command_id,
+        requested_vehicle_id=requested_vehicle_id,
+        zone_id=zone_id,
         mode=mode,
         target=target,
         heading=heading,

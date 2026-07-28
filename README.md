@@ -24,6 +24,7 @@ export PORT_CONTROL_API_TOKEN='porter1234'
 
 ros2 launch porter_bringup dashboard_laptop.launch.py   central_ip:=192.168.0.60   ollama_host:=http://agent.sds.codes   llm_model:=gemma4:31b
 ```
+
 ### 0. 최초 빌드
 
 노트북:

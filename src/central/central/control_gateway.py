@@ -4,17 +4,18 @@
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import math
 import secrets
 import threading
 import time
 import uuid
-from collections import deque
 
 from geometry_msgs.msg import PointStamped
 
 from nav_msgs.msg import Odometry
+from porter_interfaces.msg import PixelNavigationCommand, VehicleState
 
 import rclpy
 from rclpy.executors import (
@@ -24,6 +25,7 @@ from rclpy.executors import (
 from rclpy.node import Node
 
 from std_msgs.msg import Float32, String
+from std_srvs.srv import SetBool, Trigger
 
 from .control_protocol import (
     CommandValidationError,
@@ -56,6 +58,10 @@ class CentralControlGateway(Node):
             'target_pixel_topic', '/central/target_pixel'
         )
         self.declare_parameter(
+            'fleet_pixel_command_topic',
+            '/central/fleet/pixel_navigation_command',
+        )
+        self.declare_parameter(
             'target_map_json_topic', '/central/target_map_json'
         )
         self.declare_parameter(
@@ -75,6 +81,9 @@ class CentralControlGateway(Node):
         self.api_token = str(self.get_parameter('api_token').value)
         self.target_pixel_topic = str(
             self.get_parameter('target_pixel_topic').value
+        )
+        self.fleet_pixel_command_topic = str(
+            self.get_parameter('fleet_pixel_command_topic').value
         )
         self.target_map_json_topic = str(
             self.get_parameter('target_map_json_topic').value
@@ -104,6 +113,8 @@ class CentralControlGateway(Node):
             'odom': None,
             'last_map_target': None,
             'last_command': None,
+            'vehicles': {},
+            'b1_zone': 'B-1:UNKNOWN',
         }
         self._received_at = {
             'battery_percent': None,
@@ -115,6 +126,11 @@ class CentralControlGateway(Node):
         self.target_pixel_publisher = self.create_publisher(
             PointStamped,
             self.target_pixel_topic,
+            10,
+        )
+        self.fleet_pixel_publisher = self.create_publisher(
+            PixelNavigationCommand,
+            self.fleet_pixel_command_topic,
             10,
         )
         self.status_publisher = self.create_publisher(
@@ -145,6 +161,32 @@ class CentralControlGateway(Node):
             self.target_map_json_topic,
             self._on_map_target,
             10,
+        )
+        for vehicle_id in ('agv1', 'agv2'):
+            self.create_subscription(
+                VehicleState,
+                f'/central/fleet/{vehicle_id}/state',
+                self._on_vehicle_state,
+                10,
+            )
+        self.create_subscription(
+            String,
+            '/central/fleet/zones',
+            self._on_zone_state,
+            10,
+        )
+        self._fleet_emergency_client = self.create_client(
+            SetBool, '/central/fleet/emergency_stop'
+        )
+        self._vehicle_emergency_clients = {
+            vehicle_id: self.create_client(
+                SetBool,
+                f'/central/fleet/{vehicle_id}/emergency_stop',
+            )
+            for vehicle_id in ('agv1', 'agv2')
+        }
+        self._clear_b1_client = self.create_client(
+            Trigger, '/central/fleet/clear_b1_lock'
         )
 
         self.get_logger().info(
@@ -210,6 +252,30 @@ class CentralControlGateway(Node):
             value = {'raw': message.data}
         self._set_telemetry('last_map_target', value)
 
+    def _on_vehicle_state(self, message):
+        position = message.pose.pose.position
+        value = {
+            'vehicle_id': message.vehicle_id,
+            'state': message.state_text,
+            'battery_percent': float(message.battery_percent),
+            'battery_voltage': float(message.battery_voltage),
+            'pose': {
+                'x': float(position.x),
+                'y': float(position.y),
+            },
+            'current_command_id': message.current_command_id,
+            'nav2_ready': bool(message.nav2_ready),
+            'emergency_stopped': bool(message.emergency_stopped),
+            'locked_zone': message.locked_zone,
+            'telemetry_age_sec': float(message.telemetry_age_sec),
+        }
+        with self._lock:
+            self._telemetry['vehicles'][message.vehicle_id] = value
+
+    def _on_zone_state(self, message):
+        with self._lock:
+            self._telemetry['b1_zone'] = message.data
+
     def dispatch_pixel_goal(self, payload):
         """Validate and publish a target/heading pixel pair exactly once."""
         goal = validate_pixel_goal(
@@ -227,38 +293,57 @@ class CentralControlGateway(Node):
                     'duplicate': True,
                     'command_id': command_id,
                 }
-            subscribers = (
+            fleet_subscribers = (
+                self.fleet_pixel_publisher.get_subscription_count()
+            )
+            legacy_subscribers = (
                 self.target_pixel_publisher.get_subscription_count()
             )
-            if subscribers == 0:
+            if fleet_subscribers == 0 and legacy_subscribers == 0:
                 raise RuntimeError(
-                    f'no subscriber on {self.target_pixel_topic}; '
+                    'no subscriber on fleet or legacy pixel command topics; '
                     'start camera_to_map_bridge first'
                 )
 
             stamp = self.get_clock().now().to_msg()
-            self.target_pixel_publisher.publish(
-                self._point_message(
-                    goal.target.x,
-                    goal.target.y,
-                    stamp,
-                    goal.mode,
+            if fleet_subscribers > 0:
+                message = PixelNavigationCommand()
+                message.header.stamp = stamp
+                message.header.frame_id = self.camera_frame_id
+                message.command_id = command_id
+                message.requested_vehicle_id = goal.requested_vehicle_id
+                message.zone_id = goal.zone_id
+                message.mode = goal.mode
+                message.target_pixel.x = goal.target.x
+                message.target_pixel.y = goal.target.y
+                message.heading_pixel.x = goal.heading.x
+                message.heading_pixel.y = goal.heading.y
+                self.fleet_pixel_publisher.publish(message)
+            else:
+                self.target_pixel_publisher.publish(
+                    self._point_message(
+                        goal.target.x,
+                        goal.target.y,
+                        stamp,
+                        goal.mode,
+                    )
                 )
-            )
-            self.target_pixel_publisher.publish(
-                self._point_message(
-                    goal.heading.x,
-                    goal.heading.y,
-                    stamp,
-                    goal.mode,
+                self.target_pixel_publisher.publish(
+                    self._point_message(
+                        goal.heading.x,
+                        goal.heading.y,
+                        stamp,
+                        goal.mode,
+                    )
                 )
-            )
             self._recent_command_ids.append(command_id)
 
         command = {
             'state': 'PIXEL_GOAL_PUBLISHED',
             'command_id': command_id,
             'mode': goal.mode,
+            'requested_vehicle_id': goal.requested_vehicle_id or 'AUTO',
+            'zone_id': goal.zone_id,
             'target': {'x': goal.target.x, 'y': goal.target.y},
             'heading': {'x': goal.heading.x, 'y': goal.heading.y},
             'target_pixel_topic': self.target_pixel_topic,
@@ -279,7 +364,46 @@ class CentralControlGateway(Node):
             'duplicate': False,
             'command_id': command_id,
             'published_points': 2,
+            'transport': 'fleet' if fleet_subscribers > 0 else 'legacy',
         }
+
+    def set_emergency(self, vehicle_id, enabled, timeout_sec=2.0):
+        if vehicle_id in ('', 'all', 'fleet'):
+            client = self._fleet_emergency_client
+            target = 'fleet'
+        elif vehicle_id in self._vehicle_emergency_clients:
+            client = self._vehicle_emergency_clients[vehicle_id]
+            target = vehicle_id
+        else:
+            raise ValueError('vehicle_id must be agv1, agv2, or fleet')
+        if not client.wait_for_service(timeout_sec=0.25):
+            raise RuntimeError(f'{target} emergency service is unavailable')
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        future = client.call_async(request)
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise RuntimeError(f'{target} emergency service timed out')
+        response = future.result()
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {'accepted': True, 'target': target, 'enabled': bool(enabled)}
+
+    def clear_b1_lock(self, timeout_sec=2.0):
+        if not self._clear_b1_client.wait_for_service(timeout_sec=0.25):
+            raise RuntimeError('B-1 clear service is unavailable')
+        future = self._clear_b1_client.call_async(Trigger.Request())
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise RuntimeError('B-1 clear service timed out')
+        response = future.result()
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {'accepted': True, 'message': response.message}
 
     def _point_message(self, x, y, stamp, mode='direct'):
         message = PointStamped()
@@ -315,6 +439,10 @@ class CentralControlGateway(Node):
                 'target_pixel_topic': self.target_pixel_topic,
                 'target_pixel_subscribers': (
                     self.target_pixel_publisher.get_subscription_count()
+                ),
+                'fleet_pixel_command_topic': self.fleet_pixel_command_topic,
+                'fleet_pixel_subscribers': (
+                    self.fleet_pixel_publisher.get_subscription_count()
                 ),
                 'command_status_topic': self.command_status_topic,
             },
@@ -378,6 +506,36 @@ def create_app(
         except RuntimeError as exc:
             raise http_exception_class(
                 status_code=503,
+                detail=str(exc),
+            ) from exc
+
+    @app.post('/api/v1/emergency-stop')
+    async def emergency_stop(
+        payload: dict,
+        x_control_token: str | None = header_factory(default=None),
+    ):
+        authorize(x_control_token)
+        try:
+            return node.set_emergency(
+                str(payload.get('vehicle_id', 'fleet')),
+                bool(payload.get('enabled', True)),
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise http_exception_class(
+                status_code=503,
+                detail=str(exc),
+            ) from exc
+
+    @app.post('/api/v1/zones/b1/clear')
+    async def clear_b1(
+        x_control_token: str | None = header_factory(default=None),
+    ):
+        authorize(x_control_token)
+        try:
+            return node.clear_b1_lock()
+        except RuntimeError as exc:
+            raise http_exception_class(
+                status_code=409,
                 detail=str(exc),
             ) from exc
 

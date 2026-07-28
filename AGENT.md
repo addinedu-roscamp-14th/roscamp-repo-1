@@ -12,10 +12,10 @@
 
 ```text
 ┌────────────────────────────────────────────────────────┐
-│               5090 인프라 서버 (AI 브레인 영역)               │
-│  - YOLOv11 Multi-task (Instance Segmentation + OBB)   │
-│  - n8n Workflow 플랫폼 (실시간 CSV 기록 및 데이터 행정)      │
-│  - 로컬 LLM & RAG Vector DB (관리자 브리핑 생성기)           │
+│               5090 인프라 서버 (AI 브레인 영역)             │
+│  - YOLOv11 Multi-task (Instance Segmentation + OBB)    │
+│  - n8n Workflow 플랫폼 (실시간 CSV 기록 및 데이터 행정)       │
+│  - 로컬 LLM & RAG Vector DB (관리자 브리핑 생성기)          │
 └──────────────────────────▲─────────────────────────────┘
                            │ (HTTP Webhook / JSON 통신)
                            ▼

@@ -1,5 +1,111 @@
 # porter_bringup
 
+## 2대 Pinky 실행 순서
+
+두 차량과 중앙 노트북은 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. 각 차량에는
+동일한 `config/SLAM/current_map.yaml`이 있어야 합니다.
+
+### 1. AGV1 컴퓨터
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=13
+
+ros2 launch porter_bringup agv_vehicle.launch.py vehicle_id:=agv1
+```
+
+### 2. AGV2 컴퓨터
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=13
+
+ros2 launch porter_bringup agv_vehicle.launch.py vehicle_id:=agv2
+```
+
+### 3. 중앙 관제 노트북
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=13
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+ros2 launch porter_bringup fleet_central_laptop.launch.py
+```
+
+다중 차량 모드의 SLAM 웹 화면은 동일한 지도를 사용하는 `agv1`의
+`/agv1/map`, `/agv1/scan`, `agv1/base_footprint`를 기본으로 표시합니다.
+차량별 위치와 상태는 `/central/fleet/agv1/state`,
+`/central/fleet/agv2/state`에서 동시에 관리됩니다.
+
+### 4. 초기 위치 설정
+
+각 차량의 실제 시작 위치와 방향을 별도로 발행합니다. RViz를 사용할 때도
+차량에 맞는 `initialpose` 토픽을 선택해야 합니다.
+
+```bash
+ros2 topic pub --once /agv1/initialpose \
+  geometry_msgs/msg/PoseWithCovarianceStamped \
+  '{header: {frame_id: map}, pose: {pose: {orientation: {w: 1.0}}}}'
+```
+
+```bash
+ros2 topic pub --once /agv2/initialpose \
+  geometry_msgs/msg/PoseWithCovarianceStamped \
+  '{header: {frame_id: map}, pose: {pose: {orientation: {w: 1.0}}}}'
+```
+
+위 예시는 원점이므로 실제 위치의 `x`, `y`, quaternion을 넣어야 합니다.
+초기 pose를 받기 전 차량 상태는 `WAITING_FOR_INITIAL_POSE`이며 중앙 배차 대상에
+포함되지 않습니다.
+
+### 5. AUTO 배차
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/navigation/pixel-goal \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
+  -d '{
+    "command_id":"fleet-001",
+    "vehicle_id":"",
+    "target":{"x":320,"y":300},
+    "heading":{"x":380,"y":300}
+  }'
+```
+
+특정 차량은 `"vehicle_id":"agv1"` 또는 `"agv2"`로 지정합니다. B-1은
+`"mode":"parking_b1"`을 추가합니다.
+
+### 상태 확인
+
+```bash
+ros2 topic echo /central/fleet/agv1/state
+ros2 topic echo /central/fleet/agv2/state
+ros2 topic echo /central/fleet/zones
+curl -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
+  http://127.0.0.1:8100/api/v1/status
+```
+
+전체 또는 개별 비상정지:
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/emergency-stop \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
+  -d '{"vehicle_id":"fleet","enabled":true}'
+```
+
+`vehicle_id`는 `fleet`, `agv1`, `agv2`이며 해제할 때는 `enabled`를 `false`로
+설정합니다.
+
+기존 `central_laptop.launch.py`와 단일 차량 launch는 그대로 사용할 수 있습니다.
+
 Port-ER 시스템을 중앙제어 노트북과 대시보드 노트북으로 나눠 실행하는 launch
 패키지입니다. 기존 개별 노드의 토픽과 실행 파일은 변경하지 않습니다.
 
@@ -11,7 +117,7 @@ Port-ER 시스템을 중앙제어 노트북과 대시보드 노트북으로 나�
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install --packages-select \
-  central dashboard drive yolo porter_bringup
+  porter_interfaces pinky central dashboard drive yolo porter_bringup
 source install/setup.bash
 ```
 

@@ -179,7 +179,19 @@ class AGVControlCenter(ctk.CTk):
             return
         snapshot = self.ros_bridge.snapshot()
         if snapshot.ready:
-            text = "ROS 비상정지" if snapshot.emergency_active else "ROS 연결됨"
+            if snapshot.fleet_states:
+                vehicles = " | ".join(
+                    f"{vehicle_id}:{state}({x:.2f},{y:.2f})"
+                    for vehicle_id, state, _battery, _emergency, x, y
+                    in snapshot.fleet_states
+                )
+                text = f"{vehicles} | {snapshot.b1_zone}"
+            else:
+                text = (
+                    "ROS 비상정지"
+                    if snapshot.emergency_active
+                    else "ROS 연결됨"
+                )
             color = "#ff6b6b" if snapshot.emergency_active else "#61de8a"
         elif snapshot.error:
             text = "ROS 연결 실패"

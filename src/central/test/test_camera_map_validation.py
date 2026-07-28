@@ -1,14 +1,13 @@
 from pathlib import Path
 
-import pytest
-import yaml
-
-import numpy as np
-
 from central.camera_to_map_bridge import (
     CameraToMapBridge,
     validate_calibration_map,
 )
+
+import numpy as np
+import pytest
+import yaml
 
 
 def write_map(tmp_path, width=207, height=113):
