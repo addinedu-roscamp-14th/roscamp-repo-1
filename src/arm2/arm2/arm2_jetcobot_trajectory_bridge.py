@@ -204,6 +204,7 @@ class JetCobotTrajectoryBridge(Node):
         self.cancel_event = threading.Event()
         self.sweep_pause_event = threading.Event()
         self.sweep_recommand_event = threading.Event()
+        self.sweep_active_event = threading.Event()
         self.last_angles = None
         self.robot = MyCobot280(serial_port, baud_rate)
         time.sleep(1.0)
@@ -275,6 +276,12 @@ class JetCobotTrajectoryBridge(Node):
             Trigger,
             '/arm2/resume_joint1_sweep',
             self.resume_joint1_sweep,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/joint1_scan_state',
+            self.joint1_scan_state,
             callback_group=callback_group,
         )
         state_rate = float(self.get_parameter('joint_state_rate_hz').value)
@@ -591,6 +598,14 @@ class JetCobotTrajectoryBridge(Node):
         response.message = 'J1 sweep resumed; target will be resent'
         return response
 
+    def joint1_scan_state(self, _request, response):
+        """Report whether the bounded J1 scan owns the hardware lock."""
+        response.success = self.sweep_active_event.is_set()
+        response.message = (
+            'J1 scan active' if response.success else 'J1 scan inactive'
+        )
+        return response
+
     def return_home(self, _request, response):
         """Move the physical arm to the configured joint-space home."""
         try:
@@ -644,6 +659,7 @@ class JetCobotTrajectoryBridge(Node):
         if not self.execution_lock.acquire(timeout=2.0):
             raise RuntimeError('trajectory execution did not stop')
         try:
+            self.sweep_active_event.set()
             self.cancel_event.clear()
             self.sweep_pause_event.clear()
             self.sweep_recommand_event.clear()
@@ -707,6 +723,7 @@ class JetCobotTrajectoryBridge(Node):
                     break
             self._stop_hardware()
         finally:
+            self.sweep_active_event.clear()
             self.execution_lock.release()
 
     def _move_home(self):

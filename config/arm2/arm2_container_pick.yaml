@@ -37,7 +37,7 @@
     - -0.062462
     # arm2/base_link 기준 고정 보정. 컨테이너 yaw와 함께 회전하지 않습니다.
     base_correction_xyz_m:
-    - -0.01
+    - -0.03
     - 0.03
     - 0.0
     grasp_offset_rpy_deg:

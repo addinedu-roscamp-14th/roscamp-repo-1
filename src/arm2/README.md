@@ -308,3 +308,60 @@ ros2 run tf2_ros tf2_echo arm2/base_link arm2/TCP
 
 `arm`과 `arm2`는 같은 `ROS_DOMAIN_ID`에서 동시에 실행할 수 있습니다. 실제 장치가
 서로 다른 `/dev/video*`, `/dev/ttyUSB*`를 사용하도록 실행 인자를 지정해야 합니다.
+
+## A-1/A-2/A-3 목적지 저장 및 개별 이송
+
+터미널 1에서 통합 launch를 계속 실행합니다. ID 매핑은 ID 7=컨테이너,
+ID 9=A-1, ID 1=A-2, ID 4=A-3입니다.
+
+```bash
+ros2 launch arm2 arm2_container_pick_moveit.launch.py \
+    camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
+    video_device:=/dev/arm_camera \
+    calibration_name:=arm2_jetcobot_eye_in_hand_charuco_5x5_v4 \
+    params_file:=config/arm2/arm2_container_pick.yaml \
+    use_node_time_for_pose:=true \
+    marker_id:=7 \
+    stack_marker_id:=9 \
+    marker_size_m:=0.015 \
+    serial_port:=/dev/jetcobot \
+    trajectory_speed:=100 \
+    goal_correction_speed:=100 \
+    goal_tolerance_deg:=3.5 \
+    goal_timeout_sec:=15.0 \
+    use_rviz:=true
+```
+
+launch 직후 한 번만 목적지 스캔을 실행합니다. J1 스캔 중 ID 9, ID 1, ID 4를
+각각 발견하면 0.5초 정지해 자세를 저장하고, 세 곳을 모두 저장하면 홈으로
+복귀합니다. 저장값은 같은 launch가 실행되는 동안 다시 갱신되지 않습니다.
+
+```bash
+ros2 service call /arm2/scan_destinations std_srvs/srv/Trigger "{}"
+```
+
+이후 각 터미널에서 필요한 목적지 서비스를 호출합니다. 각 호출은 ID 7을 찾을
+때까지 J1을 스캔하고, 발견 시 0.5초 정지해 현재 컨테이너 위치를 저장한 뒤
+지정 목적지로 옮기고 홈으로 복귀합니다.
+
+터미널 2—A-1:
+
+```bash
+ros2 service call /arm2/transfer_to_a1 std_srvs/srv/Trigger "{}"
+```
+
+터미널 3—A-2:
+
+```bash
+ros2 service call /arm2/transfer_to_a2 std_srvs/srv/Trigger "{}"
+```
+
+터미널 4—A-3:
+
+```bash
+ros2 service call /arm2/transfer_to_a3 std_srvs/srv/Trigger "{}"
+```
+
+로봇 동작은 한 번에 하나만 실행할 수 있으므로 A-1 작업이 끝나기 전에 A-2나
+A-3 서비스를 호출하면 요청이 거부됩니다. launch를 재시작하면 저장된 목적지
+세 곳이 초기화되므로 `/arm2/scan_destinations`를 다시 호출해야 합니다.

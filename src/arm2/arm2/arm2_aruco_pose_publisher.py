@@ -87,6 +87,11 @@ class ArucoPosePublisher(Node):
         self.declare_parameter(
             'secondary_pose_topic', '/arm2/gripper_camera/stack_target_pose'
         )
+        self.declare_parameter('additional_marker_ids', [1, 4])
+        self.declare_parameter(
+            'additional_marker_frame_ids',
+            ['arm2/stack_target_marker_a2', 'arm2/stack_target_marker_a3'],
+        )
         self.declare_parameter('marker_size_m', 0.015)
         self.declare_parameter('dictionary', 'DICT_5X5_50')
         self.declare_parameter('max_reprojection_error_px', 3.0)
@@ -114,6 +119,22 @@ class ArucoPosePublisher(Node):
         self.secondary_marker_frame_id = str(
             self.get_parameter('secondary_marker_frame_id').value
         )
+        additional_ids = [
+            int(value)
+            for value in self.get_parameter('additional_marker_ids').value
+        ]
+        additional_frames = [
+            str(value)
+            for value in self.get_parameter(
+                'additional_marker_frame_ids'
+            ).value
+        ]
+        if len(additional_ids) != len(additional_frames):
+            raise ValueError(
+                'additional_marker_ids and additional_marker_frame_ids '
+                'must have the same length'
+            )
+        self.additional_markers = dict(zip(additional_ids, additional_frames))
         self.marker_size = float(
             self.get_parameter('marker_size_m').value
         )
@@ -176,6 +197,14 @@ class ArucoPosePublisher(Node):
             self.secondary_pose_publisher = self.create_publisher(
                 PoseStamped, secondary_topic, 10
             )
+        self.additional_pose_publishers = {
+            marker_id: self.create_publisher(
+                PoseStamped,
+                f'/arm2/gripper_camera/destination_{marker_id}_pose',
+                10,
+            )
+            for marker_id in self.additional_markers
+        }
         self.annotated_publisher = self.create_publisher(
             Image, self.annotated_topic, 10
         )
@@ -201,6 +230,10 @@ class ArucoPosePublisher(Node):
                 'Also detecting ArUco '
                 f'id={self.secondary_marker_id}: camera -> '
                 f'{self.secondary_marker_frame_id}'
+            )
+        for marker_id, frame_id in self.additional_markers.items():
+            self.get_logger().info(
+                f'Also detecting ArUco id={marker_id}: camera -> {frame_id}'
             )
         if self.use_node_time_for_pose:
             self.get_logger().info(
@@ -251,12 +284,18 @@ class ArucoPosePublisher(Node):
 
         selected_corners = None
         secondary_corners = None
+        additional_corners = {}
         if ids is not None:
             for index, detected_id in enumerate(ids.flatten()):
-                if int(detected_id) == self.marker_id:
+                detected_id = int(detected_id)
+                if detected_id == self.marker_id:
                     selected_corners = corners[index].reshape(4, 2)
-                if int(detected_id) == self.secondary_marker_id:
+                if detected_id == self.secondary_marker_id:
                     secondary_corners = corners[index].reshape(4, 2)
+                if detected_id in self.additional_markers:
+                    additional_corners[detected_id] = corners[index].reshape(
+                        4, 2
+                    )
 
         if selected_corners is not None and self.camera_matrix is None:
             self.missing_info_warning_count += 1
@@ -299,6 +338,29 @@ class ArucoPosePublisher(Node):
                     reprojection_error,
                     self.secondary_marker_frame_id,
                     self.secondary_pose_publisher,
+                )
+                cv2.drawFrameAxes(
+                    frame,
+                    self.camera_matrix,
+                    self.distortion,
+                    rotation_vector,
+                    translation_vector,
+                    self.marker_size * 0.5,
+                )
+
+        if self.camera_matrix is not None:
+            for marker_id, marker_corners in additional_corners.items():
+                pose = self.estimate_pose(marker_corners)
+                if pose is None:
+                    continue
+                rotation_vector, translation_vector, reprojection_error = pose
+                self.publish_pose(
+                    message,
+                    rotation_vector,
+                    translation_vector,
+                    reprojection_error,
+                    self.additional_markers[marker_id],
+                    self.additional_pose_publishers[marker_id],
                 )
                 cv2.drawFrameAxes(
                     frame,

@@ -90,6 +90,11 @@ def generate_launch_description():
             'secondary_marker_frame_id': LaunchConfiguration(
                 'secondary_marker_frame_id'
             ),
+            'additional_marker_ids': [1, 4],
+            'additional_marker_frame_ids': [
+                'arm2/stack_target_marker_a2',
+                'arm2/stack_target_marker_a3',
+            ],
             'use_node_time_for_pose': ParameterValue(
                 LaunchConfiguration('use_node_time_for_pose'),
                 value_type=bool,

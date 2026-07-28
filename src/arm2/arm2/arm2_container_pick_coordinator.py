@@ -663,9 +663,27 @@ class ContainerPickCoordinator(Node):
         self.stack_target_history = deque(
             maxlen=max(100, self.minimum_samples * 3)
         )
+        self.destination_frames = {
+            'A-1': self.stack_target_frame,
+            'A-2': 'arm2/stack_target_marker_a2',
+            'A-3': 'arm2/stack_target_marker_a3',
+        }
+        self.destination_histories = {
+            'A-1': self.stack_target_history,
+            'A-2': deque(maxlen=max(100, self.minimum_samples * 3)),
+            'A-3': deque(maxlen=max(100, self.minimum_samples * 3)),
+        }
+        self.destination_stamp_attributes = {
+            'A-1': 'last_stack_target_stamp',
+            'A-2': 'last_stack_target_a2_stamp',
+            'A-3': 'last_stack_target_a3_stamp',
+        }
         self.history_lock = threading.Lock()
         self.last_transform_stamp = None
         self.last_stack_target_stamp = None
+        self.last_stack_target_a2_stamp = None
+        self.last_stack_target_a3_stamp = None
+        self.saved_destination_poses = {}
         self.tracking_errors = {}
         # During scan-and-transfer, each marker becomes immutable as soon as
         # its stationary pose has been accepted.  The next scan command clears
@@ -689,6 +707,7 @@ class ContainerPickCoordinator(Node):
         self.sweep_joint1_client = None
         self.pause_sweep_client = None
         self.resume_sweep_client = None
+        self.scan_state_client = None
         self.current_moveit_goal = None
         self.moveit_goal_lock = threading.Lock()
         self.last_status_text = ''
@@ -742,6 +761,22 @@ class ContainerPickCoordinator(Node):
             '/arm2/reset_stack_level',
             self.reset_stack_level,
         )
+        self.create_service(
+            Trigger, '/arm2/scan_destinations', self.start_destination_scan
+        )
+        for destination_name, service_name in (
+            ('A-1', '/arm2/transfer_to_a1'),
+            ('A-2', '/arm2/transfer_to_a2'),
+            ('A-3', '/arm2/transfer_to_a3'),
+        ):
+            self.create_service(
+                Trigger,
+                service_name,
+                lambda request, response, name=destination_name:
+                    self.start_saved_destination_transfer(
+                        request, response, name
+                    ),
+            )
         self.create_timer(0.1, self.update_tracking)
         self.create_timer(1.0, self._republish_status)
 
@@ -1034,6 +1069,9 @@ class ContainerPickCoordinator(Node):
         self.resume_sweep_client = self.create_client(
             Trigger, '/arm2/resume_joint1_sweep'
         )
+        self.scan_state_client = self.create_client(
+            Trigger, '/arm2/joint1_scan_state'
+        )
 
     def publish_status(self, text):
         self.last_status_text = text
@@ -1071,6 +1109,14 @@ class ContainerPickCoordinator(Node):
             self.stack_target_pose_publisher,
             'stack target',
         )
+        for destination_name in ('A-2', 'A-3'):
+            self._collect_marker_sample(
+                self.destination_frames[destination_name],
+                self.destination_histories[destination_name],
+                self.destination_stamp_attributes[destination_name],
+                self.stack_target_pose_publisher,
+                destination_name,
+            )
 
     def _collect_marker_sample(
         self, frame, history, stamp_attribute, publisher, label
@@ -1362,10 +1408,12 @@ class ContainerPickCoordinator(Node):
         source_targets,
         destination_pose,
         validate_workspace=True,
+        placed_count=None,
     ):
         """Build release targets from scan-locked source/destination poses."""
-        with self.stack_level_lock:
-            placed_count = self.placed_stack_count
+        if placed_count is None:
+            with self.stack_level_lock:
+                placed_count = self.placed_stack_count
         layer_z_offset = stack_layer_z_offset(
             self.stack_z_offset,
             self.stack_container_height,
@@ -1632,6 +1680,275 @@ class ContainerPickCoordinator(Node):
         response.success = True
         response.message = 'Scanning for ID 7 and ID 9 started'
         return response
+
+    def start_destination_scan(self, _request, response):
+        """Scan and persist A-1/A-2/A-3 poses for this launch session."""
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.success = False
+            response.message = 'Destination scan requires MoveIt execution'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_destination_scan,
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = 'Scanning ID 9, ID 1, and ID 4 destinations'
+        return response
+
+    def execute_destination_scan(self):
+        try:
+            specs = (
+                ('ID 9 / A-1', self.destination_frames['A-1'],
+                 self.destination_histories['A-1']),
+                ('ID 1 / A-2', self.destination_frames['A-2'],
+                 self.destination_histories['A-2']),
+                ('ID 4 / A-3', self.destination_frames['A-3'],
+                 self.destination_histories['A-3']),
+            )
+            self.saved_destination_poses.clear()
+            locked, reason = self._scan_named_markers(specs)
+            if locked is None:
+                self.publish_status(f'DESTINATION SCAN FAILED: {reason}')
+                return
+            self.saved_destination_poses = dict(zip(
+                ('A-1', 'A-2', 'A-3'), locked
+            ))
+            self.publish_status(
+                'DESTINATION SCAN: A-1, A-2, A-3 saved; returning home'
+            )
+            self._call_scan_service(
+                self.return_home_client,
+                'destination scan home return',
+                timeout=self.motion_timeout + 5.0,
+            )
+        except Exception as exc:
+            self.publish_status(
+                f'DESTINATION SCAN FAILED during home return: {exc}'
+            )
+            return
+        self.publish_status(
+            'DESTINATION SCAN COMPLETED: ID 9=A-1, ID 1=A-2, ID 4=A-3'
+        )
+
+    def start_saved_destination_transfer(
+        self, _request, response, destination_name
+    ):
+        """Scan ID 7 and transfer it to one previously saved destination."""
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.success = False
+            response.message = 'Saved transfer requires MoveIt execution'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.success = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if destination_name not in self.saved_destination_poses:
+            response.success = False
+            response.message = (
+                f'{destination_name} is not saved; call '
+                '/arm2/scan_destinations first'
+            )
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_saved_destination_transfer,
+            args=(destination_name,),
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = (
+            f'Scanning ID 7 for transfer to {destination_name}'
+        )
+        return response
+
+    def execute_saved_destination_transfer(self, destination_name):
+        try:
+            specs = (('ID 7', self.marker_frame, self.history),)
+            locked, reason = self._scan_named_markers(specs)
+            if locked is None:
+                self.publish_status(
+                    f'{destination_name} TRANSFER FAILED: {reason}'
+                )
+                return
+            source_targets, reason = self.calculate_targets_from_marker_pose(
+                locked[0],
+                orientation_mode=self.stack_source_orientation_mode,
+            )
+            if source_targets is None:
+                self.publish_status(
+                    f'{destination_name} TRANSFER FAILED: '
+                    f'ID 7 target: {reason}'
+                )
+                return
+            destination_pose = self.saved_destination_poses[destination_name]
+            targets, reason = self.calculate_stack_targets_from_locked_poses(
+                source_targets,
+                destination_pose,
+                placed_count=0,
+            )
+            if targets is None:
+                self.publish_status(
+                    f'{destination_name} TRANSFER FAILED: {reason}'
+                )
+                return
+            self.execute_scanned_transfer(
+                targets,
+                destination_name=destination_name,
+                count_stack=False,
+            )
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(
+                f'{destination_name} TRANSFER FAILED: {exc}'
+            )
+
+    def _scan_named_markers(self, specs):
+        """Sweep J1 until every named marker has a stationary locked pose."""
+        clients = (
+            self.sweep_joint1_client,
+            self.pause_sweep_client,
+            self.resume_sweep_client,
+            self.stop_robot_client,
+            self.scan_state_client,
+        )
+        if any(
+            client is None or not client.wait_for_service(timeout_sec=3.0)
+            for client in clients
+        ):
+            return None, 'scan control service is unavailable'
+        with self.history_lock:
+            for _label, frame, history in specs:
+                history.clear()
+                self.scan_locked_frames.discard(frame)
+        locked = [None] * len(specs)
+        deadline = time.monotonic() + self.scan_timeout
+        pass_number = 0
+        while time.monotonic() < deadline and not all(
+            pose is not None for pose in locked
+        ):
+            pass_number += 1
+            missing = ', '.join(
+                label for (label, _frame, _history), pose
+                in zip(specs, locked) if pose is None
+            )
+            self.publish_status(
+                f'SCAN: J1 pass {pass_number}; missing {missing}'
+            )
+            sweep_future = self.sweep_joint1_client.call_async(
+                Trigger.Request()
+            )
+            if not self._wait_for_joint1_scan_active(5.0):
+                self.stop_robot_client.call_async(Trigger.Request())
+                return None, 'J1 scan did not become active'
+            # Discard samples collected before the sweep owned the hardware.
+            # Otherwise an already-visible marker can be accepted before the
+            # scan callback starts, and its early stop request can be lost.
+            with self.history_lock:
+                for index, (_label, _frame, history) in enumerate(specs):
+                    if locked[index] is None:
+                        history.clear()
+            while not sweep_future.done():
+                if self.stop_event.is_set():
+                    self.stop_robot_client.call_async(Trigger.Request())
+                    return None, 'scan stopped'
+                candidate = next((
+                    index for index, (_label, _frame, history)
+                    in enumerate(specs)
+                    if locked[index] is None
+                    and self._history_sample_count(history) > 0
+                ), None)
+                if candidate is None:
+                    time.sleep(0.05)
+                    continue
+                label, frame, history = specs[candidate]
+                pose, reason = self._pause_and_lock_marker(label, history)
+                if pose is not None:
+                    locked[candidate] = pose
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'SCAN: {label} position saved and locked'
+                    )
+                else:
+                    self.publish_status(
+                        f'SCAN: {label} lock retry: {reason}'
+                    )
+                if all(pose is not None for pose in locked):
+                    self._call_scan_service(
+                        self.stop_robot_client,
+                        'stop completed scan',
+                        timeout=5.0,
+                    )
+                    if not self._wait_for_joint1_scan_inactive(5.0):
+                        return None, 'J1 scan did not stop after marker lock'
+                    # The physical sweep is stopped and its execution lock has
+                    # been released.  Do not wait on the original long-running
+                    # Trigger future: DDS may deliver that response late even
+                    # though the hardware is already idle.
+                    return tuple(locked), 'markers locked'
+                self._call_scan_service(
+                    self.resume_sweep_client, 'resume sweep'
+                )
+            if not sweep_future.done():
+                self._wait_future(sweep_future, 10.0)
+            result = sweep_future.result()
+            if result is None or not result.success:
+                message = 'no response' if result is None else result.message
+                self._return_home_after_failed_scan()
+                return None, f'J1 scan failed: {message}'
+        if not all(pose is not None for pose in locked):
+            self._return_home_after_failed_scan()
+            missing = ', '.join(
+                label for (label, _frame, _history), pose
+                in zip(specs, locked) if pose is None
+            )
+            return None, (
+                f'{self.scan_timeout:.0f}s scan ended before detecting '
+                f'{missing}'
+            )
+        return tuple(locked), 'markers locked'
+
+    def _wait_for_joint1_scan_active(self, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            future = self.scan_state_client.call_async(Trigger.Request())
+            try:
+                self._wait_future(future, 1.0)
+            except RuntimeError:
+                continue
+            result = future.result()
+            if result is not None and result.success:
+                return True
+            if self.stop_event.wait(0.05):
+                return False
+        return False
+
+    def _wait_for_joint1_scan_inactive(self, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            future = self.scan_state_client.call_async(Trigger.Request())
+            try:
+                self._wait_future(future, 1.0)
+            except RuntimeError:
+                continue
+            result = future.result()
+            if result is not None and not result.success:
+                return True
+            if self.stop_event.wait(0.05):
+                return False
+        return False
 
     def reset_stack_level(self, _request, response):
         """Reset automatic stacking so the next placement uses layer one."""
@@ -2062,7 +2379,9 @@ class ContainerPickCoordinator(Node):
                 release, approach.pose.orientation
             )
             self.publish_status('STACK: descending vertically to release')
-            self.move_cartesian_to_pose(release)
+            self.move_segmented_descent_with_pose_finish(
+                release, 'STACK release'
+            )
             self.publish_status('STACK: opening gripper')
             self.command_gripper(open_gripper=True)
             self.publish_status('STACK: retreating vertically')
@@ -2078,8 +2397,10 @@ class ContainerPickCoordinator(Node):
             self.tracking_suspended.clear()
             self.motion_lock.release()
 
-    def execute_scanned_transfer(self, targets):
-        """Move scan-locked ID 7 to ID 9, then return home."""
+    def execute_scanned_transfer(
+        self, targets, destination_name='A-1', count_stack=True
+    ):
+        """Move scan-locked ID 7 to one locked destination, then go home."""
         if not self.motion_lock.acquire(blocking=False):
             return
         self.tracking_suspended.set()
@@ -2099,27 +2420,38 @@ class ContainerPickCoordinator(Node):
                 release.pose.orientation.w,
             ])[2]
             self.publish_status(
-                'TRANSFER: ID 7 picked; moving directly to saved ID 9: '
+                f'TRANSFER: ID 7 picked; moving to saved {destination_name}: '
                 f'tcp_yaw={destination_yaw:.2f}deg'
             )
             approach = self.move_to_reachable_stack_approach(
                 release, approach.pose.orientation
             )
-            self.publish_status('TRANSFER: descending to ID 9 release')
-            self.move_cartesian_to_pose(release)
-            self.publish_status('TRANSFER: releasing container at ID 9')
-            self.command_gripper(open_gripper=True)
-            self.publish_status('TRANSFER: retreating from ID 9')
-            self.move_cartesian_to_pose(approach)
-            with self.stack_level_lock:
-                self.placed_stack_count += 1
-                completed_layer = self.placed_stack_count
             self.publish_status(
-                f'TRANSFER: stack layer {completed_layer} placed'
+                f'TRANSFER: descending to {destination_name} release'
             )
+            self.move_segmented_descent_with_pose_finish(
+                release, f'{destination_name} release'
+            )
+            self.publish_status(
+                f'TRANSFER: releasing container at {destination_name}'
+            )
+            self.command_gripper(open_gripper=True)
+            self.publish_status(
+                f'TRANSFER: retreating from {destination_name}'
+            )
+            self.move_cartesian_to_pose(approach)
+            if count_stack:
+                with self.stack_level_lock:
+                    self.placed_stack_count += 1
+                    completed_layer = self.placed_stack_count
+                self.publish_status(
+                    f'TRANSFER: stack layer {completed_layer} placed'
+                )
             self.publish_status('TRANSFER: returning to final home')
             self.command_return_home()
-            self.publish_status('TRANSFER: ID 7 to ID 9 completed')
+            self.publish_status(
+                f'TRANSFER: ID 7 to {destination_name} completed'
+            )
         except Exception as exc:
             self.stop_event.set()
             self._stop_active_motion()
@@ -2170,6 +2502,26 @@ class ContainerPickCoordinator(Node):
             'No reachable stack approach; move ID 1 closer to the robot: '
             + '; '.join(failures)
         )
+
+    def move_segmented_descent_with_pose_finish(self, target, label):
+        """Descend in safe Cartesian segments, then finish a short remainder."""
+        try:
+            self.move_cartesian_to_pose(target, allow_segmented=True)
+        except CartesianPlanningError as exc:
+            remaining_distance = self._cartesian_request_distance(target)
+            can_finish_with_pose_goal = (
+                exc.executed_segments > 0
+                and remaining_distance is not None
+                and remaining_distance
+                <= self.stack_pose_goal_finish_max_distance
+            )
+            if not can_finish_with_pose_goal:
+                raise
+            self.publish_status(
+                f'{label}: finishing short remaining descent with pose goal: '
+                f'remaining={remaining_distance * 1000.0:.1f}mm'
+            )
+            self.move_to_pose(target)
 
     def move_with_yaw_fallbacks(self, grasp, pregrasp, initial_error):
         """Retry descent with progressively reduced marker-yaw following."""
