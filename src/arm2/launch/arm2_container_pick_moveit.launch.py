@@ -33,13 +33,13 @@ def generate_launch_description():
     default_params = 'config/arm2/arm2_container_pick.yaml'
 
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
+        DeclareLaunchArgument('video_device', default_value='/dev/arm_camera'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('stack_marker_id', default_value='1'),
+        DeclareLaunchArgument('stack_marker_id', default_value='9'),
         DeclareLaunchArgument('marker_size_m', default_value='0.015'),
         DeclareLaunchArgument(
             'stack_container_height_m', default_value='0.035'
@@ -51,7 +51,7 @@ def generate_launch_description():
             'calibration_name', default_value='arm2_jetcobot_eye_in_hand'
         ),
         DeclareLaunchArgument('params_file', default_value=default_params),
-        DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
+        DeclareLaunchArgument('serial_port', default_value='/dev/jetcobot'),
         DeclareLaunchArgument('trajectory_speed', default_value='100'),
         DeclareLaunchArgument(
             'goal_correction_speed', default_value='50'
@@ -75,23 +75,29 @@ def generate_launch_description():
         name='arm2_jetcobot_trajectory_bridge',
         namespace='arm2',
         output='screen',
-        parameters=[{
-            'serial_port': LaunchConfiguration('serial_port'),
-            'speed': ParameterValue(
-                LaunchConfiguration('trajectory_speed'), value_type=int
-            ),
-            'goal_tolerance_deg': ParameterValue(
-                LaunchConfiguration('goal_tolerance_deg'), value_type=float
-            ),
-            'goal_timeout_sec': ParameterValue(
-                LaunchConfiguration('goal_timeout_sec'), value_type=float
-            ),
-            'goal_correction_speed': ParameterValue(
-                LaunchConfiguration('goal_correction_speed'), value_type=int
-            ),
-            'goal_correction_period_sec': 1.0,
-            'gripper_speed': 50,
-        }],
+        sigterm_timeout='20.0',
+        sigkill_timeout='5.0',
+        parameters=[
+            LaunchConfiguration('resolved_params_file'),
+            {
+                'serial_port': LaunchConfiguration('serial_port'),
+                'speed': ParameterValue(
+                    LaunchConfiguration('trajectory_speed'), value_type=int
+                ),
+                'goal_tolerance_deg': ParameterValue(
+                    LaunchConfiguration('goal_tolerance_deg'), value_type=float
+                ),
+                'goal_timeout_sec': ParameterValue(
+                    LaunchConfiguration('goal_timeout_sec'), value_type=float
+                ),
+                'goal_correction_speed': ParameterValue(
+                    LaunchConfiguration('goal_correction_speed'),
+                    value_type=int,
+                ),
+                'goal_correction_period_sec': 1.0,
+                'gripper_speed': 50,
+            },
+        ],
     )
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(

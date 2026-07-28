@@ -105,7 +105,7 @@ source install/setup.bash
 
 ros2 launch arm2 arm2_handeye_charuco_calibration.launch.py \
   video_device:=/dev/video2 \
-  camera_info_url:=config/arm2/arm2_gripper_camera_info_v3.yaml \
+  camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
   dictionary:=DICT_4X4_50 \
   squares_x:=5 \
   squares_y:=5 \
@@ -215,13 +215,13 @@ ros2 launch arm2 arm2_container_pick_moveit.launch.py \
 
 
 ros2 launch arm2 arm2_container_pick_moveit.launch.py \
-    camera_info_url:=config/arm2/arm2_gripper_camera_info_v3.yaml \
+    camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
     video_device:=/dev/video2 \
     calibration_name:=arm2_jetcobot_eye_in_hand_charuco_5x5_v4 \
     params_file:=config/arm2/arm2_container_pick.yaml \
     use_node_time_for_pose:=true \
-    marker_id:=0 \
-    marker_size_m:=0.026 \
+    marker_id:=7 \
+    marker_size_m:=0.015 \
     serial_port:=/dev/ttyUSB0 \
     trajectory_speed:=100 \
     goal_correction_speed:=100 \

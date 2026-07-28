@@ -145,6 +145,17 @@ def wrap_symmetric_degrees(angle, symmetry_degrees):
     return (float(angle) + period / 2.0) % period - period / 2.0
 
 
+def nearest_symmetric_yaw_degrees(
+    target_yaw, current_yaw, symmetry_degrees
+):
+    """Choose the target-equivalent yaw closest to the current TCP yaw."""
+    delta = wrap_symmetric_degrees(
+        float(target_yaw) - float(current_yaw),
+        symmetry_degrees,
+    )
+    return wrap_degrees(float(current_yaw) + delta)
+
+
 def compose_yaw_follow_pose(
     marker_translation,
     reference_offset,
@@ -237,6 +248,7 @@ def calculate_heading_aligned_stack_poses(
     extra_depth,
     xy_offset,
     yaw_symmetry_degrees=360.0,
+    z_offset=0.0,
 ):
     """Place the held container with its heading aligned to the destination."""
     if container_height <= 0.0 or approach_clearance <= 0.0:
@@ -257,7 +269,7 @@ def calculate_heading_aligned_stack_poses(
     )
     release = np.asarray(release, dtype=np.float64)
     release[:2] += offset
-    release[2] += container_height - extra_depth
+    release[2] += container_height - extra_depth + float(z_offset)
     approach = release.copy()
     approach[2] += approach_clearance
     return release, approach, rotation, yaw_delta
@@ -277,6 +289,15 @@ def lift_distance_candidates(requested, minimum, step):
     if not candidates or abs(candidates[-1] - minimum) > 1e-9:
         candidates.append(float(minimum))
     return candidates
+
+
+def stack_layer_z_offset(base_offset, container_height, placed_count):
+    """Return placement Z offset for the next zero-based stack layer."""
+    if container_height <= 0.0:
+        raise ValueError('container height must be positive')
+    if placed_count < 0:
+        raise ValueError('placed count must be non-negative')
+    return float(base_offset) + float(container_height) * int(placed_count)
 
 
 def cartesian_path_acceptable(
@@ -374,6 +395,9 @@ class ContainerPickCoordinator(Node):
         self.container_yaw_symmetry = float(
             self.get_parameter('container_yaw_symmetry_deg').value
         )
+        self.prefer_current_gripper_yaw = bool(
+            self.get_parameter('prefer_current_gripper_yaw').value
+        )
         self.max_yaw_spread = float(
             self.get_parameter('max_yaw_spread_deg').value
         )
@@ -427,6 +451,12 @@ class ContainerPickCoordinator(Node):
         )
         self.stack_xy_offset = self._vector_parameter(
             'stack_xy_offset_m', 2
+        )
+        self.stack_z_offset = float(
+            self.get_parameter('stack_z_offset_m').value
+        )
+        self.max_stack_levels = int(
+            self.get_parameter('max_stack_levels').value
         )
         self.stack_source_orientation_mode = str(
             self.get_parameter('stack_source_orientation_mode').value
@@ -540,6 +570,15 @@ class ContainerPickCoordinator(Node):
         self.moveit_state_settle = float(
             self.get_parameter('moveit_state_settle_sec').value
         )
+        self.scan_marker_pause = float(
+            self.get_parameter('scan_marker_pause_sec').value
+        )
+        self.scan_timeout = float(
+            self.get_parameter('scan_timeout_sec').value
+        )
+        self.prefer_z_last_motion = bool(
+            self.get_parameter('prefer_z_last_motion').value
+        )
 
         if self.minimum_samples < 3:
             raise ValueError('minimum_stable_samples must be at least 3')
@@ -588,6 +627,8 @@ class ContainerPickCoordinator(Node):
         )
         if self.stack_container_height <= 0.0:
             raise ValueError('stack_container_height_m must be positive')
+        if self.max_stack_levels < 1:
+            raise ValueError('max_stack_levels must be positive')
         if self.stack_approach_clearance <= 0.0:
             raise ValueError('stack_approach_clearance_m must be positive')
         if self.stack_source_orientation_mode not in ('fixed', 'marker_yaw'):
@@ -606,6 +647,10 @@ class ContainerPickCoordinator(Node):
             raise ValueError(
                 'stack_pose_goal_finish_max_distance_m must be positive'
             )
+        if self.scan_marker_pause < 0.5:
+            raise ValueError('scan_marker_pause_sec must be at least 0.5')
+        if self.scan_timeout <= 0.0:
+            raise ValueError('scan_timeout_sec must be positive')
         lift_distance_candidates(
             self.stack_approach_clearance,
             self.stack_minimum_approach_clearance,
@@ -622,11 +667,17 @@ class ContainerPickCoordinator(Node):
         self.last_transform_stamp = None
         self.last_stack_target_stamp = None
         self.tracking_errors = {}
+        # During scan-and-transfer, each marker becomes immutable as soon as
+        # its stationary pose has been accepted.  The next scan command clears
+        # these locks and starts a new acquisition.
+        self.scan_locked_frames = set()
         self.motion_lock = threading.Lock()
         self.tracking_suspended = threading.Event()
         self.serial_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.motion_thread = None
+        self.stack_level_lock = threading.Lock()
+        self.placed_stack_count = 0
         self.robot = None
         self.move_group_client = None
         self.cartesian_path_client = None
@@ -634,6 +685,10 @@ class ContainerPickCoordinator(Node):
         self.gripper_open_client = None
         self.gripper_close_client = None
         self.stop_robot_client = None
+        self.return_home_client = None
+        self.sweep_joint1_client = None
+        self.pause_sweep_client = None
+        self.resume_sweep_client = None
         self.current_moveit_goal = None
         self.moveit_goal_lock = threading.Lock()
         self.last_status_text = ''
@@ -677,6 +732,16 @@ class ContainerPickCoordinator(Node):
             Trigger, '/arm2/move_to_pregrasp', self.start_pregrasp_test
         )
         self.create_service(Trigger, '/arm2/stop_pick', self.stop_pick)
+        self.create_service(
+            Trigger,
+            '/arm2/scan_and_transfer',
+            self.start_scan_and_transfer,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/reset_stack_level',
+            self.reset_stack_level,
+        )
         self.create_timer(0.1, self.update_tracking)
         self.create_timer(1.0, self._republish_status)
 
@@ -825,6 +890,7 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
         self.declare_parameter('container_yaw_symmetry_deg', 360.0)
+        self.declare_parameter('prefer_current_gripper_yaw', True)
         self.declare_parameter('max_yaw_spread_deg', 8.0)
         self.declare_parameter('max_container_yaw_delta_deg', 90.0)
         self.declare_parameter(
@@ -847,6 +913,8 @@ class ContainerPickCoordinator(Node):
         )
         self.declare_parameter('stack_approach_search_step_m', 0.01)
         self.declare_parameter('stack_xy_offset_m', [0.0, 0.0])
+        self.declare_parameter('stack_z_offset_m', 0.0)
+        self.declare_parameter('max_stack_levels', 3)
         self.declare_parameter('stack_source_orientation_mode', 'marker_yaw')
         self.declare_parameter(
             'stack_segmented_descent_min_fraction', 0.65
@@ -907,6 +975,9 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('cartesian_max_speed_mps', 0.04)
         self.declare_parameter('cartesian_max_joint_jump_deg', 20.0)
         self.declare_parameter('moveit_state_settle_sec', 0.4)
+        self.declare_parameter('scan_marker_pause_sec', 0.5)
+        self.declare_parameter('scan_timeout_sec', 90.0)
+        self.declare_parameter('prefer_z_last_motion', False)
 
     def _vector_parameter(self, name, length):
         values = np.asarray(self.get_parameter(name).value, dtype=np.float64)
@@ -951,6 +1022,18 @@ class ContainerPickCoordinator(Node):
         self.stop_robot_client = self.create_client(
             Trigger, '/arm2/stop_robot'
         )
+        self.return_home_client = self.create_client(
+            Trigger, '/arm2/return_home'
+        )
+        self.sweep_joint1_client = self.create_client(
+            Trigger, '/arm2/scan_joint1'
+        )
+        self.pause_sweep_client = self.create_client(
+            Trigger, '/arm2/pause_joint1_sweep'
+        )
+        self.resume_sweep_client = self.create_client(
+            Trigger, '/arm2/resume_joint1_sweep'
+        )
 
     def publish_status(self, text):
         self.last_status_text = text
@@ -992,22 +1075,30 @@ class ContainerPickCoordinator(Node):
     def _collect_marker_sample(
         self, frame, history, stamp_attribute, publisher, label
     ):
+        with self.history_lock:
+            if frame in self.scan_locked_frames:
+                return
         try:
             transform = self.buffer.lookup_transform(
                 self.base_frame, frame, Time()
             )
         except TransformException as exc:
             error = str(exc)
+            error_key = (
+                'marker transform is older than the robot TF buffer'
+                if 'extrapolation into the past' in error.lower()
+                else error
+            )
             previous_error, previous_time = self.tracking_errors.get(
                 frame, ('', 0.0)
             )
             now = time.monotonic()
-            if error != previous_error or now - previous_time >= 5.0:
+            if error_key != previous_error or now - previous_time >= 5.0:
                 self.get_logger().warning(
                     f'Cannot collect {label} marker sample: '
                     f'{self.base_frame} -> {frame}: {error}'
                 )
-                self.tracking_errors[frame] = (error, now)
+                self.tracking_errors[frame] = (error_key, now)
             return
 
         stamp = (
@@ -1122,6 +1213,20 @@ class ContainerPickCoordinator(Node):
         )
         if marker_pose is None:
             return None, reason
+        return self.calculate_targets_from_marker_pose(
+            marker_pose,
+            validate_workspace=validate_workspace,
+            orientation_mode=mode,
+        )
+
+    def calculate_targets_from_marker_pose(
+        self,
+        marker_pose,
+        validate_workspace=True,
+        orientation_mode=None,
+    ):
+        """Build pick targets from a marker pose locked during scanning."""
+        mode = orientation_mode or self.grasp_orientation_mode
         marker_translation, marker_rotation = marker_pose
         if mode == 'marker_full':
             grasp_translation, grasp_rotation = compose_pose(
@@ -1146,6 +1251,21 @@ class ContainerPickCoordinator(Node):
             if abs(yaw_delta) > self.max_yaw_delta:
                 return None, (
                     f'container yaw delta {yaw_delta:.2f}deg exceeds limit'
+                )
+            current_yaw = self._current_tcp_yaw_degrees()
+            if (
+                self.prefer_current_gripper_yaw
+                and current_yaw is not None
+                and self.container_yaw_symmetry < 360.0
+            ):
+                target_rpy = quaternion_to_rpy_degrees(grasp_rotation)
+                nearest_yaw = nearest_symmetric_yaw_degrees(
+                    target_rpy[2],
+                    current_yaw,
+                    self.container_yaw_symmetry,
+                )
+                grasp_rotation = quaternion_from_rpy_degrees(
+                    target_rpy[0], target_rpy[1], nearest_yaw
                 )
         else:
             grasp_translation, grasp_rotation = compose_fixed_base_pose(
@@ -1176,6 +1296,22 @@ class ContainerPickCoordinator(Node):
         self.grasp_pose_publisher.publish(grasp)
         self.pregrasp_pose_publisher.publish(pregrasp)
         return (grasp, pregrasp), 'targets valid'
+
+    def _current_tcp_yaw_degrees(self):
+        """Return current TCP yaw in the fixed robot base frame."""
+        try:
+            transform = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException:
+            return None
+        rotation = [
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
+        ]
+        return quaternion_to_rpy_degrees(rotation)[2]
 
     def wait_for_new_stable_targets(self):
         with self.history_lock:
@@ -1215,7 +1351,26 @@ class ContainerPickCoordinator(Node):
         )
         if destination_pose is None:
             return None, f'stack target marker: {reason}'
+        return self.calculate_stack_targets_from_locked_poses(
+            source_targets,
+            destination_pose,
+            validate_workspace=validate_workspace,
+        )
 
+    def calculate_stack_targets_from_locked_poses(
+        self,
+        source_targets,
+        destination_pose,
+        validate_workspace=True,
+    ):
+        """Build release targets from scan-locked source/destination poses."""
+        with self.stack_level_lock:
+            placed_count = self.placed_stack_count
+        layer_z_offset = stack_layer_z_offset(
+            self.stack_z_offset,
+            self.stack_container_height,
+            placed_count,
+        )
         destination_yaw = quaternion_to_rpy_degrees(destination_pose[1])[2]
         (
             release_translation,
@@ -1233,6 +1388,7 @@ class ContainerPickCoordinator(Node):
             self.grasp_extra_depth,
             self.stack_xy_offset,
             self.container_yaw_symmetry,
+            layer_z_offset,
         )
         release_translation = apply_base_frame_correction(
             release_translation,
@@ -1268,13 +1424,18 @@ class ContainerPickCoordinator(Node):
         )
         self.stack_release_pose_publisher.publish(release)
         self.stack_approach_pose_publisher.publish(approach)
-        return (source_targets, release, approach), 'stack targets valid'
+        return (
+            source_targets,
+            release,
+            approach,
+        ), f'stack layer {placed_count + 1} targets valid'
 
     def wait_for_new_stable_stack_targets(self):
         """Wait until source and destination markers are fresh and stable."""
         with self.history_lock:
             self.history.clear()
             self.stack_target_history.clear()
+            self.scan_locked_frames.clear()
         deadline = time.monotonic() + self.stabilization_timeout
         reason = 'no new marker samples'
         last_report_time = 0.0
@@ -1440,6 +1601,237 @@ class ContainerPickCoordinator(Node):
         self.publish_status('STACK: source and destination targets locked')
         self.execute_stack(targets)
 
+    def start_scan_and_transfer(self, _request, response):
+        """Start scanning for ID 7/9 and transfer the ID 7 container."""
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.success = False
+            response.message = 'Scan transfer requires MoveIt execution'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.success = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        with self.stack_level_lock:
+            if self.placed_stack_count >= self.max_stack_levels:
+                response.success = False
+                response.message = (
+                    f'Maximum stack level {self.max_stack_levels} reached; '
+                    'call /arm2/reset_stack_level'
+                )
+                return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_scan_and_transfer,
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = 'Scanning for ID 7 and ID 9 started'
+        return response
+
+    def reset_stack_level(self, _request, response):
+        """Reset automatic stacking so the next placement uses layer one."""
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'Cannot reset while robot motion is running'
+            return response
+        with self.stack_level_lock:
+            self.placed_stack_count = 0
+        self.publish_status('STACK: layer counter reset; next layer is 1')
+        response.success = True
+        response.message = 'Stack level reset; next placement is layer 1'
+        return response
+
+    def execute_scan_and_transfer(self):
+        """Scan, lock both markers, transfer ID 7 to ID 9, and go home."""
+        try:
+            locked, reason = self.scan_and_lock_marker_poses()
+            if locked is None:
+                self.publish_status(f'SCAN TRANSFER FAILED: {reason}')
+                return
+            source_pose, destination_pose = locked
+            source_targets, reason = self.calculate_targets_from_marker_pose(
+                source_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+            )
+            if source_targets is None:
+                self.publish_status(
+                    f'SCAN TRANSFER FAILED: ID 7 target: {reason}'
+                )
+                return
+            targets, reason = self.calculate_stack_targets_from_locked_poses(
+                source_targets,
+                destination_pose,
+            )
+            if targets is None:
+                self.publish_status(f'SCAN TRANSFER FAILED: {reason}')
+                return
+            self.execute_scanned_transfer(targets)
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(f'SCAN TRANSFER FAILED: {exc}')
+
+    def scan_and_lock_marker_poses(self):
+        """Sweep J1 and pause at whichever required marker appears."""
+        clients = (
+            self.sweep_joint1_client,
+            self.pause_sweep_client,
+            self.resume_sweep_client,
+            self.stop_robot_client,
+        )
+        if any(
+            not client.wait_for_service(timeout_sec=3.0)
+            for client in clients
+        ):
+            return None, 'scan control service is unavailable'
+        with self.history_lock:
+            self.history.clear()
+            self.stack_target_history.clear()
+            self.scan_locked_frames.clear()
+        locked = [None, None]
+        histories = (self.history, self.stack_target_history)
+        labels = ('ID 7', 'ID 9')
+        scan_deadline = time.monotonic() + self.scan_timeout
+        scan_error = None
+        pass_number = 0
+        while (
+            time.monotonic() < scan_deadline
+            and not all(value is not None for value in locked)
+        ):
+            pass_number += 1
+            self.publish_status(
+                f'SCAN: J1 pass {pass_number} for missing ID 7/ID 9'
+            )
+            sweep_future = self.sweep_joint1_client.call_async(
+                Trigger.Request()
+            )
+            while not sweep_future.done():
+                if self.stop_event.is_set():
+                    self.stop_robot_client.call_async(Trigger.Request())
+                    return None, 'scan stopped'
+                candidate = next(
+                    (
+                        index
+                        for index, history in enumerate(histories)
+                        if locked[index] is None
+                        and self._history_sample_count(history) > 0
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    time.sleep(0.05)
+                    continue
+                pose, reason = self._pause_and_lock_marker(
+                    labels[candidate],
+                    histories[candidate],
+                )
+                if pose is not None:
+                    locked[candidate] = pose
+                    with self.history_lock:
+                        self.scan_locked_frames.add(
+                            (
+                                self.marker_frame,
+                                self.stack_target_frame,
+                            )[candidate]
+                        )
+                    self.publish_status(
+                        f'SCAN: {labels[candidate]} position saved and locked'
+                    )
+                else:
+                    self.publish_status(
+                        f'SCAN: {labels[candidate]} lock retry: {reason}'
+                    )
+                if all(value is not None for value in locked):
+                    self.publish_status(
+                        'SCAN: ID 7 and ID 9 saved; stopping scan'
+                    )
+                    self.stop_robot_client.call_async(Trigger.Request())
+                    break
+                self._call_scan_service(
+                    self.resume_sweep_client, 'resume sweep'
+                )
+            if not sweep_future.done():
+                self._wait_future(sweep_future, 10.0)
+            result = sweep_future.result()
+            if result is None or not result.success:
+                message = 'no response' if result is None else result.message
+                scan_error = f'J1 scan failed: {message}'
+                break
+        if scan_error is not None:
+            self._return_home_after_failed_scan()
+            return None, scan_error
+        if not all(value is not None for value in locked):
+            self._return_home_after_failed_scan()
+            missing = ', '.join(
+                label for label, value in zip(labels, locked)
+                if value is None
+            )
+            return None, (
+                f'{self.scan_timeout:.0f}s scan ended before detecting '
+                f'{missing}'
+            )
+        return tuple(locked), 'markers locked'
+
+    def _return_home_after_failed_scan(self):
+        """Return home when scanning cannot proceed to a transfer."""
+        self.publish_status('SCAN: failed; returning home')
+        self._call_scan_service(
+            self.return_home_client,
+            'scan failure home return',
+            timeout=self.motion_timeout + 5.0,
+        )
+
+    def _history_sample_count(self, history):
+        with self.history_lock:
+            return len(history)
+
+    def _pause_and_lock_marker(self, label, history):
+        self._call_scan_service(
+            self.pause_sweep_client, 'pause sweep', timeout=5.0
+        )
+        # The bridge checks its pause event every 0.1 s and stops serial
+        # motion there. Wait before clearing samples so the 0.5 s capture
+        # window contains only stationary observations.
+        if self.stop_event.wait(0.2):
+            return None, 'scan stopped'
+        with self.history_lock:
+            history.clear()
+        self.publish_status(
+            f'SCAN: {label} detected; holding '
+            f'{self.scan_marker_pause:.1f}s'
+        )
+        deadline = time.monotonic() + self.scan_marker_pause + 2.0
+        minimum_hold_end = time.monotonic() + self.scan_marker_pause
+        reason = 'no stable samples'
+        while time.monotonic() < deadline:
+            if self.stop_event.wait(0.05):
+                return None, 'scan stopped'
+            if time.monotonic() < minimum_hold_end:
+                continue
+            pose, reason = self.stable_marker_pose(
+                history=history,
+                yaw_only=True,
+            )
+            if pose is not None:
+                return (
+                    np.array(pose[0], dtype=np.float64),
+                    np.array(pose[1], dtype=np.float64),
+                ), 'stable'
+        return None, reason
+
+    def _call_scan_service(self, client, label, timeout=3.0):
+        future = client.call_async(Trigger.Request())
+        self._wait_future(future, timeout)
+        result = future.result()
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            raise RuntimeError(f'{label} failed: {message}')
+
     def start_pregrasp_test(self, _request, response):
         if not self.execute_motion:
             response.success = False
@@ -1546,6 +1938,8 @@ class ContainerPickCoordinator(Node):
         try:
             self.publish_pick_target('PICK', initial_targets[0])
             self._perform_pick(initial_targets)
+            self.publish_status('PICK: returning to home')
+            self.command_return_home()
             self.publish_status('PICK: completed')
         except Exception as exc:
             self.stop_event.set()
@@ -1564,10 +1958,20 @@ class ContainerPickCoordinator(Node):
         self.publish_status('PICK: opening gripper')
         self.command_gripper(open_gripper=True)
         self.publish_status('PICK: moving to pregrasp')
-        self.move_to_pose(
-            pregrasp,
-            keep_current_orientation=self.pregrasp_test_keep_orientation,
-        )
+        if self.prefer_z_last_motion:
+            self.move_to_pose_z_last(
+                pregrasp,
+                keep_current_orientation=(
+                    self.pregrasp_test_keep_orientation
+                ),
+            )
+        else:
+            self.move_to_pose(
+                pregrasp,
+                keep_current_orientation=(
+                    self.pregrasp_test_keep_orientation
+                ),
+            )
         if self.pregrasp_test_keep_orientation:
             self.publish_status('PICK: aligning at pregrasp')
             self.move_to_pose(pregrasp)
@@ -1663,11 +2067,63 @@ class ContainerPickCoordinator(Node):
             self.command_gripper(open_gripper=True)
             self.publish_status('STACK: retreating vertically')
             self.move_cartesian_to_pose(approach)
+            self.publish_status('STACK: returning to home')
+            self.command_return_home()
             self.publish_status('STACK: completed ID 0 onto ID 1')
         except Exception as exc:
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'STACK FAILED: {exc}')
+        finally:
+            self.tracking_suspended.clear()
+            self.motion_lock.release()
+
+    def execute_scanned_transfer(self, targets):
+        """Move scan-locked ID 7 to ID 9, then return home."""
+        if not self.motion_lock.acquire(blocking=False):
+            return
+        self.tracking_suspended.set()
+        try:
+            source_targets, release, approach = targets
+            self.publish_status('TRANSFER: moving from scan pose to ID 7')
+            self.publish_pick_target('TRANSFER', source_targets[0])
+            self._perform_pick(
+                copy.deepcopy(source_targets),
+                allow_yaw_fallback=False,
+                allow_segmented_descent=True,
+            )
+            destination_yaw = quaternion_to_rpy_degrees([
+                release.pose.orientation.x,
+                release.pose.orientation.y,
+                release.pose.orientation.z,
+                release.pose.orientation.w,
+            ])[2]
+            self.publish_status(
+                'TRANSFER: ID 7 picked; moving directly to saved ID 9: '
+                f'tcp_yaw={destination_yaw:.2f}deg'
+            )
+            approach = self.move_to_reachable_stack_approach(
+                release, approach.pose.orientation
+            )
+            self.publish_status('TRANSFER: descending to ID 9 release')
+            self.move_cartesian_to_pose(release)
+            self.publish_status('TRANSFER: releasing container at ID 9')
+            self.command_gripper(open_gripper=True)
+            self.publish_status('TRANSFER: retreating from ID 9')
+            self.move_cartesian_to_pose(approach)
+            with self.stack_level_lock:
+                self.placed_stack_count += 1
+                completed_layer = self.placed_stack_count
+            self.publish_status(
+                f'TRANSFER: stack layer {completed_layer} placed'
+            )
+            self.publish_status('TRANSFER: returning to final home')
+            self.command_return_home()
+            self.publish_status('TRANSFER: ID 7 to ID 9 completed')
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(f'TRANSFER FAILED: {exc}')
         finally:
             self.tracking_suspended.clear()
             self.motion_lock.release()
@@ -1696,7 +2152,10 @@ class ContainerPickCoordinator(Node):
                 f'{clearance * 100.0:.1f} cm'
             )
             try:
-                self.move_to_pose(approach)
+                if self.prefer_z_last_motion:
+                    self.move_to_pose_z_last(approach)
+                else:
+                    self.move_to_pose(approach)
                 self.stack_approach_pose_publisher.publish(approach)
                 self.publish_status(
                     'STACK: selected approach clearance '
@@ -1847,6 +2306,65 @@ class ContainerPickCoordinator(Node):
                 if error <= 2.0:
                     return
         raise RuntimeError('robot motion timed out')
+
+    def move_to_pose_z_last(
+        self, target, keep_current_orientation=False
+    ):
+        """Delay only descent; upward targets use the normal direct move."""
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_z = float(current.transform.translation.z)
+        target_z = float(target.pose.position.z)
+        if target_z >= current_z - 0.003:
+            self.move_to_pose(target, keep_current_orientation)
+            return
+        intermediate = copy.deepcopy(target)
+        intermediate.pose.position.z = current_z
+        if keep_current_orientation:
+            intermediate.pose.orientation = copy.deepcopy(
+                current.transform.rotation
+            )
+        translation = np.array([
+            intermediate.pose.position.x,
+            intermediate.pose.position.y,
+            intermediate.pose.position.z,
+        ])
+        if not self.in_workspace(translation):
+            self.get_logger().warning(
+                'Z-last intermediate is outside workspace; using direct move'
+            )
+            self.move_to_pose(target, keep_current_orientation)
+            return
+        self.publish_status(
+            'MOTION: moving XY/orientation first at current Z '
+            '(favoring base rotation)'
+        )
+        try:
+            self.move_to_pose(
+                intermediate,
+                keep_current_orientation=keep_current_orientation,
+            )
+        except RuntimeError as exc:
+            if self.stop_event.is_set():
+                raise
+            self.get_logger().warning(
+                f'Z-last intermediate failed; using direct move: {exc}'
+            )
+            self.move_to_pose(target, keep_current_orientation)
+            return
+        descent = copy.deepcopy(target)
+        if keep_current_orientation:
+            descent.pose.orientation = copy.deepcopy(
+                intermediate.pose.orientation
+            )
+        self.publish_status('MOTION: descending Z last at target XY')
+        self.move_cartesian_to_pose(descent)
 
     def _move_to_pose_moveit(self, pose, keep_current_orientation):
         target = copy.deepcopy(pose)
@@ -2273,7 +2791,7 @@ class ContainerPickCoordinator(Node):
                 raise RuntimeError('pick stopped')
         if goal_handle is not None:
             goal_handle.cancel_goal_async()
-        raise RuntimeError('MoveIt request timed out')
+        raise RuntimeError('ROS request timed out')
 
     def command_gripper(self, open_gripper):
         if self.motion_backend == 'moveit':
@@ -2297,6 +2815,21 @@ class ContainerPickCoordinator(Node):
             self.robot.set_gripper_value(value, speed)
         if self.stop_event.wait(1.0):
             raise RuntimeError('pick stopped')
+
+    def command_return_home(self):
+        """Request the serial-owning bridge to return to joint-space home."""
+        if self.motion_backend != 'moveit':
+            raise RuntimeError(
+                'automatic home return requires the MoveIt trajectory bridge'
+            )
+        if not self.return_home_client.wait_for_service(timeout_sec=3.0):
+            raise RuntimeError('JetCobot return-home service is unavailable')
+        future = self.return_home_client.call_async(Trigger.Request())
+        self._wait_future(future, self.motion_timeout + 5.0)
+        result = future.result()
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            raise RuntimeError(f'return home failed: {message}')
 
     def publish_joint_states(self):
         if self.robot is None or not self.serial_lock.acquire(blocking=False):

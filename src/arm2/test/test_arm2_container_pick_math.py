@@ -13,8 +13,10 @@ from arm2.arm2_container_pick_coordinator import (
     ContainerPickCoordinator,
     inverted_l_workspace_contains,
     lift_distance_candidates,
+    nearest_symmetric_yaw_degrees,
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
+    stack_layer_z_offset,
 )
 import numpy as np
 
@@ -138,6 +140,31 @@ def test_stack_release_follows_destination_heading():
     )
 
 
+def test_stack_release_applies_positive_base_z_offset():
+    """A positive placement offset raises release and approach equally."""
+    release, approach, _, _ = calculate_heading_aligned_stack_poses(
+        destination_marker=[0.16, -0.10, 0.06],
+        grasp_offset=[-0.014, -0.010, -0.032],
+        grasp_rpy_degrees=[-170.0, 8.0, 120.0],
+        destination_yaw_degrees=30.0,
+        reference_marker_yaw_degrees=30.0,
+        container_height=0.035,
+        approach_clearance=0.08,
+        extra_depth=0.0,
+        xy_offset=[0.0, 0.0],
+        z_offset=0.03,
+    )
+    assert np.isclose(release[2], 0.093)
+    assert np.isclose(approach[2], 0.173)
+
+
+def test_stack_layer_offset_increases_by_container_height():
+    """Every completed placement raises the next layer by one container."""
+    assert np.isclose(stack_layer_z_offset(0.015, 0.035, 0), 0.015)
+    assert np.isclose(stack_layer_z_offset(0.015, 0.035, 1), 0.050)
+    assert np.isclose(stack_layer_z_offset(0.015, 0.035, 2), 0.085)
+
+
 def test_yaw_follow_rotates_grasp_and_xy_offset_only():
     """Marker yaw rotates XY and gripper yaw while retaining roll/pitch."""
     translation, rotation, yaw_delta = compose_yaw_follow_pose(
@@ -204,6 +231,12 @@ def test_rectangular_grasp_keeps_90_degree_heading_change():
         abs(quaternion_to_rpy_degrees(rotation)[2] - 120.0),
         90.0,
     )
+
+
+def test_nearest_symmetric_yaw_minimizes_gripper_rotation():
+    """A 180-degree-equivalent grasp nearest current TCP yaw is selected."""
+    assert nearest_symmetric_yaw_degrees(140.0, -35.0, 180.0) == -40.0
+    assert nearest_symmetric_yaw_degrees(-140.0, 35.0, 180.0) == 40.0
 
 
 def test_yaw_follow_can_keep_base_frame_position_correction():

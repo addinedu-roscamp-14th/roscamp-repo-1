@@ -51,6 +51,31 @@ def joint_errors_degrees(actual, target):
     )]
 
 
+def cumulative_joint_travel_degrees(start_degrees, points, joint_index):
+    """Return cumulative absolute travel for one trajectory joint."""
+    previous = float(start_degrees)
+    travel = 0.0
+    for point in points:
+        current = math.degrees(float(point.positions[joint_index]))
+        travel += abs(current - previous)
+        previous = current
+    return travel
+
+
+def validate_home_angles(angles):
+    """Return a validated six-joint home target in degrees."""
+    if len(angles) != len(JOINT_NAMES):
+        raise ValueError('home_joint_angles_deg must contain six values')
+    target = [float(value) for value in angles]
+    for index, (value, limits) in enumerate(zip(target, JOINT_LIMITS_DEG)):
+        if not math.isfinite(value) or not limits[0] <= value <= limits[1]:
+            raise ValueError(
+                f'home J{index + 1}={value:g}deg outside '
+                f'[{limits[0]:g}, {limits[1]:g}]'
+            )
+    return target
+
+
 class JetCobotTrajectoryBridge(Node):
     """Own the robot serial port and expose a trajectory action controller."""
 
@@ -62,10 +87,24 @@ class JetCobotTrajectoryBridge(Node):
         self.declare_parameter('command_rate_hz', 10.0)
         self.declare_parameter('joint_state_rate_hz', 10.0)
         self.declare_parameter('max_start_error_deg', 15.0)
+        self.declare_parameter('max_j6_trajectory_travel_deg', 150.0)
         self.declare_parameter('goal_tolerance_deg', 2.5)
         self.declare_parameter('goal_timeout_sec', 15.0)
         self.declare_parameter('goal_correction_speed', 50)
         self.declare_parameter('goal_correction_period_sec', 1.0)
+        self.declare_parameter(
+            'home_joint_angles_deg',
+            [87.01, 55.54, -83.58, -36.47, 4.57, -52.11],
+        )
+        self.declare_parameter('go_home_on_startup', True)
+        self.declare_parameter('go_home_on_shutdown', True)
+        self.declare_parameter('home_speed', 50)
+        self.declare_parameter('home_tolerance_deg', 3.5)
+        self.declare_parameter('home_timeout_sec', 15.0)
+        self.declare_parameter('joint1_sweep_speed', 30)
+        self.declare_parameter('joint1_sweep_angle_deg', 180.0)
+        self.declare_parameter('joint1_sweep_tolerance_deg', 3.5)
+        self.declare_parameter('joint1_sweep_duration_sec', 10.0)
         self.declare_parameter('gripper_open_value', 100)
         self.declare_parameter('gripper_closed_value', 20)
         self.declare_parameter('gripper_speed', 50)
@@ -84,6 +123,9 @@ class JetCobotTrajectoryBridge(Node):
         self.max_start_error = float(
             self.get_parameter('max_start_error_deg').value
         )
+        self.max_j6_trajectory_travel = float(
+            self.get_parameter('max_j6_trajectory_travel_deg').value
+        )
         self.goal_tolerance = float(
             self.get_parameter('goal_tolerance_deg').value
         )
@@ -96,6 +138,34 @@ class JetCobotTrajectoryBridge(Node):
         self.goal_correction_period = float(
             self.get_parameter('goal_correction_period_sec').value
         )
+        self.home_angles = validate_home_angles(
+            self.get_parameter('home_joint_angles_deg').value
+        )
+        self.go_home_on_startup = bool(
+            self.get_parameter('go_home_on_startup').value
+        )
+        self.go_home_on_shutdown = bool(
+            self.get_parameter('go_home_on_shutdown').value
+        )
+        self.home_speed = int(self.get_parameter('home_speed').value)
+        self.home_tolerance = float(
+            self.get_parameter('home_tolerance_deg').value
+        )
+        self.home_timeout = float(
+            self.get_parameter('home_timeout_sec').value
+        )
+        self.joint1_sweep_speed = int(
+            self.get_parameter('joint1_sweep_speed').value
+        )
+        self.joint1_sweep_angle = float(
+            self.get_parameter('joint1_sweep_angle_deg').value
+        )
+        self.joint1_sweep_tolerance = float(
+            self.get_parameter('joint1_sweep_tolerance_deg').value
+        )
+        self.joint1_sweep_duration = float(
+            self.get_parameter('joint1_sweep_duration_sec').value
+        )
         self.joint_states_topic = str(
             self.get_parameter('joint_states_topic').value
         )
@@ -104,12 +174,36 @@ class JetCobotTrajectoryBridge(Node):
         )
         if not 1 <= self.goal_correction_speed <= 100:
             raise ValueError('goal_correction_speed must be within 1..100')
+        if self.max_j6_trajectory_travel <= 0.0:
+            raise ValueError(
+                'max_j6_trajectory_travel_deg must be positive'
+            )
         if self.goal_correction_period <= 0.0:
             raise ValueError('goal_correction_period_sec must be positive')
+        if not 1 <= self.home_speed <= 100:
+            raise ValueError('home_speed must be within 1..100')
+        if not 1 <= self.joint1_sweep_speed <= 100:
+            raise ValueError('joint1_sweep_speed must be within 1..100')
+        joint1_range = JOINT_LIMITS_DEG[0][1] - JOINT_LIMITS_DEG[0][0]
+        if not 0.0 < self.joint1_sweep_angle <= joint1_range:
+            raise ValueError(
+                f'joint1_sweep_angle_deg must be within (0, {joint1_range:g}]'
+            )
+        if self.home_tolerance <= 0.0 or self.home_timeout <= 0.0:
+            raise ValueError('home tolerance and timeout must be positive')
+        if (
+            self.joint1_sweep_tolerance <= 0.0
+            or self.joint1_sweep_duration <= 0.0
+        ):
+            raise ValueError(
+                'joint1 sweep tolerance and duration must be positive'
+            )
 
         self.serial_lock = threading.Lock()
         self.execution_lock = threading.Lock()
         self.cancel_event = threading.Event()
+        self.sweep_pause_event = threading.Event()
+        self.sweep_recommand_event = threading.Event()
         self.last_angles = None
         self.robot = MyCobot280(serial_port, baud_rate)
         time.sleep(1.0)
@@ -153,6 +247,36 @@ class JetCobotTrajectoryBridge(Node):
             self.stop_robot,
             callback_group=callback_group,
         )
+        self.create_service(
+            Trigger,
+            '/arm2/return_home',
+            self.return_home,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/sweep_joint1',
+            self.sweep_joint1,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/scan_joint1',
+            self.scan_joint1,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/pause_joint1_sweep',
+            self.pause_joint1_sweep,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/resume_joint1_sweep',
+            self.resume_joint1_sweep,
+            callback_group=callback_group,
+        )
         state_rate = float(self.get_parameter('joint_state_rate_hz').value)
         self.create_timer(
             1.0 / state_rate,
@@ -165,6 +289,11 @@ class JetCobotTrajectoryBridge(Node):
             f'joint_states={self.joint_states_topic}, '
             f'port={serial_port}, speed={self.speed}'
         )
+        if self.go_home_on_startup:
+            self.get_logger().info(
+                f'Moving to startup home: {self.home_angles}'
+            )
+            self._move_home()
 
     def accept_goal(self, goal_request):
         """Reject malformed or concurrent trajectory goals."""
@@ -220,6 +349,16 @@ class JetCobotTrajectoryBridge(Node):
                 )
             for point in trajectory:
                 self._validate_joint_limits(point.positions)
+            j6_travel = cumulative_joint_travel_degrees(
+                current[5], trajectory, 5
+            )
+            if j6_travel > self.max_j6_trajectory_travel:
+                return self._abort(
+                    goal_handle,
+                    result,
+                    f'J6 trajectory travel {j6_travel:.1f}deg exceeds '
+                    f'{self.max_j6_trajectory_travel:.1f}deg limit',
+                )
 
             finish = duration_seconds(trajectory[-1].time_from_start)
             max_step = max(
@@ -408,7 +547,10 @@ class JetCobotTrajectoryBridge(Node):
         return self._set_gripper(False, response)
 
     def _set_gripper(self, open_gripper, response):
-        parameter = 'gripper_open_value' if open_gripper else 'gripper_closed_value'
+        parameter = (
+            'gripper_open_value'
+            if open_gripper else 'gripper_closed_value'
+        )
         value = int(self.get_parameter(parameter).value)
         speed = int(self.get_parameter('gripper_speed').value)
         try:
@@ -423,6 +565,8 @@ class JetCobotTrajectoryBridge(Node):
 
     def stop_robot(self, _request, response):
         self.cancel_event.set()
+        self.sweep_pause_event.clear()
+        self.sweep_recommand_event.clear()
         try:
             self._stop_hardware()
             response.success = True
@@ -431,6 +575,195 @@ class JetCobotTrajectoryBridge(Node):
             response.success = False
             response.message = f'robot stop failed: {exc}'
         return response
+
+    def pause_joint1_sweep(self, _request, response):
+        """Pause an active J1 sweep without ending its time budget."""
+        self.sweep_pause_event.set()
+        response.success = True
+        response.message = 'J1 sweep pause requested'
+        return response
+
+    def resume_joint1_sweep(self, _request, response):
+        """Allow a paused J1 sweep to continue."""
+        self.sweep_pause_event.clear()
+        self.sweep_recommand_event.set()
+        response.success = True
+        response.message = 'J1 sweep resumed; target will be resent'
+        return response
+
+    def return_home(self, _request, response):
+        """Move the physical arm to the configured joint-space home."""
+        try:
+            self._move_home()
+            response.success = True
+            response.message = f'home reached: {self.home_angles}'
+        except Exception as exc:
+            response.success = False
+            response.message = f'home move failed: {exc}'
+        return response
+
+    def sweep_joint1(self, _request, response):
+        """Sweep J1 for a bounded duration, then return the robot home."""
+        sweep_error = None
+        try:
+            self._sweep_joint1_for_duration()
+        except Exception as exc:
+            sweep_error = exc
+            self.get_logger().error(f'J1 sweep failed: {exc}')
+        try:
+            self.get_logger().info('J1 sweep finished; returning home')
+            self._move_home()
+            response.success = sweep_error is None
+            response.message = (
+                'J1 sweep completed and home reached'
+                if sweep_error is None
+                else f'J1 sweep failed, but home reached: {sweep_error}'
+            )
+        except Exception as exc:
+            response.success = False
+            response.message = (
+                f'J1 sweep/home failed: sweep={sweep_error}, home={exc}'
+            )
+        return response
+
+    def scan_joint1(self, _request, response):
+        """Run one bounded J1 scan without an automatic home movement."""
+        try:
+            self._sweep_joint1_for_duration()
+            response.success = True
+            response.message = 'J1 scan pass completed'
+        except Exception as exc:
+            response.success = False
+            response.message = f'J1 scan failed: {exc}'
+        return response
+
+    def _sweep_joint1_for_duration(self):
+        """Visit J1 endpoints until both are reached or time expires."""
+        self.cancel_event.set()
+        self._stop_hardware()
+        if not self.execution_lock.acquire(timeout=2.0):
+            raise RuntimeError('trajectory execution did not stop')
+        try:
+            self.cancel_event.clear()
+            self.sweep_pause_event.clear()
+            self.sweep_recommand_event.clear()
+            current = self._read_angles()
+            if current is None:
+                raise RuntimeError('failed to read current joint angles')
+            targets = []
+            half_angle = self.joint1_sweep_angle / 2.0
+            for endpoint in (half_angle, -half_angle):
+                target = list(current)
+                target[0] = endpoint
+                targets.append(target)
+            deadline = time.monotonic() + self.joint1_sweep_duration
+            self.get_logger().warning(
+                'J1 bounded sweep starting: '
+                f'{targets[0][0]:g}deg -> {targets[1][0]:g}deg, '
+                f'speed={self.joint1_sweep_speed}, '
+                f'duration={self.joint1_sweep_duration:g}s'
+            )
+            for target in targets:
+                command_required = True
+                pause_started = None
+                while time.monotonic() < deadline:
+                    if self.cancel_event.is_set():
+                        return
+                    if self.sweep_pause_event.is_set():
+                        if pause_started is None:
+                            self._stop_hardware()
+                            pause_started = time.monotonic()
+                        time.sleep(0.05)
+                        continue
+                    if pause_started is not None:
+                        deadline += time.monotonic() - pause_started
+                        pause_started = None
+                        command_required = True
+                    if self.sweep_recommand_event.is_set():
+                        self.sweep_recommand_event.clear()
+                        command_required = True
+                    if command_required:
+                        with self.serial_lock:
+                            try:
+                                self.robot.send_angles(
+                                    target,
+                                    self.joint1_sweep_speed,
+                                    _async=True,
+                                )
+                            except TypeError:
+                                self.robot.send_angles(
+                                    target, self.joint1_sweep_speed
+                                )
+                        command_required = False
+                    actual = self._read_angles()
+                    if (
+                        actual is not None
+                        and abs(actual[0] - target[0])
+                        <= self.joint1_sweep_tolerance
+                    ):
+                        break
+                    time.sleep(0.1)
+                else:
+                    break
+            self._stop_hardware()
+        finally:
+            self.execution_lock.release()
+
+    def _move_home(self):
+        """Stop active execution, command home, and wait for convergence."""
+        self._run_exclusive_targets(
+            (self.home_angles,),
+            self.home_speed,
+            self.home_tolerance,
+            self.home_timeout,
+        )
+
+    def _run_exclusive_targets(
+        self, targets, speed, tolerance, timeout
+    ):
+        """Stop trajectory execution and visit joint targets exclusively."""
+        self.cancel_event.set()
+        self._stop_hardware()
+        if not self.execution_lock.acquire(timeout=2.0):
+            raise RuntimeError('trajectory execution did not stop')
+        try:
+            for target in targets:
+                validate_home_angles(target)
+                with self.serial_lock:
+                    try:
+                        self.robot.send_angles(
+                            target, speed, _async=True
+                        )
+                    except TypeError:
+                        self.robot.send_angles(target, speed)
+                deadline = time.monotonic() + timeout
+                last_angles = None
+                while time.monotonic() < deadline:
+                    last_angles = self._read_angles()
+                    if last_angles is not None:
+                        error = max(
+                            abs(value)
+                            for value in joint_errors_degrees(
+                                last_angles, target
+                            )
+                        )
+                        if error <= tolerance:
+                            if rclpy.ok():
+                                self.get_logger().info(
+                                    'Joint target reached: target='
+                                    f'{[round(value, 2) for value in target]}, '
+                                    'actual='
+                                    f'{[round(value, 2) for value in last_angles]}'
+                                )
+                            break
+                    time.sleep(0.2)
+                else:
+                    raise RuntimeError(
+                        'joint target timeout; target='
+                        f'{target}, actual={last_angles}'
+                    )
+        finally:
+            self.execution_lock.release()
 
     def _stop_hardware(self):
         with self.serial_lock:
@@ -445,9 +778,19 @@ class JetCobotTrajectoryBridge(Node):
 
     def destroy_node(self):
         try:
-            self._stop_hardware()
-        except Exception:
-            pass
+            if self.go_home_on_shutdown:
+                if rclpy.ok():
+                    self.get_logger().info('Moving to shutdown home')
+                self._move_home()
+            else:
+                self._stop_hardware()
+        except (Exception, KeyboardInterrupt) as exc:
+            if rclpy.ok():
+                self.get_logger().error(f'Shutdown home failed: {exc}')
+            try:
+                self._stop_hardware()
+            except (Exception, KeyboardInterrupt):
+                pass
         self.action_server.destroy()
         return super().destroy_node()
 

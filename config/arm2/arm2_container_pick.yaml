@@ -1,3 +1,24 @@
+/arm2/arm2_jetcobot_trajectory_bridge:
+  ros__parameters:
+    # 2026-07-28에 arm2 실기에서 읽은 현재 자세를 홈으로 사용합니다.
+    home_joint_angles_deg:
+    - 87.01
+    - 55.54
+    - -83.58
+    - -36.47
+    - 4.57
+    - -52.11
+    go_home_on_startup: true
+    go_home_on_shutdown: true
+    home_speed: 50
+    home_tolerance_deg: 3.5
+    home_timeout_sec: 15.0
+    joint1_sweep_speed: 25
+    joint1_sweep_angle_deg: 336.0
+    joint1_sweep_tolerance_deg: 3.5
+    joint1_sweep_duration_sec: 20.0
+    max_j6_trajectory_travel_deg: 150.0
+
 /arm2/arm2_container_pick_coordinator:
   ros__parameters:
     base_frame: arm2/base_link
@@ -11,13 +32,13 @@
     # 그리퍼 yaw만 컨테이너를 추종하고 XYZ 오프셋은 base_link 방향에 고정합니다.
     rotate_grasp_offset_with_marker_yaw: false
     grasp_offset_xyz_m:
-    - -0.014261
-    - -0.010785
-    - -0.032462
+    - 0.014261
+    - -0.000085
+    - -0.062462
     # arm2/base_link 기준 고정 보정. 컨테이너 yaw와 함께 회전하지 않습니다.
     base_correction_xyz_m:
-    - 0.0
-    - 0.0
+    - -0.01
+    - 0.03
     - 0.0
     grasp_offset_rpy_deg:
     - -180.0
@@ -26,6 +47,7 @@
     reference_marker_yaw_deg: 2.349
     # 직사각형 컨테이너와 그리퍼는 180도 회전을 같은 파지 자세로 취급합니다.
     container_yaw_symmetry_deg: 180.0
+    prefer_current_gripper_yaw: true
     max_yaw_spread_deg: 12.0
     max_container_yaw_delta_deg: 180.0
     grasp_yaw_fallback_scales:
@@ -48,10 +70,15 @@
     stack_xy_offset_m:
     - 0.0
     - 0.0
+    stack_z_offset_m: 0.015
+    max_stack_levels: 3
     stack_source_orientation_mode: marker_yaw
     stack_segmented_descent_min_fraction: 0.65
     stack_segmented_descent_max_segments: 5
     stack_pose_goal_finish_max_distance_m: 0.075
+    scan_marker_pause_sec: 0.5
+    scan_timeout_sec: 90.0
+    prefer_z_last_motion: false
     minimum_stable_samples: 5
     max_translation_std_m: 0.005
     max_rotation_spread_deg: 10.0
@@ -80,7 +107,7 @@
     - 0.28
     - 0.28
     max_joint_delta_deg: 60.0
-    serial_port: /dev/ttyUSB0
+    serial_port: /dev/jetcobot
     baud_rate: 1000000
     speed: 5
     motion_timeout_sec: 30.0

@@ -24,7 +24,7 @@ def resolve_camera_info_url(context):
 def generate_launch_description():
     """Create the gripper camera and marker tracking graph."""
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
+        DeclareLaunchArgument('video_device', default_value='/dev/arm_camera'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm2/arm2_gripper_camera_info.yaml',

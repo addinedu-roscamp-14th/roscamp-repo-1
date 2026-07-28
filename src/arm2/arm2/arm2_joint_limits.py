@@ -10,7 +10,7 @@ JOINT_LIMITS_RAD = (
     (math.radians(-150.0), math.radians(150.0)),
     (math.radians(-150.0), math.radians(150.0)),
     (math.radians(-155.0), math.radians(160.0)),
-    (math.radians(-180.0), math.radians(180.0)),
+    (math.radians(-150.0), math.radians(150.0)),
 )
 JOINT_LIMITS_DEG = tuple(
     tuple(math.degrees(value) for value in limits)

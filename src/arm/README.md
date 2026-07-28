@@ -122,7 +122,7 @@ config/arm/gripper_camera_info.yaml
 
 ```bash
 ros2 launch arm gripper_aruco.launch.py \
-  video_device:=/dev/video4 \
+  video_device:=/dev/video2 \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   marker_id:=0 \
   marker_size_m:=0.02 \
@@ -172,7 +172,7 @@ ros2 run arm manual_jog --ros-args \
 ```bash
 ros2 launch arm handeye_calibration.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
-  marker_id:=0 \
+  marker_id:=7 \
   marker_size_m:=0.02
 ```
 
