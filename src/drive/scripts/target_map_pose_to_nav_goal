@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 from geometry_msgs.msg import PoseStamped
+from lifecycle_msgs.msg import State
+from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose
 import rclpy
 from rclpy.action import ActionClient
@@ -17,23 +19,47 @@ class TargetMapPoseToNavGoal(Node):
         self.declare_parameter('default_frame_id', 'map')
         self.declare_parameter('wait_for_server_timeout_sec', 10.0)
         self.declare_parameter('ignore_empty_frame_id', False)
+        self.declare_parameter(
+            'bt_navigator_lifecycle_node',
+            '/bt_navigator',
+        )
+        self.declare_parameter('lifecycle_retry_period_sec', 0.5)
 
         self.target_topic = str(self.get_parameter('target_topic').value)
         self.action_name = str(self.get_parameter('action_name').value)
         self.default_frame_id = str(self.get_parameter('default_frame_id').value)
         self.wait_timeout = float(self.get_parameter('wait_for_server_timeout_sec').value)
         self.ignore_empty_frame_id = bool(self.get_parameter('ignore_empty_frame_id').value)
+        self.lifecycle_node = str(
+            self.get_parameter('bt_navigator_lifecycle_node').value
+        ).rstrip('/')
+        self.retry_period = float(
+            self.get_parameter('lifecycle_retry_period_sec').value
+        )
+        if self.retry_period <= 0.0:
+            raise ValueError('lifecycle_retry_period_sec must be positive')
 
         self.client = ActionClient(self, NavigateToPose, self.action_name)
+        self.lifecycle_client = self.create_client(
+            GetState,
+            f'{self.lifecycle_node}/get_state',
+        )
         self.active_goal = None
+        self.pending_goal = None
+        self.inflight_goal = None
+        self.goal_request_in_flight = False
+        self.lifecycle_request_in_flight = False
+        self.last_lifecycle_state = None
         self.received_pose_count = 0
 
         self.create_subscription(PoseStamped, self.target_topic, self.on_target_pose, 10)
         self.create_timer(5.0, self.log_waiting_status)
+        self.create_timer(self.retry_period, self.try_dispatch_pending)
 
         self.get_logger().info(
             f'Subscribing target poses: {self.target_topic}; '
-            f'sending Nav2 goals to action: {self.action_name}'
+            f'sending Nav2 goals to action: {self.action_name}; '
+            f'waiting for lifecycle active: {self.lifecycle_node}'
         )
 
     def on_target_pose(self, pose_msg):
@@ -51,17 +77,53 @@ class TargetMapPoseToNavGoal(Node):
         if goal.pose.header.stamp.sec == 0 and goal.pose.header.stamp.nanosec == 0:
             goal.pose.header.stamp = self.get_clock().now().to_msg()
 
-        if not self.client.wait_for_server(timeout_sec=self.wait_timeout):
-            self.get_logger().error(
-                f'Nav2 action server is not available: {self.action_name}'
+        self.pending_goal = goal
+        self.get_logger().info(
+            'Queued Nav2 target until bt_navigator is active'
+        )
+        self.try_dispatch_pending()
+
+    def try_dispatch_pending(self):
+        if (
+            self.pending_goal is None
+            or self.goal_request_in_flight
+            or self.lifecycle_request_in_flight
+        ):
+            return
+        if not self.lifecycle_client.service_is_ready():
+            return
+
+        self.lifecycle_request_in_flight = True
+        future = self.lifecycle_client.call_async(GetState.Request())
+        future.add_done_callback(self.on_lifecycle_state)
+
+    def on_lifecycle_state(self, future):
+        self.lifecycle_request_in_flight = False
+        try:
+            state = future.result().current_state
+        except Exception as exc:
+            self.get_logger().warning(
+                f'Failed to read {self.lifecycle_node} lifecycle state: {exc}'
             )
             return
 
+        self.last_lifecycle_state = (int(state.id), str(state.label))
+        if state.id != State.PRIMARY_STATE_ACTIVE:
+            return
+        if self.pending_goal is None or self.goal_request_in_flight:
+            return
+        if not self.client.server_is_ready():
+            return
+
+        goal = self.pending_goal
+        self.pending_goal = None
         if self.active_goal is not None:
             self.get_logger().info('Canceling previous navigation goal')
             self.active_goal.cancel_goal_async()
             self.active_goal = None
 
+        self.goal_request_in_flight = True
+        self.inflight_goal = goal
         future = self.client.send_goal_async(goal)
         future.add_done_callback(self.on_goal_response)
 
@@ -75,23 +137,49 @@ class TargetMapPoseToNavGoal(Node):
         )
 
     def log_waiting_status(self):
-        if self.received_pose_count > 0:
+        if self.pending_goal is None and self.received_pose_count > 0:
             return
 
+        lifecycle_state = (
+            'unknown'
+            if self.last_lifecycle_state is None
+            else (
+                f'{self.last_lifecycle_state[1]}'
+                f'({self.last_lifecycle_state[0]})'
+            )
+        )
         self.get_logger().info(
             'Waiting for target pose: '
             f'topic={self.target_topic}, '
             f'publishers={self.count_publishers(self.target_topic)}, '
             f'action={self.action_name}, '
-            f'action_server_ready={self.client.server_is_ready()}'
+            f'action_server_ready={self.client.server_is_ready()}, '
+            f'bt_navigator_state={lifecycle_state}, '
+            f'goal_pending={self.pending_goal is not None}'
         )
 
     def on_goal_response(self, future):
-        goal_handle = future.result()
+        self.goal_request_in_flight = False
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            if self.pending_goal is None:
+                self.pending_goal = self.inflight_goal
+            self.inflight_goal = None
+            self.get_logger().warning(
+                f'Navigation goal request failed: {exc}'
+            )
+            return
         if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().warning('Navigation goal was rejected')
+            if self.pending_goal is None:
+                self.pending_goal = self.inflight_goal
+            self.inflight_goal = None
+            self.get_logger().warning(
+                'Navigation goal was rejected; keeping the latest goal pending'
+            )
             return
 
+        self.inflight_goal = None
         self.active_goal = goal_handle
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self.on_goal_result)

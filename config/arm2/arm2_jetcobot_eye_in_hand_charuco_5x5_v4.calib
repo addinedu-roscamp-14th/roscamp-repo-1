@@ -1,0 +1,20 @@
+parameters:
+  name: arm2_jetcobot_eye_in_hand_charuco_5x5_v4
+  calibration_type: eye_in_hand
+  robot_base_frame: arm2/base_link
+  robot_effector_frame: arm2/TCP
+  tracking_base_frame: arm2/gripper_camera_optical_frame
+  tracking_marker_frame: arm2/handeye_target
+  freehand_robot_movement: true
+  move_group_namespace: /
+  move_group: manipulator
+transform:
+  translation:
+    x: 0.000494746756768885
+    y: -0.03523560078753194
+    z: -0.08023584684994052
+  rotation:
+    x: -0.03798178680203399
+    y: -0.006583172458918929
+    z: -0.0003650979323145674
+    w: 0.9992566799452485

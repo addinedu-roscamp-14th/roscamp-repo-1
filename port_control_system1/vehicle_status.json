@@ -1,0 +1,14 @@
+{
+  "차량 1": {
+    "battery_pct": 100,
+    "fault": null,
+    "last_job": "'화물K' → '창고 C' 이동 완료",
+    "last_job_time": "15:45:28"
+  },
+  "차량 2": {
+    "battery_pct": 100,
+    "fault": null,
+    "last_job": "'화물H' → '창고 C' 이동 완료",
+    "last_job_time": "15:45:28"
+  }
+}

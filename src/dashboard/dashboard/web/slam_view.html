@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Port-ER SLAM</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow: hidden;
+      background: #111315;
+      color: #f4f6f8;
+    }
+    header {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 0 18px;
+      border-bottom: 1px solid #34383d;
+      background: #1c1f22;
+    }
+    h1 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #b8bec5;
+      font-size: 13px;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #42c66a;
+    }
+    main {
+      height: calc(100vh - 52px);
+      display: grid;
+      place-items: center;
+      padding: 12px;
+    }
+    img {
+      display: block;
+      width: min(calc(100vw - 24px), calc(100vh - 76px));
+      height: min(calc(100vw - 24px), calc(100vh - 76px));
+      object-fit: contain;
+      background: #303030;
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Port-ER SLAM</h1>
+    <div class="status">
+      <span class="dot"></span>
+      <span>실시간</span>
+    </div>
+  </header>
+  <main>
+    <img src="/slam/video" alt="SLAM">
+  </main>
+</body>
+</html>
