@@ -87,12 +87,24 @@ class ArucoPosePublisher(Node):
         self.declare_parameter(
             'secondary_pose_topic', '/arm2/gripper_camera/stack_target_pose'
         )
-        self.declare_parameter('additional_marker_ids', [1, 4])
+        self.declare_parameter(
+            'additional_marker_ids', [1, 2, 3, 11, 12, 13, 14, 15, 16]
+        )
         self.declare_parameter(
             'additional_marker_frame_ids',
-            ['arm2/stack_target_marker_a2', 'arm2/stack_target_marker_a3'],
+            [
+                'arm2/container_marker_1',
+                'arm2/container_marker_2',
+                'arm2/container_marker_3',
+                'arm2/destination_marker_11',
+                'arm2/destination_marker_12',
+                'arm2/destination_marker_13',
+                'arm2/destination_marker_14',
+                'arm2/destination_marker_15',
+                'arm2/destination_marker_16',
+            ],
         )
-        self.declare_parameter('marker_size_m', 0.015)
+        self.declare_parameter('marker_size_m', 0.020)
         self.declare_parameter('dictionary', 'DICT_5X5_50')
         self.declare_parameter('max_reprojection_error_px', 3.0)
         self.declare_parameter('publish_annotated', True)

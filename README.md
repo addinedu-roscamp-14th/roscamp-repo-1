@@ -310,7 +310,7 @@ ros2 launch arm container_pick_moveit.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   video_device:=/dev/video4 \
   marker_id:=0 \
-  marker_size_m:=0.015 \
+  marker_size_m:=0.020 \
   serial_port:=/dev/ttyUSB0 \
   trajectory_speed:=100 \
   goal_correction_speed:=50 \
@@ -407,4 +407,3 @@ config/weights/best.pt
 ## Rule
 
 각 패키지에는 `README.md`를 두고, 해당 패키지의 노드 기능, 실행 방법, 주요 토픽을 간단하게 정리합니다.
-

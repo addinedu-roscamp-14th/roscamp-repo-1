@@ -1,6 +1,5 @@
 /arm2/arm2_jetcobot_trajectory_bridge:
   ros__parameters:
-    # 2026-07-28에 arm2 실기에서 읽은 현재 자세를 홈으로 사용합니다.
     home_joint_angles_deg:
     - 87.01
     - 55.54
@@ -18,7 +17,6 @@
     joint1_sweep_tolerance_deg: 3.5
     joint1_sweep_duration_sec: 20.0
     max_j6_trajectory_travel_deg: 150.0
-
 /arm2/arm2_container_pick_coordinator:
   ros__parameters:
     base_frame: arm2/base_link
@@ -29,23 +27,20 @@
     offsets_configured: true
     use_marker_rotation_for_grasp: false
     grasp_orientation_mode: marker_yaw
-    # 그리퍼 yaw만 컨테이너를 추종하고 XYZ 오프셋은 base_link 방향에 고정합니다.
     rotate_grasp_offset_with_marker_yaw: false
     grasp_offset_xyz_m:
-    - 0.014261
-    - -0.000085
-    - -0.062462
-    # arm2/base_link 기준 고정 보정. 컨테이너 yaw와 함께 회전하지 않습니다.
+    - 0.016138
+    - -0.00258
+    - -0.022765
     base_correction_xyz_m:
     - -0.03
     - 0.03
     - 0.0
     grasp_offset_rpy_deg:
-    - -180.0
-    - 0.0
-    - -94.071
-    reference_marker_yaw_deg: 2.349
-    # 직사각형 컨테이너와 그리퍼는 180도 회전을 같은 파지 자세로 취급합니다.
+    - -176.745
+    - 12.171
+    - 92.222
+    reference_marker_yaw_deg: 2.257
     container_yaw_symmetry_deg: 180.0
     prefer_current_gripper_yaw: true
     max_yaw_spread_deg: 12.0
@@ -86,26 +81,26 @@
     max_marker_age_sec: 3.0
     stabilization_timeout_sec: 20.0
     workspace_min_xyz_m:
-    - -0.30
-    - -0.30
+    - -0.3
+    - -0.3
     - -0.025
     workspace_max_xyz_m:
-    - 0.30
-    - 0.30
+    - 0.3
+    - 0.3
     - 0.3
     workspace_xy_shape: inverted_l
     workspace_horizontal_min_xy_m:
-    - -0.30
-    - -0.30
+    - -0.3
+    - -0.3
     workspace_horizontal_max_xy_m:
-    - 0.30
+    - 0.3
     - 0.0
     workspace_vertical_min_xy_m:
     - -0.06
-    - -0.30
+    - -0.3
     workspace_vertical_max_xy_m:
-    - 0.30
-    - 0.30
+    - 0.3
+    - 0.3
     max_joint_delta_deg: 60.0
     serial_port: /dev/jetcobot
     baud_rate: 1000000

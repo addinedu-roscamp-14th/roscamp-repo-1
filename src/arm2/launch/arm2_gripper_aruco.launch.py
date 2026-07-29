@@ -35,7 +35,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
         DeclareLaunchArgument('secondary_marker_id', default_value='-1'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
             'marker_frame_id', default_value='arm2/container_marker'
@@ -90,10 +90,17 @@ def generate_launch_description():
             'secondary_marker_frame_id': LaunchConfiguration(
                 'secondary_marker_frame_id'
             ),
-            'additional_marker_ids': [1, 4],
+            'additional_marker_ids': [1, 2, 3, 11, 12, 13, 14, 15, 16],
             'additional_marker_frame_ids': [
-                'arm2/stack_target_marker_a2',
-                'arm2/stack_target_marker_a3',
+                'arm2/container_marker_1',
+                'arm2/container_marker_2',
+                'arm2/container_marker_3',
+                'arm2/destination_marker_11',
+                'arm2/destination_marker_12',
+                'arm2/destination_marker_13',
+                'arm2/destination_marker_14',
+                'arm2/destination_marker_15',
+                'arm2/destination_marker_16',
             ],
             'use_node_time_for_pose': ParameterValue(
                 LaunchConfiguration('use_node_time_for_pose'),

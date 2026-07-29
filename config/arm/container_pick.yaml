@@ -11,7 +11,7 @@
     use_marker_rotation_for_grasp: false
     grasp_orientation_mode: marker_yaw
 
-    # Fixed-base grasp taught with an aligned container. The 15 mm marker
+    # Fixed-base grasp taught with an aligned container. The 20 mm marker
     # supplies XYZ only because its planar rotation estimate is unstable.
     # Stop 10 mm above the previous grasp target.
     grasp_offset_xyz_m: [-0.014261, -0.010785, -0.032462]

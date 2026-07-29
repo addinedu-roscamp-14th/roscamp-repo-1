@@ -23,7 +23,7 @@ def generate_launch_description():
             default_value='config/arm/gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('calibration_name', default_value='jetcobot_eye_in_hand'),
         DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('execute_motion', default_value='false'),

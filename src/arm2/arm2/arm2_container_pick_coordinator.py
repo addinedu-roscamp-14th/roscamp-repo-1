@@ -9,8 +9,8 @@ import time
 from geometry_msgs.msg import PoseStamped
 import numpy as np
 from pymycobot.mycobot280 import MyCobot280
-import rclpy
 from rcl_interfaces.msg import SetParametersResult
+import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import (
@@ -663,27 +663,45 @@ class ContainerPickCoordinator(Node):
         self.stack_target_history = deque(
             maxlen=max(100, self.minimum_samples * 3)
         )
+        self.source_frames = {
+            0: self.marker_frame,
+            1: 'arm2/container_marker_1',
+            2: 'arm2/container_marker_2',
+            3: 'arm2/container_marker_3',
+        }
+        self.destination_ids = {
+            'A-1': (11, 12),
+            'A-2': (13, 14),
+            'A-3': (15, 16),
+        }
         self.destination_frames = {
-            'A-1': self.stack_target_frame,
-            'A-2': 'arm2/stack_target_marker_a2',
-            'A-3': 'arm2/stack_target_marker_a3',
+            marker_id: f'arm2/destination_marker_{marker_id}'
+            for marker_ids in self.destination_ids.values()
+            for marker_id in marker_ids
         }
-        self.destination_histories = {
-            'A-1': self.stack_target_history,
-            'A-2': deque(maxlen=max(100, self.minimum_samples * 3)),
-            'A-3': deque(maxlen=max(100, self.minimum_samples * 3)),
+        tracked_frames = {
+            **self.source_frames,
+            **self.destination_frames,
         }
-        self.destination_stamp_attributes = {
-            'A-1': 'last_stack_target_stamp',
-            'A-2': 'last_stack_target_a2_stamp',
-            'A-3': 'last_stack_target_a3_stamp',
+        history_size = max(100, self.minimum_samples * 3)
+        self.marker_histories = {
+            marker_id: (
+                self.history if marker_id == 0 else deque(maxlen=history_size)
+            )
+            for marker_id in tracked_frames
         }
+        self.marker_stamp_attributes = {}
+        for marker_id in tracked_frames:
+            attribute = f'last_marker_{marker_id}_stamp'
+            self.marker_stamp_attributes[marker_id] = attribute
+            setattr(self, attribute, None)
         self.history_lock = threading.Lock()
         self.last_transform_stamp = None
         self.last_stack_target_stamp = None
         self.last_stack_target_a2_stamp = None
         self.last_stack_target_a3_stamp = None
         self.saved_destination_poses = {}
+        self.saved_marker_poses = {}
         self.saved_destination_stack_counts = {
             'A-1': 0,
             'A-2': 0,
@@ -1100,31 +1118,32 @@ class ContainerPickCoordinator(Node):
         ):
             return
 
-        self._collect_marker_sample(
-            self.marker_frame,
-            self.history,
-            'last_transform_stamp',
-            self.marker_pose_publisher,
-            'source',
-        )
-        self._collect_marker_sample(
-            self.stack_target_frame,
-            self.stack_target_history,
-            'last_stack_target_stamp',
-            self.stack_target_pose_publisher,
-            'stack target',
-        )
-        for destination_name in ('A-2', 'A-3'):
+        for marker_id, frame in self.source_frames.items():
             self._collect_marker_sample(
-                self.destination_frames[destination_name],
-                self.destination_histories[destination_name],
-                self.destination_stamp_attributes[destination_name],
+                frame,
+                self.marker_histories[marker_id],
+                self.marker_stamp_attributes[marker_id],
+                self.marker_pose_publisher,
+                f'container ID {marker_id}',
+                warn_if_missing=False,
+            )
+        for marker_id, frame in self.destination_frames.items():
+            self._collect_marker_sample(
+                frame,
+                self.marker_histories[marker_id],
+                self.marker_stamp_attributes[marker_id],
                 self.stack_target_pose_publisher,
-                destination_name,
+                f'destination ID {marker_id}',
             )
 
     def _collect_marker_sample(
-        self, frame, history, stamp_attribute, publisher, label
+        self,
+        frame,
+        history,
+        stamp_attribute,
+        publisher,
+        label,
+        warn_if_missing=True,
     ):
         with self.history_lock:
             if frame in self.scan_locked_frames:
@@ -1134,6 +1153,8 @@ class ContainerPickCoordinator(Node):
                 self.base_frame, frame, Time()
             )
         except TransformException as exc:
+            if not warn_if_missing:
+                return
             error = str(exc)
             error_key = (
                 'marker transform is older than the robot TF buffer'
@@ -1655,7 +1676,7 @@ class ContainerPickCoordinator(Node):
         self.execute_stack(targets)
 
     def start_scan_and_transfer(self, _request, response):
-        """Start scanning for ID 7/9 and transfer the ID 7 container."""
+        """Start legacy scanning for primary container ID 0 and A-1 ID 11."""
         if not self.execute_motion or self.motion_backend != 'moveit':
             response.success = False
             response.message = 'Scan transfer requires MoveIt execution'
@@ -1683,7 +1704,7 @@ class ContainerPickCoordinator(Node):
         )
         self.motion_thread.start()
         response.success = True
-        response.message = 'Scanning for ID 7 and ID 9 started'
+        response.message = 'Scanning for container ID 0 and A-1 ID 11 started'
         return response
 
     def start_destination_scan(self, _request, response):
@@ -1703,32 +1724,39 @@ class ContainerPickCoordinator(Node):
         )
         self.motion_thread.start()
         response.success = True
-        response.message = 'Scanning ID 9, ID 1, and ID 4 destinations'
+        response.message = 'Scanning destination IDs 11-16'
         return response
 
     def execute_destination_scan(self):
         try:
-            specs = (
-                ('ID 9 / A-1', self.destination_frames['A-1'],
-                 self.destination_histories['A-1']),
-                ('ID 1 / A-2', self.destination_frames['A-2'],
-                 self.destination_histories['A-2']),
-                ('ID 4 / A-3', self.destination_frames['A-3'],
-                 self.destination_histories['A-3']),
+            destination_marker_ids = tuple(range(11, 17))
+            specs = tuple(
+                (
+                    f'ID {marker_id}',
+                    self.destination_frames[marker_id],
+                    self.marker_histories[marker_id],
+                )
+                for marker_id in destination_marker_ids
             )
             self.saved_destination_poses.clear()
+            self.saved_marker_poses.clear()
             locked, reason = self._scan_named_markers(specs)
             if locked is None:
                 self.publish_status(f'DESTINATION SCAN FAILED: {reason}')
                 return
-            self.saved_destination_poses = dict(zip(
-                ('A-1', 'A-2', 'A-3'), locked
-            ))
+            for marker_id, pose in zip(destination_marker_ids, locked[:6]):
+                self.saved_marker_poses[marker_id] = pose
+            # Preserve the existing A-1/A-2/A-3 transfer behavior by using
+            # the first marker in each area's pair as its placement target.
+            self.saved_destination_poses = {
+                name: self.saved_marker_poses[marker_ids[0]]
+                for name, marker_ids in self.destination_ids.items()
+            }
             with self.stack_level_lock:
                 for name in self.saved_destination_stack_counts:
                     self.saved_destination_stack_counts[name] = 0
             self.publish_status(
-                'DESTINATION SCAN: A-1, A-2, A-3 saved; returning home'
+                'DESTINATION SCAN: IDs 11-16 saved; returning home'
             )
             self._call_scan_service(
                 self.return_home_client,
@@ -1742,13 +1770,14 @@ class ContainerPickCoordinator(Node):
             self._recover_home_after_failure('DESTINATION SCAN')
             return
         self.publish_status(
-            'DESTINATION SCAN COMPLETED: ID 9=A-1, ID 1=A-2, ID 4=A-3'
+            'DESTINATION SCAN COMPLETED: A-1=11/12, A-2=13/14, '
+            'A-3=15/16'
         )
 
     def start_saved_destination_transfer(
         self, _request, response, destination_name
     ):
-        """Scan ID 7 and transfer it to one previously saved destination."""
+        """Scan one container ID 0-3 and transfer it to a saved destination."""
         if not self.execute_motion or self.motion_backend != 'moveit':
             response.success = False
             response.message = 'Saved transfer requires MoveIt execution'
@@ -1788,27 +1817,44 @@ class ContainerPickCoordinator(Node):
         self.motion_thread.start()
         response.success = True
         response.message = (
-            f'Scanning ID 7 for transfer to {destination_name}'
+            f'Scanning container ID 0-3 for transfer to {destination_name}'
         )
         return response
 
     def execute_saved_destination_transfer(self, destination_name):
         try:
-            specs = (('ID 7', self.marker_frame, self.history),)
-            locked, reason = self._scan_named_markers(specs)
+            specs = tuple(
+                (
+                    f'container ID {marker_id}',
+                    frame,
+                    self.marker_histories[marker_id],
+                )
+                for marker_id, frame in self.source_frames.items()
+            )
+            locked, reason = self._scan_named_markers(
+                specs,
+                required_count=len(specs),
+                minimum_required_locks=1,
+                accept_initial_pose=True,
+            )
             if locked is None:
                 self.publish_status(
                     f'{destination_name} TRANSFER FAILED: {reason}'
                 )
                 return
+            source_marker_id, source_pose = next(
+                (marker_id, pose)
+                for marker_id, pose in zip(self.source_frames, locked)
+                if pose is not None
+            )
             source_targets, reason = self.calculate_targets_from_marker_pose(
-                locked[0],
+                source_pose,
                 orientation_mode=self.stack_source_orientation_mode,
             )
             if source_targets is None:
                 self.publish_status(
                     f'{destination_name} TRANSFER FAILED: '
-                    f'ID 7 target: {reason}'
+                    f'container ID {source_marker_id} target: {reason}'
                 )
                 self._recover_home_after_failure(destination_name)
                 return
@@ -1842,8 +1888,64 @@ class ContainerPickCoordinator(Node):
             )
             self._recover_home_after_failure(destination_name)
 
-    def _scan_named_markers(self, specs):
+    def _scan_named_markers(
+        self,
+        specs,
+        required_count=None,
+        minimum_required_locks=None,
+        accept_initial_pose=False,
+    ):
         """Sweep J1 until every named marker has a stationary locked pose."""
+        if required_count is None:
+            required_count = len(specs)
+        if not 1 <= required_count <= len(specs):
+            raise ValueError('required_count must select at least one spec')
+        if minimum_required_locks is None:
+            minimum_required_locks = required_count
+        if not 1 <= minimum_required_locks <= required_count:
+            raise ValueError(
+                'minimum_required_locks must be within required specs'
+            )
+
+        def scan_complete():
+            return sum(
+                pose is not None for pose in locked[:required_count]
+            ) >= minimum_required_locks
+
+        locked = [None] * len(specs)
+        if accept_initial_pose:
+            with self.history_lock:
+                for _label, frame, history in specs:
+                    history.clear()
+                    self.scan_locked_frames.discard(frame)
+            initial_deadline = time.monotonic() + self.scan_marker_pause + 2.0
+            last_reason = 'no marker samples'
+            while time.monotonic() < initial_deadline:
+                for index, (label, frame, history) in enumerate(specs):
+                    pose, last_reason = self.stable_marker_pose(
+                        history=history,
+                        yaw_only=True,
+                    )
+                    if pose is None:
+                        continue
+                    locked[index] = (
+                        np.array(pose[0], dtype=np.float64),
+                        np.array(pose[1], dtype=np.float64),
+                    )
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'INITIAL VIEW: {label} position saved; '
+                        'skipping J1 scan'
+                    )
+                    return tuple(locked), 'initial marker locked'
+                if self.stop_event.wait(0.05):
+                    return None, 'scan stopped'
+            self.publish_status(
+                'INITIAL VIEW: no stable container visible; starting J1 scan '
+                f'({last_reason})'
+            )
+
         clients = (
             self.sweep_joint1_client,
             self.pause_sweep_client,
@@ -1860,12 +1962,9 @@ class ContainerPickCoordinator(Node):
             for _label, frame, history in specs:
                 history.clear()
                 self.scan_locked_frames.discard(frame)
-        locked = [None] * len(specs)
         deadline = time.monotonic() + self.scan_timeout
         pass_number = 0
-        while time.monotonic() < deadline and not all(
-            pose is not None for pose in locked
-        ):
+        while time.monotonic() < deadline and not scan_complete():
             pass_number += 1
             missing = ', '.join(
                 label for (label, _frame, _history), pose
@@ -1913,7 +2012,7 @@ class ContainerPickCoordinator(Node):
                     self.publish_status(
                         f'SCAN: {label} lock retry: {reason}'
                     )
-                if all(pose is not None for pose in locked):
+                if scan_complete():
                     self._call_scan_service(
                         self.stop_robot_client,
                         'stop completed scan',
@@ -1936,11 +2035,12 @@ class ContainerPickCoordinator(Node):
                 message = 'no response' if result is None else result.message
                 self._return_home_after_failed_scan()
                 return None, f'J1 scan failed: {message}'
-        if not all(pose is not None for pose in locked):
+        if not scan_complete():
             self._return_home_after_failed_scan()
             missing = ', '.join(
                 label for (label, _frame, _history), pose
-                in zip(specs, locked) if pose is None
+                in zip(specs[:required_count], locked[:required_count])
+                if pose is None
             )
             return None, (
                 f'{self.scan_timeout:.0f}s scan ended before detecting '
@@ -1998,7 +2098,7 @@ class ContainerPickCoordinator(Node):
         return response
 
     def execute_scan_and_transfer(self):
-        """Scan, lock both markers, transfer ID 7 to ID 9, and go home."""
+        """Scan and transfer primary container ID 0 to A-1 ID 11."""
         try:
             locked, reason = self.scan_and_lock_marker_poses()
             if locked is None:
@@ -2011,7 +2111,7 @@ class ContainerPickCoordinator(Node):
             )
             if source_targets is None:
                 self.publish_status(
-                    f'SCAN TRANSFER FAILED: ID 7 target: {reason}'
+                    f'SCAN TRANSFER FAILED: ID 0 target: {reason}'
                 )
                 self._recover_home_after_failure('SCAN TRANSFER')
                 return
@@ -2049,7 +2149,7 @@ class ContainerPickCoordinator(Node):
             self.scan_locked_frames.clear()
         locked = [None, None]
         histories = (self.history, self.stack_target_history)
-        labels = ('ID 7', 'ID 9')
+        labels = ('ID 0', 'ID 11')
         scan_deadline = time.monotonic() + self.scan_timeout
         scan_error = None
         pass_number = 0
@@ -2059,7 +2159,7 @@ class ContainerPickCoordinator(Node):
         ):
             pass_number += 1
             self.publish_status(
-                f'SCAN: J1 pass {pass_number} for missing ID 7/ID 9'
+                f'SCAN: J1 pass {pass_number} for missing ID 0/ID 11'
             )
             sweep_future = self.sweep_joint1_client.call_async(
                 Trigger.Request()
@@ -2102,7 +2202,7 @@ class ContainerPickCoordinator(Node):
                     )
                 if all(value is not None for value in locked):
                     self.publish_status(
-                        'SCAN: ID 7 and ID 9 saved; stopping scan'
+                        'SCAN: ID 0 and ID 11 saved; stopping scan'
                     )
                     self.stop_robot_client.call_async(Trigger.Request())
                     break
@@ -2456,13 +2556,13 @@ class ContainerPickCoordinator(Node):
         count_stack=True,
         saved_stack_name=None,
     ):
-        """Move scan-locked ID 7 to one locked destination, then go home."""
+        """Move a scan-locked container to one locked destination."""
         if not self.motion_lock.acquire(blocking=False):
             return
         self.tracking_suspended.set()
         try:
             source_targets, release, approach = targets
-            self.publish_status('TRANSFER: moving from scan pose to ID 7')
+            self.publish_status('TRANSFER: moving to saved container pose')
             self.publish_pick_target('TRANSFER', source_targets[0])
             self._perform_pick(
                 copy.deepcopy(source_targets),
@@ -2476,7 +2576,7 @@ class ContainerPickCoordinator(Node):
                 release.pose.orientation.w,
             ])[2]
             self.publish_status(
-                f'TRANSFER: ID 7 picked; moving to saved {destination_name}: '
+                f'TRANSFER: container picked; moving to {destination_name}: '
                 f'tcp_yaw={destination_yaw:.2f}deg'
             )
             approach = self.move_to_reachable_stack_approach(
@@ -2518,7 +2618,7 @@ class ContainerPickCoordinator(Node):
             self.publish_status('TRANSFER: returning to final home')
             self.command_return_home()
             self.publish_status(
-                f'TRANSFER: ID 7 to {destination_name} completed'
+                f'TRANSFER: container to {destination_name} completed'
             )
         except Exception as exc:
             self.stop_event.set()

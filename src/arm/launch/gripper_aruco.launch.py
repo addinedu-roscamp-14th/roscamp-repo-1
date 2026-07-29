@@ -35,7 +35,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
         DeclareLaunchArgument('secondary_marker_id', default_value='-1'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
             'marker_frame_id', default_value='arm/container_marker'

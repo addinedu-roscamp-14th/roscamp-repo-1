@@ -22,7 +22,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
         DeclareLaunchArgument('stack_marker_id', default_value='1'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('baud_rate', default_value='1000000'),
         DeclareLaunchArgument('trajectory_speed', default_value='100'),

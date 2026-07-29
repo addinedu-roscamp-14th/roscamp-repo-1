@@ -279,7 +279,7 @@ def test_base_frame_correction_does_not_rotate_with_marker_yaw():
 
 
 def test_runtime_tuning_vector_rejects_unsafe_values():
-    """RQt tuning must reject malformed and metre-scale offset mistakes."""
+    """Runtime tuning must reject malformed and metre-scale offset mistakes."""
     valid = ContainerPickCoordinator._validated_tuning_vector(
         'grasp_offset_xyz_m',
         [0.006, -0.01, -0.04],

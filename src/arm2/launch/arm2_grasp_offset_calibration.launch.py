@@ -21,7 +21,7 @@ def generate_launch_description():
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
             'calibration_name',

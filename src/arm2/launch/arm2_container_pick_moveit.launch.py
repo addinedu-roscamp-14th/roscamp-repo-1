@@ -39,8 +39,8 @@ def generate_launch_description():
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('stack_marker_id', default_value='9'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('stack_marker_id', default_value='11'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument(
             'stack_container_height_m', default_value='0.035'
         ),

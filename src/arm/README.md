@@ -225,7 +225,7 @@ ros2 launch arm handeye_charuco_calibration.launch.py \
 검출 영상은 `/arm/gripper_camera/charuco_annotated`, pose는
 `/arm/gripper_camera/charuco_pose`에서 확인합니다. 보드를 고정한 상태에서 서로 다른
 위치와 Roll/Pitch/Yaw 자세를 20~30개 수집한 뒤 계산하고 저장합니다. 컨테이너 추적에는
-이 보드 설정이 아니라 기존 `DICT_5X5_50`, ID 0, 15 mm 단일 마커를 계속 사용합니다.
+이 보드 설정이 아니라 `DICT_5X5_50`, ID 0, 20 mm 단일 마커를 사용합니다.
 annotated 영상의 `DETECT markers=N corners=N`과 `POSE OK`로 상태를 확인합니다.
 마커는 검출되지만 `corners=0`이면 출력 보드와 `legacy_pattern` 설정이 서로 다른지
 확인합니다. CPU 부하가 크면 `detection_rate_hz:=3.0`으로 낮춰도 샘플 수집에는
@@ -263,7 +263,7 @@ arm/gripper_camera_optical_frame -> arm/container_marker
 ros2 launch arm gripper_aruco.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   marker_id:=0 \
-  marker_size_m:=0.015 \
+  marker_size_m:=0.020 \
   marker_frame_id:=arm/container_marker
 
 ros2 run tf2_ros tf2_echo arm/base_link arm/container_marker
@@ -271,7 +271,7 @@ ros2 run tf2_ros tf2_echo arm/base_link arm/container_marker
 
 ## 5. 컨테이너 추적과 Pick dry-run
 
-컨테이너의 `DICT_5X5_50`, ID `0`, 검은 사각형 한 변 `15 mm` 마커를 추적합니다.
+컨테이너의 `DICT_5X5_50`, ID `0`, 검은 사각형 한 변 `20 mm` 마커를 추적합니다.
 처음에는 로봇을 움직이지 않고 계산된 목표만 확인합니다. 다른 카메라 및 로봇 시리얼
 노드는 모두 종료한 뒤 실행합니다.
 
@@ -279,7 +279,7 @@ ros2 run tf2_ros tf2_echo arm/base_link arm/container_marker
 ros2 launch arm container_pick.launch.py \
   camera_info_url:=config/arm/gripper_camera_info.yaml \
   marker_id:=0 \
-  marker_size_m:=0.015 \
+  marker_size_m:=0.020 \
   execute_motion:=false
 ```
 
@@ -306,7 +306,7 @@ ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
 현재 grasp 오프셋은 수동으로 가르친 파지 자세의 초기 측정값입니다. dry-run에서는
 시각화를 위해 작업공간 밖 pose도 발행하지만 실제 실행에서는 반드시 작업공간 검사를
 통과해야 합니다.
-15 mm 단일 마커의 회전값은 흔들릴 수 있어 dry-run은 회전 spread를 `30도`까지,
+20 mm 단일 마커의 회전값은 흔들릴 수 있어 dry-run은 회전 spread를 `30도`까지,
 실제 실행은 `15도`까지 허용합니다.
 
 인터페이스:
@@ -330,7 +330,7 @@ ros2 service call /arm/pick_container std_srvs/srv/Trigger '{}'
 config/arm/container_pick.yaml
 ```
 
-현재 15 mm 단일 마커는 위치는 안정적이지만 평면 회전값이 흔들리므로, 정렬된
+현재 20 mm 단일 마커는 위치는 안정적이지만 평면 회전값이 흔들리므로, 정렬된
 컨테이너를 전제로 마커 XYZ에 base 좌표계 오프셋을 더하고 수동으로 가르친 고정 TCP
 방향을 사용합니다. 실제 모터 명령은 `execute_motion:=true`를 명시해야만 활성화됩니다.
 
@@ -446,7 +446,7 @@ ros2 launch arm container_pick_moveit.launch.py \
   calibration_name:=jetcobot_eye_in_hand \
   use_node_time_for_pose:=true \
   marker_id:=0 \
-  marker_size_m:=0.015 \
+  marker_size_m:=0.020 \
   serial_port:=/dev/ttyUSB0 \
   trajectory_speed:=100 \
   goal_correction_speed:=100 \
@@ -462,7 +462,7 @@ ros2 launch arm container_pick_moveit.launch.py \
   calibration_name:=jetcobot_eye_in_hand_charuco \
   marker_id:=0 \
   stack_marker_id:=1 \
-  marker_size_m:=0.015 \
+  marker_size_m:=0.020 \
   stack_container_height_m:=0.035 \
   serial_port:=/dev/ttyUSB0 \
   trajectory_speed:=100 \
@@ -503,7 +503,7 @@ ros2 launch arm container_pick_hardware.launch.py \
   video_device:=/dev/video4 \
   use_node_time_for_pose:=true \
   marker_id:=0 \
-  marker_size_m:=0.015 \
+  marker_size_m:=0.020 \
   serial_port:=/dev/ttyUSB0 \
   baud_rate:=1000000 \
   trajectory_speed:=100 \

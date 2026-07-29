@@ -87,7 +87,7 @@ class ArucoPosePublisher(Node):
         self.declare_parameter(
             'secondary_pose_topic', '/arm/gripper_camera/stack_target_pose'
         )
-        self.declare_parameter('marker_size_m', 0.015)
+        self.declare_parameter('marker_size_m', 0.020)
         self.declare_parameter('dictionary', 'DICT_5X5_50')
         self.declare_parameter('max_reprojection_error_px', 3.0)
         self.declare_parameter('publish_annotated', True)
