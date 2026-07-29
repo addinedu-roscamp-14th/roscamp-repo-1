@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 import math
 import threading
@@ -20,8 +21,15 @@ from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalRespons
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from std_msgs.msg import Float32, String
 from std_srvs.srv import SetBool, Trigger
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 @dataclass
@@ -55,6 +63,7 @@ class FleetDispatcher(Node):
         self.declare_parameter('telemetry_timeout_sec', 3.0)
         self.declare_parameter('state_publish_rate_hz', 2.0)
         self.declare_parameter('b1_zone_id', 'B-1')
+        self.declare_parameter('subscribe_odom_fallback', False)
 
         vehicle_ids = [
             str(value).strip('/')
@@ -66,6 +75,9 @@ class FleetDispatcher(Node):
             self.get_parameter('telemetry_timeout_sec').value
         )
         self.b1_zone_id = str(self.get_parameter('b1_zone_id').value)
+        self.subscribe_odom_fallback = bool(
+            self.get_parameter('subscribe_odom_fallback').value
+        )
         self.callback_group = ReentrantCallbackGroup()
         self._lock = threading.RLock()
         self._zone_condition = threading.Condition(self._lock)
@@ -116,6 +128,9 @@ class FleetDispatcher(Node):
         self.zone_publisher = self.create_publisher(
             String, '/central/fleet/zones', 10
         )
+        self.marker_publisher = self.create_publisher(
+            MarkerArray, '/central/fleet/vehicle_markers', 10
+        )
         self.create_service(
             SetBool,
             '/central/fleet/emergency_stop',
@@ -144,27 +159,34 @@ class FleetDispatcher(Node):
         )
 
     def _create_vehicle_subscriptions(self, vehicle_id):
+        telemetry_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.create_subscription(
             PoseWithCovarianceStamped,
             f'/{vehicle_id}/amcl_pose',
             lambda message, vid=vehicle_id: self._on_amcl_pose(vid, message),
-            10,
+            telemetry_qos,
             callback_group=self.callback_group,
         )
-        self.create_subscription(
-            Odometry,
-            f'/{vehicle_id}/odom',
-            lambda message, vid=vehicle_id: self._on_odom(vid, message),
-            10,
-            callback_group=self.callback_group,
-        )
+        if self.subscribe_odom_fallback:
+            self.create_subscription(
+                Odometry,
+                f'/{vehicle_id}/odom',
+                lambda message, vid=vehicle_id: self._on_odom(vid, message),
+                telemetry_qos,
+                callback_group=self.callback_group,
+            )
         self.create_subscription(
             Float32,
             f'/{vehicle_id}/battery/percent',
             lambda message, vid=vehicle_id: self._on_battery(
                 vid, 'battery_percent', message
             ),
-            10,
+            telemetry_qos,
             callback_group=self.callback_group,
         )
         self.create_subscription(
@@ -173,7 +195,7 @@ class FleetDispatcher(Node):
             lambda message, vid=vehicle_id: self._on_battery(
                 vid, 'battery_voltage', message
             ),
-            10,
+            telemetry_qos,
             callback_group=self.callback_group,
         )
 
@@ -504,8 +526,11 @@ class FleetDispatcher(Node):
 
     def _publish_states(self):
         now = time.monotonic()
+        markers = MarkerArray()
         with self._lock:
-            for vehicle_id, runtime in self.vehicles.items():
+            for marker_id, (vehicle_id, runtime) in enumerate(
+                self.vehicles.items()
+            ):
                 message = VehicleState()
                 message.header.stamp = self.get_clock().now().to_msg()
                 message.header.frame_id = 'map'
@@ -550,6 +575,15 @@ class FleetDispatcher(Node):
                 message.locked_zone = runtime.locked_zone
                 message.telemetry_age_sec = float(age)
                 self.state_publishers[vehicle_id].publish(message)
+                if runtime.has_amcl_pose:
+                    markers.markers.extend(
+                        self._vehicle_markers(
+                            marker_id,
+                            runtime,
+                            message.header.stamp,
+                            age <= self.telemetry_timeout,
+                        )
+                    )
             zone = String()
             zone.data = (
                 f'B-1:UNKNOWN:{self._b1_owner}'
@@ -557,6 +591,48 @@ class FleetDispatcher(Node):
                 else f'B-1:{self._b1_owner or "FREE"}'
             )
             self.zone_publisher.publish(zone)
+            self.marker_publisher.publish(markers)
+
+    @staticmethod
+    def _vehicle_markers(marker_id, runtime, stamp, online):
+        color = (
+            (0.90, 0.20, 0.16)
+            if runtime.vehicle_id == 'agv1'
+            else (0.12, 0.42, 0.92)
+        )
+        alpha = 1.0 if online else 0.35
+
+        body = Marker()
+        body.header.stamp = stamp
+        body.header.frame_id = 'map'
+        body.ns = 'fleet_vehicle'
+        body.id = marker_id * 2
+        body.type = Marker.CUBE
+        body.action = Marker.ADD
+        body.pose = copy.deepcopy(runtime.pose.pose)
+        body.pose.position.z = 0.04
+        body.scale.x = 0.34
+        body.scale.y = 0.14
+        body.scale.z = 0.08
+        body.color.r, body.color.g, body.color.b = color
+        body.color.a = alpha
+
+        label = Marker()
+        label.header = body.header
+        label.ns = 'fleet_vehicle_label'
+        label.id = marker_id * 2 + 1
+        label.type = Marker.TEXT_VIEW_FACING
+        label.action = Marker.ADD
+        label.pose.position = copy.deepcopy(runtime.pose.pose.position)
+        label.pose.position.z = 0.16
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.10
+        label.color.r = 1.0
+        label.color.g = 1.0
+        label.color.b = 1.0
+        label.color.a = alpha
+        label.text = runtime.vehicle_id.upper()
+        return body, label
 
 
 def main(args=None):

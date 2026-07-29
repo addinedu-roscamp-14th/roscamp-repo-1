@@ -19,12 +19,20 @@ porter_interfaces/msg/VehicleState
 
 /central/fleet/zones
 std_msgs/String
+
+/central/fleet/vehicle_markers
+visualization_msgs/MarkerArray
 ```
 
 AUTO 명령은 준비된 유휴 차량 중 목표와 가까운 차량을 선택하며 동률이면
 `agv1`을 선택합니다. `vehicle_id`가 지정되면 다른 차량으로 대체하지 않습니다.
 B-1은 한 차량만 점유할 수 있고, 통신이 끊기면 `UNKNOWN`으로 잠긴 상태를
 유지합니다.
+
+`fleet_dispatcher`는 무선 트래픽을 줄이기 위해 기본적으로 고주기
+`/<vehicle_id>/odom`을 구독하지 않고 `/<vehicle_id>/amcl_pose`만 사용합니다.
+초기 위치 설정 전 odom fallback이 꼭 필요할 때만
+`subscribe_odom_fallback:=true`로 실행합니다.
 
 ## `control_gateway`
 

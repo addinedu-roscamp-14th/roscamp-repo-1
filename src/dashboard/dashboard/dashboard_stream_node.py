@@ -8,6 +8,7 @@ import time
 
 import cv2
 from cv_bridge import CvBridge
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 import rclpy
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
@@ -75,6 +76,8 @@ class DashboardStreamNode(Node):
         self.declare_parameter('slam_map_topic', '/map')
         self.declare_parameter('slam_base_frame', 'base_footprint')
         self.declare_parameter('slam_scan_topic', '/scan')
+        self.declare_parameter('slam_pose_topic', '')
+        self.declare_parameter('slam_enable_scan', True)
         self.declare_parameter('slam_scan_max_age_sec', 0.5)
         self.declare_parameter('slam_live_fps', 15.0)
         self.declare_parameter('slam_output_width', 720)
@@ -108,6 +111,12 @@ class DashboardStreamNode(Node):
         self.slam_scan_topic = str(
             self.get_parameter('slam_scan_topic').value
         )
+        self.slam_pose_topic = str(
+            self.get_parameter('slam_pose_topic').value
+        )
+        self.slam_enable_scan = bool(
+            self.get_parameter('slam_enable_scan').value
+        )
         self.slam_scan_max_age = float(
             self.get_parameter('slam_scan_max_age_sec').value
         )
@@ -128,6 +137,7 @@ class DashboardStreamNode(Node):
         self.slam_jpegs = LatestJpegStore()
         self.maps = LatestFrameStore()
         self.scans = LatestFrameStore()
+        self.poses = LatestFrameStore()
         self.detection_lock = threading.Lock()
         self.latest_detection = None
         self.detection_received_at = 0.0
@@ -148,8 +158,11 @@ class DashboardStreamNode(Node):
         self.slam_map_encoded_at = 0.0
         self.slam_map_encode_duration_ms = 0.0
         self.slam_state_lock = threading.Lock()
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_buffer = None
+        self.tf_listener = None
+        if not self.slam_pose_topic or self.slam_enable_scan:
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
         self.encoder_thread = threading.Thread(
             target=self._encode_frames,
             name='dashboard-jpeg-encoder',
@@ -202,12 +215,22 @@ class DashboardStreamNode(Node):
             depth=1,
             durability=DurabilityPolicy.VOLATILE,
         )
-        self.scan_subscription = self.create_subscription(
-            LaserScan,
-            self.slam_scan_topic,
-            self._on_scan,
-            scan_qos,
-        )
+        self.pose_subscription = None
+        if self.slam_pose_topic:
+            self.pose_subscription = self.create_subscription(
+                PoseWithCovarianceStamped,
+                self.slam_pose_topic,
+                self._on_pose,
+                scan_qos,
+            )
+        self.scan_subscription = None
+        if self.slam_enable_scan:
+            self.scan_subscription = self.create_subscription(
+                LaserScan,
+                self.slam_scan_topic,
+                self._on_scan,
+                scan_qos,
+            )
         self.encoder_thread.start()
         self.slam_encoder_thread.start()
         self.slam_stream_thread.start()
@@ -219,7 +242,9 @@ class DashboardStreamNode(Node):
         )
         self.get_logger().info(
             f'SLAM stream input={self.slam_map_topic}, '
-            f'scan={self.slam_scan_topic}, '
+            f'pose={self.slam_pose_topic or "TF"}, '
+            f'scan={self.slam_scan_topic if self.slam_enable_scan else "off"},'
+            ' '
             f'base_frame={self.slam_base_frame}, '
             f'mjpeg_fps={self.slam_live_fps:.1f}'
         )
@@ -266,6 +291,9 @@ class DashboardStreamNode(Node):
 
     def _on_scan(self, message):
         self.scans.put(message)
+
+    def _on_pose(self, message):
+        self.poses.put(message)
 
     def _encode_frames(self):
         interval = 1.0 / self.web_fps
@@ -396,16 +424,27 @@ class DashboardStreamNode(Node):
             robot_visible = False
             tf_error = ''
             try:
-                transform = self.tf_buffer.lookup_transform(
-                    map_frame,
-                    self.slam_base_frame,
-                    Time(),
-                )
-                translation = transform.transform.translation
-                rotation = transform.transform.rotation
-                world_x = float(translation.x)
-                world_y = float(translation.y)
-                world_yaw = quaternion_to_yaw(rotation)
+                pose_snapshot = self.poses.latest()
+                if pose_snapshot is not None:
+                    pose = pose_snapshot.message.pose.pose
+                    world_x = float(pose.position.x)
+                    world_y = float(pose.position.y)
+                    world_yaw = quaternion_to_yaw(pose.orientation)
+                elif self.tf_buffer is not None:
+                    transform = self.tf_buffer.lookup_transform(
+                        map_frame,
+                        self.slam_base_frame,
+                        Time(),
+                    )
+                    translation = transform.transform.translation
+                    rotation = transform.transform.rotation
+                    world_x = float(translation.x)
+                    world_y = float(translation.y)
+                    world_yaw = quaternion_to_yaw(rotation)
+                else:
+                    raise RuntimeError(
+                        f'waiting for pose on {self.slam_pose_topic}'
+                    )
                 robot_visible = draw_robot_pose(
                     frame,
                     layout,
@@ -424,12 +463,12 @@ class DashboardStreamNode(Node):
                     2,
                     cv2.LINE_AA,
                 )
-            except TransformException as exc:
+            except (TransformException, RuntimeError) as exc:
                 tf_error = str(exc)
 
             scan_points = 0
             scan_tf_error = ''
-            scan = self.scans.latest()
+            scan = self.scans.latest() if self.slam_enable_scan else None
             if (
                 scan is not None
                 and time.monotonic() - scan.received_at

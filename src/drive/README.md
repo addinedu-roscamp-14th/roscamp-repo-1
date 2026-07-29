@@ -26,9 +26,9 @@ map -> agv1/odom -> agv1/base_footprint -> agv1/base_link
 Nav2의 최종 속도는 `/<vehicle_id>/cmd_vel_safe_input`으로 전달되어 Pinky 안전
 게이트를 거칩니다.
 
-노트북에서 Nav2를 실행하고 중앙 관제의 map 목표 자세를 핑키 차량의 주행으로 연결하는
-패키지입니다. Nav2 localization/navigation launch, 파라미터, Behavior Tree와 RViz 설정을
-포함합니다.
+Nav2 localization/navigation launch, 파라미터, Behavior Tree와 RViz 설정을
+제공하는 패키지입니다. 다중 차량 모드에서는 각 차량 컴퓨터에서 namespaced Nav2를
+실행하고 중앙 관제는 차량별 Nav2 action으로 목표만 전달합니다.
 
 ## 구성
 
@@ -137,7 +137,11 @@ source install/setup.bash
 source ~/poter_ws/install/setup.bash
 ```
 
-## 전체 실행 순서
+## 단일 차량 호환 실행 순서
+
+아래 절차는 기존 단일 차량에서 Nav2를 노트북에 두는 호환 모드입니다. `agv1`,
+`agv2` 다중 차량 운용에서는 `porter_bringup agv_vehicle.launch.py`가 각 차량의
+Nav2까지 실행하므로 아래 노트북 Nav2 명령을 함께 실행하지 않습니다.
 
 ### 1. 차량 하드웨어 실행
 

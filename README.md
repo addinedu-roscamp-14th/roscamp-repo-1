@@ -45,9 +45,10 @@ source install/setup.bash
 source install/setup.bash
 ```
 
-### 1. 차량 하드웨어 실행
+### 1. 차량 하드웨어와 Nav2 실행
 
-핑키에서 센서, odometry와 모터 제어만 실행합니다. 차량에서는 Nav2를 실행하지 않습니다.
+다중 차량 모드에서는 각 핑키에서 센서, odometry, 모터 제어, AMCL과 Nav2를
+함께 실행합니다. 중앙 노트북은 차량별 Nav2 action으로 목표만 전달합니다.
 
 ```bash
 # AGV1
@@ -72,9 +73,13 @@ b: 255}"
 노트북에서 차량 데이터가 들어오는지 확인합니다.
 
 ```bash
-ros2 topic hz /scan
-ros2 topic hz /odom
-ros2 run tf2_ros tf2_echo odom base_footprint
+ros2 topic hz /agv1/scan
+ros2 topic hz /agv1/odom
+ros2 run tf2_ros tf2_echo agv1/odom agv1/base_footprint
+
+ros2 topic hz /agv2/scan
+ros2 topic hz /agv2/odom
+ros2 run tf2_ros tf2_echo agv2/odom agv2/base_footprint
 ```
 
 ### 2. 원본 카메라 실행
@@ -203,9 +208,10 @@ ros2 run central rqt_click_to_target
 ros2 run central camera_to_map_bridge
 ```
 
-### 7. 노트북에서 Nav2 실행
+### 7. 단일 차량 호환 모드에서 노트북 Nav2 실행
 
-노트북 터미널 7:
+아래 명령은 기존 단일 차량 호환 모드에서만 사용합니다. `agv_vehicle.launch.py`를
+`start_nav2:=true`로 실행한 다중 차량 모드에서는 실행하지 않습니다.
 
 ```bash
 ros2 launch drive bringup_launch.xml \
@@ -309,7 +315,7 @@ ros2 topic echo /central/target_map_waypoints
 - `config/SLAM/current_map.yaml`과 `config/central/camera_map_calibration.yaml`은 같은 지도 기준이어야 합니다.
 - SLAM 지도를 새로 저장하거나 카메라 위치가 바뀌면 `ros2 run calibration direct_calibrator`로 다시 캘리브레이션합니다.
 - SLAM mapping과 Nav2 localization은 동시에 실행하지 않습니다.
-- 차량과 노트북 양쪽에서 Nav2를 동시에 실행하지 않습니다.
+- 다중 차량에서는 각 차량에서만 Nav2를 실행하며 중앙 노트북에서 Nav2를 중복 실행하지 않습니다.
 - `/central/target_map_pose`가 지도 밖이면 Nav2가 `Goal Coordinates ... outside bounds`로 거부합니다.
 
 ## Quick Start: 로봇팔 컨테이너 Pick
@@ -397,9 +403,10 @@ v4l2_camera
   → YOLO / calibration
   → central
   → /central/target_map_pose
-  → 노트북 Nav2
-  → /cmd_vel
-  → 차량
+  → fleet dispatcher
+  → /agv1 또는 /agv2 Nav2 action
+  → 차량 로컬 Nav2
+  → /agv1 또는 /agv2/cmd_vel
 ```
 
 ## Camera Transport
@@ -420,4 +427,3 @@ config/weights/best.pt
 ## Rule
 
 각 패키지에는 `README.md`를 두고, 해당 패키지의 노드 기능, 실행 방법, 주요 토픽을 간단하게 정리합니다.
-

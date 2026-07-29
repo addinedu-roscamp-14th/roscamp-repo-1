@@ -16,6 +16,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('slam_map_topic', default_value='/map'),
         DeclareLaunchArgument('slam_scan_topic', default_value='/scan'),
+        DeclareLaunchArgument('slam_pose_topic', default_value=''),
+        DeclareLaunchArgument('slam_enable_scan', default_value='true'),
         DeclareLaunchArgument(
             'slam_base_frame',
             default_value='base_footprint',
@@ -35,6 +37,14 @@ def generate_launch_description():
                     'slam_scan_topic': ParameterValue(
                         LaunchConfiguration('slam_scan_topic'),
                         value_type=str,
+                    ),
+                    'slam_pose_topic': ParameterValue(
+                        LaunchConfiguration('slam_pose_topic'),
+                        value_type=str,
+                    ),
+                    'slam_enable_scan': ParameterValue(
+                        LaunchConfiguration('slam_enable_scan'),
+                        value_type=bool,
                     ),
                     'slam_base_frame': ParameterValue(
                         LaunchConfiguration('slam_base_frame'),

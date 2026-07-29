@@ -26,6 +26,11 @@ def generate_launch_description():
         DeclareLaunchArgument('start_camera', default_value='true'),
         DeclareLaunchArgument('start_yolo', default_value='true'),
         DeclareLaunchArgument('start_dashboard_api', default_value='true'),
+        DeclareLaunchArgument(
+            'dashboard_enable_scan',
+            default_value='false',
+            description='Stream AGV1 LaserScan to the central dashboard',
+        ),
         DeclareLaunchArgument('use_rviz', default_value='true'),
         DeclareLaunchArgument('control_host', default_value='0.0.0.0'),
         DeclareLaunchArgument(
@@ -56,6 +61,10 @@ def generate_launch_description():
                         ),
                         'dashboard_slam_map_topic': '/agv1/map',
                         'dashboard_slam_scan_topic': '/agv1/scan',
+                        'dashboard_slam_pose_topic': '/agv1/amcl_pose',
+                        'dashboard_slam_enable_scan': LaunchConfiguration(
+                            'dashboard_enable_scan'
+                        ),
                         'dashboard_slam_base_frame': 'agv1/base_footprint',
                         'start_nav2': 'false',
                         'start_navigation_control': 'false',
@@ -69,6 +78,7 @@ def generate_launch_description():
             executable='fleet_dispatcher',
             name='fleet_dispatcher',
             output='screen',
+            parameters=[{'subscribe_odom_fallback': False}],
         ),
         Node(
             package='central',

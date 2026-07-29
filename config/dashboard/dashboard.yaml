@@ -12,6 +12,8 @@
     slam_map_topic: /map
     slam_base_frame: base_footprint
     slam_scan_topic: /scan
+    slam_pose_topic: ""
+    slam_enable_scan: true
     slam_scan_max_age_sec: 0.5
     slam_live_fps: 15.0
     slam_output_width: 720

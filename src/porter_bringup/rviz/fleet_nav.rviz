@@ -48,11 +48,11 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /agv1/robot_description
-      Enabled: true
+      Enabled: false
       Name: AGV1 Robot
       TF Prefix: agv1
       Update Interval: 0
-      Value: true
+      Value: false
       Visual Enabled: true
     - Class: rviz_default_plugins/RobotModel
       Description Source: Topic
@@ -62,18 +62,18 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /agv2/robot_description
-      Enabled: true
+      Enabled: false
       Name: AGV2 Robot
       TF Prefix: agv2
       Update Interval: 0
-      Value: true
+      Value: false
       Visual Enabled: true
     - Alpha: 1
       Class: rviz_default_plugins/LaserScan
       Color: 255; 40; 40
       Color Transformer: FlatColor
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Name: AGV1 Scan
       Position Transformer: XYZ
       Selectable: true
@@ -86,13 +86,13 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /agv1/scan
       Use Fixed Frame: true
-      Value: true
+      Value: false
     - Alpha: 1
       Class: rviz_default_plugins/LaserScan
       Color: 40; 120; 255
       Color Transformer: FlatColor
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Name: AGV2 Scan
       Position Transformer: XYZ
       Selectable: true
@@ -105,12 +105,12 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /agv2/scan
       Use Fixed Frame: true
-      Value: true
+      Value: false
     - Angle Tolerance: 0.1
       Class: rviz_default_plugins/Odometry
       Covariance:
         Value: false
-      Enabled: true
+      Enabled: false
       Keep: 100
       Name: AGV1 Odometry
       Position Tolerance: 0.01
@@ -129,12 +129,12 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /agv1/odom
-      Value: true
+      Value: false
     - Angle Tolerance: 0.1
       Class: rviz_default_plugins/Odometry
       Covariance:
         Value: false
-      Enabled: true
+      Enabled: false
       Keep: 100
       Name: AGV2 Odometry
       Position Tolerance: 0.01
@@ -153,10 +153,10 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /agv2/odom
-      Value: true
+      Value: false
     - Class: nav2_rviz_plugins/ParticleCloud
       Color: 255; 70; 70
-      Enabled: true
+      Enabled: false
       Max Arrow Length: 0.3
       Min Arrow Length: 0.02
       Name: AGV1 AMCL
@@ -167,10 +167,10 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Best Effort
         Value: /agv1/particle_cloud
-      Value: true
+      Value: false
     - Class: nav2_rviz_plugins/ParticleCloud
       Color: 50; 140; 255
-      Enabled: true
+      Enabled: false
       Max Arrow Length: 0.3
       Min Arrow Length: 0.02
       Name: AGV2 AMCL
@@ -181,6 +181,19 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Best Effort
         Value: /agv2/particle_cloud
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Fleet Vehicles
+      Namespaces:
+        fleet_vehicle: true
+        fleet_vehicle_label: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /central/fleet/vehicle_markers
       Value: true
     - Alpha: 1
       Buffer Length: 1

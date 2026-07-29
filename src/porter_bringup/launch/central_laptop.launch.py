@@ -40,6 +40,12 @@ def generate_launch_description():
     dashboard_slam_scan_topic = LaunchConfiguration(
         'dashboard_slam_scan_topic'
     )
+    dashboard_slam_pose_topic = LaunchConfiguration(
+        'dashboard_slam_pose_topic'
+    )
+    dashboard_slam_enable_scan = LaunchConfiguration(
+        'dashboard_slam_enable_scan'
+    )
     dashboard_slam_base_frame = LaunchConfiguration(
         'dashboard_slam_base_frame'
     )
@@ -69,6 +75,8 @@ def generate_launch_description():
             'params_file': dashboard_params,
             'slam_map_topic': dashboard_slam_map_topic,
             'slam_scan_topic': dashboard_slam_scan_topic,
+            'slam_pose_topic': dashboard_slam_pose_topic,
+            'slam_enable_scan': dashboard_slam_enable_scan,
             'slam_base_frame': dashboard_slam_base_frame,
         }.items(),
     )
@@ -204,6 +212,14 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'dashboard_slam_scan_topic',
             default_value='/scan',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_pose_topic',
+            default_value='',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_enable_scan',
+            default_value='true',
         ),
         DeclareLaunchArgument(
             'dashboard_slam_base_frame',
