@@ -42,6 +42,10 @@ def _launch_nav2(context):
     with source.open('r', encoding='utf-8') as stream:
         params = yaml.safe_load(stream)
     params = _rewrite_frames(params, vehicle_id)
+    # ROS parameter files match fully-qualified node names. Nesting the file
+    # under the vehicle namespace makes every Nav2 block apply to /agvX/*.
+    params.pop('/**', None)
+    params = {vehicle_id: params}
     generated = Path(tempfile.gettempdir()) / f'porter_nav2_{vehicle_id}.yaml'
     with generated.open('w', encoding='utf-8') as stream:
         yaml.safe_dump(params, stream, sort_keys=False)

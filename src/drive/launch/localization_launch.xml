@@ -58,8 +58,6 @@
             <param name='respawn_delay' value="2.0"/>
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
         </node>
 
         <node pkg="nav2_map_server" exec="map_server" name='filter_mask_server' output="screen">
@@ -69,8 +67,6 @@
             <param name='respawn_delay' value="2.0"/>
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
         </node>
 
         <node pkg="nav2_map_server" exec="costmap_filter_info_server" name='costmap_filter_info_server' output="screen">
@@ -79,8 +75,6 @@
             <param name='respawn_delay' value="2.0"/>
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
         </node>
 
         <node pkg="nav2_amcl" exec="amcl" name='amcl' output="screen">
@@ -89,8 +83,6 @@
             <param name='respawn_delay' value="2.0"/>
             <param name='log_level' value="$(var log_level)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
         </node>
 
         <node pkg="nav2_lifecycle_manager" exec="lifecycle_manager" name="lifecycle_manager_localization" output="screen">

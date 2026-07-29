@@ -70,7 +70,6 @@ bt_navigator:
 controller_server:
   ros__parameters:
     # --- 시스템 기본 설정 ---
-    /bond_disable_heartbeat_timeout: true    # 라이프사이클 노드 간 상태 체크(하트비트) 타임아웃 무시 여부
 
     # ==========================================================
     # 1. 주행 컨트롤러 (Regulated Pure Pursuit) 파라미터
@@ -268,11 +267,6 @@ costmap_filter_info_server:
     mask_topic: "/keepout_filter_mask"
     base: 0.0
     multiplier: 1.0
-
-/**:
-  ros__parameters:
-    bond_timeout: 10.0                      # [s] lifecycle_manager가 관리 노드의 bond를 모니터링하는 최대 시간 (기본 4.0초는 부하 상황에서 너무 짧음)
-    /bond_disable_heartbeat_timeout: true    # 관리되는 노드(map_server 등) 쪽에서 bond 형성 타임아웃 자체를 끔 (controller_server에 이미 적용된 것과 동일한 우회책)
 
 # The yaml_filename does not need to be specified since it going to be set by defaults in launch.
 # If you'd rather set it in the yaml, remove the default "map" value in the tb3_simulation_launch.py

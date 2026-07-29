@@ -83,8 +83,6 @@
             <param name='log_level' value="$(var log_level)"/>
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
             <remap from="cmd_vel" to="cmd_vel_nav"/>
         </node>
 
@@ -94,8 +92,6 @@
             <param name='log_level' value="$(var log_level)"/>
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
         </node>
 
         <node pkg="nav2_planner" exec="planner_server" name="planner_server" output="screen">
@@ -104,8 +100,6 @@
             <param name='log_level' value="$(var log_level)"/>
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
         </node>
 
         <node pkg="nav2_behaviors" exec="behavior_server" name="behavior_server" output="screen">
@@ -114,8 +108,6 @@
             <param name='log_level' value="$(var log_level)"/>
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
         </node>
 
         <node pkg="nav2_bt_navigator" exec="bt_navigator" name="bt_navigator" output="screen">
@@ -125,8 +117,6 @@
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
             <param name="default_nav_to_pose_bt_xml" value="$(var default_nav_to_pose_bt_xml)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
             <remap from="cmd_vel" to="cmd_vel_nav"/>
         </node>
 
@@ -136,8 +126,6 @@
             <param name='log_level' value="$(var log_level)"/>
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
         </node>
 
         <node pkg="nav2_velocity_smoother" exec="velocity_smoother" name="velocity_smoother" output="screen">
@@ -146,8 +134,6 @@
             <param name='log_level' value="$(var log_level)"/>
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
-            <param name='/bond_disable_heartbeat_timeout' value="true"/>
-
             <remap from="cmd_vel" to="cmd_vel_nav"/>
             <remap from="cmd_vel_smoothed" to="$(var cmd_vel_output_topic)"/>
         </node>
