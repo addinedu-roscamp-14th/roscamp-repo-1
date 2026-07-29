@@ -64,36 +64,6 @@ def generate_launch_description():
                 ),
             ],
         ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution([
-                    FindPackageShare('drive'),
-                    'launch',
-                    'multi_vehicle_nav.launch.py',
-                ])
-            ),
-            launch_arguments={
-                'vehicle_id': 'agv1',
-                'workspace': workspace,
-                'use_composition': 'False',
-                'start_navigation': 'False',
-            }.items(),
-        ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution([
-                    FindPackageShare('drive'),
-                    'launch',
-                    'multi_vehicle_nav.launch.py',
-                ])
-            ),
-            launch_arguments={
-                'vehicle_id': 'agv2',
-                'workspace': workspace,
-                'use_composition': 'False',
-                'start_navigation': 'False',
-            }.items(),
-        ),
         Node(
             package='central',
             executable='fleet_dispatcher',

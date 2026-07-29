@@ -105,7 +105,7 @@ def generate_launch_description():
             ]),
         ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
-        DeclareLaunchArgument('use_composition', default_value='True'),
+        DeclareLaunchArgument('use_composition', default_value='False'),
         DeclareLaunchArgument('start_navigation', default_value='True'),
         OpaqueFunction(function=_launch_nav2),
     ])

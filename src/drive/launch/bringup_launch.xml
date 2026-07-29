@@ -21,7 +21,7 @@
 
     <group>
         <push-ros-namespace namespace="$(var namespace)"/>
-        <node pkg="rclcpp_components" exec="component_container_isolated" name='$(var container_name)' output="screen" args="--ros-args --log-level $(var log_level)">
+        <node pkg="rclcpp_components" exec="component_container_isolated" name='$(var container_name)' output="screen" args="--ros-args --log-level $(var log_level)" if="$(var use_composition)">
             <param from="$(var params_file)"/>
             <param name='map' value="$(var map)"/>
             <param name='autostart' value="$(var autostart)"/>

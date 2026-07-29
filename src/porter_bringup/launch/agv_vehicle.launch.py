@@ -45,6 +45,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('start_nav2', default_value='true'),
+        DeclareLaunchArgument(
+            'use_composition',
+            default_value='false',
+            description='Run Nav2 in a component container',
+        ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([
@@ -75,6 +80,7 @@ def generate_launch_description():
                 'map': LaunchConfiguration('map'),
                 'keepout_mask': LaunchConfiguration('keepout_mask'),
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
+                'use_composition': LaunchConfiguration('use_composition'),
             }.items(),
         ),
     ])
