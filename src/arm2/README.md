@@ -375,3 +375,41 @@ pose가 초기화되므로 `/arm2/scan_destinations`를 다시 호출해야 합�
 ```bash
 ros2 service call /arm2/reset_stack_level std_srvs/srv/Trigger "{}"
 ```
+
+### Pregrasp 폐루프 미세 보정
+
+저장 목적지 이송은 MoveIt으로 pregrasp에 도착한 뒤, 선택된 컨테이너 ID의
+마커를 다시 측정해 XY를 작은 Cartesian 단계로 보정합니다. 손목을 최종 yaw로
+정렬하면 상단 마커가 시야에서 사라지므로, 보정 중에는 현재 손목 자세를 유지하고
+마지막 관측의 yaw로 한 번만 정렬합니다. Z는 보정하지 않고 마지막으로 잠근 마커
+pose에서 계산한 파지점까지 기존 수직 하강을 사용합니다.
+
+기본 설정은 다음과 같습니다.
+
+```yaml
+visual_servo_enabled: false
+visual_servo_samples: 10
+visual_servo_xy_tolerance_m: 0.002
+visual_servo_yaw_tolerance_deg: 2.0
+visual_servo_xy_gain: 0.6
+visual_servo_yaw_gain: 0.6
+visual_servo_max_xy_step_m: 0.005
+visual_servo_max_yaw_step_deg: 2.0
+visual_servo_max_initial_error_m: 0.02
+visual_servo_max_iterations: 5
+visual_servo_required_consecutive_successes: 3
+visual_servo_timeout_sec: 10.0
+visual_servo_marker_loss_timeout_sec: 2.0
+visual_servo_settle_sec: 0.6
+```
+
+현재 손목 카메라는 pregrasp에서 상단 마커를 잃으므로 기본값은 비활성화되어
+있습니다. 이 상태에서는 초기 위치의 안정 pose를 잠근 뒤 마커가 사라져도 저장
+좌표로 기존 파지를 계속합니다. 마커가 pregrasp에서도 보이는 배치에서만
+`visual_servo_enabled: true`로 활성화합니다.
+
+활성화한 경우 각 반복은 이동 전 샘플을 폐기하고 새로운 10개 샘플만 사용합니다. XY 오차가
+20mm를 넘거나, 마커를 2초 동안 잃거나, 정규화한 오차가 두 번 연속 증가하거나,
+5회 안에 연속 3회 허용 오차를 만족하지 못하면 하강하지 않고 실패 복귀합니다.
+초기 위치에서 ID 0~3 중 하나를 잠근 경우 해당 ID의 TF만 pregrasp 보정에
+사용합니다.

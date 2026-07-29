@@ -3,6 +3,7 @@
 from arm2.arm2_container_pick_coordinator import (
     apply_base_frame_correction,
     apply_vertical_pick_offsets,
+    bounded_visual_servo_step,
     calculate_heading_aligned_stack_poses,
     calculate_stack_poses,
     cartesian_path_acceptable,
@@ -17,6 +18,7 @@ from arm2.arm2_container_pick_coordinator import (
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
     stack_layer_z_offset,
+    visual_servo_within_tolerance,
 )
 import numpy as np
 
@@ -312,6 +314,36 @@ def test_cartesian_shortfall_is_bounded_in_metres():
     assert cartesian_path_acceptable(0.955, 0.08, 0.97, 0.90, 0.005)
     assert not cartesian_path_acceptable(0.955, 0.18, 0.97, 0.90, 0.005)
     assert not cartesian_path_acceptable(0.89, 0.01, 0.97, 0.90, 0.005)
+
+
+def test_visual_servo_step_applies_gain_and_xy_norm_limit():
+    """Visual correction scales error and caps the planar step norm."""
+    xy_step, yaw_step = bounded_visual_servo_step(
+        [0.008, -0.004],
+        5.0,
+        xy_gain=0.6,
+        yaw_gain=0.6,
+        max_xy_step=0.005,
+        max_yaw_step_degrees=2.0,
+    )
+
+    assert np.isclose(np.linalg.norm(xy_step), 0.005)
+    assert np.sign(xy_step[0]) == 1
+    assert np.sign(xy_step[1]) == -1
+    assert yaw_step == 2.0
+
+
+def test_visual_servo_tolerance_requires_both_xy_and_yaw():
+    """Convergence requires every planar axis and yaw to be bounded."""
+    assert visual_servo_within_tolerance(
+        [0.0015, -0.0010], 1.5, 0.002, 2.0
+    )
+    assert not visual_servo_within_tolerance(
+        [0.0021, 0.0], 1.5, 0.002, 2.0
+    )
+    assert not visual_servo_within_tolerance(
+        [0.001, 0.0], 2.1, 0.002, 2.0
+    )
 
 
 def test_segmented_descent_requires_safe_progress_and_attempt_budget():

@@ -132,6 +132,41 @@ def apply_base_frame_correction(translation, correction):
     )
 
 
+def bounded_visual_servo_step(
+    error_xy,
+    yaw_error_degrees,
+    xy_gain,
+    yaw_gain,
+    max_xy_step,
+    max_yaw_step_degrees,
+):
+    """Return gain-scaled XY/yaw corrections with independent hard limits."""
+    xy_step = np.asarray(error_xy, dtype=np.float64) * float(xy_gain)
+    norm = float(np.linalg.norm(xy_step))
+    if norm > max_xy_step:
+        xy_step *= float(max_xy_step) / norm
+    yaw_step = float(yaw_error_degrees) * float(yaw_gain)
+    yaw_step = float(np.clip(
+        yaw_step,
+        -float(max_yaw_step_degrees),
+        float(max_yaw_step_degrees),
+    ))
+    return xy_step, yaw_step
+
+
+def visual_servo_within_tolerance(
+    error_xy,
+    yaw_error_degrees,
+    xy_tolerance,
+    yaw_tolerance_degrees,
+):
+    """Return whether XY and yaw errors satisfy refinement tolerances."""
+    return (
+        float(np.max(np.abs(error_xy))) <= float(xy_tolerance)
+        and abs(float(yaw_error_degrees)) <= float(yaw_tolerance_degrees)
+    )
+
+
 def wrap_degrees(angle):
     """Wrap an angle to [-180, 180)."""
     return (float(angle) + 180.0) % 360.0 - 180.0
@@ -421,6 +456,54 @@ class ContainerPickCoordinator(Node):
         self.refresh_marker_before_descent = bool(
             self.get_parameter('refresh_marker_before_descent').value
         )
+        self.visual_servo_enabled = bool(
+            self.get_parameter('visual_servo_enabled').value
+        )
+        self.visual_servo_samples = int(
+            self.get_parameter('visual_servo_samples').value
+        )
+        self.visual_servo_xy_tolerance = float(
+            self.get_parameter('visual_servo_xy_tolerance_m').value
+        )
+        self.visual_servo_yaw_tolerance = float(
+            self.get_parameter('visual_servo_yaw_tolerance_deg').value
+        )
+        self.visual_servo_xy_gain = float(
+            self.get_parameter('visual_servo_xy_gain').value
+        )
+        self.visual_servo_yaw_gain = float(
+            self.get_parameter('visual_servo_yaw_gain').value
+        )
+        self.visual_servo_max_xy_step = float(
+            self.get_parameter('visual_servo_max_xy_step_m').value
+        )
+        self.visual_servo_max_yaw_step = float(
+            self.get_parameter('visual_servo_max_yaw_step_deg').value
+        )
+        self.visual_servo_max_initial_error = float(
+            self.get_parameter(
+                'visual_servo_max_initial_error_m'
+            ).value
+        )
+        self.visual_servo_max_iterations = int(
+            self.get_parameter('visual_servo_max_iterations').value
+        )
+        self.visual_servo_required_successes = int(
+            self.get_parameter(
+                'visual_servo_required_consecutive_successes'
+            ).value
+        )
+        self.visual_servo_timeout = float(
+            self.get_parameter('visual_servo_timeout_sec').value
+        )
+        self.visual_servo_marker_loss_timeout = float(
+            self.get_parameter(
+                'visual_servo_marker_loss_timeout_sec'
+            ).value
+        )
+        self.visual_servo_settle = float(
+            self.get_parameter('visual_servo_settle_sec').value
+        )
         self.pregrasp_test_keep_orientation = bool(
             self.get_parameter(
                 'pregrasp_test_keep_current_orientation'
@@ -603,6 +686,35 @@ class ContainerPickCoordinator(Node):
             )
         if self.grasp_extra_depth < 0.0:
             raise ValueError('grasp_extra_depth_m must be non-negative')
+        if self.visual_servo_samples < 3:
+            raise ValueError('visual_servo_samples must be at least 3')
+        if (
+            self.visual_servo_xy_tolerance <= 0.0
+            or self.visual_servo_yaw_tolerance <= 0.0
+        ):
+            raise ValueError('visual servo tolerances must be positive')
+        if not 0.0 < self.visual_servo_xy_gain <= 1.0:
+            raise ValueError('visual_servo_xy_gain must be within (0, 1]')
+        if not 0.0 < self.visual_servo_yaw_gain <= 1.0:
+            raise ValueError('visual_servo_yaw_gain must be within (0, 1]')
+        if (
+            self.visual_servo_max_xy_step <= 0.0
+            or self.visual_servo_max_yaw_step <= 0.0
+            or self.visual_servo_max_initial_error <= 0.0
+        ):
+            raise ValueError('visual servo limits must be positive')
+        if self.visual_servo_max_iterations < 1:
+            raise ValueError('visual_servo_max_iterations must be positive')
+        if self.visual_servo_required_successes < 1:
+            raise ValueError(
+                'visual_servo_required_consecutive_successes must be positive'
+            )
+        if (
+            self.visual_servo_timeout <= 0.0
+            or self.visual_servo_marker_loss_timeout <= 0.0
+            or self.visual_servo_settle < 0.0
+        ):
+            raise ValueError('visual servo timing values are invalid')
         if not (
             0.0 <= self.cartesian_absolute_min_fraction
             <= self.cartesian_min_fraction <= 1.0
@@ -958,6 +1070,24 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('grasp_extra_depth_m', 0.0)
         self.declare_parameter('grasp_stop_above_m', 0.0)
         self.declare_parameter('refresh_marker_before_descent', True)
+        self.declare_parameter('visual_servo_enabled', False)
+        self.declare_parameter('visual_servo_samples', 10)
+        self.declare_parameter('visual_servo_xy_tolerance_m', 0.002)
+        self.declare_parameter('visual_servo_yaw_tolerance_deg', 2.0)
+        self.declare_parameter('visual_servo_xy_gain', 0.6)
+        self.declare_parameter('visual_servo_yaw_gain', 0.6)
+        self.declare_parameter('visual_servo_max_xy_step_m', 0.005)
+        self.declare_parameter('visual_servo_max_yaw_step_deg', 2.0)
+        self.declare_parameter('visual_servo_max_initial_error_m', 0.020)
+        self.declare_parameter('visual_servo_max_iterations', 5)
+        self.declare_parameter(
+            'visual_servo_required_consecutive_successes', 3
+        )
+        self.declare_parameter('visual_servo_timeout_sec', 10.0)
+        self.declare_parameter(
+            'visual_servo_marker_loss_timeout_sec', 2.0
+        )
+        self.declare_parameter('visual_servo_settle_sec', 0.6)
         self.declare_parameter(
             'pregrasp_test_keep_current_orientation', True
         )
@@ -1115,6 +1245,7 @@ class ContainerPickCoordinator(Node):
         if self.tracking_suspended.is_set() or (
             self.motion_lock.locked()
             and not self.refresh_marker_before_descent
+            and not self.visual_servo_enabled
         ):
             return
 
@@ -1203,12 +1334,17 @@ class ContainerPickCoordinator(Node):
         yaw_only=False,
         history=None,
         position_only=False,
+        sample_count=None,
     ):
         selected_history = self.history if history is None else history
+        required_samples = (
+            self.minimum_samples
+            if sample_count is None else int(sample_count)
+        )
         with self.history_lock:
-            samples = list(selected_history)[-self.minimum_samples:]
-        if len(samples) < self.minimum_samples:
-            return None, f'need {self.minimum_samples - len(samples)} more samples'
+            samples = list(selected_history)[-required_samples:]
+        if len(samples) < required_samples:
+            return None, f'need {required_samples - len(samples)} more samples'
 
         now_ns = self.get_clock().now().nanoseconds
         age = (now_ns - samples[-1][0]) / 1e9
@@ -1371,19 +1507,189 @@ class ContainerPickCoordinator(Node):
 
     def _current_tcp_yaw_degrees(self):
         """Return current TCP yaw in the fixed robot base frame."""
+        pose = self._current_tcp_pose()
+        if pose is None:
+            return None
+        return quaternion_to_rpy_degrees(pose[1])[2]
+
+    def _current_tcp_pose(self):
+        """Return current TCP translation and rotation in the base frame."""
         try:
             transform = self.buffer.lookup_transform(
                 self.base_frame, self.moveit_ee_link, Time()
             )
         except TransformException:
             return None
-        rotation = [
+        translation = np.array([
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            transform.transform.translation.z,
+        ], dtype=np.float64)
+        rotation = normalize_quaternion([
             transform.transform.rotation.x,
             transform.transform.rotation.y,
             transform.transform.rotation.z,
             transform.transform.rotation.w,
-        ]
-        return quaternion_to_rpy_degrees(rotation)[2]
+        ])
+        return translation, rotation
+
+    def _wait_for_visual_servo_targets(
+        self, marker_frame, marker_history, deadline
+    ):
+        """Collect a fresh stable marker batch for one refinement cycle."""
+        with self.history_lock:
+            marker_history.clear()
+            self.scan_locked_frames.discard(marker_frame)
+        marker_deadline = min(
+            deadline,
+            time.monotonic() + self.visual_servo_marker_loss_timeout,
+        )
+        reason = 'no new marker samples'
+        while time.monotonic() < marker_deadline:
+            if self.stop_event.wait(0.05):
+                return None, 'pick stopped'
+            marker_pose, reason = self.stable_marker_pose(
+                history=marker_history,
+                yaw_only=True,
+                sample_count=self.visual_servo_samples,
+            )
+            if marker_pose is None:
+                continue
+            return self.calculate_targets_from_marker_pose(
+                marker_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+            )
+        return None, f'marker lost or unstable: {reason}'
+
+    def refine_pregrasp_with_visual_feedback(
+        self,
+        initial_targets,
+        marker_frame,
+        marker_history,
+        marker_id,
+        correct_yaw=True,
+    ):
+        """Correct pregrasp XY/yaw iteratively from fresh camera feedback."""
+        latest_targets = copy.deepcopy(initial_targets)
+        deadline = time.monotonic() + self.visual_servo_timeout
+        consecutive_successes = 0
+        previous_metric = None
+        increasing_count = 0
+
+        for iteration in range(1, self.visual_servo_max_iterations + 1):
+            if time.monotonic() >= deadline:
+                raise RuntimeError('visual servo timed out')
+            refreshed, reason = self._wait_for_visual_servo_targets(
+                marker_frame, marker_history, deadline
+            )
+            if refreshed is None:
+                raise RuntimeError(f'visual servo failed: {reason}')
+            latest_targets = refreshed
+            _grasp, desired_pregrasp = refreshed
+            current = self._current_tcp_pose()
+            if current is None:
+                raise RuntimeError('visual servo cannot read current TCP TF')
+            current_translation, current_rotation = current
+            desired_translation = np.array([
+                desired_pregrasp.pose.position.x,
+                desired_pregrasp.pose.position.y,
+                desired_pregrasp.pose.position.z,
+            ])
+            error_xy = desired_translation[:2] - current_translation[:2]
+            desired_yaw = quaternion_to_rpy_degrees([
+                desired_pregrasp.pose.orientation.x,
+                desired_pregrasp.pose.orientation.y,
+                desired_pregrasp.pose.orientation.z,
+                desired_pregrasp.pose.orientation.w,
+            ])[2]
+            current_rpy = quaternion_to_rpy_degrees(current_rotation)
+            yaw_error = wrap_degrees(desired_yaw - current_rpy[2])
+            xy_error_norm = float(np.linalg.norm(error_xy))
+            if xy_error_norm > self.visual_servo_max_initial_error:
+                raise RuntimeError(
+                    'visual servo XY error exceeds safety limit: '
+                    f'{xy_error_norm * 1000.0:.1f}mm'
+                )
+            controlled_yaw_error = yaw_error if correct_yaw else 0.0
+            metric = max(
+                xy_error_norm / self.visual_servo_xy_tolerance,
+                abs(controlled_yaw_error)
+                / self.visual_servo_yaw_tolerance,
+            )
+            self.publish_status(
+                f'VISUAL SERVO: ID {marker_id} iteration '
+                f'{iteration}/{self.visual_servo_max_iterations}: '
+                f'error_xy_mm='
+                f'{np.round(error_xy * 1000.0, 2).tolist()}, '
+                f'yaw_error_deg={yaw_error:.2f}'
+                + (
+                    ''
+                    if correct_yaw
+                    else ' (yaw locked for final alignment)'
+                )
+            )
+
+            if visual_servo_within_tolerance(
+                error_xy,
+                controlled_yaw_error,
+                self.visual_servo_xy_tolerance,
+                self.visual_servo_yaw_tolerance,
+            ):
+                consecutive_successes += 1
+                if (
+                    consecutive_successes
+                    >= self.visual_servo_required_successes
+                ):
+                    self.publish_status(
+                        'VISUAL SERVO: converged; locking final marker pose'
+                    )
+                    return latest_targets
+                continue
+
+            consecutive_successes = 0
+            if previous_metric is not None and metric > previous_metric:
+                increasing_count += 1
+            else:
+                increasing_count = 0
+            if increasing_count >= 2:
+                raise RuntimeError(
+                    'visual servo error increased twice consecutively'
+                )
+            previous_metric = metric
+
+            xy_step, yaw_step = bounded_visual_servo_step(
+                error_xy,
+                controlled_yaw_error,
+                self.visual_servo_xy_gain,
+                self.visual_servo_yaw_gain,
+                self.visual_servo_max_xy_step,
+                self.visual_servo_max_yaw_step,
+            )
+            correction_translation = current_translation.copy()
+            correction_translation[:2] += xy_step
+            correction_rotation = quaternion_from_rpy_degrees(
+                current_rpy[0],
+                current_rpy[1],
+                current_rpy[2] + (yaw_step if correct_yaw else 0.0),
+            )
+            correction = self.make_pose(
+                correction_translation,
+                correction_rotation,
+                self.get_clock().now().to_msg(),
+            )
+            self.publish_status(
+                'VISUAL SERVO: Cartesian correction '
+                f'xy_mm={np.round(xy_step * 1000.0, 2).tolist()}, '
+                f'yaw_deg={yaw_step:.2f}'
+            )
+            self.move_cartesian_to_pose(correction)
+            if self.stop_event.wait(self.visual_servo_settle):
+                raise RuntimeError('pick stopped')
+
+        raise RuntimeError(
+            'visual servo did not converge within '
+            f'{self.visual_servo_max_iterations} iterations'
+        )
 
     def wait_for_new_stable_targets(self):
         with self.history_lock:
@@ -1879,6 +2185,7 @@ class ContainerPickCoordinator(Node):
                 destination_name=destination_name,
                 count_stack=False,
                 saved_stack_name=destination_name,
+                source_marker_id=source_marker_id,
             )
         except Exception as exc:
             self.stop_event.set()
@@ -2421,6 +2728,9 @@ class ContainerPickCoordinator(Node):
         initial_targets,
         allow_yaw_fallback=True,
         allow_segmented_descent=False,
+        marker_frame=None,
+        marker_history=None,
+        marker_id=0,
     ):
         grasp, pregrasp = initial_targets
         self.publish_status('PICK: opening gripper')
@@ -2440,10 +2750,28 @@ class ContainerPickCoordinator(Node):
                     self.pregrasp_test_keep_orientation
                 ),
             )
+        if (
+            self.visual_servo_enabled
+            and marker_frame is not None
+            and marker_history is not None
+        ):
+            # The wrist camera loses the top marker after final grasp-yaw
+            # alignment. Refine XY while retaining the visible wrist attitude,
+            # then use the last observed marker yaw for one final alignment.
+            grasp, pregrasp = self.refine_pregrasp_with_visual_feedback(
+                (grasp, pregrasp),
+                marker_frame,
+                marker_history,
+                marker_id,
+                correct_yaw=False,
+            )
         if self.pregrasp_test_keep_orientation:
             self.publish_status('PICK: aligning at pregrasp')
             self.move_to_pose(pregrasp)
-        if self.refresh_marker_before_descent:
+        if (
+            not self.visual_servo_enabled
+            and self.refresh_marker_before_descent
+        ):
             refreshed, reason = self.wait_for_new_stable_targets()
             if refreshed is None:
                 raise RuntimeError(
@@ -2555,11 +2883,11 @@ class ContainerPickCoordinator(Node):
         destination_name='A-1',
         count_stack=True,
         saved_stack_name=None,
+        source_marker_id=0,
     ):
         """Move a scan-locked container to one locked destination."""
         if not self.motion_lock.acquire(blocking=False):
             return
-        self.tracking_suspended.set()
         try:
             source_targets, release, approach = targets
             self.publish_status('TRANSFER: moving to saved container pose')
@@ -2568,7 +2896,11 @@ class ContainerPickCoordinator(Node):
                 copy.deepcopy(source_targets),
                 allow_yaw_fallback=False,
                 allow_segmented_descent=True,
+                marker_frame=self.source_frames[source_marker_id],
+                marker_history=self.marker_histories[source_marker_id],
+                marker_id=source_marker_id,
             )
+            self.tracking_suspended.set()
             destination_yaw = quaternion_to_rpy_degrees([
                 release.pose.orientation.x,
                 release.pose.orientation.y,
