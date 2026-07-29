@@ -44,7 +44,7 @@ Visualization Manager:
       Description Source: Topic
       Description Topic:
         Depth: 5
-        Durability Policy: Volatile
+        Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /agv1/robot_description
@@ -58,7 +58,7 @@ Visualization Manager:
       Description Source: Topic
       Description Topic:
         Depth: 5
-        Durability Policy: Volatile
+        Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /agv2/robot_description
@@ -105,6 +105,54 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /agv2/scan
       Use Fixed Frame: true
+      Value: true
+    - Angle Tolerance: 0.1
+      Class: rviz_default_plugins/Odometry
+      Covariance:
+        Value: false
+      Enabled: true
+      Keep: 100
+      Name: AGV1 Odometry
+      Position Tolerance: 0.01
+      Shape:
+        Alpha: 1
+        Color: 255; 40; 40
+        Head Length: 0.05
+        Head Radius: 0.04
+        Shaft Length: 0.15
+        Shaft Radius: 0.015
+        Value: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /agv1/odom
+      Value: true
+    - Angle Tolerance: 0.1
+      Class: rviz_default_plugins/Odometry
+      Covariance:
+        Value: false
+      Enabled: true
+      Keep: 100
+      Name: AGV2 Odometry
+      Position Tolerance: 0.01
+      Shape:
+        Alpha: 1
+        Color: 40; 120; 255
+        Head Length: 0.05
+        Head Radius: 0.04
+        Shaft Length: 0.15
+        Shaft Radius: 0.015
+        Value: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /agv2/odom
       Value: true
     - Class: nav2_rviz_plugins/ParticleCloud
       Color: 255; 70; 70

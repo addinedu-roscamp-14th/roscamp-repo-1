@@ -51,11 +51,13 @@ source install/setup.bash
 
 ```bash
 # AGV1
-ros2 launch porter_bringup agv_vehicle.launch.py vehicle_id:=agv1
-
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv1 \
+  start_nav2:=true
 # AGV2
-ros2 launch porter_bringup agv_vehicle.launch.py vehicle_id:=agv2
-
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv2 \
+  start_nav2:=true
 ```
 
 ```bash

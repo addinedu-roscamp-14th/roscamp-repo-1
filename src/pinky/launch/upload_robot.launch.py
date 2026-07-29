@@ -38,6 +38,7 @@ def generate_launch_description():
                     ' is_sim:=', LaunchConfiguration('is_sim'),
                     ' cam_tilt_deg:=', LaunchConfiguration('cam_tilt_deg')
                 ]),
+            # Xacro prefixes joint names; robot_state_publisher prefixes links.
             'frame_prefix': [namespace],
         }]
     )

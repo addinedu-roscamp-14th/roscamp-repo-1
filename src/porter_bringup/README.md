@@ -13,7 +13,9 @@ source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 export ROS_DOMAIN_ID=13
 
-ros2 launch porter_bringup agv_vehicle.launch.py vehicle_id:=agv1
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv1 \
+  start_nav2:=true
 ```
 
 ### 2. AGV2 컴퓨터
@@ -24,7 +26,9 @@ source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 export ROS_DOMAIN_ID=13
 
-ros2 launch porter_bringup agv_vehicle.launch.py vehicle_id:=agv2
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv2 \
+  start_nav2:=true
 ```
 
 ### 3. 중앙 관제 노트북
