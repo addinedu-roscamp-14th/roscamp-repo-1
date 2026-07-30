@@ -101,6 +101,21 @@ class JetCobotTrajectoryBridge(Node):
         self.declare_parameter('home_speed', 50)
         self.declare_parameter('home_tolerance_deg', 3.5)
         self.declare_parameter('home_timeout_sec', 15.0)
+        self.declare_parameter(
+            'a1_joint_angles_deg',
+            [3.77, -4.65, -7.55, -71.01, 0.7, -51.15],
+        )
+        self.declare_parameter('a1_speed', 30)
+        self.declare_parameter(
+            'a2_joint_angles_deg',
+            [-40.07, -6.24, -7.55, -62.84, 0.87, -51.15],
+        )
+        self.declare_parameter('a2_speed', 30)
+        self.declare_parameter(
+            'a3_joint_angles_deg',
+            [-90.0, -6.24, -6.67, -73.91, -0.08, -52.11],
+        )
+        self.declare_parameter('a3_speed', 30)
         self.declare_parameter('joint1_sweep_speed', 30)
         self.declare_parameter('joint1_sweep_angle_deg', 180.0)
         self.declare_parameter('joint1_sweep_tolerance_deg', 3.5)
@@ -154,6 +169,18 @@ class JetCobotTrajectoryBridge(Node):
         self.home_timeout = float(
             self.get_parameter('home_timeout_sec').value
         )
+        self.a1_angles = validate_home_angles(
+            self.get_parameter('a1_joint_angles_deg').value
+        )
+        self.a1_speed = int(self.get_parameter('a1_speed').value)
+        self.a2_angles = validate_home_angles(
+            self.get_parameter('a2_joint_angles_deg').value
+        )
+        self.a2_speed = int(self.get_parameter('a2_speed').value)
+        self.a3_angles = validate_home_angles(
+            self.get_parameter('a3_joint_angles_deg').value
+        )
+        self.a3_speed = int(self.get_parameter('a3_speed').value)
         self.joint1_sweep_speed = int(
             self.get_parameter('joint1_sweep_speed').value
         )
@@ -182,6 +209,12 @@ class JetCobotTrajectoryBridge(Node):
             raise ValueError('goal_correction_period_sec must be positive')
         if not 1 <= self.home_speed <= 100:
             raise ValueError('home_speed must be within 1..100')
+        if not 1 <= self.a1_speed <= 100:
+            raise ValueError('a1_speed must be within 1..100')
+        if not 1 <= self.a2_speed <= 100:
+            raise ValueError('a2_speed must be within 1..100')
+        if not 1 <= self.a3_speed <= 100:
+            raise ValueError('a3_speed must be within 1..100')
         if not 1 <= self.joint1_sweep_speed <= 100:
             raise ValueError('joint1_sweep_speed must be within 1..100')
         joint1_range = JOINT_LIMITS_DEG[0][1] - JOINT_LIMITS_DEG[0][0]
@@ -252,6 +285,30 @@ class JetCobotTrajectoryBridge(Node):
             Trigger,
             '/arm2/return_home',
             self.return_home,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/go_initial_pose',
+            self.return_home,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/go_a1_pose',
+            self.go_a1_pose,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/go_a2_pose',
+            self.go_a2_pose,
+            callback_group=callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/go_a3_pose',
+            self.go_a3_pose,
             callback_group=callback_group,
         )
         self.create_service(
@@ -615,6 +672,54 @@ class JetCobotTrajectoryBridge(Node):
         except Exception as exc:
             response.success = False
             response.message = f'home move failed: {exc}'
+        return response
+
+    def go_a1_pose(self, _request, response):
+        """Move the physical arm to the configured A-1 joint pose."""
+        try:
+            self._run_exclusive_targets(
+                (self.a1_angles,),
+                self.a1_speed,
+                self.home_tolerance,
+                self.home_timeout,
+            )
+            response.success = True
+            response.message = f'A-1 pose reached: {self.a1_angles}'
+        except Exception as exc:
+            response.success = False
+            response.message = f'A-1 pose move failed: {exc}'
+        return response
+
+    def go_a2_pose(self, _request, response):
+        """Move the physical arm to the configured A-2 joint pose."""
+        try:
+            self._run_exclusive_targets(
+                (self.a2_angles,),
+                self.a2_speed,
+                self.home_tolerance,
+                self.home_timeout,
+            )
+            response.success = True
+            response.message = f'A-2 pose reached: {self.a2_angles}'
+        except Exception as exc:
+            response.success = False
+            response.message = f'A-2 pose move failed: {exc}'
+        return response
+
+    def go_a3_pose(self, _request, response):
+        """Move the physical arm to the configured A-3 joint pose."""
+        try:
+            self._run_exclusive_targets(
+                (self.a3_angles,),
+                self.a3_speed,
+                self.home_tolerance,
+                self.home_timeout,
+            )
+            response.success = True
+            response.message = f'A-3 pose reached: {self.a3_angles}'
+        except Exception as exc:
+            response.success = False
+            response.message = f'A-3 pose move failed: {exc}'
         return response
 
     def sweep_joint1(self, _request, response):

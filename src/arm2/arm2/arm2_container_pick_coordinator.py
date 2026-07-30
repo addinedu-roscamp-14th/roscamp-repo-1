@@ -839,6 +839,7 @@ class ContainerPickCoordinator(Node):
         self.saved_destination_stack_counts = {
             name: 0 for name in self.destination_ids
         }
+        self.saved_destination_stack_counts['TRAILER'] = 0
         self.tracking_errors = {}
         # During scan-and-transfer, each marker becomes immutable as soon as
         # its stationary pose has been accepted.  The next scan command clears
@@ -933,6 +934,15 @@ class ContainerPickCoordinator(Node):
                 lambda request, response, name=destination_name:
                     self.start_saved_destination_transfer(
                         request, response, name
+                    ),
+            )
+        for marker_id in range(9):
+            self.create_service(
+                Trigger,
+                f'/arm2/load_id{marker_id}_to_trailer',
+                lambda request, response, selected_id=marker_id:
+                    self.start_loading_transfer(
+                        request, response, selected_id
                     ),
             )
         self.create_timer(0.1, self.update_tracking)
@@ -1293,6 +1303,14 @@ class ContainerPickCoordinator(Node):
                 self.stack_target_pose_publisher,
                 f'destination ID {marker_id}',
             )
+        self._collect_marker_sample(
+            self.trailer_frame,
+            self.marker_histories[10],
+            self.marker_stamp_attributes[10],
+            self.stack_target_pose_publisher,
+            'trailer ID 10',
+            warn_if_missing=False,
+        )
 
     def _collect_marker_sample(
         self,
@@ -2123,6 +2141,111 @@ class ContainerPickCoordinator(Node):
             'A-2-1=13, A-2-2=14, A-3-1=15, A-3-2=16; '
             f'trailer ID 10={"saved" if 10 in self.saved_marker_poses else "not seen"}'
         )
+
+    def start_loading_transfer(self, _request, response, source_marker_id):
+        """Scan one selected container and trailer ID 10, then load it."""
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.success = False
+            response.message = 'Trailer loading requires MoveIt execution'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.success = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_loading_transfer,
+            args=(source_marker_id,),
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = (
+            f'Scanning container ID {source_marker_id} and trailer ID 10, '
+            'then loading the selected container'
+        )
+        return response
+
+    def execute_loading_transfer(self, source_marker_id):
+        """Scan a selected source and trailer, then execute the transfer."""
+        specs = (
+            (
+                f'container ID {source_marker_id}',
+                self.source_frames[source_marker_id],
+                self.marker_histories[source_marker_id],
+            ),
+            (
+                'trailer ID 10',
+                self.trailer_frame,
+                self.marker_histories[10],
+            ),
+        )
+        locked, reason = self._scan_named_markers(specs)
+        if locked is None:
+            self.publish_status(
+                f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
+            )
+            return
+        # Freeze both accepted base-frame poses for the complete operation.
+        # Re-observing either marker from the moving wrist camera must not
+        # change the pick or trailer target after this point.
+        self.tracking_suspended.set()
+        source_pose, trailer_pose = copy.deepcopy(locked)
+        try:
+            source_targets, reason = self.calculate_targets_from_marker_pose(
+                source_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+            )
+            if source_targets is None:
+                self.publish_status(
+                    f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
+                )
+                self._recover_home_after_failure(
+                    f'TRAILER LOAD ID {source_marker_id}'
+                )
+                return
+            with self.stack_level_lock:
+                placed_count = self.saved_destination_stack_counts['TRAILER']
+            if placed_count >= self.max_stack_levels:
+                self.publish_status(
+                    f'TRAILER LOAD ID {source_marker_id} FAILED: '
+                    f'maximum {self.max_stack_levels} layers reached'
+                )
+                self._recover_home_after_failure(
+                    f'TRAILER LOAD ID {source_marker_id}'
+                )
+                return
+            targets, reason = self.calculate_stack_targets_from_locked_poses(
+                source_targets,
+                trailer_pose,
+                placed_count=placed_count,
+            )
+            if targets is None:
+                self.publish_status(
+                    f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
+                )
+                self._recover_home_after_failure(
+                    f'TRAILER LOAD ID {source_marker_id}'
+                )
+                return
+            self.publish_status(
+                f'TRAILER LOAD: ID {source_marker_id} and ID 10 locked; '
+                'tracking frozen until home return; '
+                'destination IDs 11-16 preserved'
+            )
+            self.execute_scanned_transfer(
+                targets,
+                destination_name='TRAILER',
+                count_stack=False,
+                saved_stack_name='TRAILER',
+                source_marker_id=source_marker_id,
+            )
+        finally:
+            self.tracking_suspended.clear()
 
     def start_saved_destination_transfer(
         self, _request, response, destination_name

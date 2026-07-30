@@ -364,6 +364,28 @@ ros2 service call /arm2/transfer_to_a3_1 std_srvs/srv/Trigger "{}"
 ros2 service call /arm2/transfer_to_a3_2 std_srvs/srv/Trigger "{}"
 ```
 
+### 컨테이너 ID 0~8을 트레일러 ID 10에 다시 적재
+
+아래 서비스는 호출할 때마다 선택한 컨테이너 ID와 트레일러 ID 10만 J1
+스캔으로 찾아 위치를 잠급니다. 두 위치가 모두 저장되면 선택한 컨테이너를 집어
+트레일러에 적재하고 홈으로 복귀합니다. 이 스캔은 기존 ID 11~16 목적지
+저장값을 초기화하거나 갱신하지 않습니다.
+
+```bash
+ros2 service call /arm2/load_id0_to_trailer std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/load_id1_to_trailer std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/load_id2_to_trailer std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/load_id3_to_trailer std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/load_id4_to_trailer std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/load_id5_to_trailer std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/load_id6_to_trailer std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/load_id7_to_trailer std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/load_id8_to_trailer std_srvs/srv/Trigger "{}"
+```
+
+각 호출은 별도의 터미널에서 실행할 수 있지만 로봇 동작은 한 번에 하나만
+허용되므로 이전 적재와 홈 복귀가 끝난 뒤 다음 서비스를 호출해야 합니다.
+
 로봇 동작은 한 번에 하나만 실행할 수 있으므로 한 세부구역 작업이 끝나기 전에
 다른 이송 서비스를 호출하면 요청이 거부됩니다. launch를 재시작하면 저장 pose가
 초기화되므로 `/arm2/scan_destinations`를 다시 호출해야 합니다.

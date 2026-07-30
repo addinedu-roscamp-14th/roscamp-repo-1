@@ -12,6 +12,30 @@
     home_speed: 50
     home_tolerance_deg: 3.5
     home_timeout_sec: 15.0
+    a1_joint_angles_deg:
+    - 3.77
+    - -4.65
+    - -7.55
+    - -71.01
+    - 0.7
+    - -51.15
+    a1_speed: 30
+    a2_joint_angles_deg:
+    - -40.07
+    - -6.24
+    - -7.55
+    - -62.84
+    - 0.87
+    - -51.15
+    a2_speed: 30
+    a3_joint_angles_deg:
+    - -90.0
+    - -6.24
+    - -6.67
+    - -73.91
+    - -0.08
+    - -52.11
+    a3_speed: 30
     joint1_sweep_speed: 25
     joint1_sweep_angle_deg: 336.0
     joint1_sweep_tolerance_deg: 3.5
@@ -34,8 +58,8 @@
     - -0.018597
     base_correction_xyz_m:
     - -0.02
-    - 0.02
-    - 0.0
+    - -0.005
+    - -0.005
     grasp_offset_rpy_deg:
     - 179.226
     - 6.873
