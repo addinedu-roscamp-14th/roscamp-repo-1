@@ -8,6 +8,7 @@
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
+  <depend>arm2_interfaces</depend>
   <depend>geometry_msgs</depend>
   <depend>control_msgs</depend>
   <depend>easy_handeye2_msgs</depend>

@@ -7,6 +7,7 @@ import threading
 import time
 
 from geometry_msgs.msg import PoseStamped
+from arm2_interfaces.srv import TransferById
 import numpy as np
 from pymycobot.mycobot280 import MyCobot280
 from rcl_interfaces.msg import SetParametersResult
@@ -840,6 +841,9 @@ class ContainerPickCoordinator(Node):
             name: 0 for name in self.destination_ids
         }
         self.saved_destination_stack_counts['TRAILER'] = 0
+        self.saved_destination_stack_counts.update({
+            f'ID-{marker_id}': 0 for marker_id in range(9)
+        })
         self.tracking_errors = {}
         # During scan-and-transfer, each marker becomes immutable as soon as
         # its stationary pose has been accepted.  The next scan command clears
@@ -919,6 +923,11 @@ class ContainerPickCoordinator(Node):
         )
         self.create_service(
             Trigger, '/arm2/scan_destinations', self.start_destination_scan
+        )
+        self.create_service(
+            TransferById,
+            '/arm2/transfer_by_id',
+            self.start_id_to_id_transfer,
         )
         for destination_name, service_name in (
             ('A-1-1', '/arm2/transfer_to_a1_1'),
@@ -2169,6 +2178,115 @@ class ContainerPickCoordinator(Node):
             'then loading the selected container'
         )
         return response
+
+    def start_id_to_id_transfer(self, request, response):
+        """Accept a source/destination ID pair supplied by another system."""
+        source_id = int(request.source_id)
+        destination_id = int(request.destination_id)
+        valid_ids = set(self.source_frames)
+        if source_id not in valid_ids or destination_id not in valid_ids:
+            response.accepted = False
+            response.message = 'source_id and destination_id must be within 0..8'
+            return response
+        if source_id == destination_id:
+            response.accepted = False
+            response.message = 'source_id and destination_id must be different'
+            return response
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.accepted = False
+            response.message = 'ID transfer requires MoveIt execution'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.accepted = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.accepted = False
+            response.message = 'A robot motion is already running'
+            return response
+        stack_name = f'ID-{destination_id}'
+        with self.stack_level_lock:
+            placed_count = self.saved_destination_stack_counts[stack_name]
+        if placed_count >= self.max_stack_levels:
+            response.accepted = False
+            response.message = (
+                f'Destination ID {destination_id} already has the maximum '
+                f'{self.max_stack_levels} layers'
+            )
+            return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_id_to_id_transfer,
+            args=(source_id, destination_id),
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.accepted = True
+        response.message = (
+            f'Scanning source ID {source_id} and destination ID '
+            f'{destination_id}, then starting transfer'
+        )
+        return response
+
+    def execute_id_to_id_transfer(self, source_id, destination_id):
+        """Scan two requested IDs and stack source onto destination."""
+        specs = (
+            (
+                f'source container ID {source_id}',
+                self.source_frames[source_id],
+                self.marker_histories[source_id],
+            ),
+            (
+                f'destination container ID {destination_id}',
+                self.source_frames[destination_id],
+                self.marker_histories[destination_id],
+            ),
+        )
+        locked, reason = self._scan_named_markers(specs)
+        if locked is None:
+            self.publish_status(
+                f'ID {source_id} -> ID {destination_id} FAILED: {reason}'
+            )
+            return
+        self.tracking_suspended.set()
+        source_pose, destination_pose = copy.deepcopy(locked)
+        try:
+            source_targets, reason = self.calculate_targets_from_marker_pose(
+                source_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+            )
+            if source_targets is None:
+                raise RuntimeError(f'source target: {reason}')
+            stack_name = f'ID-{destination_id}'
+            with self.stack_level_lock:
+                placed_count = self.saved_destination_stack_counts[stack_name]
+            targets, reason = self.calculate_stack_targets_from_locked_poses(
+                source_targets,
+                destination_pose,
+                placed_count=placed_count,
+            )
+            if targets is None:
+                raise RuntimeError(f'destination target: {reason}')
+            self.publish_status(
+                f'ID TRANSFER: ID {source_id} and ID {destination_id} '
+                'saved and locked; starting transfer'
+            )
+            self.execute_scanned_transfer(
+                targets,
+                destination_name=f'ID {destination_id}',
+                count_stack=False,
+                saved_stack_name=stack_name,
+                source_marker_id=source_id,
+            )
+        except Exception as exc:
+            self.publish_status(
+                f'ID {source_id} -> ID {destination_id} FAILED: {exc}'
+            )
+            self._recover_home_after_failure(
+                f'ID {source_id} -> ID {destination_id}'
+            )
+        finally:
+            self.tracking_suspended.clear()
 
     def execute_loading_transfer(self, source_marker_id):
         """Scan a selected source and trailer, then execute the transfer."""

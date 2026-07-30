@@ -386,6 +386,21 @@ ros2 service call /arm2/load_id8_to_trailer std_srvs/srv/Trigger "{}"
 각 호출은 별도의 터미널에서 실행할 수 있지만 로봇 동작은 한 번에 하나만
 허용되므로 이전 적재와 홈 복귀가 끝난 뒤 다음 서비스를 호출해야 합니다.
 
+### 외부 연동용 ID-to-ID 이송
+
+외부 프로그램은 `/arm2/transfer_by_id` 요청의 두 필드만 채우면 됩니다.
+`source_id` 컨테이너를 집어 `destination_id` 컨테이너 위에 놓습니다. 두 ID는
+0~8 범위여야 하고 서로 달라야 합니다. 호출 후 두 ID만 스캔하고, 각각 0.5초
+안정 위치를 저장·잠근 다음 기존과 같은 집기와 적재 동작을 수행합니다.
+
+예를 들어 ID 8을 ID 5 위에 놓으려면:
+
+```bash
+ros2 service call /arm2/transfer_by_id \
+  arm2_interfaces/srv/TransferById \
+  "{source_id: 8, destination_id: 5}"
+```
+
 로봇 동작은 한 번에 하나만 실행할 수 있으므로 한 세부구역 작업이 끝나기 전에
 다른 이송 서비스를 호출하면 요청이 거부됩니다. launch를 재시작하면 저장 pose가
 초기화되므로 `/arm2/scan_destinations`를 다시 호출해야 합니다.

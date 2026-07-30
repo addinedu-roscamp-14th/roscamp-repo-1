@@ -1,0 +1,5 @@
+int32 source_id
+int32 destination_id
+---
+bool accepted
+string message
