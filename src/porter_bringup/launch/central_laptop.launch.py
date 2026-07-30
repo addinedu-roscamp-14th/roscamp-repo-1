@@ -26,6 +26,7 @@ def generate_launch_description():
     map_file = LaunchConfiguration('map')
     keepout_mask = LaunchConfiguration('keepout_mask')
     yolo_weights = LaunchConfiguration('yolo_weights')
+    yolo_obb_weights = LaunchConfiguration('yolo_obb_weights')
     calibration_yaml = LaunchConfiguration('calibration_yaml')
     b1_camera_left_offset_m = LaunchConfiguration(
         'b1_camera_left_offset_m'
@@ -174,6 +175,15 @@ def generate_launch_description():
             ]),
         ),
         DeclareLaunchArgument(
+            'yolo_obb_weights',
+            default_value=PathJoinSubstitution([
+                workspace,
+                'config',
+                'weights',
+                'best1.pt',
+            ]),
+        ),
+        DeclareLaunchArgument(
             'calibration_yaml',
             default_value=PathJoinSubstitution([
                 workspace,
@@ -317,6 +327,7 @@ def generate_launch_description():
             condition=IfCondition(start_yolo),
             parameters=[{
                 'weights_path': yolo_weights,
+                'obb_weights_path': yolo_obb_weights,
                 'input_topic': '/image_rect/compressed',
                 'input_is_compressed': True,
             }],
