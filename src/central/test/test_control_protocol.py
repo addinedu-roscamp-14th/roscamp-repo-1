@@ -23,6 +23,8 @@ def test_valid_pixel_goal_is_normalized():
 
     assert goal.command_id == 'job-42'
     assert goal.mode == 'direct'
+    assert goal.requested_vehicle_id == ''
+    assert goal.zone_id == ''
     assert goal.target.x == 100.0
     assert goal.heading.x == 130.5
 
@@ -39,6 +41,35 @@ def test_b1_parking_mode_is_accepted():
         minimum_heading_distance_px=10.0,
     )
     assert goal.mode == 'parking_b1'
+    assert goal.zone_id == 'B-1'
+
+
+def test_vehicle_selection_is_normalized():
+    goal = validate_pixel_goal(
+        {
+            'vehicle_id': '/agv2/',
+            'target': {'x': 100, 'y': 200},
+            'heading': {'x': 130, 'y': 200},
+        },
+        image_width=640,
+        image_height=480,
+        minimum_heading_distance_px=10.0,
+    )
+    assert goal.requested_vehicle_id == 'agv2'
+
+
+def test_unknown_vehicle_is_rejected():
+    with pytest.raises(CommandValidationError, match='vehicle_id'):
+        validate_pixel_goal(
+            {
+                'vehicle_id': 'agv3',
+                'target': {'x': 100, 'y': 200},
+                'heading': {'x': 130, 'y': 200},
+            },
+            image_width=640,
+            image_height=480,
+            minimum_heading_distance_px=10.0,
+        )
 
 
 def test_unknown_goal_mode_is_rejected():

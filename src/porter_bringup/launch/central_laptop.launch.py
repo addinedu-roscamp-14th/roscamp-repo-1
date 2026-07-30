@@ -26,6 +26,7 @@ def generate_launch_description():
     map_file = LaunchConfiguration('map')
     keepout_mask = LaunchConfiguration('keepout_mask')
     yolo_weights = LaunchConfiguration('yolo_weights')
+    yolo_obb_weights = LaunchConfiguration('yolo_obb_weights')
     calibration_yaml = LaunchConfiguration('calibration_yaml')
     b1_camera_left_offset_m = LaunchConfiguration(
         'b1_camera_left_offset_m'
@@ -34,6 +35,21 @@ def generate_launch_description():
         'b1_camera_down_offset_m'
     )
     dashboard_params = LaunchConfiguration('dashboard_params_file')
+    dashboard_slam_map_topic = LaunchConfiguration(
+        'dashboard_slam_map_topic'
+    )
+    dashboard_slam_scan_topic = LaunchConfiguration(
+        'dashboard_slam_scan_topic'
+    )
+    dashboard_slam_pose_topic = LaunchConfiguration(
+        'dashboard_slam_pose_topic'
+    )
+    dashboard_slam_enable_scan = LaunchConfiguration(
+        'dashboard_slam_enable_scan'
+    )
+    dashboard_slam_base_frame = LaunchConfiguration(
+        'dashboard_slam_base_frame'
+    )
     nav2_params = LaunchConfiguration('nav2_params_file')
     control_params = LaunchConfiguration('control_params_file')
     control_host = LaunchConfiguration('control_host')
@@ -58,6 +74,11 @@ def generate_launch_description():
         condition=IfCondition(start_dashboard_api),
         launch_arguments={
             'params_file': dashboard_params,
+            'slam_map_topic': dashboard_slam_map_topic,
+            'slam_scan_topic': dashboard_slam_scan_topic,
+            'slam_pose_topic': dashboard_slam_pose_topic,
+            'slam_enable_scan': dashboard_slam_enable_scan,
+            'slam_base_frame': dashboard_slam_base_frame,
         }.items(),
     )
     nav2_launch = IncludeLaunchDescription(
@@ -154,6 +175,15 @@ def generate_launch_description():
             ]),
         ),
         DeclareLaunchArgument(
+            'yolo_obb_weights',
+            default_value=PathJoinSubstitution([
+                workspace,
+                'config',
+                'weights',
+                'best1.pt',
+            ]),
+        ),
+        DeclareLaunchArgument(
             'calibration_yaml',
             default_value=PathJoinSubstitution([
                 workspace,
@@ -184,6 +214,26 @@ def generate_launch_description():
                 'dashboard',
                 'dashboard.yaml',
             ]),
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_map_topic',
+            default_value='/map',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_scan_topic',
+            default_value='/scan',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_pose_topic',
+            default_value='',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_enable_scan',
+            default_value='true',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_base_frame',
+            default_value='base_footprint',
         ),
         DeclareLaunchArgument(
             'nav2_params_file',
@@ -277,6 +327,7 @@ def generate_launch_description():
             condition=IfCondition(start_yolo),
             parameters=[{
                 'weights_path': yolo_weights,
+                'obb_weights_path': yolo_obb_weights,
                 'input_topic': '/image_rect/compressed',
                 'input_is_compressed': True,
             }],

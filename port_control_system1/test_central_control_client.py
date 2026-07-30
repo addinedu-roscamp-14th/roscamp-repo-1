@@ -50,3 +50,5 @@ def test_pixel_goal_contains_token_and_coordinates(monkeypatch):
     assert captured['json']['target'] == {'x': 320.0, 'y': 300.0}
     assert captured['json']['heading'] == {'x': 380.0, 'y': 300.0}
     assert captured['json']['mode'] == 'parking_b1'
+    assert captured['json']['vehicle_id'] == ''
+    assert captured['json']['zone_id'] == 'B-1'

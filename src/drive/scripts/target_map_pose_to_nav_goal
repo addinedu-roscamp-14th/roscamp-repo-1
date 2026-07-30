@@ -66,16 +66,15 @@ class TargetMapPoseToNavGoal(Node):
         self.received_pose_count += 1
 
         goal = NavigateToPose.Goal()
-        goal.pose = pose_msg
+        goal.pose = PoseStamped()
+        goal.pose.header.frame_id = pose_msg.header.frame_id
+        goal.pose.pose = pose_msg.pose
 
         if not goal.pose.header.frame_id:
             if self.ignore_empty_frame_id:
                 self.get_logger().warning('Ignored target pose with empty frame_id')
                 return
             goal.pose.header.frame_id = self.default_frame_id
-
-        if goal.pose.header.stamp.sec == 0 and goal.pose.header.stamp.nanosec == 0:
-            goal.pose.header.stamp = self.get_clock().now().to_msg()
 
         self.pending_goal = goal
         self.get_logger().info(

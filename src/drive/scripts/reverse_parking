@@ -118,7 +118,6 @@ class ReverseParking(Node):
 
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = 'map'
-        goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = self.prep_x
         goal.pose.pose.position.y = self.prep_y
         goal.pose.pose.orientation.z = math.sin(self.prep_yaw / 2.0)

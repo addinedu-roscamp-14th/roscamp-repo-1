@@ -10,23 +10,24 @@
     <arg name="params_file" default="$(find-pkg-share drive)/params/nav2_params.yaml"/>
     <arg name="default_nav_to_pose_bt_xml" default="$(find-pkg-share drive)/behavior_trees/navigate_to_pose_w_replanning_and_recovery_45deg.xml"/>
     <arg name="autostart" default="True"/>
+    <arg name="start_navigation" default="True"/>
     <arg name="container_name" default="nav2_container"/>
+    <arg name="container_target" default="$(var container_name)"/>
     <arg name="use_composition" default="True"/>
     <arg name="use_respawn" default="False"/>
     <arg name="log_level" default="info"/>
+    <arg name="cmd_vel_output_topic" default="cmd_vel"/>
     <arg name="lifecycle_nodes_local" default="['map_server', 'filter_mask_server', 'costmap_filter_info_server', 'amcl']"/>
     <arg name="lifecycle_nodes_nav" default="['controller_server', 'smoother_server', 'planner_server', 'behavior_server', 'bt_navigator', 'waypoint_follower', 'velocity_smoother']"/>
 
     <group>
         <push-ros-namespace namespace="$(var namespace)"/>
-        <node pkg="rclcpp_components" exec="component_container_isolated" name='$(var container_name)' output="screen" args="--ros-args --log-level $(var log_level)">
+        <node pkg="rclcpp_components" exec="component_container_isolated" name='$(var container_name)' output="screen" args="--ros-args --log-level $(var log_level)" if="$(var use_composition)">
             <param from="$(var params_file)"/>
             <param name='map' value="$(var map)"/>
             <param name='autostart' value="$(var autostart)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
             
-            <remap from="/tf" to="tf"/>
-            <remap from="/tf_static" to="tf_static"/>
         </node>
 
         <include file="$(find-pkg-share drive)/launch/localization_launch.xml">
@@ -38,19 +39,20 @@
             <arg name="autostart" value="$(var autostart)"/>
             <arg name="use_composition" value="$(var use_composition)"/>
             <arg name="use_respawn" value="$(var use_respawn)"/>
-            <arg name="container_name" value="$(var container_name)"/>
+            <arg name="container_name" value="$(var container_target)"/>
             <arg name="log_level" value="$(var log_level)"/>
+            <arg name="cmd_vel_output_topic" value="$(var cmd_vel_output_topic)"/>
             <arg name='lifecycle_nodes' value="$(var lifecycle_nodes_local)"/>
         </include>
 
-        <include file="$(find-pkg-share drive)/launch/navigation_launch.xml">
+        <include file="$(find-pkg-share drive)/launch/navigation_launch.xml" if="$(var start_navigation)">
             <arg name="params_file" value="$(var params_file)"/>
             <arg name="use_sim_time" value="$(var use_sim_time)"/>
             <arg name="default_nav_to_pose_bt_xml" value="$(var default_nav_to_pose_bt_xml)"/>
             <arg name="autostart" value="$(var autostart)"/>
             <arg name="use_composition" value="$(var use_composition)"/>
             <arg name="use_respawn" value="$(var use_respawn)"/>
-            <arg name="container_name" value="$(var container_name)"/>
+            <arg name="container_name" value="$(var container_target)"/>
             <arg name="log_level" value="$(var log_level)"/>
             <arg name='lifecycle_nodes' value="$(var lifecycle_nodes_nav)"/>
         </include>

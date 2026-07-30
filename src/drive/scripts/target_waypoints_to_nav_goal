@@ -61,11 +61,10 @@ class TargetWaypointsToNavGoal(Node):
             self.get_logger().warning(f'Ignored empty waypoint {source_type}')
             return
 
-        now = self.get_clock().now().to_msg()
         normalized_poses = []
         for index, pose in enumerate(poses):
             normalized_pose = PoseStamped()
-            normalized_pose.header = pose.header
+            normalized_pose.header.frame_id = pose.header.frame_id
             normalized_pose.pose = pose.pose
 
             if not normalized_pose.header.frame_id:
@@ -75,9 +74,6 @@ class TargetWaypointsToNavGoal(Node):
                     )
                     return
                 normalized_pose.header.frame_id = self.default_frame_id
-
-            if normalized_pose.header.stamp.sec == 0 and normalized_pose.header.stamp.nanosec == 0:
-                normalized_pose.header.stamp = now
 
             normalized_poses.append(normalized_pose)
 

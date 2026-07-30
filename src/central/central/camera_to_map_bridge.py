@@ -11,7 +11,10 @@ import tty
 from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import Path as PathMsg
 import numpy as np
+from porter_interfaces.action import DispatchNavigation
+from porter_interfaces.msg import PixelNavigationCommand
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -105,6 +108,14 @@ class CameraToMapBridge(Node):
 
         self.declare_parameter('calibration_yaml', 'config/central/camera_map_calibration.yaml')
         self.declare_parameter('input_pixel_topic', '/central/target_pixel')
+        self.declare_parameter(
+            'fleet_pixel_command_topic',
+            '/central/fleet/pixel_navigation_command',
+        )
+        self.declare_parameter(
+            'dispatch_action',
+            '/central/dispatch_navigation',
+        )
         self.declare_parameter('output_pose_topic', '/central/target_map_pose')
         self.declare_parameter('output_json_topic', '/central/target_map_json')
         self.declare_parameter('target_id', 'target')
@@ -133,6 +144,12 @@ class CameraToMapBridge(Node):
             str(self.get_parameter('calibration_yaml').value)
         )
         self.input_pixel_topic = str(self.get_parameter('input_pixel_topic').value)
+        self.fleet_pixel_command_topic = str(
+            self.get_parameter('fleet_pixel_command_topic').value
+        )
+        self.dispatch_action = str(
+            self.get_parameter('dispatch_action').value
+        )
         self.output_pose_topic = str(self.get_parameter('output_pose_topic').value)
         self.output_json_topic = str(self.get_parameter('output_json_topic').value)
         self.target_id = str(self.get_parameter('target_id').value)
@@ -196,6 +213,17 @@ class CameraToMapBridge(Node):
             self.on_pixel_point,
             10,
         )
+        self.create_subscription(
+            PixelNavigationCommand,
+            self.fleet_pixel_command_topic,
+            self.on_fleet_pixel_command,
+            10,
+        )
+        self.dispatch_client = ActionClient(
+            self,
+            DispatchNavigation,
+            self.dispatch_action,
+        )
         self.get_logger().info(f'Loaded calibration: {self.calibration_yaml_path}')
         self.get_logger().info(f'Subscribing pixel points: {self.input_pixel_topic}')
         self.get_logger().info(f'Publishing map PoseStamped: {self.output_pose_topic}')
@@ -212,6 +240,107 @@ class CameraToMapBridge(Node):
             self.get_logger().info(
                 'Click 1: target position, click 2: target heading direction'
             )
+
+    def on_fleet_pixel_command(self, message):
+        target_pixel = [
+            float(message.target_pixel.x),
+            float(message.target_pixel.y),
+        ]
+        heading_pixel = [
+            float(message.heading_pixel.x),
+            float(message.heading_pixel.y),
+        ]
+        target_x, target_y = self.camera_pixel_to_map_xy(target_pixel)
+        heading_x, heading_y = self.camera_pixel_to_map_xy(heading_pixel)
+        is_b1 = message.zone_id == 'B-1' or message.mode == 'parking_b1'
+        if is_b1:
+            left_x, left_y = self.camera_left_map_offset(
+                target_pixel, self.b1_camera_left_offset_m
+            )
+            down_x, down_y = self.camera_down_map_offset(
+                target_pixel, self.b1_camera_down_offset_m
+            )
+            target_x += left_x + down_x
+            target_y += left_y + down_y
+            heading_x += left_x + down_x
+            heading_y += left_y + down_y
+
+        delta_x = heading_x - target_x
+        delta_y = heading_y - target_y
+        distance = float(np.hypot(delta_x, delta_y))
+        if distance < self.minimum_direction_distance:
+            self.get_logger().warning(
+                f'Rejected fleet command {message.command_id}: '
+                f'heading distance {distance:.3f}m is too short'
+            )
+            return
+        yaw = float(np.arctan2(delta_y, delta_x))
+        source = PointStamped()
+        source.header = message.header
+        pose = self.build_pose_msg(source, target_x, target_y, yaw)
+        self.pose_pub.publish(pose)
+        self.json_pub.publish(self.build_json_msg(
+            source,
+            target_pixel,
+            heading_pixel,
+            target_x,
+            target_y,
+            heading_x,
+            heading_y,
+            yaw,
+        ))
+
+        if not self.dispatch_client.server_is_ready():
+            self.get_logger().error(
+                f'Fleet dispatcher unavailable: {self.dispatch_action}'
+            )
+            return
+        goal = DispatchNavigation.Goal()
+        goal.command_id = message.command_id
+        goal.requested_vehicle_id = message.requested_vehicle_id
+        goal.zone_id = 'B-1' if is_b1 else message.zone_id
+        goal.poses = [pose]
+        future = self.dispatch_client.send_goal_async(
+            goal,
+            feedback_callback=self._on_dispatch_feedback,
+        )
+        future.add_done_callback(self._on_dispatch_response)
+        self.get_logger().info(
+            f'Dispatching {message.command_id}: '
+            f'vehicle={message.requested_vehicle_id or "AUTO"}, '
+            f'zone={goal.zone_id or "-"}, '
+            f'map=({target_x:.3f}, {target_y:.3f})'
+        )
+
+    def _on_dispatch_feedback(self, feedback_message):
+        feedback = feedback_message.feedback
+        self.get_logger().info(
+            f'Fleet feedback: vehicle={feedback.assigned_vehicle_id}, '
+            f'state={feedback.state}'
+        )
+
+    def _on_dispatch_response(self, future):
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'Fleet dispatch request failed: {exc}')
+            return
+        if not goal_handle.accepted:
+            self.get_logger().error('Fleet dispatcher rejected command')
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_dispatch_result)
+
+    def _on_dispatch_result(self, future):
+        try:
+            result = future.result().result
+            log = self.get_logger().info if result.success else self.get_logger().error
+            log(
+                f'Fleet result: vehicle={result.assigned_vehicle_id}, '
+                f'success={result.success}, message={result.message}'
+            )
+        except Exception as exc:
+            self.get_logger().error(f'Failed to receive fleet result: {exc}')
 
     def resolve_path(self, configured_path):
         path = Path(configured_path)

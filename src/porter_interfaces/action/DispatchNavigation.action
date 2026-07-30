@@ -1,0 +1,13 @@
+string command_id
+string requested_vehicle_id
+string zone_id
+geometry_msgs/PoseStamped[] poses
+---
+bool success
+uint16 error_code
+string message
+string assigned_vehicle_id
+---
+string assigned_vehicle_id
+string state
+uint32 current_waypoint
