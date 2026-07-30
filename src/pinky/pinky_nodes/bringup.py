@@ -40,6 +40,8 @@ class Pinky(Node):
         self.declare_parameter('frame_prefix', '')
         self.declare_parameter('left_wheel_joint', 'left_wheel_joint')
         self.declare_parameter('right_wheel_joint', 'right_wheel_joint')
+        self.declare_parameter('caster_rotate_joint', 'caster_rotate_joint')
+        self.declare_parameter('caster_wheel_joint', 'caster_wheel_joint')
         self.declare_parameter('serial_port', SERIAL_PORT_NAME)
         self.declare_parameter('baud_rate', BAUDRATE)
         
@@ -54,6 +56,12 @@ class Pinky(Node):
         )
         self.right_wheel_joint = str(
             self.get_parameter('right_wheel_joint').value
+        )
+        self.caster_rotate_joint = str(
+            self.get_parameter('caster_rotate_joint').value
+        )
+        self.caster_wheel_joint = str(
+            self.get_parameter('caster_wheel_joint').value
         )
         
         self.get_logger().info(f'Wheel radius: {self.wheel_radius}')
@@ -207,12 +215,17 @@ class Pinky(Node):
     def _publish_joint_states(self, current_time, rpm_l, rpm_r):
         joint_msg = JointState()
         joint_msg.header.stamp = current_time.to_msg()
-        joint_msg.name = [self.left_wheel_joint, self.right_wheel_joint]
+        joint_msg.name = [
+            self.left_wheel_joint,
+            self.right_wheel_joint,
+            self.caster_rotate_joint,
+            self.caster_wheel_joint,
+        ]
         
         pos_l_rad = (self.last_encoder_l / PULSE_PER_ROT) * (2 * math.pi)
         pos_r_rad = (self.last_encoder_r / PULSE_PER_ROT) * (2 * math.pi)
-        joint_msg.position = [pos_l_rad, pos_r_rad]
-        joint_msg.velocity = [rpm_l * RPM2RAD, rpm_r * RPM2RAD]
+        joint_msg.position = [pos_l_rad, pos_r_rad, 0.0, 0.0]
+        joint_msg.velocity = [rpm_l * RPM2RAD, rpm_r * RPM2RAD, 0.0, 0.0]
 
         self.joint_pub.publish(joint_msg)
 

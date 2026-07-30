@@ -9,47 +9,61 @@
 카메라·YOLO, fleet dispatcher, 제어 API와 RViz만 실행하며 Nav2를 중복 실행하지
 않습니다.
 
-### 1. AGV1 컴퓨터
+### 1. 중앙 관제 노트북
 
 ```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 export ROS_DOMAIN_ID=12
-
-ros2 launch porter_bringup agv_vehicle.launch.py \
-  vehicle_id:=agv1 \
-  start_nav2:=true
-```
-
-### 2. AGV2 컴퓨터
-
-```bash
-cd ~/poter_ws
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-export ROS_DOMAIN_ID=12
-
-ros2 launch porter_bringup agv_vehicle.launch.py \
-  vehicle_id:=agv2 \
-  start_nav2:=true
-```
-
-### 3. 중앙 관제 노트북
-
-```bash
-cd ~/poter_ws
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-export ROS_DOMAIN_ID=12
+export ROS_DISCOVERY_SERVER=127.0.0.1:11811
 export PORT_CONTROL_API_TOKEN='porter1234'
 
 ros2 launch porter_bringup fleet_central_laptop.launch.py
 ```
 
+### 2. AGV1 컴퓨터
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=12
+export ROS_DISCOVERY_SERVER=<중앙_노트북_IP>:11811
+
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv1 \
+  discovery_server:=$ROS_DISCOVERY_SERVER \
+  start_nav2:=true
+```
+
+### 3. AGV2 컴퓨터
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=12
+export ROS_DISCOVERY_SERVER=<중앙_노트북_IP>:11811
+
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv2 \
+  discovery_server:=$ROS_DISCOVERY_SERVER \
+  start_nav2:=true
+```
+
+중앙 launch는 `0.0.0.0:11811`에서 Fast DDS Discovery Server를 함께 실행합니다.
+따라서 중앙 launch를 먼저 실행하고 각 차량의 `discovery_server`에는 중앙
+노트북의 실제 Wi-Fi IP를 넣습니다. 이 설정은 여러 Nav2 프로세스의 멀티캐스트
+검색 트래픽을 줄이고 무선 연결이 반복해서 끊기는 현상을 완화합니다.
+
+별도 터미널에서 `ros2 topic`, `ros2 action`, `rqt`를 실행할 때도 해당 컴퓨터의
+`ROS_DISCOVERY_SERVER`를 위와 같이 먼저 설정해야 합니다. 중앙에서는
+`127.0.0.1:11811`, 차량에서는 `<중앙_노트북_IP>:11811`을 사용합니다.
+
 이 launch는 두 차량을 한 화면에 표시하는 저대역폭 fleet RViz를 함께 실행합니다.
-지도, 차량 위치 마커, 경로만 기본 구독하며 원격 `/scan`, `/odom`,
-`/particle_cloud`, 로봇 모델은 기본 비활성화합니다. 툴바의
+지도, 저주기 차량 위치 마커, 경로와 두 RobotModel을 기본 표시하며 원격
+`/scan`, `/odom`, `/particle_cloud`는 기본 비활성화합니다. 툴바의
 `AGV1 Initial Pose`로 1번 차량을, `AGV2 Initial Pose`로 2번 차량을 실제
 위치와 방향에 맞게 각각 설정합니다. 두 도구는 각각 `/agv1/initialpose`,
 `/agv2/initialpose`에 발행합니다. RViz가 필요 없으면 `use_rviz:=false`를
@@ -68,8 +82,13 @@ ros2 launch porter_bringup fleet_central_laptop.launch.py \
   dashboard_enable_scan:=true
 ```
 
-RViz에서도 `AGV1 Scan`, `AGV2 Scan` 체크는 진단할 때만 켭니다. 체크하는 동안
-해당 LaserScan이 차량에서 중앙 노트북으로 계속 전송됩니다.
+RViz의 실제 RobotModel은 두 대 모두 표시하되 5 Hz로만 갱신됩니다. 모델이
+겹쳐 보이면 두 차량의 초기 위치가 아직 같은 위치로 설정된 것입니다. 툴바의
+차량별 `Initial Pose`를 각각 지정합니다. `Fleet Vehicles`는 RobotModel과
+별개인 2 Hz 경량 차량 마커이므로 항상 두 차량 상태를 확인할 수 있습니다.
+
+`AGV1 Scan`, `AGV2 Scan` 체크는 진단할 때만 켭니다. 체크하는 동안 해당
+LaserScan이 차량에서 중앙 노트북으로 계속 전송됩니다.
 차량별 위치와 상태는 `/central/fleet/agv1/state`,
 `/central/fleet/agv2/state`에서 동시에 관리됩니다.
 
@@ -93,6 +112,16 @@ ros2 topic pub --once /agv2/initialpose \
 위 예시는 원점이므로 실제 위치의 `x`, `y`, quaternion을 넣어야 합니다.
 초기 pose를 받기 전 차량 상태는 `WAITING_FOR_INITIAL_POSE`이며 중앙 배차 대상에
 포함되지 않습니다.
+
+### 4.1 RViz에서 차량별 수동 목표 전송
+
+중앙 fleet RViz 툴바에는 `2D Goal Pose` 도구가 두 개 있습니다. 첫 번째는
+AGV1의 `/agv1/goal_pose`, 두 번째는 AGV2의 `/agv2/goal_pose`로 발행됩니다.
+이 도구를 선택한 뒤 지도에서 목표 위치를 누르고 드래그해 최종 방향을
+지정하면 중앙 목표 라우터가 각 차량의 namespaced Nav2 액션으로 전달합니다.
+
+- 첫 번째 `2D Goal Pose`: `/agv1/navigate_to_pose`
+- 두 번째 `2D Goal Pose`: `/agv2/navigate_to_pose`
 
 ### 5. AUTO 배차
 
@@ -142,9 +171,13 @@ curl -X POST http://127.0.0.1:8100/api/v1/emergency-stop \
 - 중앙 dispatcher는 차량별 `/amcl_pose`와 배터리만 지속 구독합니다.
 - 중앙 RViz는 지도, 저주기 차량 마커, 경로만 기본 표시합니다.
 - 웹 SLAM 화면은 `/agv1/map`과 `/agv1/amcl_pose`를 사용합니다.
-- 원격 LaserScan, odom, particle cloud, robot model은 기본 구독하지 않습니다.
+- 원격 LaserScan, odom, particle cloud는 기본 구독하지 않습니다.
+- 두 RobotModel은 저주기 갱신하고 `Fleet Vehicles` 경량 마커를 함께 사용합니다.
 - 차량 내부 Nav2는 기존 `/scan`, `/odom`, TF를 그대로 사용합니다.
 - Nav2의 voxel map 발행과 full costmap 반복 발행은 끕니다.
+- Fast DDS Discovery Server를 사용해 세 컴퓨터 사이의 검색 트래픽을 줄입니다.
+- 물리 차량에서는 중복 `joint_state_publisher`를 실행하지 않습니다.
+- LaserScan은 Best Effort, depth 1로 발행해 오래된 프레임 재전송을 막습니다.
 
 변경 후 중앙 노트북과 두 차량에서 최신 코드를 빌드합니다.
 

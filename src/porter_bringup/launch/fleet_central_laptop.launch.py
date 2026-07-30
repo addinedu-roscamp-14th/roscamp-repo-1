@@ -3,8 +3,10 @@
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     GroupAction,
     IncludeLaunchDescription,
+    SetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -34,11 +36,42 @@ def generate_launch_description():
         DeclareLaunchArgument('use_rviz', default_value='true'),
         DeclareLaunchArgument('control_host', default_value='0.0.0.0'),
         DeclareLaunchArgument(
+            'discovery_server_port',
+            default_value='11811',
+        ),
+        DeclareLaunchArgument(
+            'start_discovery_server',
+            default_value='true',
+        ),
+        DeclareLaunchArgument(
             'api_token',
             default_value=EnvironmentVariable(
                 'PORT_CONTROL_API_TOKEN',
                 default_value='',
             ),
+        ),
+        ExecuteProcess(
+            cmd=[
+                'fastdds',
+                'discovery',
+                '-i',
+                '0',
+                '-l',
+                '0.0.0.0',
+                '-p',
+                LaunchConfiguration('discovery_server_port'),
+            ],
+            output='screen',
+            condition=IfCondition(
+                LaunchConfiguration('start_discovery_server')
+            ),
+        ),
+        SetEnvironmentVariable(
+            'ROS_DISCOVERY_SERVER',
+            [
+                '127.0.0.1:',
+                LaunchConfiguration('discovery_server_port'),
+            ],
         ),
         GroupAction(
             scoped=True,
@@ -81,6 +114,28 @@ def generate_launch_description():
             parameters=[{'subscribe_odom_fallback': False}],
         ),
         Node(
+            package='drive',
+            executable='target_map_pose_to_nav_goal',
+            name='agv1_manual_goal_to_nav',
+            output='screen',
+            parameters=[{
+                'target_topic': '/agv1/goal_pose',
+                'action_name': '/agv1/navigate_to_pose',
+                'default_frame_id': 'map',
+            }],
+        ),
+        Node(
+            package='drive',
+            executable='target_map_pose_to_nav_goal',
+            name='agv2_manual_goal_to_nav',
+            output='screen',
+            parameters=[{
+                'target_topic': '/agv2/goal_pose',
+                'action_name': '/agv2/navigate_to_pose',
+                'default_frame_id': 'map',
+            }],
+        ),
+        Node(
             package='central',
             executable='camera_to_map_bridge',
             name='camera_to_map_bridge',
@@ -111,6 +166,22 @@ def generate_launch_description():
                     'host': LaunchConfiguration('control_host'),
                     'api_token': LaunchConfiguration('api_token'),
                 },
+            ],
+        ),
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='fleet_map_anchor',
+            output='screen',
+            arguments=[
+                '--x', '0',
+                '--y', '0',
+                '--z', '0',
+                '--roll', '0',
+                '--pitch', '0',
+                '--yaw', '0',
+                '--frame-id', 'map',
+                '--child-frame-id', 'fleet_map_anchor',
             ],
         ),
         Node(

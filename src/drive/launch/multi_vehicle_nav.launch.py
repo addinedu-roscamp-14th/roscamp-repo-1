@@ -33,6 +33,22 @@ def _rewrite_frames(value, vehicle_id):
     return value
 
 
+def _rewrite_keepout_topics(params, vehicle_id):
+    """Use absolute filter topics so nested costmap nodes resolve them correctly."""
+    filter_info_topic = f'/{vehicle_id}/costmap_filter_info'
+    mask_topic = f'/{vehicle_id}/keepout_filter_mask'
+
+    global_costmap = params['global_costmap']['global_costmap']['ros__parameters']
+    global_costmap['keepout_filter']['filter_info_topic'] = filter_info_topic
+
+    mask_server = params['filter_mask_server']['ros__parameters']
+    mask_server['topic_name'] = mask_topic
+
+    info_server = params['costmap_filter_info_server']['ros__parameters']
+    info_server['filter_info_topic'] = filter_info_topic
+    info_server['mask_topic'] = mask_topic
+
+
 def _launch_nav2(context):
     vehicle_id = LaunchConfiguration('vehicle_id').perform(context).strip('/')
     if vehicle_id not in ('agv1', 'agv2'):
@@ -42,6 +58,7 @@ def _launch_nav2(context):
     with source.open('r', encoding='utf-8') as stream:
         params = yaml.safe_load(stream)
     params = _rewrite_frames(params, vehicle_id)
+    _rewrite_keepout_topics(params, vehicle_id)
     # ROS parameter files match fully-qualified node names. Nesting the file
     # under the vehicle namespace makes every Nav2 block apply to /agvX/*.
     params.pop('/**', None)
@@ -65,7 +82,8 @@ def _launch_nav2(context):
                 'map': LaunchConfiguration('map'),
                 'keepout_mask': LaunchConfiguration('keepout_mask'),
                 'params_file': str(generated),
-                'container_name': f'{vehicle_id}_nav2_container',
+                'container_name': 'nav2_container',
+                'container_target': f'/{vehicle_id}/nav2_container',
                 'cmd_vel_output_topic': 'cmd_vel_safe_input',
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'use_composition': LaunchConfiguration('use_composition'),
@@ -109,7 +127,7 @@ def generate_launch_description():
             ]),
         ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
-        DeclareLaunchArgument('use_composition', default_value='False'),
+        DeclareLaunchArgument('use_composition', default_value='True'),
         DeclareLaunchArgument('start_navigation', default_value='True'),
         OpaqueFunction(function=_launch_nav2),
     ])

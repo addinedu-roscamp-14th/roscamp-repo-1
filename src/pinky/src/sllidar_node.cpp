@@ -59,7 +59,8 @@ class SLlidarNode : public rclcpp::Node
     : Node("sllidar_node")
     {
 
-      scan_pub = this->create_publisher<sensor_msgs::msg::LaserScan>("scan", rclcpp::QoS(rclcpp::KeepLast(10)));
+      scan_pub = this->create_publisher<sensor_msgs::msg::LaserScan>(
+        "scan", rclcpp::SensorDataQoS().keep_last(1));
       
     }
 
@@ -352,17 +353,17 @@ public:
             RCLCPP_ERROR(this->get_logger(),"Can not start scan: %08x!", op_result);
         }
 
-        rclcpp::Time start_scan_time;
         rclcpp::Time end_scan_time;
         double scan_duration;
         while (rclcpp::ok() && !need_exit) {
             sl_lidar_response_measurement_node_hq_t nodes[8192];
             size_t   count = _countof(nodes);
 
-            start_scan_time = this->now();
             op_result = drv->grabScanDataHq(nodes, count);
             end_scan_time = this->now();
-            scan_duration = (end_scan_time - start_scan_time).seconds();
+            scan_duration = 1.0 / std::max(scan_frequency, 1.0f);
+            const rclcpp::Time scan_stamp =
+                end_scan_time - rclcpp::Duration::from_seconds(scan_duration);
 
             if (op_result == SL_RESULT_OK) {
                 op_result = drv->ascendScanData(nodes, count);
@@ -392,7 +393,7 @@ public:
                         }
     
                         publish_scan(scan_pub, angle_compensate_nodes, angle_compensate_nodes_count,
-                                start_scan_time, scan_duration, inverted,
+                                scan_stamp, scan_duration, inverted,
                                 angle_min, angle_max, max_distance,
                                 frame_id);
 
@@ -414,7 +415,7 @@ public:
                         angle_max = DEG2RAD(getAngle(nodes[end_node]));
 
                         publish_scan(scan_pub, &nodes[start_node], end_node-start_node +1,
-                                start_scan_time, scan_duration, inverted,
+                                scan_stamp, scan_duration, inverted,
                                 angle_min, angle_max, max_distance,
                                 frame_id);
                     }
@@ -423,7 +424,7 @@ public:
                     float angle_min = DEG2RAD(0.0f);
                     float angle_max = DEG2RAD(359.0f);
                     publish_scan(scan_pub, nodes, count,
-                                start_scan_time, scan_duration, inverted,
+                                scan_stamp, scan_duration, inverted,
                                 angle_min, angle_max, max_distance,
                                 frame_id);
                 }
@@ -480,4 +481,3 @@ int main(int argc, char * argv[])
   rclcpp::shutdown();
   return ret;
 }
-

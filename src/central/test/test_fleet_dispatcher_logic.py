@@ -104,3 +104,17 @@ def test_vehicle_is_not_dispatchable_before_initial_pose():
     assert not dispatcher._vehicle_ready('agv1')
     runtime.has_amcl_pose = True
     assert dispatcher._vehicle_ready('agv1')
+
+
+def test_nav_pose_uses_latest_tf_and_preserves_target():
+    source = target_pose(1.2, -0.4)
+    source.header.frame_id = 'map'
+    source.header.stamp.sec = 123
+
+    normalized = FleetDispatcher._latest_tf_pose(source)
+
+    assert normalized.header.frame_id == 'map'
+    assert normalized.header.stamp.sec == 0
+    assert normalized.header.stamp.nanosec == 0
+    assert math.isclose(normalized.pose.position.x, 1.2)
+    assert math.isclose(normalized.pose.position.y, -0.4)

@@ -38,6 +38,7 @@ def generate_launch_description():
             launch_arguments={
                 'namespace': vehicle_id,
                 'is_sim': use_sim_time,
+                'start_joint_state_publisher': 'false',
             }.items(),
         ),
         Node(
@@ -82,6 +83,14 @@ def generate_launch_description():
                     ),
                     'right_wheel_joint': ParameterValue(
                         [vehicle_id, '/r_wheel_joint'],
+                        value_type=str,
+                    ),
+                    'caster_rotate_joint': ParameterValue(
+                        [vehicle_id, '/caster_rotate_joint'],
+                        value_type=str,
+                    ),
+                    'caster_wheel_joint': ParameterValue(
+                        [vehicle_id, '/caster_wheel_joint'],
                         value_type=str,
                     ),
                     'serial_port': motor_serial_port,

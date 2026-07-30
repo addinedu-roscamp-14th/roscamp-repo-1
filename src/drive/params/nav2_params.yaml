@@ -1,9 +1,9 @@
 amcl:
   ros__parameters:
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
+    alpha1: 0.3
+    alpha2: 0.3
+    alpha3: 0.5
+    alpha4: 0.3
     alpha5: 0.2
     base_frame_id: "base_footprint"
     beam_skip_distance: 0.5
@@ -12,30 +12,30 @@ amcl:
     do_beamskip: false
     global_frame_id: "map"
     lambda_short: 0.1
-    laser_likelihood_max_dist: 2.0
+    laser_likelihood_max_dist: 0.5
     laser_max_range: 100.0
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
-    max_beams: 60
+    max_beams: 100
     max_particles: 3000
     min_particles: 800
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
-    sigma_hit: 0.2
+    sigma_hit: 0.12
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.05
-    update_min_d: 0.05
-    z_hit: 0.5
-    z_max: 0.05
-    z_rand: 0.5
-    z_short: 0.05
+    update_min_a: 0.02
+    update_min_d: 0.01
+    z_hit: 0.7
+    z_max: 0.03
+    z_rand: 0.25
+    z_short: 0.02
     scan_topic: scan
     set_initial_pose: true
     initial_pose: [0, 0, 0]
@@ -165,8 +165,8 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      movement_time_allowance: 20.0              # [s] 이 시간 동안 아래 거리만큼 못 움직이면 끼인 것으로 판단
-      required_movement_radius: 0.05             # [m] 위 시간 동안 최소 0.05m 반경은 벗어나야 함 (못 벗어나면 Recovery 실행)
+      movement_time_allowance: 8.0               # [s] 실제 map 위치가 멈추면 빠르게 Recovery 실행
+      required_movement_radius: 0.03             # [m] 8초 동안 최소 0.03m 이동하지 못하면 끼임으로 판단
 
 
 local_costmap:

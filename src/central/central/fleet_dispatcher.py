@@ -385,11 +385,14 @@ class FleetDispatcher(Node):
             )
             if len(request.poses) == 1:
                 nav_goal = NavigateToPose.Goal()
-                nav_goal.pose = request.poses[0]
+                nav_goal.pose = self._latest_tf_pose(request.poses[0])
                 client = self.nav_pose_clients[vehicle_id]
             else:
                 nav_goal = NavigateThroughPoses.Goal()
-                nav_goal.poses = list(request.poses)
+                nav_goal.poses = [
+                    self._latest_tf_pose(pose)
+                    for pose in request.poses
+                ]
                 client = self.nav_waypoint_clients[vehicle_id]
 
             send_future = client.send_goal_async(
@@ -438,6 +441,13 @@ class FleetDispatcher(Node):
                 runtime.active_nav_goal = None
             if leaving_b1 and navigation_succeeded:
                 self._release_b1(vehicle_id)
+
+    @staticmethod
+    def _latest_tf_pose(source):
+        pose = PoseStamped()
+        pose.header.frame_id = source.header.frame_id or 'map'
+        pose.pose = source.pose
+        return pose
 
     @staticmethod
     def _publish_dispatch_feedback(

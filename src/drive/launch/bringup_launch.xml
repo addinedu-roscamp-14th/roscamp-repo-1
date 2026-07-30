@@ -12,6 +12,7 @@
     <arg name="autostart" default="True"/>
     <arg name="start_navigation" default="True"/>
     <arg name="container_name" default="nav2_container"/>
+    <arg name="container_target" default="$(var container_name)"/>
     <arg name="use_composition" default="True"/>
     <arg name="use_respawn" default="False"/>
     <arg name="log_level" default="info"/>
@@ -38,7 +39,7 @@
             <arg name="autostart" value="$(var autostart)"/>
             <arg name="use_composition" value="$(var use_composition)"/>
             <arg name="use_respawn" value="$(var use_respawn)"/>
-            <arg name="container_name" value="$(var container_name)"/>
+            <arg name="container_name" value="$(var container_target)"/>
             <arg name="log_level" value="$(var log_level)"/>
             <arg name="cmd_vel_output_topic" value="$(var cmd_vel_output_topic)"/>
             <arg name='lifecycle_nodes' value="$(var lifecycle_nodes_local)"/>
@@ -51,7 +52,7 @@
             <arg name="autostart" value="$(var autostart)"/>
             <arg name="use_composition" value="$(var use_composition)"/>
             <arg name="use_respawn" value="$(var use_respawn)"/>
-            <arg name="container_name" value="$(var container_name)"/>
+            <arg name="container_name" value="$(var container_target)"/>
             <arg name="log_level" value="$(var log_level)"/>
             <arg name='lifecycle_nodes' value="$(var lifecycle_nodes_nav)"/>
         </include>

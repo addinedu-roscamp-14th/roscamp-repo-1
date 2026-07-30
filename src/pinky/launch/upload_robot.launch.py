@@ -3,6 +3,7 @@ from os import environ
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, Shutdown
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, Command, TextSubstitution
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -14,6 +15,10 @@ def generate_launch_description():
     namespace_arg = DeclareLaunchArgument("namespace", default_value="")
     is_sim = DeclareLaunchArgument("is_sim", default_value="false")
     cam_tilt_deg = DeclareLaunchArgument("cam_tilt_deg", default_value="0")
+    start_joint_state_publisher = DeclareLaunchArgument(
+        "start_joint_state_publisher",
+        default_value="true",
+    )
 
     namespace = PythonExpression([
         "'", LaunchConfiguration('namespace'), "' + ('/' if '", LaunchConfiguration('namespace'), "' != '' else '')"
@@ -48,6 +53,9 @@ def generate_launch_description():
         executable='joint_state_publisher',
         name='joint_state_publisher',
         namespace=LaunchConfiguration('namespace'),
+        condition=IfCondition(
+            LaunchConfiguration('start_joint_state_publisher')
+        ),
         parameters=[{
             "source_list": ['joint_states'],
             "rate": 20.0,
@@ -62,6 +70,7 @@ def generate_launch_description():
     ld.add_action(namespace_arg)
     ld.add_action(is_sim)
     ld.add_action(cam_tilt_deg)
+    ld.add_action(start_joint_state_publisher)
     ld.add_action(rsp_node)
     ld.add_action(jsp_node)
 

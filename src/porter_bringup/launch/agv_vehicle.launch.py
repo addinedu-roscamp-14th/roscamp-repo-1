@@ -5,11 +5,24 @@ visualizes both vehicles and dispatches goals to their namespaced actions.
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+    TimerAction,
+)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+
+
+def _configure_discovery(context):
+    server = LaunchConfiguration('discovery_server').perform(context).strip()
+    if not server:
+        return []
+    return [SetEnvironmentVariable('ROS_DISCOVERY_SERVER', server)]
 
 
 def generate_launch_description():
@@ -44,12 +57,26 @@ def generate_launch_description():
             'motor_serial_port', default_value='/dev/ttyAMA5'
         ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument(
+            'discovery_server',
+            default_value=EnvironmentVariable(
+                'ROS_DISCOVERY_SERVER',
+                default_value='',
+            ),
+            description='Fast DDS server, for example 10.0.0.2:11811',
+        ),
         DeclareLaunchArgument('start_nav2', default_value='true'),
         DeclareLaunchArgument(
             'use_composition',
-            default_value='false',
+            default_value='true',
             description='Run Nav2 in a component container',
         ),
+        DeclareLaunchArgument(
+            'nav2_start_delay',
+            default_value='8.0',
+            description='Wait for hardware TF and sensor topics before Nav2',
+        ),
+        OpaqueFunction(function=_configure_discovery),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([
@@ -65,22 +92,29 @@ def generate_launch_description():
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
             }.items(),
         ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution([
-                    FindPackageShare('drive'),
-                    'launch',
-                    'multi_vehicle_nav.launch.py',
-                ])
-            ),
+        TimerAction(
+            period=LaunchConfiguration('nav2_start_delay'),
             condition=IfCondition(LaunchConfiguration('start_nav2')),
-            launch_arguments={
-                'vehicle_id': vehicle_id,
-                'workspace': workspace,
-                'map': LaunchConfiguration('map'),
-                'keepout_mask': LaunchConfiguration('keepout_mask'),
-                'use_sim_time': LaunchConfiguration('use_sim_time'),
-                'use_composition': LaunchConfiguration('use_composition'),
-            }.items(),
+            actions=[
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        PathJoinSubstitution([
+                            FindPackageShare('drive'),
+                            'launch',
+                            'multi_vehicle_nav.launch.py',
+                        ])
+                    ),
+                    launch_arguments={
+                        'vehicle_id': vehicle_id,
+                        'workspace': workspace,
+                        'map': LaunchConfiguration('map'),
+                        'keepout_mask': LaunchConfiguration('keepout_mask'),
+                        'use_sim_time': LaunchConfiguration('use_sim_time'),
+                        'use_composition': LaunchConfiguration(
+                            'use_composition'
+                        ),
+                    }.items(),
+                ),
+            ],
         ),
     ])
