@@ -1,0 +1,10 @@
+# Goal
+string spot_id
+---
+# Result
+bool success
+string message
+---
+# Feedback
+string phase
+float32 progress

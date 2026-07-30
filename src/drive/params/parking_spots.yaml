@@ -1,0 +1,10 @@
+parking_spots:
+  park_red:
+    approach:
+      x: 1.218242
+      y: 0.375254
+      yaw: -3.095542
+    parked:
+      x: 1.673782
+      y: 0.408066
+      yaw: -3.094020

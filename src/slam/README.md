@@ -30,8 +30,11 @@ ros2 launch pinky bringup_robot.launch.xml
 ros2 launch slam map_building.launch.xml
 ```
 
-차량이 `/map`, `/scan`, `/odom`, `/tf`, `/tf_static`과 `map -> odom` TF를 발행하는
-상태에서 노트북의 API 서버를 실행합니다.
+현재 차량 bringup의 `sllidar_node`는 `/scan` 발행 시점을 기준으로 `header.stamp`를 찍도록
+수정되어 있습니다. 이전처럼 scan 수집 시작 시각을 stamp로 쓰면 `/scan`이 현재 TF보다
+0.5~1초 이상 과거로 들어와 SLAM/Nav2 message filter에서 drop될 수 있습니다.
+
+노트북에서는 SLAM과 RViz를 실행합니다.
 
 ```bash
 ros2 launch slam slam_bringup.launch.xml
@@ -102,6 +105,7 @@ ros2 run nav2_map_server map_saver_cli \
 ```bash
 ros2 topic hz /scan
 ros2 topic hz /odom
+ros2 topic echo /scan --once --field header
 ros2 run tf2_ros tf2_echo odom base_footprint
 ros2 topic echo /map --once
 ```
@@ -110,4 +114,9 @@ ros2 topic echo /map --once
 `map -> odom -> base_footprint` TF에서 받고 LiDAR 점은 `/scan`에서 받습니다.
 
 차량과 노트북은 같은 네트워크와 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. Nav2와 SLAM이
-동시에 `map -> odom` TF를 발행하지 않도록 구성합니다.
+동시에 `map -> odom` TF를 발행하지 않도록 mapping 중에는 `drive bringup_launch.xml`을
+실행하지 않습니다.
+
+실차 운용 기본 domain은 현재 `ROS_DOMAIN_ID=13`입니다. `/scan` timestamp가 계속 과거로
+들어오는지 확인하려면 scan header stamp와 현재 ROS 시간을 비교합니다. 지연이 크면
+차량 쪽 `pinky` 패키지를 다시 빌드하고 bringup을 재시작해야 합니다.
