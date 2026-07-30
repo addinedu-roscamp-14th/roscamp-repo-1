@@ -11,6 +11,7 @@ launch/bringup_launch.xml            # AMCL, map server와 Nav2 전체 실행
 launch/localization_launch.xml       # map server와 AMCL
 launch/navigation_launch.xml         # planner, controller와 Nav2 서버
 launch/nav2_view.launch.xml          # Nav2 RViz 화면
+launch/navigation_event.launch.xml   # Nav2 시작/종료 JSON 이벤트 발행
 launch/target_map_pose_nav.launch.xml # 중앙 목표를 Nav2 action으로 전달
 launch/target_waypoints_nav.launch.xml # 여러 중앙 목표를 Nav2 through-poses action으로 전달
 params/nav2_params.yaml              # AMCL, costmap, planner/controller 설정
@@ -58,6 +59,45 @@ ros2 lifecycle get /controller_server
 두 입력 중 하나만 발행하면 됩니다. 새 waypoint 묶음이 들어오면 진행 중인 이전 waypoint
 goal을 취소하고 새 묶음을 전송합니다.
 
+### `navigation_event_publisher`
+
+Nav2 action status와 `/amcl_pose`를 감시해 자율주행 시작/종료 이벤트를 JSON 문자열로
+발행합니다. LLM 또는 외부 자연어 AI 연동 쪽에서는 `std_msgs/String.data`를 JSON으로 파싱하면
+됩니다.
+
+```text
+입력: /amcl_pose (geometry_msgs/PoseWithCovarianceStamped)
+입력: /navigate_to_pose/_action/status (action_msgs/GoalStatusArray)
+입력: /navigate_through_poses/_action/status (action_msgs/GoalStatusArray)
+출력: /drive/navigation_event (std_msgs/String JSON)
+```
+
+시작 시 현재 위치가 `start_position_1_x/y` 반경 `start_position_tolerance_m` 안이면
+`start_type`을 `position_1`로, 아니면 `other`로 발행합니다. 기본 `position_1`은
+`parking_new`의 마지막 고정 후진 기준 추정 좌표인 `x=1.694457`, `y=0.397200`입니다.
+시작/종료 시 현재 위치가 `params/navigation_areas.yaml`에 등록된 좌표 반경 안인지 검사해
+`current_area`와 `matched_area`를 함께 발행합니다. 기본 area는
+`A:0.192099:0.043845`, `B:0.200000:0.100000`,
+`parking_yellow:1.694457:0.397200`입니다.
+
+```yaml
+area_tolerance_m: 0.25
+areas:
+  A:
+    x: 0.192099
+    y: 0.043845
+  B:
+    x: 0.200000
+    y: 0.100000
+  parking_yellow:
+    x: 1.694457
+    y: 0.397200
+```
+
+```bash
+ros2 launch drive navigation_event.launch.xml
+```
+
 ### `parking_action_server`
 
 지정한 주차 ID를 읽어 접근 경로를 Nav2 `NavigateToPose` goal로 순차 실행한 뒤, 마지막
@@ -95,6 +135,7 @@ Nav2 `NavigateToPose` goal로 순차 실행합니다. 마지막 구간은 `parke
 ```text
 approach: x=1.218242, y=0.375254, yaw=-3.095542
 auto pre-approach: x=1.392214, y=0.261071, yaw=-3.095542
+estimated final reverse position: x=1.694457, y=0.397200
 reverse_distance_m: 0.476720       # [m] 약 47.7 cm 고정 후진
 reverse_speed: 0.095344            # [m/s] 약 5.0초 후진
 ```
