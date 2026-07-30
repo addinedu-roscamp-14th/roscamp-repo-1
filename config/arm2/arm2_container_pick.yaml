@@ -1,12 +1,12 @@
 /arm2/arm2_jetcobot_trajectory_bridge:
   ros__parameters:
     home_joint_angles_deg:
-    - 87.01
-    - 55.54
-    - -83.58
-    - -36.47
-    - 4.57
-    - -52.11
+    - 93.07
+    - 12.3
+    - -25.83
+    - -61.87
+    - 2.54
+    - -43.33
     go_home_on_startup: true
     go_home_on_shutdown: true
     home_speed: 50
@@ -76,13 +76,20 @@
     stack_approach_clearance_m: 0.08
     stack_minimum_approach_clearance_m: 0.03
     stack_approach_search_step_m: 0.01
+    stack_yaw_fallback_offsets_deg:
+    - 0.0
+    - 180.0
+    - 15.0
+    - -15.0
+    - 30.0
+    - -30.0
     stack_xy_offset_m:
     - 0.0
     - 0.0
     stack_z_offset_m: 0.015
     max_stack_levels: 3
     stack_source_orientation_mode: marker_yaw
-    stack_segmented_descent_min_fraction: 0.65
+    stack_segmented_descent_min_fraction: 0.3
     stack_segmented_descent_max_segments: 5
     stack_pose_goal_finish_max_distance_m: 0.075
     scan_marker_pause_sec: 0.5

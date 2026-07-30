@@ -309,10 +309,17 @@ ros2 run tf2_ros tf2_echo arm2/base_link arm2/TCP
 `arm`과 `arm2`는 같은 `ROS_DOMAIN_ID`에서 동시에 실행할 수 있습니다. 실제 장치가
 서로 다른 `/dev/video*`, `/dev/ttyUSB*`를 사용하도록 실행 인자를 지정해야 합니다.
 
-## A-1/A-2/A-3 목적지 저장 후 개별 이송
+## A-1/A-2/A-3 세부 목적지 저장 후 개별 이송
 
-터미널 1에서 통합 launch를 계속 실행합니다. 컨테이너 ID는 0, 1, 2, 3이고,
-목적지는 A-1=ID 11/12, A-2=ID 13/14, A-3=ID 15/16입니다.
+터미널 1에서 통합 launch를 계속 실행합니다. 컨테이너 ID는 0~8이고,
+트레일러는 ID 10입니다. 세부 목적지는 다음과 같습니다.
+
+- A-1-1 = ID 11
+- A-1-2 = ID 12
+- A-2-1 = ID 13
+- A-2-2 = ID 14
+- A-3-1 = ID 15
+- A-3-2 = ID 16
 
 ```bash
 ros2 launch arm2 arm2_container_pick_moveit.launch.py \
@@ -334,43 +341,37 @@ ros2 launch arm2 arm2_container_pick_moveit.launch.py \
 
 launch 직후 한 번만 목적지 스캔을 실행합니다. J1 스캔 중 ID
 11, 12, 13, 14, 15, 16을 각각 발견하면 0.5초 정지해 자세를 저장합니다.
-ID 11~16이 모두 저장되면 홈으로 복귀합니다. 저장값은 같은 launch가 실행되는
-동안 다시 갱신되지 않습니다.
+스캔 도중 ID 10 트레일러가 보이면 그 자세도 저장합니다. ID 11~16이 모두
+저장되면 ID 10을 찾지 못했더라도 홈으로 복귀합니다. 저장값은 같은 launch가
+실행되는 동안 다시 갱신되지 않습니다.
 
 ```bash
 ros2 service call /arm2/scan_destinations std_srvs/srv/Trigger "{}"
 ```
 
 이후 각 터미널에서 필요한 목적지 서비스를 호출합니다. 각 호출은 컨테이너 ID
-0~3 중 하나를 찾을 때까지 J1을 스캔하고, 발견 시 0.5초 정지해 현재 컨테이너
+0~8 중 하나를 찾을 때까지 J1을 스캔하고, 발견 시 0.5초 정지해 현재 컨테이너
 위치를 저장한 뒤 지정 목적지로 옮기고 홈으로 복귀합니다.
 
-터미널 2—A-1:
+세부구역별 서비스:
 
 ```bash
-ros2 service call /arm2/transfer_to_a1 std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/transfer_to_a1_1 std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/transfer_to_a1_2 std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/transfer_to_a2_1 std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/transfer_to_a2_2 std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/transfer_to_a3_1 std_srvs/srv/Trigger "{}"
+ros2 service call /arm2/transfer_to_a3_2 std_srvs/srv/Trigger "{}"
 ```
 
-터미널 3—A-2:
+로봇 동작은 한 번에 하나만 실행할 수 있으므로 한 세부구역 작업이 끝나기 전에
+다른 이송 서비스를 호출하면 요청이 거부됩니다. launch를 재시작하면 저장 pose가
+초기화되므로 `/arm2/scan_destinations`를 다시 호출해야 합니다.
 
-```bash
-ros2 service call /arm2/transfer_to_a2 std_srvs/srv/Trigger "{}"
-```
-
-터미널 4—A-3:
-
-```bash
-ros2 service call /arm2/transfer_to_a3 std_srvs/srv/Trigger "{}"
-```
-
-로봇 동작은 한 번에 하나만 실행할 수 있으므로 A-1 작업이 끝나기 전에 A-2나
-A-3 서비스를 호출하면 요청이 거부됩니다. launch를 재시작하면 ID 11~16의 저장
-pose가 초기화되므로 `/arm2/scan_destinations`를 다시 호출해야 합니다.
-
-같은 목적지 서비스를 반복 호출하면 목적지별로 최대 3층까지 쌓습니다. 컨테이너
-높이는 35mm이며, 각 목적지는 서로 독립적으로 1층, 2층(+35mm), 3층(+70mm)을
-기억합니다. 네 번째 요청은 거부됩니다. 실제 적재물을 치운 뒤 카운터만 다시
-1층으로 초기화하려면 다음 서비스를 호출합니다.
+같은 세부 목적지 서비스를 반복 호출하면 세부구역별로 최대 3층까지 쌓습니다.
+컨테이너 높이는 35mm이며, 여섯 세부구역은 서로 독립적으로 1층,
+2층(+35mm), 3층(+70mm)을 기억합니다. 네 번째 요청은 거부됩니다. 실제
+적재물을 치운 뒤 카운터만 다시 1층으로 초기화하려면 다음 서비스를 호출합니다.
 
 ```bash
 ros2 service call /arm2/reset_stack_level std_srvs/srv/Trigger "{}"
@@ -411,5 +412,5 @@ visual_servo_settle_sec: 0.6
 활성화한 경우 각 반복은 이동 전 샘플을 폐기하고 새로운 10개 샘플만 사용합니다. XY 오차가
 20mm를 넘거나, 마커를 2초 동안 잃거나, 정규화한 오차가 두 번 연속 증가하거나,
 5회 안에 연속 3회 허용 오차를 만족하지 못하면 하강하지 않고 실패 복귀합니다.
-초기 위치에서 ID 0~3 중 하나를 잠근 경우 해당 ID의 TF만 pregrasp 보정에
+초기 위치에서 ID 0~8 중 하나를 잠근 경우 해당 ID의 TF만 pregrasp 보정에
 사용합니다.

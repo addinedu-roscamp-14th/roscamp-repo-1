@@ -532,6 +532,11 @@ class ContainerPickCoordinator(Node):
         self.stack_approach_search_step = float(
             self.get_parameter('stack_approach_search_step_m').value
         )
+        self.stack_yaw_fallback_offsets = [
+            float(value) for value in self.get_parameter(
+                'stack_yaw_fallback_offsets_deg'
+            ).value
+        ]
         self.stack_xy_offset = self._vector_parameter(
             'stack_xy_offset_m', 2
         )
@@ -743,6 +748,14 @@ class ContainerPickCoordinator(Node):
             raise ValueError('max_stack_levels must be positive')
         if self.stack_approach_clearance <= 0.0:
             raise ValueError('stack_approach_clearance_m must be positive')
+        if any(
+            not math.isfinite(offset) or abs(offset) > 180.0
+            for offset in self.stack_yaw_fallback_offsets
+        ):
+            raise ValueError(
+                'stack_yaw_fallback_offsets_deg values must be finite and '
+                'within [-180, 180]'
+            )
         if self.stack_source_orientation_mode not in ('fixed', 'marker_yaw'):
             raise ValueError(
                 'stack_source_orientation_mode must be fixed or marker_yaw'
@@ -780,19 +793,28 @@ class ContainerPickCoordinator(Node):
             1: 'arm2/container_marker_1',
             2: 'arm2/container_marker_2',
             3: 'arm2/container_marker_3',
+            4: 'arm2/container_marker_4',
+            5: 'arm2/container_marker_5',
+            6: 'arm2/container_marker_6',
+            7: 'arm2/container_marker_7',
+            8: 'arm2/container_marker_8',
         }
         self.destination_ids = {
-            'A-1': (11, 12),
-            'A-2': (13, 14),
-            'A-3': (15, 16),
+            'A-1-1': 11,
+            'A-1-2': 12,
+            'A-2-1': 13,
+            'A-2-2': 14,
+            'A-3-1': 15,
+            'A-3-2': 16,
         }
         self.destination_frames = {
             marker_id: f'arm2/destination_marker_{marker_id}'
-            for marker_ids in self.destination_ids.values()
-            for marker_id in marker_ids
+            for marker_id in self.destination_ids.values()
         }
+        self.trailer_frame = 'arm2/trailer_marker_10'
         tracked_frames = {
             **self.source_frames,
+            10: self.trailer_frame,
             **self.destination_frames,
         }
         history_size = max(100, self.minimum_samples * 3)
@@ -815,9 +837,7 @@ class ContainerPickCoordinator(Node):
         self.saved_destination_poses = {}
         self.saved_marker_poses = {}
         self.saved_destination_stack_counts = {
-            'A-1': 0,
-            'A-2': 0,
-            'A-3': 0,
+            name: 0 for name in self.destination_ids
         }
         self.tracking_errors = {}
         # During scan-and-transfer, each marker becomes immutable as soon as
@@ -900,9 +920,12 @@ class ContainerPickCoordinator(Node):
             Trigger, '/arm2/scan_destinations', self.start_destination_scan
         )
         for destination_name, service_name in (
-            ('A-1', '/arm2/transfer_to_a1'),
-            ('A-2', '/arm2/transfer_to_a2'),
-            ('A-3', '/arm2/transfer_to_a3'),
+            ('A-1-1', '/arm2/transfer_to_a1_1'),
+            ('A-1-2', '/arm2/transfer_to_a1_2'),
+            ('A-2-1', '/arm2/transfer_to_a2_1'),
+            ('A-2-2', '/arm2/transfer_to_a2_2'),
+            ('A-3-1', '/arm2/transfer_to_a3_1'),
+            ('A-3-2', '/arm2/transfer_to_a3_2'),
         ):
             self.create_service(
                 Trigger,
@@ -1100,6 +1123,10 @@ class ContainerPickCoordinator(Node):
             'stack_minimum_approach_clearance_m', 0.03
         )
         self.declare_parameter('stack_approach_search_step_m', 0.01)
+        self.declare_parameter(
+            'stack_yaw_fallback_offsets_deg',
+            [0.0, 15.0, -15.0, 30.0, -30.0, 180.0],
+        )
         self.declare_parameter('stack_xy_offset_m', [0.0, 0.0])
         self.declare_parameter('stack_z_offset_m', 0.0)
         self.declare_parameter('max_stack_levels', 3)
@@ -2014,7 +2041,7 @@ class ContainerPickCoordinator(Node):
         return response
 
     def start_destination_scan(self, _request, response):
-        """Scan and persist A-1/A-2/A-3 poses for this launch session."""
+        """Scan and persist six destination poses and an optional trailer."""
         if not self.execute_motion or self.motion_backend != 'moveit':
             response.success = False
             response.message = 'Destination scan requires MoveIt execution'
@@ -2030,33 +2057,47 @@ class ContainerPickCoordinator(Node):
         )
         self.motion_thread.start()
         response.success = True
-        response.message = 'Scanning destination IDs 11-16'
+        response.message = 'Scanning destination IDs 11-16 and optional trailer ID 10'
         return response
 
     def execute_destination_scan(self):
         try:
             destination_marker_ids = tuple(range(11, 17))
+            scan_marker_ids = destination_marker_ids + (10,)
             specs = tuple(
                 (
-                    f'ID {marker_id}',
-                    self.destination_frames[marker_id],
+                    (
+                        f'ID {marker_id}'
+                        if marker_id != 10 else 'trailer ID 10 (optional)'
+                    ),
+                    (
+                        self.destination_frames[marker_id]
+                        if marker_id != 10 else self.trailer_frame
+                    ),
                     self.marker_histories[marker_id],
                 )
-                for marker_id in destination_marker_ids
+                for marker_id in scan_marker_ids
             )
             self.saved_destination_poses.clear()
             self.saved_marker_poses.clear()
-            locked, reason = self._scan_named_markers(specs)
+            locked, reason = self._scan_named_markers(
+                specs,
+                required_count=len(destination_marker_ids),
+            )
             if locked is None:
                 self.publish_status(f'DESTINATION SCAN FAILED: {reason}')
                 return
-            for marker_id, pose in zip(destination_marker_ids, locked[:6]):
-                self.saved_marker_poses[marker_id] = pose
-            # Preserve the existing A-1/A-2/A-3 transfer behavior by using
-            # the first marker in each area's pair as its placement target.
+            # All required destinations are now locked in base_frame.  Freeze
+            # marker collection for the entire home return so IDs 11-16 seen
+            # again by the wrist camera cannot affect the first accepted
+            # poses.
+            self.tracking_suspended.set()
+            for marker_id, pose in zip(scan_marker_ids, locked):
+                if pose is not None:
+                    self.saved_marker_poses[marker_id] = pose
             self.saved_destination_poses = {
-                name: self.saved_marker_poses[marker_ids[0]]
-                for name, marker_ids in self.destination_ids.items()
+                name: self.saved_marker_poses[marker_id]
+                for name, marker_id in self.destination_ids.items()
             }
             with self.stack_level_lock:
                 for name in self.saved_destination_stack_counts:
@@ -2075,15 +2116,18 @@ class ContainerPickCoordinator(Node):
             )
             self._recover_home_after_failure('DESTINATION SCAN')
             return
+        finally:
+            self.tracking_suspended.clear()
         self.publish_status(
-            'DESTINATION SCAN COMPLETED: A-1=11/12, A-2=13/14, '
-            'A-3=15/16'
+            'DESTINATION SCAN COMPLETED: A-1-1=11, A-1-2=12, '
+            'A-2-1=13, A-2-2=14, A-3-1=15, A-3-2=16; '
+            f'trailer ID 10={"saved" if 10 in self.saved_marker_poses else "not seen"}'
         )
 
     def start_saved_destination_transfer(
         self, _request, response, destination_name
     ):
-        """Scan one container ID 0-3 and transfer it to a saved destination."""
+        """Scan one container ID 0-8 and transfer it to a saved destination."""
         if not self.execute_motion or self.motion_backend != 'moveit':
             response.success = False
             response.message = 'Saved transfer requires MoveIt execution'
@@ -2123,7 +2167,7 @@ class ContainerPickCoordinator(Node):
         self.motion_thread.start()
         response.success = True
         response.message = (
-            f'Scanning container ID 0-3 for transfer to {destination_name}'
+            f'Scanning container ID 0-8 for transfer to {destination_name}'
         )
         return response
 
@@ -2400,7 +2444,7 @@ class ContainerPickCoordinator(Node):
         )
         response.success = True
         response.message = (
-            'A-1/A-2/A-3 stack levels reset; next placement is layer 1'
+            'A-1-1 through A-3-2 stack levels reset; next placement is layer 1'
         )
         return response
 
@@ -2854,12 +2898,10 @@ class ContainerPickCoordinator(Node):
                 'STACK: moving above ID 1 and aligning heading: '
                 f'tcp_yaw={destination_yaw:.2f}deg'
             )
-            approach = self.move_to_reachable_stack_approach(
-                release, approach.pose.orientation
-            )
-            self.publish_status('STACK: descending vertically to release')
-            self.move_segmented_descent_with_pose_finish(
-                release, 'STACK release'
+            approach = self.move_to_reachable_stack_release(
+                release,
+                approach.pose.orientation,
+                'STACK release',
             )
             self.publish_status('STACK: opening gripper')
             self.command_gripper(open_gripper=True)
@@ -2911,14 +2953,10 @@ class ContainerPickCoordinator(Node):
                 f'TRANSFER: container picked; moving to {destination_name}: '
                 f'tcp_yaw={destination_yaw:.2f}deg'
             )
-            approach = self.move_to_reachable_stack_approach(
-                release, approach.pose.orientation
-            )
-            self.publish_status(
-                f'TRANSFER: descending to {destination_name} release'
-            )
-            self.move_segmented_descent_with_pose_finish(
-                release, f'{destination_name} release'
+            approach = self.move_to_reachable_stack_release(
+                release,
+                approach.pose.orientation,
+                f'{destination_name} release',
             )
             self.publish_status(
                 f'TRANSFER: releasing container at {destination_name}'
@@ -2961,47 +2999,128 @@ class ContainerPickCoordinator(Node):
             self.tracking_suspended.clear()
             self.motion_lock.release()
 
-    def move_to_reachable_stack_approach(self, release, orientation):
-        """Use the highest reachable clearance above the stack target."""
+    def move_to_reachable_stack_approach(
+        self,
+        release,
+        orientation,
+        excluded_yaw_offsets=None,
+    ):
+        """Find a reachable clearance and yaw without changing target XYZ."""
         failures = []
+        excluded_yaw_offsets = set(excluded_yaw_offsets or ())
+        base_rpy = quaternion_to_rpy_degrees([
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w,
+        ])
         for clearance in lift_distance_candidates(
             self.stack_approach_clearance,
             self.stack_minimum_approach_clearance,
             self.stack_approach_search_step,
         ):
-            approach = copy.deepcopy(release)
-            approach.pose.position.z += clearance
-            approach.pose.orientation = copy.deepcopy(orientation)
-            translation = np.array([
-                approach.pose.position.x,
-                approach.pose.position.y,
-                approach.pose.position.z,
-            ])
-            if not self.in_workspace(translation):
-                failures.append(f'{clearance:.3f}m: outside workspace')
-                continue
+            for yaw_offset in self.stack_yaw_fallback_offsets:
+                if yaw_offset in excluded_yaw_offsets:
+                    continue
+                candidate_rotation = quaternion_from_rpy_degrees(
+                    base_rpy[0],
+                    base_rpy[1],
+                    wrap_degrees(base_rpy[2] + yaw_offset),
+                )
+                approach = copy.deepcopy(release)
+                approach.pose.position.z += clearance
+                (
+                    approach.pose.orientation.x,
+                    approach.pose.orientation.y,
+                    approach.pose.orientation.z,
+                    approach.pose.orientation.w,
+                ) = map(float, candidate_rotation)
+                translation = np.array([
+                    approach.pose.position.x,
+                    approach.pose.position.y,
+                    approach.pose.position.z,
+                ])
+                if not self.in_workspace(translation):
+                    failures.append(
+                        f'yaw {yaw_offset:+.0f}deg/{clearance:.3f}m: '
+                        'outside workspace'
+                    )
+                    continue
+                self.publish_status(
+                    'STACK: trying approach '
+                    f'yaw offset {yaw_offset:+.0f} deg, '
+                    f'clearance {clearance * 100.0:.1f} cm'
+                )
+                try:
+                    if self.prefer_z_last_motion:
+                        self.move_to_pose_z_last(approach)
+                    else:
+                        self.move_to_pose(approach)
+                    release.pose.orientation = copy.deepcopy(
+                        approach.pose.orientation
+                    )
+                    self.stack_approach_pose_publisher.publish(approach)
+                    self.publish_status(
+                        'STACK: selected approach '
+                        f'yaw offset {yaw_offset:+.0f} deg, '
+                        f'clearance {clearance * 100.0:.1f} cm'
+                    )
+                    return approach, yaw_offset
+                except RuntimeError as exc:
+                    error = str(exc)
+                    retryable = (
+                        'code=99999' in error
+                        or 'code=-4' in error
+                    )
+                    if not retryable:
+                        raise
+                    if 'code=-4' in error:
+                        self.publish_status(
+                            'STACK: controller rejected this yaw branch; '
+                            'trying the next yaw candidate'
+                        )
+                    failures.append(
+                        f'yaw {yaw_offset:+.0f}deg/{clearance:.3f}m: {error}'
+                    )
+        raise RuntimeError(
+            'No reachable stack approach at fixed XYZ: '
+            + '; '.join(failures)
+        )
+
+    def move_to_reachable_stack_release(self, release, orientation, label):
+        """Select a yaw that supports both approach and vertical descent."""
+        excluded_yaw_offsets = set()
+        descent_failures = []
+        while len(excluded_yaw_offsets) < len(
+            self.stack_yaw_fallback_offsets
+        ):
+            approach, yaw_offset = self.move_to_reachable_stack_approach(
+                release,
+                orientation,
+                excluded_yaw_offsets=excluded_yaw_offsets,
+            )
             self.publish_status(
-                'STACK: trying approach clearance '
-                f'{clearance * 100.0:.1f} cm'
+                f'{label}: testing vertical descent with '
+                f'yaw offset {yaw_offset:+.0f} deg'
             )
             try:
-                if self.prefer_z_last_motion:
-                    self.move_to_pose_z_last(approach)
-                else:
-                    self.move_to_pose(approach)
-                self.stack_approach_pose_publisher.publish(approach)
-                self.publish_status(
-                    'STACK: selected approach clearance '
-                    f'{clearance * 100.0:.1f} cm'
-                )
+                self.move_segmented_descent_with_pose_finish(release, label)
                 return approach
-            except RuntimeError as exc:
-                if 'code=99999' not in str(exc):
-                    raise
-                failures.append(f'{clearance:.3f}m: {exc}')
+            except CartesianPlanningError as exc:
+                descent_failures.append(
+                    f'yaw {yaw_offset:+.0f}deg: {exc}'
+                )
+                excluded_yaw_offsets.add(yaw_offset)
+                self.publish_status(
+                    f'{label}: vertical descent failed with '
+                    f'yaw offset {yaw_offset:+.0f} deg; '
+                    'retreating and trying the next yaw'
+                )
+                if exc.executed_segments > 0:
+                    self.move_cartesian_to_pose(approach)
         raise RuntimeError(
-            'No reachable stack approach; move ID 1 closer to the robot: '
-            + '; '.join(failures)
+            f'No yaw supports the complete vertical descent for {label}: '
+            + '; '.join(descent_failures)
         )
 
     def move_segmented_descent_with_pose_finish(self, target, label):
