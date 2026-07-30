@@ -1,0 +1,11 @@
+area_tolerance_m: 0.25
+areas:
+  A:
+    x: 0.192099
+    y: 0.043845
+  B:
+    x: 0.200000
+    y: 0.100000
+  parking_yellow:
+    x: 1.694457
+    y: 0.397200
