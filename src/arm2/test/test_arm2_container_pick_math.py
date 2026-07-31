@@ -2,6 +2,7 @@
 
 from arm2.arm2_container_pick_coordinator import (
     apply_base_frame_correction,
+    apply_marker_yaw_correction,
     apply_vertical_pick_offsets,
     bounded_visual_servo_step,
     calculate_heading_aligned_stack_poses,
@@ -12,15 +13,63 @@ from arm2.arm2_container_pick_coordinator import (
     compose_pose,
     compose_yaw_follow_pose,
     ContainerPickCoordinator,
+    grouped_marker_locks_satisfied,
     inverted_l_workspace_contains,
     lift_distance_candidates,
     nearest_symmetric_yaw_degrees,
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
     stack_layer_z_offset,
+    symmetric_marker_yaw_degrees,
     visual_servo_within_tolerance,
 )
 import numpy as np
+
+
+def test_trailer_scan_requires_source_and_either_trailer():
+    """A load scan accepts trailer ID 9 or 10, but always needs its source."""
+    assert grouped_marker_locks_satisfied(
+        ['source', 'trailer-9', None], (0,), (1, 2)
+    )
+    assert grouped_marker_locks_satisfied(
+        ['source', None, 'trailer-10'], (0,), (1, 2)
+    )
+    assert not grouped_marker_locks_satisfied(
+        [None, 'trailer-9', 'trailer-10'], (0,), (1, 2)
+    )
+    assert not grouped_marker_locks_satisfied(
+        ['source', None, None], (0,), (1, 2)
+    )
+
+
+def test_place_correction_follows_marker_red_axis():
+    """Marker-local -X remains left of the red axis after marker rotation."""
+    correction = [-0.04, 0.0, 0.0]
+    assert np.allclose(
+        apply_marker_yaw_correction([0.2, 0.1, 0.05], correction, 0.0),
+        [0.16, 0.1, 0.05],
+    )
+    assert np.allclose(
+        apply_marker_yaw_correction([0.2, 0.1, 0.05], correction, 90.0),
+        [0.2, 0.06, 0.05],
+        atol=1e-9,
+    )
+
+
+def test_marker_correction_heading_is_identical_after_half_turn():
+    """A rectangular container at yaw+180 uses the same correction axes."""
+    reference = -1.728
+    yaw_a = symmetric_marker_yaw_degrees(12.0, reference, 180.0)
+    yaw_b = symmetric_marker_yaw_degrees(192.0, reference, 180.0)
+    assert np.isclose(yaw_a, yaw_b)
+    correction = [-0.02, -0.015, -0.02]
+    target_a = apply_marker_yaw_correction(
+        [0.1, 0.2, 0.05], correction, yaw_a
+    )
+    target_b = apply_marker_yaw_correction(
+        [0.1, 0.2, 0.05], correction, yaw_b
+    )
+    assert np.allclose(target_a, target_b, atol=1e-9)
 
 
 def test_compose_pose_rotates_marker_offset():

@@ -21,6 +21,22 @@ from .arm2_joint_limits import JOINT_LIMITS_DEG
 JOINT_NAMES = [f'{index}_Joint' for index in range(1, 7)]
 
 
+def clamp_measured_joints_for_planning(angles, tolerance_degrees):
+    """Clamp only small measured limit overshoots for MoveIt state input."""
+    tolerance = float(tolerance_degrees)
+    if tolerance < 0.0:
+        raise ValueError('joint-state clamp tolerance must be non-negative')
+    clamped = []
+    for angle, (lower, upper) in zip(angles, JOINT_LIMITS_DEG):
+        value = float(angle)
+        if lower - tolerance <= value < lower:
+            value = lower
+        elif upper < value <= upper + tolerance:
+            value = upper
+        clamped.append(value)
+    return clamped
+
+
 def duration_seconds(duration):
     """Convert a ROS duration message to floating-point seconds."""
     return float(duration.sec) + float(duration.nanosec) / 1e9
@@ -49,6 +65,25 @@ def joint_errors_degrees(actual, target):
     return [float(goal) - float(measured) for measured, goal in zip(
         actual, target
     )]
+
+
+def adaptive_joint_command_degrees(
+    target,
+    actual,
+    current_command,
+    joint_indices,
+    gain,
+    max_total_correction,
+):
+    """Apply bounded measured-error feedback to selected command joints."""
+    command = [float(value) for value in current_command]
+    for index in joint_indices:
+        error = float(target[index]) - float(actual[index])
+        proposed = command[index] + gain * error
+        lower = float(target[index]) - max_total_correction
+        upper = float(target[index]) + max_total_correction
+        command[index] = max(lower, min(upper, proposed))
+    return command
 
 
 def cumulative_joint_travel_degrees(start_degrees, points, joint_index):
@@ -92,6 +127,20 @@ class JetCobotTrajectoryBridge(Node):
         self.declare_parameter('goal_timeout_sec', 15.0)
         self.declare_parameter('goal_correction_speed', 50)
         self.declare_parameter('goal_correction_period_sec', 1.0)
+        self.declare_parameter('adaptive_goal_correction_enabled', True)
+        self.declare_parameter(
+            'adaptive_goal_correction_joints', ['4_Joint']
+        )
+        self.declare_parameter(
+            'adaptive_goal_correction_tolerance_deg', 0.5
+        )
+        self.declare_parameter('adaptive_goal_correction_gain', 1.0)
+        self.declare_parameter(
+            'adaptive_goal_correction_max_total_deg', 3.0
+        )
+        self.declare_parameter(
+            'adaptive_goal_correction_max_attempts', 4
+        )
         self.declare_parameter(
             'home_joint_angles_deg',
             [87.01, 55.54, -83.58, -36.47, 4.57, -52.11],
@@ -125,6 +174,9 @@ class JetCobotTrajectoryBridge(Node):
         self.declare_parameter('gripper_speed', 50)
         self.declare_parameter('joint_states_topic', '/arm2/joint_states')
         self.declare_parameter(
+            'joint_state_limit_clamp_tolerance_deg', 0.5
+        )
+        self.declare_parameter(
             'follow_joint_trajectory_action',
             '/arm2/arm_group_controller/follow_joint_trajectory',
         )
@@ -152,6 +204,47 @@ class JetCobotTrajectoryBridge(Node):
         )
         self.goal_correction_period = float(
             self.get_parameter('goal_correction_period_sec').value
+        )
+        self.adaptive_goal_correction_enabled = bool(
+            self.get_parameter(
+                'adaptive_goal_correction_enabled'
+            ).value
+        )
+        adaptive_joint_names = [
+            str(value) for value in self.get_parameter(
+                'adaptive_goal_correction_joints'
+            ).value
+        ]
+        unknown_adaptive_joints = (
+            set(adaptive_joint_names) - set(JOINT_NAMES)
+        )
+        if unknown_adaptive_joints:
+            raise ValueError(
+                'Unknown adaptive correction joints: '
+                f'{sorted(unknown_adaptive_joints)}'
+            )
+        self.adaptive_goal_correction_indices = [
+            JOINT_NAMES.index(name) for name in adaptive_joint_names
+        ]
+        self.adaptive_goal_correction_tolerance = float(
+            self.get_parameter(
+                'adaptive_goal_correction_tolerance_deg'
+            ).value
+        )
+        self.adaptive_goal_correction_gain = float(
+            self.get_parameter(
+                'adaptive_goal_correction_gain'
+            ).value
+        )
+        self.adaptive_goal_correction_max_total = float(
+            self.get_parameter(
+                'adaptive_goal_correction_max_total_deg'
+            ).value
+        )
+        self.adaptive_goal_correction_max_attempts = int(
+            self.get_parameter(
+                'adaptive_goal_correction_max_attempts'
+            ).value
         )
         self.home_angles = validate_home_angles(
             self.get_parameter('home_joint_angles_deg').value
@@ -196,6 +289,16 @@ class JetCobotTrajectoryBridge(Node):
         self.joint_states_topic = str(
             self.get_parameter('joint_states_topic').value
         )
+        self.joint_state_limit_clamp_tolerance = float(
+            self.get_parameter(
+                'joint_state_limit_clamp_tolerance_deg'
+            ).value
+        )
+        if not 0.0 <= self.joint_state_limit_clamp_tolerance <= 2.0:
+            raise ValueError(
+                'joint_state_limit_clamp_tolerance_deg must be within 0..2'
+            )
+        self.last_joint_state_clamp_log = 0.0
         self.follow_joint_trajectory_action = str(
             self.get_parameter('follow_joint_trajectory_action').value
         )
@@ -207,6 +310,20 @@ class JetCobotTrajectoryBridge(Node):
             )
         if self.goal_correction_period <= 0.0:
             raise ValueError('goal_correction_period_sec must be positive')
+        if self.adaptive_goal_correction_tolerance <= 0.0:
+            raise ValueError(
+                'adaptive correction tolerance must be positive'
+            )
+        if not 0.0 < self.adaptive_goal_correction_gain <= 1.0:
+            raise ValueError('adaptive correction gain must be within (0, 1]')
+        if self.adaptive_goal_correction_max_total <= 0.0:
+            raise ValueError(
+                'adaptive correction maximum must be positive'
+            )
+        if self.adaptive_goal_correction_max_attempts < 1:
+            raise ValueError(
+                'adaptive correction attempts must be positive'
+            )
         if not 1 <= self.home_speed <= 100:
             raise ValueError('home_speed must be within 1..100')
         if not 1 <= self.a1_speed <= 100:
@@ -468,6 +585,8 @@ class JetCobotTrajectoryBridge(Node):
             ]
             deadline = time.monotonic() + self.goal_timeout
             last_correction = 0.0
+            correction_attempts = 0
+            correction_command = list(final_degrees)
             last_actual = None
             last_errors = None
             while time.monotonic() < deadline:
@@ -481,9 +600,22 @@ class JetCobotTrajectoryBridge(Node):
                 if actual is not None:
                     errors = joint_errors_degrees(actual, final_degrees)
                     error = max(abs(value) for value in errors)
+                    adaptive_error = max(
+                        (
+                            abs(errors[index])
+                            for index in
+                            self.adaptive_goal_correction_indices
+                        ),
+                        default=0.0,
+                    )
                     last_actual = list(actual)
                     last_errors = errors
-                    if error <= self.goal_tolerance:
+                    adaptive_reached = (
+                        not self.adaptive_goal_correction_enabled
+                        or adaptive_error
+                        <= self.adaptive_goal_correction_tolerance
+                    )
+                    if error <= self.goal_tolerance and adaptive_reached:
                         goal_handle.succeed()
                         result.error_code = (
                             FollowJointTrajectory.Result.SUCCESSFUL
@@ -492,14 +624,41 @@ class JetCobotTrajectoryBridge(Node):
                         return result
                     now = time.monotonic()
                     if now - last_correction >= self.goal_correction_period:
+                        if (
+                            self.adaptive_goal_correction_enabled
+                            and not adaptive_reached
+                        ):
+                            if (
+                                correction_attempts
+                                >= self.adaptive_goal_correction_max_attempts
+                            ):
+                                break
+                            correction_command = (
+                                adaptive_joint_command_degrees(
+                                    final_degrees,
+                                    actual,
+                                    correction_command,
+                                    self.adaptive_goal_correction_indices,
+                                    self.adaptive_goal_correction_gain,
+                                    self.adaptive_goal_correction_max_total,
+                                )
+                            )
+                            validate_home_angles(correction_command)
+                            correction_attempts += 1
                         self.get_logger().info(
                             'Correcting final joint target: '
                             f'max_error={error:.2f}deg, '
-                            f'errors={[round(value, 2) for value in errors]}, '
+                            f'adaptive_error={adaptive_error:.2f}deg, '
+                            f'attempt={correction_attempts}/'
+                            f'{self.adaptive_goal_correction_max_attempts}, '
+                            'errors='
+                            f'{[round(value, 2) for value in errors]}, '
+                            'command='
+                            f'{[round(value, 2) for value in correction_command]}, '
                             f'speed={self.goal_correction_speed}'
                         )
-                        self._send_radians(
-                            trajectory[-1].positions,
+                        self._send_degrees(
+                            correction_command,
                             speed=self.goal_correction_speed,
                         )
                         last_correction = now
@@ -547,6 +706,10 @@ class JetCobotTrajectoryBridge(Node):
 
     def _send_radians(self, positions, speed=None):
         degrees = [math.degrees(float(value)) for value in positions]
+        self._send_degrees(degrees, speed)
+
+    def _send_degrees(self, degrees, speed=None):
+        """Send one six-joint degree command to the physical controller."""
         command_speed = self.speed if speed is None else int(speed)
         with self.serial_lock:
             try:
@@ -596,10 +759,25 @@ class JetCobotTrajectoryBridge(Node):
         angles = self._read_angles()
         if angles is None:
             return
+        planning_angles = clamp_measured_joints_for_planning(
+            angles,
+            self.joint_state_limit_clamp_tolerance,
+        )
+        if planning_angles != [float(value) for value in angles]:
+            now = time.monotonic()
+            if now - self.last_joint_state_clamp_log >= 5.0:
+                self.get_logger().warning(
+                    'Clamping small measured joint-limit overshoot for '
+                    f'MoveIt state only: measured={angles}, '
+                    f'published={planning_angles}'
+                )
+                self.last_joint_state_clamp_log = now
         message = JointState()
         message.header.stamp = self.get_clock().now().to_msg()
         message.name = JOINT_NAMES
-        message.position = [math.radians(value) for value in angles]
+        message.position = [
+            math.radians(value) for value in planning_angles
+        ]
         message.velocity = [0.0] * len(JOINT_NAMES)
         message.effort = [0.0] * len(JOINT_NAMES)
         self.joint_state_publisher.publish(message)

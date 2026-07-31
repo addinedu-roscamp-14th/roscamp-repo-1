@@ -133,6 +133,25 @@ def apply_base_frame_correction(translation, correction):
     )
 
 
+def apply_marker_yaw_correction(
+    translation,
+    correction,
+    marker_yaw_degrees,
+):
+    """Apply an XYZ correction expressed in the marker's yaw frame."""
+    correction = np.asarray(correction, dtype=np.float64)
+    if correction.shape != (3,):
+        raise ValueError('marker correction must contain three values')
+    angle = math.radians(float(marker_yaw_degrees))
+    cosine, sine = math.cos(angle), math.sin(angle)
+    rotated = np.array([
+        cosine * correction[0] - sine * correction[1],
+        sine * correction[0] + cosine * correction[1],
+        correction[2],
+    ])
+    return np.asarray(translation, dtype=np.float64) + rotated
+
+
 def bounded_visual_servo_step(
     error_xy,
     yaw_error_degrees,
@@ -190,6 +209,18 @@ def nearest_symmetric_yaw_degrees(
         symmetry_degrees,
     )
     return wrap_degrees(float(current_yaw) + delta)
+
+
+def symmetric_marker_yaw_degrees(
+    marker_yaw,
+    reference_marker_yaw,
+    symmetry_degrees,
+):
+    """Map equivalent marker headings onto one correction-frame heading."""
+    return float(reference_marker_yaw) + wrap_symmetric_degrees(
+        float(marker_yaw) - float(reference_marker_yaw),
+        symmetry_degrees,
+    )
 
 
 def compose_yaw_follow_pose(
@@ -336,6 +367,18 @@ def stack_layer_z_offset(base_offset, container_height, placed_count):
     return float(base_offset) + float(container_height) * int(placed_count)
 
 
+def grouped_marker_locks_satisfied(
+    locked,
+    required_indices,
+    any_of_indices,
+):
+    """Require every source lock and at least one alternative target lock."""
+    return (
+        all(locked[index] is not None for index in required_indices)
+        and any(locked[index] is not None for index in any_of_indices)
+    )
+
+
 def cartesian_path_acceptable(
     fraction,
     requested_distance,
@@ -420,8 +463,23 @@ class ContainerPickCoordinator(Node):
             ).value
         )
         self.grasp_offset = self._vector_parameter('grasp_offset_xyz_m', 3)
-        self.base_correction = self._vector_parameter(
-            'base_correction_xyz_m', 3
+        self.pick_correction = self._vector_parameter(
+            'pick_correction_xyz_m', 3
+        )
+        self.id_transfer_pick_correction = self._vector_parameter(
+            'id_transfer_pick_correction_xyz_m', 3
+        )
+        self.place_correction = self._vector_parameter(
+            'place_correction_xyz_m', 3
+        )
+        self.saved_destination_correction = self._vector_parameter(
+            'saved_destination_correction_xyz_m', 3
+        )
+        self.id_transfer_correction = self._vector_parameter(
+            'id_transfer_correction_xyz_m', 3
+        )
+        self.trailer_correction = self._vector_parameter(
+            'trailer_correction_xyz_m', 3
         )
         self.grasp_rpy = self._vector_parameter('grasp_offset_rpy_deg', 3)
         self.grasp_rotation = quaternion_from_rpy_degrees(*self.grasp_rpy)
@@ -812,10 +870,13 @@ class ContainerPickCoordinator(Node):
             marker_id: f'arm2/destination_marker_{marker_id}'
             for marker_id in self.destination_ids.values()
         }
-        self.trailer_frame = 'arm2/trailer_marker_10'
+        self.trailer_frames = {
+            9: 'arm2/trailer_marker_9',
+            10: 'arm2/trailer_marker_10',
+        }
         tracked_frames = {
             **self.source_frames,
-            10: self.trailer_frame,
+            **self.trailer_frames,
             **self.destination_frames,
         }
         history_size = max(100, self.minimum_samples * 3)
@@ -851,6 +912,10 @@ class ContainerPickCoordinator(Node):
         self.scan_locked_frames = set()
         self.motion_lock = threading.Lock()
         self.tracking_suspended = threading.Event()
+        # Destination IDs 11-16 are only camera-sampled while the explicit
+        # destination scan is running.  Once accepted, their base-frame poses
+        # in saved_destination_poses are the sole source used by transfers.
+        self.destination_scan_active = threading.Event()
         self.serial_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.motion_thread = None
@@ -864,6 +929,9 @@ class ContainerPickCoordinator(Node):
         self.gripper_close_client = None
         self.stop_robot_client = None
         self.return_home_client = None
+        self.go_a1_client = None
+        self.go_a2_client = None
+        self.go_a3_client = None
         self.sweep_joint1_client = None
         self.pause_sweep_client = None
         self.resume_sweep_client = None
@@ -972,7 +1040,14 @@ class ContainerPickCoordinator(Node):
         self.get_logger().info(
             'Loaded grasp tuning: '
             f'grasp_offset={self.grasp_offset.tolist()}, '
-            f'base_correction={self.base_correction.tolist()}, '
+            f'pick_correction={self.pick_correction.tolist()}, '
+            'id_transfer_pick_correction='
+            f'{self.id_transfer_pick_correction.tolist()}, '
+            f'place_correction={self.place_correction.tolist()}, '
+            'saved_destination_correction='
+            f'{self.saved_destination_correction.tolist()}, '
+            f'id_transfer_correction={self.id_transfer_correction.tolist()}, '
+            f'trailer_correction={self.trailer_correction.tolist()}, '
             f'grasp_rpy={self.grasp_rpy.tolist()}, '
             f'reference_yaw={self.reference_marker_yaw:.3f}deg, '
             f'yaw_symmetry={self.container_yaw_symmetry:.1f}deg'
@@ -984,7 +1059,12 @@ class ContainerPickCoordinator(Node):
             'allow_full_pick',
             'offsets_configured',
             'grasp_offset_xyz_m',
-            'base_correction_xyz_m',
+            'pick_correction_xyz_m',
+            'id_transfer_pick_correction_xyz_m',
+            'place_correction_xyz_m',
+            'saved_destination_correction_xyz_m',
+            'id_transfer_correction_xyz_m',
+            'trailer_correction_xyz_m',
             'grasp_offset_rpy_deg',
             'reference_marker_yaw_deg',
             'container_yaw_symmetry_deg',
@@ -1012,11 +1092,51 @@ class ContainerPickCoordinator(Node):
                     limit=0.5,
                 )
 
-            base_correction = self.base_correction
-            if 'base_correction_xyz_m' in requested:
-                base_correction = self._validated_tuning_vector(
-                    'base_correction_xyz_m',
-                    requested['base_correction_xyz_m'],
+            pick_correction = self.pick_correction
+            if 'pick_correction_xyz_m' in requested:
+                pick_correction = self._validated_tuning_vector(
+                    'pick_correction_xyz_m',
+                    requested['pick_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            id_transfer_pick_correction = self.id_transfer_pick_correction
+            if 'id_transfer_pick_correction_xyz_m' in requested:
+                id_transfer_pick_correction = self._validated_tuning_vector(
+                    'id_transfer_pick_correction_xyz_m',
+                    requested['id_transfer_pick_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            place_correction = self.place_correction
+            if 'place_correction_xyz_m' in requested:
+                place_correction = self._validated_tuning_vector(
+                    'place_correction_xyz_m',
+                    requested['place_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            saved_destination_correction = self.saved_destination_correction
+            if 'saved_destination_correction_xyz_m' in requested:
+                saved_destination_correction = self._validated_tuning_vector(
+                    'saved_destination_correction_xyz_m',
+                    requested['saved_destination_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            id_transfer_correction = self.id_transfer_correction
+            if 'id_transfer_correction_xyz_m' in requested:
+                id_transfer_correction = self._validated_tuning_vector(
+                    'id_transfer_correction_xyz_m',
+                    requested['id_transfer_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            trailer_correction = self.trailer_correction
+            if 'trailer_correction_xyz_m' in requested:
+                trailer_correction = self._validated_tuning_vector(
+                    'trailer_correction_xyz_m',
+                    requested['trailer_correction_xyz_m'],
                     limit=0.2,
                 )
 
@@ -1046,7 +1166,12 @@ class ContainerPickCoordinator(Node):
             return SetParametersResult(successful=False, reason=str(exc))
 
         self.grasp_offset = grasp_offset
-        self.base_correction = base_correction
+        self.pick_correction = pick_correction
+        self.id_transfer_pick_correction = id_transfer_pick_correction
+        self.place_correction = place_correction
+        self.saved_destination_correction = saved_destination_correction
+        self.id_transfer_correction = id_transfer_correction
+        self.trailer_correction = trailer_correction
         self.grasp_rpy = grasp_rpy
         self.grasp_rotation = quaternion_from_rpy_degrees(*grasp_rpy)
         self.reference_marker_yaw = reference_yaw
@@ -1064,7 +1189,14 @@ class ContainerPickCoordinator(Node):
             f'allow_full_pick={self.allow_full_pick}, '
             f'offsets_configured={self.offsets_configured}, '
             f'grasp_offset={self.grasp_offset.tolist()}, '
-            f'base_correction={self.base_correction.tolist()}, '
+            f'pick_correction={self.pick_correction.tolist()}, '
+            'id_transfer_pick_correction='
+            f'{self.id_transfer_pick_correction.tolist()}, '
+            f'place_correction={self.place_correction.tolist()}, '
+            'saved_destination_correction='
+            f'{self.saved_destination_correction.tolist()}, '
+            f'id_transfer_correction={self.id_transfer_correction.tolist()}, '
+            f'trailer_correction={self.trailer_correction.tolist()}, '
             f'grasp_rpy={self.grasp_rpy.tolist()}'
         )
         return SetParametersResult(successful=True)
@@ -1098,7 +1230,18 @@ class ContainerPickCoordinator(Node):
             'rotate_grasp_offset_with_marker_yaw', True
         )
         self.declare_parameter('grasp_offset_xyz_m', [0.0, 0.0, 0.0])
-        self.declare_parameter('base_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('pick_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter(
+            'id_transfer_pick_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter('place_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter(
+            'saved_destination_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter(
+            'id_transfer_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter('trailer_correction_xyz_m', [0.0, 0.0, 0.0])
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
         self.declare_parameter('container_yaw_symmetry_deg', 360.0)
@@ -1259,6 +1402,15 @@ class ContainerPickCoordinator(Node):
         self.return_home_client = self.create_client(
             Trigger, '/arm2/return_home'
         )
+        self.go_a1_client = self.create_client(
+            Trigger, '/arm2/go_a1_pose'
+        )
+        self.go_a2_client = self.create_client(
+            Trigger, '/arm2/go_a2_pose'
+        )
+        self.go_a3_client = self.create_client(
+            Trigger, '/arm2/go_a3_pose'
+        )
         self.sweep_joint1_client = self.create_client(
             Trigger, '/arm2/scan_joint1'
         )
@@ -1304,22 +1456,25 @@ class ContainerPickCoordinator(Node):
                 f'container ID {marker_id}',
                 warn_if_missing=False,
             )
-        for marker_id, frame in self.destination_frames.items():
+        if self.destination_scan_active.is_set():
+            for marker_id, frame in self.destination_frames.items():
+                self._collect_marker_sample(
+                    frame,
+                    self.marker_histories[marker_id],
+                    self.marker_stamp_attributes[marker_id],
+                    self.stack_target_pose_publisher,
+                    f'destination ID {marker_id}',
+                    warn_if_missing=False,
+                )
+        for marker_id, frame in self.trailer_frames.items():
             self._collect_marker_sample(
                 frame,
                 self.marker_histories[marker_id],
                 self.marker_stamp_attributes[marker_id],
                 self.stack_target_pose_publisher,
-                f'destination ID {marker_id}',
+                f'trailer ID {marker_id}',
+                warn_if_missing=False,
             )
-        self._collect_marker_sample(
-            self.trailer_frame,
-            self.marker_histories[10],
-            self.marker_stamp_attributes[10],
-            self.stack_target_pose_publisher,
-            'trailer ID 10',
-            warn_if_missing=False,
-        )
 
     def _collect_marker_sample(
         self,
@@ -1486,11 +1641,21 @@ class ContainerPickCoordinator(Node):
         marker_pose,
         validate_workspace=True,
         orientation_mode=None,
+        pick_correction=None,
     ):
         """Build pick targets from a marker pose locked during scanning."""
+        if pick_correction is None:
+            pick_correction = self.pick_correction
         mode = orientation_mode or self.grasp_orientation_mode
         marker_translation, marker_rotation = marker_pose
+        correction_yaw = None
         if mode == 'marker_full':
+            marker_yaw = quaternion_to_rpy_degrees(marker_rotation)[2]
+            correction_yaw = symmetric_marker_yaw_degrees(
+                marker_yaw,
+                self.reference_marker_yaw,
+                self.container_yaw_symmetry,
+            )
             grasp_translation, grasp_rotation = compose_pose(
                 marker_translation,
                 marker_rotation,
@@ -1499,6 +1664,11 @@ class ContainerPickCoordinator(Node):
             )
         elif mode == 'marker_yaw':
             marker_yaw = quaternion_to_rpy_degrees(marker_rotation)[2]
+            correction_yaw = symmetric_marker_yaw_degrees(
+                marker_yaw,
+                self.reference_marker_yaw,
+                self.container_yaw_symmetry,
+            )
             grasp_translation, grasp_rotation, yaw_delta = (
                 compose_yaw_follow_pose(
                     marker_translation,
@@ -1535,10 +1705,17 @@ class ContainerPickCoordinator(Node):
                 self.grasp_offset,
                 self.grasp_rotation,
             )
-        grasp_translation = apply_base_frame_correction(
-            grasp_translation,
-            self.base_correction,
-        )
+        if correction_yaw is None:
+            grasp_translation = apply_base_frame_correction(
+                grasp_translation,
+                pick_correction,
+            )
+        else:
+            grasp_translation = apply_marker_yaw_correction(
+                grasp_translation,
+                pick_correction,
+                correction_yaw,
+            )
         grasp_translation, pregrasp_translation = apply_vertical_pick_offsets(
             grasp_translation,
             self.pregrasp_lift,
@@ -1795,8 +1972,11 @@ class ContainerPickCoordinator(Node):
         destination_pose,
         validate_workspace=True,
         placed_count=None,
+        destination_correction=None,
     ):
         """Build release targets from scan-locked source/destination poses."""
+        if destination_correction is None:
+            destination_correction = self.place_correction
         if placed_count is None:
             with self.stack_level_lock:
                 placed_count = self.placed_stack_count
@@ -1824,13 +2004,15 @@ class ContainerPickCoordinator(Node):
             self.container_yaw_symmetry,
             layer_z_offset,
         )
-        release_translation = apply_base_frame_correction(
+        release_translation = apply_marker_yaw_correction(
             release_translation,
-            self.base_correction,
+            destination_correction,
+            self.reference_marker_yaw + destination_yaw_delta,
         )
-        approach_translation = apply_base_frame_correction(
+        approach_translation = apply_marker_yaw_correction(
             approach_translation,
-            self.base_correction,
+            destination_correction,
+            self.reference_marker_yaw + destination_yaw_delta,
         )
         if abs(destination_yaw_delta) > self.max_yaw_delta:
             return None, (
@@ -2078,28 +2260,34 @@ class ContainerPickCoordinator(Node):
             response.message = 'A robot motion is already running'
             return response
         self.stop_event.clear()
+        self.destination_scan_active.set()
         self.motion_thread = threading.Thread(
             target=self.execute_destination_scan,
             daemon=True,
         )
         self.motion_thread.start()
         response.success = True
-        response.message = 'Scanning destination IDs 11-16 and optional trailer ID 10'
+        response.message = (
+            'Scanning destinations along HOME-A1-A2-A3-A2-A1-HOME'
+        )
         return response
 
     def execute_destination_scan(self):
         try:
             destination_marker_ids = tuple(range(11, 17))
-            scan_marker_ids = destination_marker_ids + (10,)
+            trailer_marker_ids = tuple(self.trailer_frames)
+            scan_marker_ids = destination_marker_ids + trailer_marker_ids
             specs = tuple(
                 (
                     (
                         f'ID {marker_id}'
-                        if marker_id != 10 else 'trailer ID 10 (optional)'
+                        if marker_id not in self.trailer_frames
+                        else f'trailer ID {marker_id} (optional)'
                     ),
                     (
                         self.destination_frames[marker_id]
-                        if marker_id != 10 else self.trailer_frame
+                        if marker_id not in self.trailer_frames
+                        else self.trailer_frames[marker_id]
                     ),
                     self.marker_histories[marker_id],
                 )
@@ -2107,7 +2295,7 @@ class ContainerPickCoordinator(Node):
             )
             self.saved_destination_poses.clear()
             self.saved_marker_poses.clear()
-            locked, reason = self._scan_named_markers(
+            locked, reason = self._scan_destination_route(
                 specs,
                 required_count=len(destination_marker_ids),
             )
@@ -2130,29 +2318,108 @@ class ContainerPickCoordinator(Node):
                 for name in self.saved_destination_stack_counts:
                     self.saved_destination_stack_counts[name] = 0
             self.publish_status(
-                'DESTINATION SCAN: IDs 11-16 saved; returning home'
-            )
-            self._call_scan_service(
-                self.return_home_client,
-                'destination scan home return',
-                timeout=self.motion_timeout + 5.0,
+                'DESTINATION SCAN: IDs 11-16 saved; route ended at home'
             )
         except Exception as exc:
             self.publish_status(
-                f'DESTINATION SCAN FAILED during home return: {exc}'
+                f'DESTINATION SCAN FAILED during pose route: {exc}'
             )
             self._recover_home_after_failure('DESTINATION SCAN')
             return
         finally:
             self.tracking_suspended.clear()
+            self.destination_scan_active.clear()
         self.publish_status(
             'DESTINATION SCAN COMPLETED: A-1-1=11, A-1-2=12, '
             'A-2-1=13, A-2-2=14, A-3-1=15, A-3-2=16; '
-            f'trailer ID 10={"saved" if 10 in self.saved_marker_poses else "not seen"}'
+            'trailer IDs '
+            + ', '.join(
+                f'{marker_id}='
+                f'{"saved" if marker_id in self.saved_marker_poses else "not seen"}'
+                for marker_id in self.trailer_frames
+            )
         )
 
+    def _scan_destination_route(self, specs, required_count):
+        """Visit home/A poses and lock stable destination marker poses."""
+        route = (
+            ('HOME', self.return_home_client),
+            ('A-1', self.go_a1_client),
+            ('A-2', self.go_a2_client),
+            ('A-3', self.go_a3_client),
+            ('A-2', self.go_a2_client),
+            ('A-1', self.go_a1_client),
+            ('HOME', self.return_home_client),
+        )
+        if any(
+            client is None or not client.wait_for_service(timeout_sec=3.0)
+            for _name, client in route
+        ):
+            return None, 'destination route service is unavailable'
+
+        locked = [None] * len(specs)
+        with self.history_lock:
+            self.scan_locked_frames.clear()
+            for _label, _frame, history in specs:
+                history.clear()
+
+        for route_index, (pose_name, client) in enumerate(route, start=1):
+            if self.stop_event.is_set():
+                return None, 'destination route stopped'
+            self.publish_status(
+                f'DESTINATION SCAN: route {route_index}/{len(route)} '
+                f'moving to {pose_name}'
+            )
+            self._call_scan_service(
+                client,
+                f'destination route {pose_name}',
+                timeout=self.motion_timeout + 5.0,
+            )
+            with self.history_lock:
+                for index, (_label, _frame, history) in enumerate(specs):
+                    if locked[index] is None:
+                        history.clear()
+
+            deadline = (
+                time.monotonic() + self.scan_marker_pause + 2.0
+            )
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.05):
+                    return None, 'destination route stopped'
+                for index, (label, frame, history) in enumerate(specs):
+                    if locked[index] is not None:
+                        continue
+                    pose, _reason = self.stable_marker_pose(
+                        history=history,
+                        yaw_only=True,
+                    )
+                    if pose is None:
+                        continue
+                    locked[index] = (
+                        np.array(pose[0], dtype=np.float64),
+                        np.array(pose[1], dtype=np.float64),
+                    )
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'DESTINATION SCAN: {label} saved at {pose_name}'
+                    )
+                if all(pose is not None for pose in locked):
+                    break
+
+        missing = [
+            specs[index][0]
+            for index in range(required_count)
+            if locked[index] is None
+        ]
+        if missing:
+            return None, (
+                'route ended before detecting ' + ', '.join(missing)
+            )
+        return tuple(locked), 'destination route completed'
+
     def start_loading_transfer(self, _request, response, source_marker_id):
-        """Scan one selected container and trailer ID 10, then load it."""
+        """Scan one selected container and trailer ID 9 or 10, then load it."""
         if not self.execute_motion or self.motion_backend != 'moveit':
             response.success = False
             response.message = 'Trailer loading requires MoveIt execution'
@@ -2174,7 +2441,7 @@ class ContainerPickCoordinator(Node):
         self.motion_thread.start()
         response.success = True
         response.message = (
-            f'Scanning container ID {source_marker_id} and trailer ID 10, '
+            f'Scanning container ID {source_marker_id} and trailer ID 9/10, '
             'then loading the selected container'
         )
         return response
@@ -2254,6 +2521,7 @@ class ContainerPickCoordinator(Node):
             source_targets, reason = self.calculate_targets_from_marker_pose(
                 source_pose,
                 orientation_mode=self.stack_source_orientation_mode,
+                pick_correction=self.id_transfer_pick_correction,
             )
             if source_targets is None:
                 raise RuntimeError(f'source target: {reason}')
@@ -2264,6 +2532,7 @@ class ContainerPickCoordinator(Node):
                 source_targets,
                 destination_pose,
                 placed_count=placed_count,
+                destination_correction=self.id_transfer_correction,
             )
             if targets is None:
                 raise RuntimeError(f'destination target: {reason}')
@@ -2290,19 +2559,24 @@ class ContainerPickCoordinator(Node):
 
     def execute_loading_transfer(self, source_marker_id):
         """Scan a selected source and trailer, then execute the transfer."""
-        specs = (
+        specs = [(
+            f'container ID {source_marker_id}',
+            self.source_frames[source_marker_id],
+            self.marker_histories[source_marker_id],
+        )]
+        specs.extend(
             (
-                f'container ID {source_marker_id}',
-                self.source_frames[source_marker_id],
-                self.marker_histories[source_marker_id],
-            ),
-            (
-                'trailer ID 10',
-                self.trailer_frame,
-                self.marker_histories[10],
-            ),
+                f'trailer ID {marker_id}',
+                frame,
+                self.marker_histories[marker_id],
+            )
+            for marker_id, frame in self.trailer_frames.items()
         )
-        locked, reason = self._scan_named_markers(specs)
+        locked, reason = self._scan_named_markers(
+            tuple(specs),
+            required_indices=(0,),
+            any_of_indices=(1, 2),
+        )
         if locked is None:
             self.publish_status(
                 f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
@@ -2312,7 +2586,12 @@ class ContainerPickCoordinator(Node):
         # Re-observing either marker from the moving wrist camera must not
         # change the pick or trailer target after this point.
         self.tracking_suspended.set()
-        source_pose, trailer_pose = copy.deepcopy(locked)
+        source_pose = copy.deepcopy(locked[0])
+        selected_offset = next(
+            index for index in (1, 2) if locked[index] is not None
+        )
+        trailer_pose = copy.deepcopy(locked[selected_offset])
+        trailer_marker_id = tuple(self.trailer_frames)[selected_offset - 1]
         try:
             source_targets, reason = self.calculate_targets_from_marker_pose(
                 source_pose,
@@ -2341,6 +2620,7 @@ class ContainerPickCoordinator(Node):
                 source_targets,
                 trailer_pose,
                 placed_count=placed_count,
+                destination_correction=self.trailer_correction,
             )
             if targets is None:
                 self.publish_status(
@@ -2351,7 +2631,8 @@ class ContainerPickCoordinator(Node):
                 )
                 return
             self.publish_status(
-                f'TRAILER LOAD: ID {source_marker_id} and ID 10 locked; '
+                f'TRAILER LOAD: ID {source_marker_id} and trailer ID '
+                f'{trailer_marker_id} locked; '
                 'tracking frozen until home return; '
                 'destination IDs 11-16 preserved'
             )
@@ -2458,6 +2739,7 @@ class ContainerPickCoordinator(Node):
                 source_targets,
                 destination_pose,
                 placed_count=placed_count,
+                destination_correction=self.saved_destination_correction,
             )
             if targets is None:
                 self.publish_status(
@@ -2486,8 +2768,32 @@ class ContainerPickCoordinator(Node):
         required_count=None,
         minimum_required_locks=None,
         accept_initial_pose=False,
+        required_indices=None,
+        any_of_indices=None,
     ):
         """Sweep J1 until every named marker has a stationary locked pose."""
+        use_grouped_requirements = (
+            required_indices is not None or any_of_indices is not None
+        )
+        if use_grouped_requirements:
+            if required_count is not None or minimum_required_locks is not None:
+                raise ValueError(
+                    'grouped marker requirements cannot use count requirements'
+                )
+            required_indices = tuple(required_indices or ())
+            any_of_indices = tuple(any_of_indices or ())
+            selected_indices = required_indices + any_of_indices
+            if not selected_indices or any(
+                index < 0 or index >= len(specs)
+                for index in selected_indices
+            ):
+                raise ValueError('marker requirement index is out of range')
+            if len(set(selected_indices)) != len(selected_indices):
+                raise ValueError('marker requirement indices must be unique')
+            if not required_indices or not any_of_indices:
+                raise ValueError(
+                    'grouped marker requirements need required and any-of indices'
+                )
         if required_count is None:
             required_count = len(specs)
         if not 1 <= required_count <= len(specs):
@@ -2500,6 +2806,12 @@ class ContainerPickCoordinator(Node):
             )
 
         def scan_complete():
+            if use_grouped_requirements:
+                return grouped_marker_locks_satisfied(
+                    locked,
+                    required_indices,
+                    any_of_indices,
+                )
             return sum(
                 pose is not None for pose in locked[:required_count]
             ) >= minimum_required_locks
@@ -2834,6 +3146,7 @@ class ContainerPickCoordinator(Node):
             f'{label}: failure recovery; returning home in 5 seconds'
         )
         time.sleep(5.0)
+        self.stop_event.clear()
         try:
             self.command_return_home()
         except Exception as exc:

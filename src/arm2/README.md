@@ -248,21 +248,44 @@ ros2 topic echo /arm2/container_pick/status
 
 ```yaml
 grasp_offset_xyz_m: [0.006879, -0.002075, -0.036814]
-base_correction_xyz_m: [0.0, -0.007925, 0.0]
+pick_correction_xyz_m: [0.0, -0.007925, 0.0]
+id_transfer_pick_correction_xyz_m: [-0.02, -0.01, -0.02]
+place_correction_xyz_m: [0.0, 0.0, 0.0]
+saved_destination_correction_xyz_m: [-0.02, -0.01, -0.005]
+id_transfer_correction_xyz_m: [0.02, 0.0, 0.0]
+trailer_correction_xyz_m: [-0.05, 0.0, 0.0]
 ```
 
 - `grasp_offset_xyz_m`: 마커 기준 자세에서 가르친 파지 오프셋입니다.
   현재 arm2 설정은 `rotate_grasp_offset_with_marker_yaw: false`이므로 그리퍼 yaw만
   컨테이너를 추종하고 XYZ 오프셋 방향은 `arm2/base_link`에 고정됩니다.
-- `base_correction_xyz_m`: `arm2/base_link` 축에 고정해서 마지막에 더합니다.
-  컨테이너가 어느 방향을 향해도 보정 방향은 바뀌지 않습니다.
+- `pick_correction_xyz_m`: `marker_yaw`/`marker_full` 집기 목표에 마커 축
+  기준으로 더하며 마커 yaw와 함께 회전합니다. X는 빨간 축, Y는 초록 축입니다.
+  `fixed` 모드에서만 `arm2/base_link` 축 기준으로 적용됩니다.
+- `id_transfer_pick_correction_xyz_m`: `/arm2/transfer_by_id`의 집기에만
+  적용됩니다. 현재 값은 초록 축 반대 10 mm이며 기존 X/Z 집기 보정을
+  유지합니다.
+- `place_correction_xyz_m`: 놓기 접근점과 최종 놓기점에만 목적지 마커 축
+  기준으로 더합니다. X는 빨간 축, Y는 초록 축이며 마커 yaw와 함께 회전합니다.
+- `saved_destination_correction_xyz_m`: `/arm2/transfer_to_a1_1`부터
+  `/arm2/transfer_to_a3_2`까지 저장 목적지 이송에만 적용됩니다.
+  `[-0.02, -0.01, -0.005]`는 빨간 축 반대 20 mm, 초록 축 반대 10 mm,
+  Z 아래 5 mm입니다.
+- `id_transfer_correction_xyz_m`: `/arm2/transfer_by_id`로 컨테이너 사이를
+  옮길 때만 적용됩니다. `[-0.03, 0.0, 0.0]`은 목적지 마커의 빨간 축
+  반대 방향으로 30 mm 이동합니다.
+- `trailer_correction_xyz_m`: `/arm2/load_id0_to_trailer`부터
+  `/arm2/load_id8_to_trailer`까지의 트레일러 놓기에만 적용됩니다. 따라서
+  `[-0.05, 0.0, 0.0]`은 ID 9/10 마커가 회전해도 항상 빨간 축 반대 방향으로
+  50 mm 이동합니다.
 - `container_yaw_symmetry_deg: 180.0`: 직사각형 컨테이너의 0도와 180도를
-  동일한 파지 자세로 처리합니다. 45도와 90도 회전은 그대로 추종합니다.
+  동일한 파지 자세와 동일한 XYZ 보정 방향으로 처리합니다. 45도와 90도
+  회전은 그대로 추종합니다.
 
 예를 들어 모든 컨테이너 자세에서 로봇 베이스의 `-Y` 방향으로 10 mm 보정하려면:
 
 ```yaml
-base_correction_xyz_m: [0.0, -0.01, 0.0]
+pick_correction_xyz_m: [0.0, -0.01, 0.0]
 ```
 
 카메라 또는 ArUco 검출 프로세스가 종료되면 launch가 2초 후 자동으로 다시
@@ -312,7 +335,7 @@ ros2 run tf2_ros tf2_echo arm2/base_link arm2/TCP
 ## A-1/A-2/A-3 세부 목적지 저장 후 개별 이송
 
 터미널 1에서 통합 launch를 계속 실행합니다. 컨테이너 ID는 0~8이고,
-트레일러는 ID 10입니다. 세부 목적지는 다음과 같습니다.
+트레일러는 ID 9 또는 ID 10입니다. 세부 목적지는 다음과 같습니다.
 
 - A-1-1 = ID 11
 - A-1-2 = ID 12
@@ -339,18 +362,20 @@ ros2 launch arm2 arm2_container_pick_moveit.launch.py \
     use_rviz:=true
 ```
 
-launch 직후 한 번만 목적지 스캔을 실행합니다. J1 스캔 중 ID
-11, 12, 13, 14, 15, 16을 각각 발견하면 0.5초 정지해 자세를 저장합니다.
-스캔 도중 ID 10 트레일러가 보이면 그 자세도 저장합니다. ID 11~16이 모두
-저장되면 ID 10을 찾지 못했더라도 홈으로 복귀합니다. 저장값은 같은 launch가
-실행되는 동안 다시 갱신되지 않습니다.
+launch 직후 한 번만 목적지 스캔을 실행합니다. 로봇은
+`HOME → A-1 → A-2 → A-3 → A-2 → A-1 → HOME` 순서로 이동합니다.
+각 자세에서 이동 중 샘플을 버리고 정지 상태로 ID 11, 12, 13, 14, 15, 16을
+1초 이상 안정화한 뒤 최초 자세를 저장합니다. 이동 중 ID 9 또는 ID 10
+트레일러가 안정적으로 보이면 해당 자세도 저장합니다.
+ID 11~16이 모두 저장되면 트레일러를 찾지 못했더라도 홈으로 복귀합니다.
+저장값은 같은 launch가 실행되는 동안 다시 갱신되지 않습니다.
 
 ```bash
 ros2 service call /arm2/scan_destinations std_srvs/srv/Trigger "{}"
 ```
 
 이후 각 터미널에서 필요한 목적지 서비스를 호출합니다. 각 호출은 컨테이너 ID
-0~8 중 하나를 찾을 때까지 J1을 스캔하고, 발견 시 0.5초 정지해 현재 컨테이너
+0~8 중 하나를 찾을 때까지 J1을 스캔하고, 발견 시 1초 정지해 현재 컨테이너
 위치를 저장한 뒤 지정 목적지로 옮기고 홈으로 복귀합니다.
 
 세부구역별 서비스:
@@ -364,12 +389,13 @@ ros2 service call /arm2/transfer_to_a3_1 std_srvs/srv/Trigger "{}"
 ros2 service call /arm2/transfer_to_a3_2 std_srvs/srv/Trigger "{}"
 ```
 
-### 컨테이너 ID 0~8을 트레일러 ID 10에 다시 적재
+### 컨테이너 ID 0~8을 트레일러 ID 9 또는 ID 10에 다시 적재
 
-아래 서비스는 호출할 때마다 선택한 컨테이너 ID와 트레일러 ID 10만 J1
-스캔으로 찾아 위치를 잠급니다. 두 위치가 모두 저장되면 선택한 컨테이너를 집어
-트레일러에 적재하고 홈으로 복귀합니다. 이 스캔은 기존 ID 11~16 목적지
-저장값을 초기화하거나 갱신하지 않습니다.
+아래 서비스는 호출할 때마다 선택한 컨테이너 ID와 트레일러 ID 9·10을
+J1 스캔으로 찾습니다. 선택한 컨테이너와 트레일러 둘 중 하나가 안정적으로
+저장되면 두 좌표를 잠그고, 컨테이너를 집어 선택된 트레일러에 적재한 뒤
+홈으로 복귀합니다. 두 트레일러가 동시에 보이면 ID 9를 우선합니다. 이 스캔은
+기존 ID 11~16 목적지 저장값을 초기화하거나 갱신하지 않습니다.
 
 ```bash
 ros2 service call /arm2/load_id0_to_trailer std_srvs/srv/Trigger "{}"
@@ -451,3 +477,67 @@ visual_servo_settle_sec: 0.6
 5회 안에 연속 3회 허용 오차를 만족하지 못하면 하강하지 않고 실패 복귀합니다.
 초기 위치에서 ID 0~8 중 하나를 잠근 경우 해당 ID의 TF만 pregrasp 보정에
 사용합니다.
+
+## 카메라 재시작 반복성 확인
+
+2026-07-30에 동일 자세에서 3회 측정한 보정 영상의 세션 중심 중앙값
+`U=300.350 px`, `V=293.686 px`를 기준으로 사용합니다. 이 값은 CameraInfo나
+영상을 이동시키는 보정값이 아니라 재시작 전후 변화를 판정하는 고정 기준입니다.
+
+로봇팔을 움직이지 않고 카메라와 진단 노드만 실행합니다.
+
+```bash
+ros2 launch arm2 arm2_camera_repeatability.launch.py
+```
+
+200개 검출 표본마다 `/arm2/gripper_camera/repeatability`에 JSON 결과를
+발행합니다.
+
+```bash
+ros2 topic echo /arm2/gripper_camera/repeatability
+```
+
+결과에는 보정 좌표계 중심, 기준 대비 `delta_u_px`, `delta_v_px`, 유클리드
+`delta_px`, 프레임 내부 RMS, 마커 크기로 계산한 `mm_per_px`와 `delta_mm`가
+포함됩니다. `delta_px <= 2`는 `stable`, `2 < delta_px <= 5`는 `warning`,
+5px 초과는 `unstable`로 판정합니다. CameraInfo가 실행 중 변경되면 현재 표본
+묶음을 폐기하고 경고합니다.
+
+## Arm2 home 관절 명령 보상
+
+2026-07-31에 기존 home 명령을 반복했을 때 실제 J4가 목표보다 약 `-2.02°`에
+고정되는 현상을 확인했습니다. 같은 명령을 10회 재전송해도 줄어들지 않았으며,
+관측 바이어스를 역보상한 명령으로 A-1에서 5회 동일 방향 접근했을 때 J1~J5의
+목표 오차가 최대 `0.09°`, J6 반복 범위가 `0.35°`로 측정됐습니다.
+
+따라서 `config/arm2/arm2_container_pick.yaml`의
+`home_joint_angles_deg`는 실제로 기존 물리 home 자세에 도착하도록 다음 보상
+명령을 사용합니다.
+
+```yaml
+home_joint_angles_deg: [93.86, 13.27, -25.91, -59.85, 3.15, -43.33]
+```
+
+이 값은 startup/shutdown home에만 적용합니다. 작업공간 전체에서 일정한 관절
+오프셋이라고 검증되지 않았으므로 MoveIt 궤적 목표에는 전역으로 더하지 않습니다.
+
+### MoveIt 최종 J4 제한 폐루프 보정
+
+A-1/A-2/A-3에서 각 3회 측정한 J4의 `목표-실제` 평균 오차는 각각
+`1.11°`, `1.23°`, `1.06°`였고 반복 범위는 최대 `0.08°`였습니다. 이 결과에
+따라 계획 경로는 변경하지 않고 MoveIt 궤적의 마지막 목표점에서만 J4를
+폐루프 보정합니다.
+
+```yaml
+adaptive_goal_correction_enabled: true
+adaptive_goal_correction_joints: [4_Joint]
+adaptive_goal_correction_tolerance_deg: 0.5
+adaptive_goal_correction_gain: 1.0
+adaptive_goal_correction_max_total_deg: 3.0
+adaptive_goal_correction_max_attempts: 4
+```
+
+매 보정 시 실제 `목표-실제` 잔차를 직전 명령에 더하되 원래 MoveIt 목표에서
+최대 ±3°까지만 허용합니다. 네 번 안에 J4 잔차가 0.5° 이하로 수렴하지 않거나
+보정 명령이 관절 한계를 벗어나면 trajectory를 성공 처리하지 않습니다. 다른
+관절은 측정 위치에 따라 오차 방향과 크기가 달라 J4 보정 대상에 포함하지 않습니다.

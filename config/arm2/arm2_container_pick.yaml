@@ -1,46 +1,55 @@
 /arm2/arm2_jetcobot_trajectory_bridge:
   ros__parameters:
     home_joint_angles_deg:
-    - 93.07
-    - 12.3
-    - -25.83
-    - -61.87
-    - 2.54
-    - -43.33
+    - 90.17
+    - 1.23
+    - -4.47
+    - -71.54
+    - 1.57
+    - -44.91
     go_home_on_startup: true
     go_home_on_shutdown: true
     home_speed: 50
     home_tolerance_deg: 3.5
     home_timeout_sec: 15.0
     a1_joint_angles_deg:
-    - 3.77
-    - -4.65
-    - -7.55
-    - -71.01
-    - 0.7
-    - -51.15
+    - 16.96
+    - 40.25
+    - -36.37
+    - -67.67
+    - 1.04
+    - -45.26
     a1_speed: 30
     a2_joint_angles_deg:
-    - -40.07
-    - -6.24
-    - -7.55
-    - -62.84
-    - 0.87
-    - -51.15
+    - -28.74
+    - 30.85
+    - -13.7
+    - -74.7
+    - 1.22
+    - -44.64
     a2_speed: 30
     a3_joint_angles_deg:
-    - -90.0
-    - -6.24
-    - -6.67
-    - -73.91
-    - -0.08
-    - -52.11
+    - -79.98
+    - 14.85
+    - -17.74
+    - -71.1
+    - 1.13
+    - -52.38
     a3_speed: 30
     joint1_sweep_speed: 25
     joint1_sweep_angle_deg: 336.0
     joint1_sweep_tolerance_deg: 3.5
     joint1_sweep_duration_sec: 20.0
     max_j6_trajectory_travel_deg: 150.0
+    joint_state_limit_clamp_tolerance_deg: 0.5
+    adaptive_goal_correction_enabled: true
+    adaptive_goal_correction_joints:
+    - 3_Joint
+    - 4_Joint
+    adaptive_goal_correction_tolerance_deg: 0.5
+    adaptive_goal_correction_gain: 1.0
+    adaptive_goal_correction_max_total_deg: 7.0
+    adaptive_goal_correction_max_attempts: 4
 /arm2/arm2_container_pick_coordinator:
   ros__parameters:
     base_frame: arm2/base_link
@@ -56,16 +65,37 @@
     - 0.016841
     - -0.005065
     - -0.018597
-    base_correction_xyz_m:
+    pick_correction_xyz_m:
     - -0.02
-    - 0.015
+    - 0.01
+    - -0.02
+    id_transfer_pick_correction_xyz_m:
+    - -0.02
+    - -0.01
+    - -0.02
+    place_correction_xyz_m:
+    - 0.0
+    - 0.0
+    - 0.0
+    saved_destination_correction_xyz_m:
+    - -0.02
+    - -0.01
     - -0.005
+    id_transfer_correction_xyz_m:
+    - -0.001
+    - -0.014
+    - -0.005
+    trailer_correction_xyz_m:
+    - -0.05
+    - 0.0
+    - 0.0
     grasp_offset_rpy_deg:
     - 179.226
     - 6.873
     - 86.896
     reference_marker_yaw_deg: -1.728
     container_yaw_symmetry_deg: 180.0
+    # 180도 대칭인 동일 파지 자세 중 현재 손목에서 가까운 해를 선택
     prefer_current_gripper_yaw: true
     max_yaw_spread_deg: 12.0
     max_container_yaw_delta_deg: 180.0
@@ -116,14 +146,14 @@
     stack_segmented_descent_min_fraction: 0.3
     stack_segmented_descent_max_segments: 5
     stack_pose_goal_finish_max_distance_m: 0.075
-    scan_marker_pause_sec: 0.5
+    scan_marker_pause_sec: 1.0
     scan_timeout_sec: 90.0
     prefer_z_last_motion: false
-    minimum_stable_samples: 5
-    max_translation_std_m: 0.005
+    minimum_stable_samples: 10
+    max_translation_std_m: 0.0015
     max_rotation_spread_deg: 10.0
     dry_run_max_rotation_spread_deg: 30.0
-    max_marker_age_sec: 3.0
+    max_marker_age_sec: 1.0
     stabilization_timeout_sec: 20.0
     workspace_min_xyz_m:
     - -0.3
