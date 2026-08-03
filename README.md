@@ -11,23 +11,56 @@
 명령은 각각 새 터미널에서 실행하며, 모든 터미널에서 먼저 다음 환경을 불러옵니다.
 
 
-## 중앙관제 런치
+### 1. 중앙 관제 노트북
 
 ```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DISCOVERY_SERVER=127.0.0.1:11811
 export PORT_CONTROL_API_TOKEN='porter1234'
 
-ros2 launch porter_bringup central_laptop.launch.py   control_host:=0.0.0.0
-
-export PORT_CONTROL_API_TOKEN='porter1234'
-
-ros2 launch porter_bringup fleet_central_laptop.launch.py \
-  control_host:=0.0.0.0
+ros2 launch porter_bringup fleet_central_laptop.launch.py
 ```
 
-``` bash
+### 2. AGV1
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DISCOVERY_SERVER=192.168.0.60:11811
+
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv1 \
+  discovery_server:=$ROS_DISCOVERY_SERVER \
+  start_nav2:=true
+```
+
+### 3. AGV2
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DISCOVERY_SERVER=192.168.0.60:11811
+
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv2 \
+  discovery_server:=$ROS_DISCOVERY_SERVER \
+  start_nav2:=true
+```
+
+### 중앙제어 노트북 
+
+```bash
+cd ~/poter_ws 
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
 export PORT_CONTROL_API_TOKEN='porter1234'
 
-ros2 launch porter_bringup dashboard_laptop.launch.py   central_ip:=192.168.0.60   ollama_host:=http://agent.sds.codes   llm_model:=gemma4:31b
+ros2 launch porter_bringup dashboard_laptop.launch.py \
+  central_ip:=192.168.0.60
 ```
 
 ### 0. 최초 빌드
@@ -66,8 +99,11 @@ ros2 run pinky led_server
 ```
 
 ```bash
-ros2 service call /set_led pinky_interfaces/srv/SetLed "{command: 'fill', r: 0, g: 0,
-b: 255}"
+ros2 service call /set_led pinky/srv/SetLed \
+  "{command: 'fill', pixels: [], r: 0, g: 0, b: 255}"
+
+ros2 service call /set_led pinky/srv/SetLed \
+  "{command: 'fill', pixels: [], r: 255, g: 255, b: 0}"
 ```
 
 노트북에서 차량 데이터가 들어오는지 확인합니다.
