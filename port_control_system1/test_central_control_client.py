@@ -41,7 +41,9 @@ def test_pixel_goal_contains_token_and_coordinates(monkeypatch):
         {'x': 320, 'y': 300},
         {'x': 380, 'y': 300},
         command_id='vlm-test',
+        predecessor_command_id='vlm-before',
         mode='parking_b1',
+        queue_if_busy=True,
     )
 
     assert result['accepted']
@@ -52,3 +54,5 @@ def test_pixel_goal_contains_token_and_coordinates(monkeypatch):
     assert captured['json']['mode'] == 'parking_b1'
     assert captured['json']['vehicle_id'] == ''
     assert captured['json']['zone_id'] == 'B-1'
+    assert captured['json']['predecessor_command_id'] == 'vlm-before'
+    assert captured['json']['queue_if_busy'] is True

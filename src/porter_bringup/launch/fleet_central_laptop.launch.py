@@ -12,6 +12,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -27,6 +28,11 @@ def generate_launch_description():
         DeclareLaunchArgument('video_device', default_value='/dev/video2'),
         DeclareLaunchArgument('start_camera', default_value='true'),
         DeclareLaunchArgument('start_yolo', default_value='true'),
+        DeclareLaunchArgument(
+            'start_collision_supervisor',
+            default_value='true',
+            description='Enable top-down YOLO inter-vehicle collision holds',
+        ),
         DeclareLaunchArgument('start_dashboard_api', default_value='true'),
         DeclareLaunchArgument(
             'dashboard_enable_scan',
@@ -35,6 +41,26 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('use_rviz', default_value='true'),
         DeclareLaunchArgument('control_host', default_value='0.0.0.0'),
+        DeclareLaunchArgument(
+            'b1_waiting_distance_m',
+            default_value='0.25',
+            description='Distance behind B-1 used by a queued vehicle',
+        ),
+        DeclareLaunchArgument(
+            'a_zone_waiting_distance_m',
+            default_value='0.20',
+            description='Distance behind the A zone used by a queued vehicle',
+        ),
+        DeclareLaunchArgument(
+            'a_zone_waiting_camera_down_offset_m',
+            default_value='0.05',
+            description='Additional camera-down offset for the A waiting pose',
+        ),
+        DeclareLaunchArgument(
+            'b1_exit_forward_distance_m',
+            default_value='0.10',
+            description='Forward distance after the B-1 left exit turn',
+        ),
         DeclareLaunchArgument(
             'discovery_server_port',
             default_value='11811',
@@ -111,7 +137,46 @@ def generate_launch_description():
             executable='fleet_dispatcher',
             name='fleet_dispatcher',
             output='screen',
-            parameters=[{'subscribe_odom_fallback': False}],
+            parameters=[{
+                'subscribe_odom_fallback': False,
+                'b1_exit_left_turn_deg': 90.0,
+                'b1_exit_forward_distance_m': ParameterValue(
+                    LaunchConfiguration('b1_exit_forward_distance_m'),
+                    value_type=float,
+                ),
+                'zone_release_hysteresis_m': 0.05,
+            }],
+        ),
+        Node(
+            package='central',
+            executable='fleet_collision_supervisor',
+            name='fleet_collision_supervisor',
+            output='screen',
+            condition=IfCondition(
+                LaunchConfiguration('start_collision_supervisor')
+            ),
+            parameters=[
+                PathJoinSubstitution([
+                    workspace,
+                    'config',
+                    'central',
+                    'fleet_collision_supervisor.yaml',
+                ]),
+                {
+                    'calibration_yaml': PathJoinSubstitution([
+                        workspace,
+                        'config',
+                        'central',
+                        'camera_map_calibration.yaml',
+                    ]),
+                },
+            ],
+        ),
+        Node(
+            package='central',
+            executable='map_relay',
+            name='map_relay',
+            output='screen',
         ),
         Node(
             package='drive',
@@ -147,6 +212,20 @@ def generate_launch_description():
                     'central',
                     'camera_map_calibration.yaml',
                 ]),
+                'b1_waiting_distance_m': ParameterValue(
+                    LaunchConfiguration('b1_waiting_distance_m'),
+                    value_type=float,
+                ),
+                'a_zone_waiting_distance_m': ParameterValue(
+                    LaunchConfiguration('a_zone_waiting_distance_m'),
+                    value_type=float,
+                ),
+                'a_zone_waiting_camera_down_offset_m': ParameterValue(
+                    LaunchConfiguration(
+                        'a_zone_waiting_camera_down_offset_m'
+                    ),
+                    value_type=float,
+                ),
                 'waypoint_mode': False,
             }],
         ),

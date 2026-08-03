@@ -1,0 +1,22 @@
+fleet_collision_supervisor:
+  ros__parameters:
+    detection_topic: /central/yolo/detections
+    status_topic: /central/fleet/collision_status
+    minimum_detection_confidence: 0.60
+    max_detection_age_sec: 1.5
+    max_fleet_pose_age_sec: 1.5
+    prediction_horizon_sec: 3.0
+    prediction_step_sec: 0.1
+    minimum_separation_m: 0.22
+    release_separation_m: 0.30
+    release_stable_sec: 0.8
+    minimum_hold_sec: 0.5
+    nominal_plan_speed_mps: 0.12
+    max_prediction_speed_mps: 0.35
+    velocity_filter_alpha: 0.35
+    max_tracking_speed_mps: 0.7
+    motion_threshold_mps: 0.015
+    preferred_priority_vehicle: agv1
+    update_rate_hz: 10.0
+    agv1_labels: [car_yellow]
+    agv2_labels: [car_blue, car_bule]

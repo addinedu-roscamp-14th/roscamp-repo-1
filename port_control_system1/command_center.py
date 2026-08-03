@@ -54,13 +54,21 @@ from cargo_dispatch_tool import (
     load_named_locations,
     location_coord_text,
 )
-from llm_command_parser import LLMParseError, parse_command_with_llm
+from llm_command_parser import (
+    LLMParseError,
+    parse_command_with_llm,
+    resolve_execution_mode,
+)
 from ros_control_bridge import RosControlBridge
+from realtime_llm_agent import RealtimeLLMAgent
 from visual_navigation import (
     VisualNavigationError,
     compact_detections,
+    is_reciprocal_zone_exchange,
     resolve_detection_approach,
+    select_nearest_visible_vehicle,
     validate_pixel_navigation,
+    zone_mode_for_label,
 )
 from yolo_detection_client import (
     YoloDetectionClient,
@@ -68,6 +76,8 @@ from yolo_detection_client import (
 )
 
 PointXY = Tuple[float, float]
+
+VEHICLE_IDS = ("agv1", "agv2")
 
 
 # -----------------------------------------------------------------------------
@@ -329,8 +339,8 @@ class CommandPopup(ctk.CTkToplevel):
             row=0, column=0, sticky="w", padx=15, pady=(15, 5))
         ctk.CTkLabel(
             self,
-            text="Claude Haiku가 우선 해석합니다 (동의어/영어 혼용/일괄 이동 가능).\n"
-                 "예: \"cargo A를 port로 go\" / \"창고에 있는 물건 전부를 항만으로 이동\"",
+            text="비전 LLM이 현재 카메라와 YOLO 결과를 우선 해석합니다.\n"
+                 "예: \"A-3 구역의 컨테이너를 B-1로 옮겨\" / \"노란 차를 항구로 보내\"",
             font=self.font_body, text_color="gray70",
         ).grid(row=1, column=0, sticky="w", padx=15, pady=(0, 10))
 
@@ -422,6 +432,10 @@ class CommandPopup(ctk.CTkToplevel):
                 image_height,
             )
             if handled:
+                RealtimeLLMAgent.get_instance().set_objective(
+                    command,
+                    llm_result.get('actions'),
+                )
                 return
             self._log("[LLM 결과를 적용할 수 없어 규칙 기반으로 재시도]")
 
@@ -477,6 +491,17 @@ class CommandPopup(ctk.CTkToplevel):
         )
         return summary
 
+    def _extract_vehicle_id(self, action: Dict) -> str:
+        """LLM이 지정한 vehicle_id를 검증합니다. agv1/agv2가 아니면 자동배차(빈 문자열)."""
+        vehicle_id = str(action.get("vehicle_id") or "").strip().lower()
+        if vehicle_id not in VEHICLE_IDS:
+            if vehicle_id:
+                self._log(
+                    f'[VLM 차량 지정 무시] "{vehicle_id}"는 agv1/agv2가 아니라 자동배차로 전환'
+                )
+            return ""
+        return vehicle_id
+
     def _handle_llm_result(
         self,
         command: str,
@@ -485,7 +510,7 @@ class CommandPopup(ctk.CTkToplevel):
         image_width=640,
         image_height=480,
     ) -> bool:
-        """LLM 응답({"actions": [...]})을 검증하고 순서대로 실행합니다.
+        """LLM 응답을 검증하고 의존성에 따라 병렬 또는 순차 전송합니다.
         한 문장에 지시가 여러 개 섞여 있으면 actions에 여러 개가 들어오고, 전부 실행합니다.
         하나도 실행하지 못했으면 False를 반환해서 규칙 기반 파서로 넘어가게 합니다."""
         actions = result.get("actions")
@@ -493,7 +518,34 @@ class CommandPopup(ctk.CTkToplevel):
             return False
 
         any_handled = False
-        for action in actions:
+        plan_context = {'predecessor_command_id': ''}
+        execution_mode = resolve_execution_mode(command, result)
+        exchange_plan = is_reciprocal_zone_exchange(
+            actions,
+            detection_summary,
+            RosControlBridge.get_instance().snapshot().b1_zone,
+        )
+        parallel_plan = exchange_plan or execution_mode == 'parallel'
+        if exchange_plan:
+            self._log(
+                '[VLM 구역 교환 계획] 두 차량이 서로의 구역을 점유 중이므로 '
+                '대기점 이탈을 병렬 실행하고 최종 정차까지 계속합니다.'
+            )
+        elif parallel_plan and len(actions) > 1:
+            self._log(
+                f'[VLM 동시 계획] 독립적인 {len(actions)}개 차량 명령을 '
+                '선행 명령 연결 없이 동시에 전송합니다.'
+            )
+        elif len(actions) > 1:
+            self._log(
+                f'[VLM 순차 계획] {len(actions)}개 단계를 앞 단계 성공 후 '
+                '순서대로 실행합니다.'
+            )
+        for step_index, action in enumerate(actions, start=1):
+            if len(actions) > 1:
+                self._log(
+                    f'[VLM 계획 단계 {step_index}/{len(actions)}] {action}'
+                )
             if (
                 isinstance(action, dict)
                 and self._handle_single_action(
@@ -502,6 +554,11 @@ class CommandPopup(ctk.CTkToplevel):
                     detection_summary,
                     image_width,
                     image_height,
+                    (
+                        {'predecessor_command_id': ''}
+                        if parallel_plan
+                        else plan_context
+                    ),
                 )
             ):
                 any_handled = True
@@ -514,11 +571,14 @@ class CommandPopup(ctk.CTkToplevel):
         detection_summary=None,
         image_width=640,
         image_height=480,
+        plan_context=None,
     ) -> bool:
         """actions 배열 안의 액션 하나를 검증하고 실행합니다.
         검증에 실패하면 왜 실패했는지 로그에 남깁니다 - 여러 액션 중 하나가 조용히
         빠지면 사용자가 원인을 알기 어려우므로, 실패 이유를 항상 보이게 합니다."""
         action_type = action.get("type")
+        if plan_context is None:
+            plan_context = {'predecessor_command_id': ''}
 
         if action_type == "cargo_single":
             item = action.get("item")
@@ -583,12 +643,23 @@ class CommandPopup(ctk.CTkToplevel):
             self._execute_travel(stops)
             return True
 
+        if action_type == "visual_transfer":
+            return self._execute_visual_transfer(
+                command,
+                action,
+                detection_summary,
+                image_width,
+                image_height,
+                plan_context,
+            )
+
         if action_type == "visual_navigation":
             if detection_summary is None:
                 self._log(
                     '[VLM 객체 접근 거부] 최신 YOLO 검출 JSON이 없습니다.'
                 )
                 return True
+            vehicle_id = self._extract_vehicle_id(action)
             try:
                 target, heading, selected = resolve_detection_approach(
                     action,
@@ -596,13 +667,23 @@ class CommandPopup(ctk.CTkToplevel):
                     image_width,
                     image_height,
                 )
+                mode = zone_mode_for_label(selected['label'])
+                # resolve_detection_approach() already ran the overlap
+                # check above (validate_pixel_navigation): if we got here
+                # without VisualNavigationError, no other detection sits on
+                # this zone's target point in the current frame.
+                zone_visually_empty = mode in ('parking_b1', 'parking_a')
                 response = CentralControlClient().send_pixel_goal(
                     target,
                     heading,
-                    mode=(
-                        'parking_b1'
-                        if selected['label'] == 'B-1'
-                        else 'direct'
+                    predecessor_command_id=plan_context.get(
+                        'predecessor_command_id', ''
+                    ),
+                    mode=mode,
+                    vehicle_id=vehicle_id,
+                    zone_visually_empty=zone_visually_empty,
+                    queue_if_busy=bool(
+                        plan_context.get('predecessor_command_id')
                     ),
                 )
             except (VisualNavigationError, CentralControlApiError) as exc:
@@ -613,13 +694,20 @@ class CommandPopup(ctk.CTkToplevel):
                 )
                 return True
 
+            mode_text = {
+                'parking_b1': '주차',
+                'parking_a': '화물 적재 대기',
+            }.get(mode, action.get('approach_side'))
             command_id = response.get('command_id', 'unknown')
+            if command_id != 'unknown':
+                plan_context['predecessor_command_id'] = command_id
             self._log(
                 '[VLM 객체 접근 좌표 계산] '
                 f'index={selected["detection_index"]}, '
                 f'label={selected["label"]}, '
-                f'mode={"parking" if selected["label"] == "B-1" else "approach"}, '
+                f'mode={"approach" if mode == "direct" else mode}, '
                 f'side={action.get("approach_side")}, '
+                f'vehicle={vehicle_id or "AUTO"}, '
                 f'target={target}, heading={heading}, '
                 f'command_id={command_id}'
             )
@@ -627,7 +715,8 @@ class CommandPopup(ctk.CTkToplevel):
                 text=(
                     '[VLM 객체 접근 명령 전송 완료]\n'
                     f'객체={selected["label"]}, '
-                    f'방식={"주차" if selected["label"] == "B-1" else action.get("approach_side")}\n'
+                    f'방식={mode_text}, '
+                    f'차량={vehicle_id or "자동배차"}\n'
                     f'목표={target}, 방향={heading}'
                 ),
                 text_color='#28C76F',
@@ -637,6 +726,7 @@ class CommandPopup(ctk.CTkToplevel):
         if action_type == "pixel_navigation":
             target = action.get("target")
             heading = action.get("heading")
+            vehicle_id = self._extract_vehicle_id(action)
             try:
                 validate_pixel_navigation(
                     target,
@@ -648,6 +738,13 @@ class CommandPopup(ctk.CTkToplevel):
                 response = CentralControlClient().send_pixel_goal(
                     target,
                     heading,
+                    predecessor_command_id=plan_context.get(
+                        'predecessor_command_id', ''
+                    ),
+                    vehicle_id=vehicle_id,
+                    queue_if_busy=bool(
+                        plan_context.get('predecessor_command_id')
+                    ),
                 )
             except (VisualNavigationError, CentralControlApiError) as exc:
                 self._log(f"[VLM 좌표 전송 실패] {exc}")
@@ -658,14 +755,18 @@ class CommandPopup(ctk.CTkToplevel):
                 return True
 
             command_id = response.get("command_id", "unknown")
+            if command_id != 'unknown':
+                plan_context['predecessor_command_id'] = command_id
             duplicate = bool(response.get("duplicate", False))
             self._log(
-                f"[VLM 좌표 전송] target={target}, heading={heading}, "
+                f"[VLM 좌표 전송] vehicle={vehicle_id or 'AUTO'}, "
+                f"target={target}, heading={heading}, "
                 f"command_id={command_id}, duplicate={duplicate}"
             )
             self.result_label.configure(
                 text=(
                     "[VLM 차량 이동 명령 전송 완료]\n"
+                    f"차량={vehicle_id or '자동배차'}\n"
                     f"목표={target}, 방향={heading}\n"
                     f"명령 ID={command_id}"
                 ),
@@ -675,6 +776,158 @@ class CommandPopup(ctk.CTkToplevel):
 
         # type == "unknown" 이거나 예상 밖의 값이면 처리 못 한 것으로 간주
         return False
+
+    def _execute_visual_transfer(
+        self,
+        command,
+        action,
+        detection_summary,
+        image_width,
+        image_height,
+        plan_context,
+    ):
+        """Dispatch one live AGV through the visible source and destination."""
+        if detection_summary is None:
+            self._log('[실시간 운송 거부] 최신 YOLO 검출 JSON이 없습니다.')
+            return True
+
+        source_action = {
+            'detection_index': action.get('source_detection_index'),
+            'approach_side': 'bottom',
+        }
+        destination_action = {
+            'detection_index': action.get('destination_detection_index'),
+            'approach_side': 'bottom',
+        }
+        try:
+            source_target, source_heading, source = resolve_detection_approach(
+                source_action,
+                detection_summary,
+                image_width,
+                image_height,
+            )
+            destination_target, destination_heading, destination = (
+                resolve_detection_approach(
+                    destination_action,
+                    detection_summary,
+                    image_width,
+                    image_height,
+                )
+            )
+            vehicle_id = self._select_live_transfer_vehicle(
+                action,
+                source,
+                detection_summary,
+            )
+            if not vehicle_id:
+                raise VisualNavigationError(
+                    '현재 프레임과 Fleet 상태에서 운송 차량을 선택할 수 없습니다'
+                )
+
+            client = CentralControlClient()
+            source_response = client.send_pixel_goal(
+                source_target,
+                source_heading,
+                predecessor_command_id=plan_context.get(
+                    'predecessor_command_id', ''
+                ),
+                mode=zone_mode_for_label(source['label']),
+                vehicle_id=vehicle_id,
+                zone_visually_empty=True,
+                queue_if_busy=bool(
+                    plan_context.get('predecessor_command_id')
+                ),
+            )
+            source_command_id = source_response.get('command_id', '')
+            if not source_command_id:
+                raise CentralControlApiError(
+                    '출발 구역 이동 명령 ID를 받지 못했습니다'
+                )
+            destination_response = client.send_pixel_goal(
+                destination_target,
+                destination_heading,
+                predecessor_command_id=source_command_id,
+                mode=zone_mode_for_label(destination['label']),
+                vehicle_id=vehicle_id,
+                zone_visually_empty=True,
+                queue_if_busy=True,
+            )
+        except (VisualNavigationError, CentralControlApiError) as exc:
+            self._log(f'[실시간 운송 계획 실패] {exc}')
+            self.result_label.configure(
+                text=f'[실시간 운송 계획 실패] {exc}',
+                text_color='#EA5455',
+            )
+            return True
+
+        destination_command_id = destination_response.get(
+            'command_id', 'unknown'
+        )
+        if destination_command_id != 'unknown':
+            plan_context['predecessor_command_id'] = destination_command_id
+        self._log(
+            '[실시간 운송 계획 전송] '
+            f'현재 차량={vehicle_id}, '
+            f'{source["label"]}({source_command_id}) → '
+            f'{destination["label"]}({destination_command_id})'
+        )
+        self.result_label.configure(
+            text=(
+                '[현재 화면 기준 운송 경로 전송 완료]\n'
+                f'차량={vehicle_id}, '
+                f'{source["label"]} 도착 후 {destination["label"]} 이동\n'
+                '저장된 화물 위치 데이터는 변경하지 않았습니다.'
+            ),
+            text_color='#28C76F',
+        )
+        return True
+
+    def _select_live_transfer_vehicle(
+        self,
+        action,
+        source_detection,
+        detection_summary,
+    ):
+        requested = self._extract_vehicle_id(action)
+        if requested:
+            return requested
+
+        snapshot = RosControlBridge.get_instance().snapshot()
+        states = {
+            vehicle_id: state
+            for vehicle_id, state, _battery, emergency, _x, _y
+            in snapshot.fleet_states
+            if not emergency
+        }
+        ready = {
+            vehicle_id for vehicle_id, state in states.items()
+            if state == 'READY'
+        }
+        operational = {
+            vehicle_id for vehicle_id, state in states.items()
+            if state in {'READY', 'BUSY'}
+        }
+        eligible = ready or operational or None
+        selected = select_nearest_visible_vehicle(
+            source_detection,
+            detection_summary,
+            eligible,
+        )
+        if not selected and ready:
+            selected = sorted(ready)[0]
+        if not selected and operational:
+            selected = sorted(operational)[0]
+        if not selected and not states:
+            selected = select_nearest_visible_vehicle(
+                source_detection,
+                detection_summary,
+            )
+        if selected:
+            self._log(
+                '[현재 상태 차량 선택] '
+                f'{selected}, fleet_state={states.get(selected, "영상 기준")}'
+            )
+        return selected
 
     def _run_cargo_command(self, command: str) -> None:
         """화물 배차 명령 (규칙 기반 폴백 경로)."""

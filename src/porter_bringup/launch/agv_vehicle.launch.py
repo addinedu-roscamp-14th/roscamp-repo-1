@@ -58,6 +58,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument(
+            'scan_max_age_sec',
+            default_value='0.5',
+            description='Maximum LaserScan age accepted by the vehicle',
+        ),
+        DeclareLaunchArgument(
             'discovery_server',
             default_value=EnvironmentVariable(
                 'ROS_DISCOVERY_SERVER',
@@ -90,6 +95,7 @@ def generate_launch_description():
                 'lidar_serial_port': LaunchConfiguration('lidar_serial_port'),
                 'motor_serial_port': LaunchConfiguration('motor_serial_port'),
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
+                'scan_max_age_sec': LaunchConfiguration('scan_max_age_sec'),
             }.items(),
         ),
         TimerAction(

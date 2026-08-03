@@ -22,6 +22,16 @@ def generate_launch_description():
     api_token = LaunchConfiguration('api_token')
     ollama_host = LaunchConfiguration('ollama_host')
     llm_model = LaunchConfiguration('llm_model')
+    realtime_llm_enabled = LaunchConfiguration('realtime_llm_enabled')
+    realtime_llm_interval_sec = LaunchConfiguration(
+        'realtime_llm_interval_sec'
+    )
+    realtime_llm_heartbeat_sec = LaunchConfiguration(
+        'realtime_llm_heartbeat_sec'
+    )
+    realtime_llm_initial_delay_sec = LaunchConfiguration(
+        'realtime_llm_initial_delay_sec'
+    )
 
     dashboard_directory = PathJoinSubstitution([
         workspace,
@@ -69,7 +79,7 @@ def generate_launch_description():
             'ollama_host',
             default_value=EnvironmentVariable(
                 'OLLAMA_HOST',
-                default_value='http://127.0.0.1:11434',
+                default_value='http://agent.sds.codes',
             ),
         ),
         DeclareLaunchArgument(
@@ -78,6 +88,26 @@ def generate_launch_description():
                 'LOCAL_LLM_MODEL',
                 default_value='gemma4:31b',
             ),
+        ),
+        DeclareLaunchArgument(
+            'realtime_llm_enabled',
+            default_value='true',
+            description='Continuously reassess the latest operator objective',
+        ),
+        DeclareLaunchArgument(
+            'realtime_llm_interval_sec',
+            default_value='2.0',
+            description='Minimum live-scene polling interval',
+        ),
+        DeclareLaunchArgument(
+            'realtime_llm_heartbeat_sec',
+            default_value='5.0',
+            description='Reassess unchanged scenes at this interval',
+        ),
+        DeclareLaunchArgument(
+            'realtime_llm_initial_delay_sec',
+            default_value='5.0',
+            description='Delay before reassessing a newly dispatched command',
         ),
         SetEnvironmentVariable(
             'PORT_CONTROL_CCTV_URL',
@@ -113,6 +143,22 @@ def generate_launch_description():
         ),
         SetEnvironmentVariable('OLLAMA_HOST', ollama_host),
         SetEnvironmentVariable('LOCAL_LLM_MODEL', llm_model),
+        SetEnvironmentVariable(
+            'PORT_CONTROL_REALTIME_LLM_ENABLED',
+            realtime_llm_enabled,
+        ),
+        SetEnvironmentVariable(
+            'PORT_CONTROL_REALTIME_LLM_INTERVAL_SEC',
+            realtime_llm_interval_sec,
+        ),
+        SetEnvironmentVariable(
+            'PORT_CONTROL_REALTIME_LLM_HEARTBEAT_SEC',
+            realtime_llm_heartbeat_sec,
+        ),
+        SetEnvironmentVariable(
+            'PORT_CONTROL_REALTIME_LLM_INITIAL_DELAY_SEC',
+            realtime_llm_initial_delay_sec,
+        ),
         ExecuteProcess(
             cmd=[python_executable, dashboard_script],
             cwd=dashboard_directory,

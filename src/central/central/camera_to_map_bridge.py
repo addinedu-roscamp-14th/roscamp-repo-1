@@ -102,6 +102,14 @@ def validate_calibration_map(calibration, calibration_yaml_path):
         )
 
 
+def waiting_point_behind_target(target_x, target_y, yaw, distance):
+    """Return a staging point behind a final pose in the map frame."""
+    return (
+        float(target_x - np.cos(yaw) * distance),
+        float(target_y - np.sin(yaw) * distance),
+    )
+
+
 class CameraToMapBridge(Node):
     def __init__(self):
         super().__init__('camera_to_map_bridge')
@@ -124,6 +132,20 @@ class CameraToMapBridge(Node):
         self.declare_parameter('validate_calibration_map', True)
         self.declare_parameter('b1_camera_left_offset_m', 0.15)
         self.declare_parameter('b1_camera_down_offset_m', 0.03)
+        self.declare_parameter('b1_waiting_distance_m', 0.25)
+        # A-1/A-2/A-3 cargo bins share one fixed, pre-measured map-frame stop
+        # pose (measured with RViz "2D Pose Estimate") instead of a pixel ->
+        # map conversion, since the loading spot in front of the shelf is the
+        # same regardless of which bin is being worked.
+        # Fixed A-zone stop measured at rectified camera pixel (157, 262).
+        self.declare_parameter('a_zone_map_x', 0.16812885)
+        self.declare_parameter('a_zone_map_y', 0.06234431)
+        self.declare_parameter('a_zone_map_yaw_deg', 90.0)
+        self.declare_parameter('a_zone_stop_back_offset_m', 0.10)
+        self.declare_parameter('a_zone_waiting_distance_m', 0.20)
+        self.declare_parameter(
+            'a_zone_waiting_camera_down_offset_m', 0.05
+        )
         self.declare_parameter('waypoint_mode', False)
         self.declare_parameter('enable_spacebar_commit', True)
         self.declare_parameter(
@@ -170,6 +192,35 @@ class CameraToMapBridge(Node):
         )
         if self.b1_camera_down_offset_m < 0.0:
             raise ValueError('b1_camera_down_offset_m must not be negative')
+        self.b1_waiting_distance_m = float(
+            self.get_parameter('b1_waiting_distance_m').value
+        )
+        if self.b1_waiting_distance_m < 0.0:
+            raise ValueError('b1_waiting_distance_m must not be negative')
+        self.a_zone_map_x = float(self.get_parameter('a_zone_map_x').value)
+        self.a_zone_map_y = float(self.get_parameter('a_zone_map_y').value)
+        self.a_zone_map_yaw = float(
+            np.radians(float(self.get_parameter('a_zone_map_yaw_deg').value))
+        )
+        self.a_zone_stop_back_offset_m = float(
+            self.get_parameter('a_zone_stop_back_offset_m').value
+        )
+        if self.a_zone_stop_back_offset_m < 0.0:
+            raise ValueError('a_zone_stop_back_offset_m must not be negative')
+        self.a_zone_waiting_distance_m = float(
+            self.get_parameter('a_zone_waiting_distance_m').value
+        )
+        if self.a_zone_waiting_distance_m < 0.0:
+            raise ValueError('a_zone_waiting_distance_m must not be negative')
+        self.a_zone_waiting_camera_down_offset_m = float(
+            self.get_parameter(
+                'a_zone_waiting_camera_down_offset_m'
+            ).value
+        )
+        if self.a_zone_waiting_camera_down_offset_m < 0.0:
+            raise ValueError(
+                'a_zone_waiting_camera_down_offset_m must not be negative'
+            )
         self.waypoint_mode = bool(self.get_parameter('waypoint_mode').value)
         self.enable_spacebar_commit = bool(
             self.get_parameter('enable_spacebar_commit').value
@@ -250,31 +301,49 @@ class CameraToMapBridge(Node):
             float(message.heading_pixel.x),
             float(message.heading_pixel.y),
         ]
-        target_x, target_y = self.camera_pixel_to_map_xy(target_pixel)
-        heading_x, heading_y = self.camera_pixel_to_map_xy(heading_pixel)
-        is_b1 = message.zone_id == 'B-1' or message.mode == 'parking_b1'
-        if is_b1:
-            left_x, left_y = self.camera_left_map_offset(
-                target_pixel, self.b1_camera_left_offset_m
+        is_a = message.zone_id == 'A' or message.mode == 'parking_a'
+        is_b1 = False
+        if is_a:
+            # A-1/A-2/A-3 share one fixed, pre-measured map pose: skip the
+            # pixel -> map conversion entirely (target/heading pixels only
+            # exist to satisfy the pixel-goal HTTP schema upstream).
+            yaw = self.a_zone_map_yaw
+            target_x = float(
+                self.a_zone_map_x
+                - np.cos(yaw) * self.a_zone_stop_back_offset_m
             )
-            down_x, down_y = self.camera_down_map_offset(
-                target_pixel, self.b1_camera_down_offset_m
+            target_y = float(
+                self.a_zone_map_y
+                - np.sin(yaw) * self.a_zone_stop_back_offset_m
             )
-            target_x += left_x + down_x
-            target_y += left_y + down_y
-            heading_x += left_x + down_x
-            heading_y += left_y + down_y
+            heading_x = target_x + float(np.cos(yaw))
+            heading_y = target_y + float(np.sin(yaw))
+        else:
+            target_x, target_y = self.camera_pixel_to_map_xy(target_pixel)
+            heading_x, heading_y = self.camera_pixel_to_map_xy(heading_pixel)
+            is_b1 = message.zone_id == 'B-1' or message.mode == 'parking_b1'
+            if is_b1:
+                left_x, left_y = self.camera_left_map_offset(
+                    target_pixel, self.b1_camera_left_offset_m
+                )
+                down_x, down_y = self.camera_down_map_offset(
+                    target_pixel, self.b1_camera_down_offset_m
+                )
+                target_x += left_x + down_x
+                target_y += left_y + down_y
+                heading_x += left_x + down_x
+                heading_y += left_y + down_y
 
-        delta_x = heading_x - target_x
-        delta_y = heading_y - target_y
-        distance = float(np.hypot(delta_x, delta_y))
-        if distance < self.minimum_direction_distance:
-            self.get_logger().warning(
-                f'Rejected fleet command {message.command_id}: '
-                f'heading distance {distance:.3f}m is too short'
-            )
-            return
-        yaw = float(np.arctan2(delta_y, delta_x))
+            delta_x = heading_x - target_x
+            delta_y = heading_y - target_y
+            distance = float(np.hypot(delta_x, delta_y))
+            if distance < self.minimum_direction_distance:
+                self.get_logger().warning(
+                    f'Rejected fleet command {message.command_id}: '
+                    f'heading distance {distance:.3f}m is too short'
+                )
+                return
+            yaw = float(np.arctan2(delta_y, delta_x))
         source = PointStamped()
         source.header = message.header
         pose = self.build_pose_msg(source, target_x, target_y, yaw)
@@ -297,8 +366,37 @@ class CameraToMapBridge(Node):
             return
         goal = DispatchNavigation.Goal()
         goal.command_id = message.command_id
+        goal.predecessor_command_id = message.predecessor_command_id
         goal.requested_vehicle_id = message.requested_vehicle_id
-        goal.zone_id = 'B-1' if is_b1 else message.zone_id
+        goal.zone_id = 'B-1' if is_b1 else ('A' if is_a else message.zone_id)
+        goal.zone_visually_empty = message.zone_visually_empty
+        goal.queue_if_busy = message.queue_if_busy
+        waiting_distance = (
+            self.b1_waiting_distance_m
+            if is_b1
+            else self.a_zone_waiting_distance_m if is_a else 0.0
+        )
+        goal.use_waiting_pose = waiting_distance > 0.0
+        if goal.use_waiting_pose:
+            waiting_x, waiting_y = waiting_point_behind_target(
+                target_x,
+                target_y,
+                yaw,
+                waiting_distance,
+            )
+            if is_a and self.a_zone_waiting_camera_down_offset_m > 0.0:
+                down_x, down_y = self.camera_down_map_offset(
+                    target_pixel,
+                    self.a_zone_waiting_camera_down_offset_m,
+                )
+                waiting_x += down_x
+                waiting_y += down_y
+            goal.waiting_pose = self.build_pose_msg(
+                source,
+                waiting_x,
+                waiting_y,
+                yaw,
+            )
         goal.poses = [pose]
         future = self.dispatch_client.send_goal_async(
             goal,
@@ -309,7 +407,10 @@ class CameraToMapBridge(Node):
             f'Dispatching {message.command_id}: '
             f'vehicle={message.requested_vehicle_id or "AUTO"}, '
             f'zone={goal.zone_id or "-"}, '
-            f'map=({target_x:.3f}, {target_y:.3f})'
+            f'map=({target_x:.3f}, {target_y:.3f}), '
+            f'waiting_distance={waiting_distance:.2f}m, '
+            f'a_waiting_camera_down='
+            f'{self.a_zone_waiting_camera_down_offset_m if is_a else 0.0:.2f}m'
         )
 
     def _on_dispatch_feedback(self, feedback_message):
@@ -334,11 +435,14 @@ class CameraToMapBridge(Node):
     def _on_dispatch_result(self, future):
         try:
             result = future.result().result
-            log = self.get_logger().info if result.success else self.get_logger().error
-            log(
+            message = (
                 f'Fleet result: vehicle={result.assigned_vehicle_id}, '
                 f'success={result.success}, message={result.message}'
             )
+            if result.success:
+                self.get_logger().info(message)
+            else:
+                self.get_logger().error(message)
         except Exception as exc:
             self.get_logger().error(f'Failed to receive fleet result: {exc}')
 

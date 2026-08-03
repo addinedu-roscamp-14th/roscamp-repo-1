@@ -3,6 +3,7 @@ from pathlib import Path
 from central.camera_to_map_bridge import (
     CameraToMapBridge,
     validate_calibration_map,
+    waiting_point_behind_target,
 )
 
 import numpy as np
@@ -81,3 +82,15 @@ def test_b1_offset_moves_toward_camera_image_down():
 
     assert offset_x == pytest.approx(0.0)
     assert offset_y == pytest.approx(0.03)
+
+
+def test_waiting_point_is_behind_final_heading():
+    waiting_x, waiting_y = waiting_point_behind_target(
+        1.0,
+        2.0,
+        np.pi / 2.0,
+        0.25,
+    )
+
+    assert waiting_x == pytest.approx(1.0)
+    assert waiting_y == pytest.approx(1.75)
