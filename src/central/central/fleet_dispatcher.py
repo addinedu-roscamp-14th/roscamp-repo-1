@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from dataclasses import dataclass, field
 import math
@@ -12,7 +13,12 @@ import time
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
+from nav2_msgs.action import (
+    DriveOnHeading,
+    NavigateThroughPoses,
+    NavigateToPose,
+    Spin,
+)
 from nav_msgs.msg import Odometry
 from porter_interfaces.action import DispatchNavigation
 from porter_interfaces.msg import VehicleState
@@ -68,6 +74,13 @@ class FleetDispatcher(Node):
         self.declare_parameter('zone_release_hysteresis_m', 0.05)
         self.declare_parameter('b1_exit_left_turn_deg', 90.0)
         self.declare_parameter('b1_exit_forward_distance_m', 0.10)
+        self.declare_parameter('b1_exit_forward_speed_mps', 0.05)
+        self.declare_parameter('b1_exit_behavior_timeout_sec', 10.0)
+        self.declare_parameter('b1_exit_detection_radius_m', 0.35)
+        self.declare_parameter('b1_exit_turn_tolerance_deg', 5.0)
+        self.declare_parameter('b1_exit_turn_max_corrections', 2)
+        self.declare_parameter('b1_exit_pose_update_timeout_sec', 3.0)
+        self.declare_parameter('b1_exit_turn_settle_sec', 0.5)
         self.declare_parameter('sequence_dependency_timeout_sec', 300.0)
         self.declare_parameter('subscribe_odom_fallback', False)
 
@@ -108,6 +121,41 @@ class FleetDispatcher(Node):
             raise ValueError(
                 'b1_exit_forward_distance_m must be non-negative'
             )
+        self.b1_exit_forward_speed_mps = float(
+            self.get_parameter('b1_exit_forward_speed_mps').value
+        )
+        if self.b1_exit_forward_speed_mps <= 0.0:
+            raise ValueError('b1_exit_forward_speed_mps must be positive')
+        self.b1_exit_behavior_timeout_sec = float(
+            self.get_parameter('b1_exit_behavior_timeout_sec').value
+        )
+        if self.b1_exit_behavior_timeout_sec <= 0.0:
+            raise ValueError('b1_exit_behavior_timeout_sec must be positive')
+        self.b1_exit_detection_radius_m = float(
+            self.get_parameter('b1_exit_detection_radius_m').value
+        )
+        if self.b1_exit_detection_radius_m <= 0.0:
+            raise ValueError('b1_exit_detection_radius_m must be positive')
+        self.b1_exit_turn_tolerance_rad = math.radians(float(
+            self.get_parameter('b1_exit_turn_tolerance_deg').value
+        ))
+        if not 0.0 < self.b1_exit_turn_tolerance_rad < math.pi:
+            raise ValueError('b1_exit_turn_tolerance_deg must be in (0, 180)')
+        self.b1_exit_turn_max_corrections = int(
+            self.get_parameter('b1_exit_turn_max_corrections').value
+        )
+        if self.b1_exit_turn_max_corrections < 0:
+            raise ValueError('b1_exit_turn_max_corrections must be non-negative')
+        self.b1_exit_pose_update_timeout_sec = float(
+            self.get_parameter('b1_exit_pose_update_timeout_sec').value
+        )
+        if self.b1_exit_pose_update_timeout_sec <= 0.0:
+            raise ValueError('b1_exit_pose_update_timeout_sec must be positive')
+        self.b1_exit_turn_settle_sec = float(
+            self.get_parameter('b1_exit_turn_settle_sec').value
+        )
+        if self.b1_exit_turn_settle_sec < 0.0:
+            raise ValueError('b1_exit_turn_settle_sec must be non-negative')
         self.sequence_dependency_timeout_sec = float(
             self.get_parameter('sequence_dependency_timeout_sec').value
         )
@@ -144,6 +192,8 @@ class FleetDispatcher(Node):
         }
         self.nav_pose_clients = {}
         self.nav_waypoint_clients = {}
+        self.spin_clients = {}
+        self.drive_on_heading_clients = {}
         self.gate_clients = {}
         self.state_publishers = {}
         for vehicle_id in vehicle_ids:
@@ -157,6 +207,18 @@ class FleetDispatcher(Node):
                 self,
                 NavigateThroughPoses,
                 f'/{vehicle_id}/navigate_through_poses',
+                callback_group=self.callback_group,
+            )
+            self.spin_clients[vehicle_id] = ActionClient(
+                self,
+                Spin,
+                f'/{vehicle_id}/spin',
+                callback_group=self.callback_group,
+            )
+            self.drive_on_heading_clients[vehicle_id] = ActionClient(
+                self,
+                DriveOnHeading,
+                f'/{vehicle_id}/drive_on_heading',
                 callback_group=self.callback_group,
             )
             self.gate_clients[vehicle_id] = self.create_client(
@@ -842,33 +904,23 @@ class FleetDispatcher(Node):
         queued_zone_id = ''
         acquired_target_zone = False
         try:
-            if (
-                self._requires_b1_exit_turn(
-                    runtime.locked_zone, request.zone_id
-                )
-                and self._vehicle_is_at_zone(runtime, 'B-1')
-            ):
+            if self._requires_b1_exit_maneuver(runtime, request.zone_id):
                 self._publish_dispatch_feedback(
                     goal_handle,
                     vehicle_id,
                     'ROTATING_LEFT_BEFORE_B1_EXIT',
                     0,
                 )
-                turn_pose = self._b1_exit_turn_pose(
-                    runtime.pose,
-                    self.b1_exit_left_turn_deg,
-                )
                 self.get_logger().info(
                     f'{vehicle_id} leaving B-1: rotating left '
                     f'{self.b1_exit_left_turn_deg:.1f}deg in place before '
                     'translation'
                 )
-                turn_success, turn_message = await self._navigate_single_pose(
+                turn_success, turn_message = await self._rotate_b1_exit_verified(
                     goal_handle,
                     vehicle_id,
                     command_id,
-                    turn_pose,
-                    'B-1 exit rotation',
+                    math.radians(self.b1_exit_left_turn_deg),
                 )
                 if not turn_success:
                     if goal_handle.is_cancel_requested:
@@ -887,22 +939,17 @@ class FleetDispatcher(Node):
                         'ADVANCING_BEFORE_B1_EXIT',
                         0,
                     )
-                    forward_pose = self._forward_pose(
-                        turn_pose,
-                        self.b1_exit_forward_distance_m,
-                    )
                     self.get_logger().info(
                         f'{vehicle_id} leaving B-1: advancing '
                         f'{self.b1_exit_forward_distance_m:.2f}m after turn '
                         'before following the destination path'
                     )
                     forward_success, forward_message = (
-                        await self._navigate_single_pose(
+                        await self._drive_forward(
                             goal_handle,
                             vehicle_id,
                             command_id,
-                            forward_pose,
-                            'B-1 exit forward motion',
+                            self.b1_exit_forward_distance_m,
                         )
                     )
                     if not forward_success:
@@ -1124,11 +1171,201 @@ class FleetDispatcher(Node):
             self.vehicles[vehicle_id].active_nav_goal = None
         return True, ''
 
+    async def _spin_in_place(
+        self,
+        goal_handle,
+        vehicle_id,
+        command_id,
+        target_yaw_rad,
+    ):
+        """Run Nav2 Spin so the B-1 exit turn cannot become a path arc."""
+        goal = Spin.Goal()
+        goal.target_yaw = float(target_yaw_rad)
+        self._set_duration(
+            goal.time_allowance,
+            self.b1_exit_behavior_timeout_sec,
+        )
+        return await self._execute_behavior(
+            goal_handle,
+            vehicle_id,
+            command_id,
+            self.spin_clients[vehicle_id],
+            goal,
+            'B-1 exit rotation',
+        )
+
+    async def _rotate_b1_exit_verified(
+        self,
+        goal_handle,
+        vehicle_id,
+        command_id,
+        relative_yaw_rad,
+    ):
+        """Rotate, verify map-frame yaw, and correct before translation."""
+        with self._lock:
+            runtime = self.vehicles[vehicle_id]
+            start_pose_time = runtime.pose_received_at
+            start_yaw = self._pose_yaw(runtime.pose)
+        target_yaw = self._normalize_angle(start_yaw + relative_yaw_rad)
+        correction = float(relative_yaw_rad)
+
+        for attempt in range(self.b1_exit_turn_max_corrections + 1):
+            success, message = await self._spin_in_place(
+                goal_handle,
+                vehicle_id,
+                command_id,
+                correction,
+            )
+            if not success:
+                return False, message
+
+            if self.b1_exit_turn_settle_sec > 0.0:
+                await asyncio.sleep(self.b1_exit_turn_settle_sec)
+            measured_pose = await self._wait_for_new_vehicle_pose(
+                vehicle_id,
+                start_pose_time,
+                self.b1_exit_pose_update_timeout_sec,
+            )
+            if measured_pose is None:
+                return (
+                    False,
+                    'B-1 exit rotation could not be verified: '
+                    'no fresh AMCL pose',
+                )
+
+            with self._lock:
+                start_pose_time = self.vehicles[vehicle_id].pose_received_at
+            measured_yaw = self._pose_yaw(measured_pose)
+            yaw_error = self._normalize_angle(target_yaw - measured_yaw)
+            self.get_logger().info(
+                f'{vehicle_id} B-1 turn verification: '
+                f'target={math.degrees(target_yaw):.1f}deg, '
+                f'measured={math.degrees(measured_yaw):.1f}deg, '
+                f'error={math.degrees(yaw_error):.1f}deg, '
+                f'attempt={attempt + 1}'
+            )
+            if abs(yaw_error) <= self.b1_exit_turn_tolerance_rad:
+                return True, ''
+            correction = yaw_error
+
+        return (
+            False,
+            'B-1 exit rotation did not reach the required heading: '
+            f'error={math.degrees(correction):.1f}deg',
+        )
+
+    async def _wait_for_new_vehicle_pose(
+        self,
+        vehicle_id,
+        previous_pose_time,
+        timeout_sec,
+    ):
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            with self._lock:
+                runtime = self.vehicles[vehicle_id]
+                pose_time = runtime.pose_received_at
+                if (
+                    pose_time is not None
+                    and (
+                        previous_pose_time is None
+                        or pose_time > previous_pose_time
+                    )
+                ):
+                    return copy.deepcopy(runtime.pose)
+            await asyncio.sleep(0.05)
+        return None
+
+    async def _drive_forward(
+        self,
+        goal_handle,
+        vehicle_id,
+        command_id,
+        distance_m,
+    ):
+        """Drive straight along the vehicle x-axis after the B-1 turn."""
+        goal = DriveOnHeading.Goal()
+        goal.target.x = float(distance_m)
+        goal.speed = float(self.b1_exit_forward_speed_mps)
+        self._set_duration(
+            goal.time_allowance,
+            self.b1_exit_behavior_timeout_sec,
+        )
+        return await self._execute_behavior(
+            goal_handle,
+            vehicle_id,
+            command_id,
+            self.drive_on_heading_clients[vehicle_id],
+            goal,
+            'B-1 exit forward motion',
+        )
+
+    async def _execute_behavior(
+        self,
+        goal_handle,
+        vehicle_id,
+        command_id,
+        client,
+        behavior_goal,
+        phase,
+    ):
+        if not client.server_is_ready():
+            return False, f'{phase} action server is unavailable'
+        behavior_handle = await client.send_goal_async(behavior_goal)
+        if not behavior_handle.accepted:
+            return False, f'Nav2 rejected the {phase}'
+        with self._lock:
+            self.vehicles[vehicle_id].active_nav_goal = behavior_handle
+        behavior_result = await behavior_handle.get_result_async()
+        if goal_handle.is_cancel_requested:
+            return False, f'canceled during {phase}'
+        if self._command_preempted(command_id):
+            return False, f'superseded during {phase}'
+        if behavior_result.status != GoalStatus.STATUS_SUCCEEDED:
+            result = behavior_result.result
+            detail = getattr(result, 'error_msg', '') or 'no detail'
+            error_code = getattr(result, 'error_code', 0)
+            return (
+                False,
+                f'{phase} failed: status={behavior_result.status}, '
+                f'error_code={error_code}, message={detail}',
+            )
+        with self._lock:
+            self.vehicles[vehicle_id].active_nav_goal = None
+        return True, ''
+
+    @staticmethod
+    def _set_duration(duration, seconds):
+        whole_seconds = int(seconds)
+        duration.sec = whole_seconds
+        duration.nanosec = int((float(seconds) - whole_seconds) * 1e9)
+
     @staticmethod
     def _requires_b1_exit_turn(locked_zone, target_zone):
         return locked_zone == 'B-1' and target_zone != 'B-1'
 
-    def _vehicle_is_at_zone(self, runtime, zone_id):
+    def _requires_b1_exit_maneuver(self, runtime, target_zone):
+        """Keep the exit maneuver active despite a slightly early lock release."""
+        if target_zone == 'B-1':
+            return False
+        if runtime.locked_zone == 'B-1':
+            return self._vehicle_is_at_zone(
+                runtime,
+                'B-1',
+                radius_m=self.b1_exit_detection_radius_m,
+            )
+        with self._lock:
+            has_b1_reference = 'B-1' in self._zone_target_poses
+        return (
+            has_b1_reference
+            and self._vehicle_is_at_zone(
+                runtime,
+                'B-1',
+                radius_m=self.b1_exit_detection_radius_m,
+            )
+        )
+
+    def _vehicle_is_at_zone(self, runtime, zone_id, radius_m=None):
         """Reject a false exit turn when a reserved vehicle is still en route."""
         with self._lock:
             target_pose = self._zone_target_poses.get(zone_id)
@@ -1136,10 +1373,33 @@ class FleetDispatcher(Node):
             # Preserve the mandatory exit behavior after a dispatcher restart,
             # where an operator or recovered lock may not have a cached pose.
             return True
+        radius = (
+            self.zone_occupancy_radius_m
+            if radius_m is None
+            else float(radius_m)
+        )
         return math.hypot(
             runtime.pose.pose.position.x - target_pose.pose.position.x,
             runtime.pose.pose.position.y - target_pose.pose.position.y,
-        ) <= self.zone_occupancy_radius_m
+        ) <= radius
+
+    @staticmethod
+    def _pose_yaw(pose_stamped):
+        orientation = pose_stamped.pose.orientation
+        return math.atan2(
+            2.0 * (
+                orientation.w * orientation.z
+                + orientation.x * orientation.y
+            ),
+            1.0 - 2.0 * (
+                orientation.y * orientation.y
+                + orientation.z * orientation.z
+            ),
+        )
+
+    @staticmethod
+    def _normalize_angle(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     @staticmethod
     def _b1_exit_turn_pose(current_pose, left_turn_deg=90.0):

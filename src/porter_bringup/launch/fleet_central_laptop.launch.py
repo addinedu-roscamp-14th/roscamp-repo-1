@@ -62,6 +62,26 @@ def generate_launch_description():
             description='Forward distance after the B-1 left exit turn',
         ),
         DeclareLaunchArgument(
+            'b1_exit_forward_speed_mps',
+            default_value='0.05',
+            description='Straight-line speed after the B-1 left exit turn',
+        ),
+        DeclareLaunchArgument(
+            'b1_exit_behavior_timeout_sec',
+            default_value='10.0',
+            description='Timeout for each B-1 exit behavior action',
+        ),
+        DeclareLaunchArgument(
+            'b1_exit_detection_radius_m',
+            default_value='0.35',
+            description='Radius used to recognize a vehicle at B-1 before exit',
+        ),
+        DeclareLaunchArgument(
+            'b1_exit_turn_tolerance_deg',
+            default_value='5.0',
+            description='Required AMCL yaw accuracy before B-1 forward motion',
+        ),
+        DeclareLaunchArgument(
             'discovery_server_port',
             default_value='11811',
         ),
@@ -142,6 +162,22 @@ def generate_launch_description():
                 'b1_exit_left_turn_deg': 90.0,
                 'b1_exit_forward_distance_m': ParameterValue(
                     LaunchConfiguration('b1_exit_forward_distance_m'),
+                    value_type=float,
+                ),
+                'b1_exit_forward_speed_mps': ParameterValue(
+                    LaunchConfiguration('b1_exit_forward_speed_mps'),
+                    value_type=float,
+                ),
+                'b1_exit_behavior_timeout_sec': ParameterValue(
+                    LaunchConfiguration('b1_exit_behavior_timeout_sec'),
+                    value_type=float,
+                ),
+                'b1_exit_detection_radius_m': ParameterValue(
+                    LaunchConfiguration('b1_exit_detection_radius_m'),
+                    value_type=float,
+                ),
+                'b1_exit_turn_tolerance_deg': ParameterValue(
+                    LaunchConfiguration('b1_exit_turn_tolerance_deg'),
                     value_type=float,
                 ),
                 'zone_release_hysteresis_m': 0.05,

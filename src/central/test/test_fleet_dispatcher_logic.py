@@ -270,6 +270,7 @@ def make_zoned_dispatcher():
     dispatcher.telemetry_timeout = 3.0
     dispatcher.zone_occupancy_radius_m = 0.18
     dispatcher.zone_release_hysteresis_m = 0.05
+    dispatcher.b1_exit_detection_radius_m = 0.35
     dispatcher.get_logger = lambda: _NullLogger()
     return dispatcher
 
@@ -462,6 +463,26 @@ def test_b1_reserved_vehicle_does_not_turn_until_it_reaches_zone():
     assert not dispatcher._vehicle_is_at_zone(runtime, 'B-1')
     runtime.pose.pose.position.x = 0.9
     assert dispatcher._vehicle_is_at_zone(runtime, 'B-1')
+
+
+def test_b1_exit_maneuver_survives_early_lock_release_near_zone():
+    dispatcher = make_zoned_dispatcher()
+    runtime = dispatcher.vehicles['agv1']
+    dispatcher._zone_target_poses['B-1'] = target_pose(1.0, 0.0)
+    runtime.pose.pose.position.x = 0.72
+
+    assert runtime.locked_zone == ''
+    assert dispatcher._requires_b1_exit_maneuver(runtime, 'A')
+    assert not dispatcher._requires_b1_exit_maneuver(runtime, 'B-1')
+
+
+def test_b1_exit_maneuver_does_not_trigger_far_from_zone():
+    dispatcher = make_zoned_dispatcher()
+    runtime = dispatcher.vehicles['agv1']
+    dispatcher._zone_target_poses['B-1'] = target_pose(1.0, 0.0)
+    runtime.pose.pose.position.x = 0.60
+
+    assert not dispatcher._requires_b1_exit_maneuver(runtime, 'A')
 
 
 def test_a_zone_releases_as_soon_as_entered_vehicle_exits():
