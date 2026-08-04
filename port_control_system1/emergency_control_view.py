@@ -381,7 +381,11 @@ class EmergencyControlView(ctk.CTkFrame):
         }
         if char in velocity_commands and self.ros_bridge.snapshot().ready:
             linear, angular = velocity_commands[char]
-            self.ros_bridge.send_velocity(linear, angular)
+            selected = self.device_selector.get()
+            vehicle_id = "agv1" if "Red" in selected else "agv2"
+            self.ros_bridge.send_velocity(
+                linear, angular, vehicle_id=vehicle_id
+            )
             return
 
         import subprocess
@@ -393,7 +397,9 @@ class EmergencyControlView(ctk.CTkFrame):
     def _activate_emergency_stop(self) -> None:
         from tkinter import messagebox
 
-        if self.ros_bridge.emergency_stop():
+        selected = self.device_selector.get()
+        vehicle_id = "agv1" if "Red" in selected else "agv2"
+        if self.ros_bridge.emergency_stop(vehicle_id):
             messagebox.showwarning(
                 "비상 정지",
                 "현재 ROS 도메인의 /cmd_vel 정지 신호를 100Hz로 유지합니다.",
@@ -407,7 +413,9 @@ class EmergencyControlView(ctk.CTkFrame):
     def _release_emergency_stop(self) -> None:
         from tkinter import messagebox
 
-        if self.ros_bridge.release_emergency_stop():
+        selected = self.device_selector.get()
+        vehicle_id = "agv1" if "Red" in selected else "agv2"
+        if self.ros_bridge.release_emergency_stop(vehicle_id):
             messagebox.showinfo(
                 "비상 정지 해제",
                 "정지 유지 신호를 해제했습니다. 이동 전에 주변 안전을 확인하세요.",

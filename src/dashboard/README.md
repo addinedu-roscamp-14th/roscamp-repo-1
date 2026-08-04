@@ -82,7 +82,7 @@ http://<노트북-IP>:8000/slam/video
 http://<노트북-IP>:8000/slam/map.png
 ```
 
-`/slam/video`는 지도 위에 차량 pose와 LiDAR를 합성해 MJPEG로 전송합니다. 브라우저에서
+`/slam/video`는 지도 위에 차량 pose와 선택적인 LiDAR를 합성해 MJPEG로 전송합니다. 브라우저에서
 확인할 때는 `/slam/view`를 열고, HTTP 클라이언트에서 스트림을 직접 받을 때는
 `/slam/video`를 사용합니다.
 
@@ -108,6 +108,8 @@ sudo ufw allow 8000/tcp
 | `slam_map_topic` | `/map` | 실시간 SLAM 지도 토픽 |
 | `slam_base_frame` | `base_footprint` | 지도에 표시할 차량 TF frame |
 | `slam_scan_topic` | `/scan` | 지도에 표시할 LiDAR 토픽 |
+| `slam_pose_topic` | 빈 문자열 | 지정하면 TF 대신 이 `PoseWithCovarianceStamped`를 사용 |
+| `slam_enable_scan` | `true` | LiDAR 구독 및 오버레이 사용 여부 |
 | `slam_scan_max_age_sec` | `0.5` | 이 시간보다 오래된 스캔은 표시하지 않음 |
 | `slam_live_fps` | `15.0` | SLAM 합성 MJPEG 전송 FPS |
 | `slam_output_width` | `720` | SLAM 웹 영상 너비 |

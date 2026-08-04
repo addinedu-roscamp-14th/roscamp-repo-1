@@ -12,3 +12,6 @@ log/
 # Editor and OS files
 .vscode/
 .DS_Store
+
+# Model weights
+**/best.pt

@@ -38,6 +38,8 @@ class CentralControlClient:
         heading,
         command_id=None,
         mode='direct',
+        vehicle_id='',
+        zone_id='',
     ):
         """Send one VLM-selected target and heading pixel pair."""
         target_payload = self._pixel_payload(target, 'target')
@@ -54,6 +56,8 @@ class CentralControlClient:
                 json={
                     'command_id': command_id,
                     'mode': mode,
+                    'vehicle_id': vehicle_id,
+                    'zone_id': zone_id or ('B-1' if mode == 'parking_b1' else ''),
                     'target': target_payload,
                     'heading': heading_payload,
                 },
@@ -75,6 +79,36 @@ class CentralControlClient:
                 f'{body.get("detail", body)}'
             )
         return body
+
+    def status(self):
+        """Return both AGV states and the B-1 lock from the gateway."""
+        headers = {}
+        if self.token:
+            headers['X-Control-Token'] = self.token
+        response = requests.get(
+            f'{self.base_url}/api/v1/status',
+            headers=headers,
+            timeout=self.timeout_sec,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def set_emergency(self, enabled=True, vehicle_id='fleet'):
+        """Latch or release the fleet/per-vehicle emergency gate."""
+        headers = {'Content-Type': 'application/json'}
+        if self.token:
+            headers['X-Control-Token'] = self.token
+        response = requests.post(
+            f'{self.base_url}/api/v1/emergency-stop',
+            headers=headers,
+            json={
+                'vehicle_id': vehicle_id,
+                'enabled': bool(enabled),
+            },
+            timeout=self.timeout_sec,
+        )
+        response.raise_for_status()
+        return response.json()
 
     @staticmethod
     def _pixel_payload(value, field_name):

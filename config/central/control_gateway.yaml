@@ -4,6 +4,7 @@ central_control_gateway:
     port: 8100
     api_token: ''
     target_pixel_topic: /central/target_pixel
+    fleet_pixel_command_topic: /central/fleet/pixel_navigation_command
     target_map_json_topic: /central/target_map_json
     command_status_topic: /central/control/status
     battery_percent_topic: /battery/percent

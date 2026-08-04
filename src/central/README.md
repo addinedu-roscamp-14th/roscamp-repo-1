@@ -3,7 +3,36 @@
 중앙 관제에서 카메라 픽셀 좌표를 SLAM `/map` 좌표로 변환하고, 차량/브릿지에 전달 가능한 형태로 발행하는 패키지입니다.
 
 현재 핵심 노드는 `rqt_click_to_target`, `camera_to_map_bridge`,
-`control_gateway`입니다.
+`control_gateway`, `fleet_dispatcher`입니다.
+
+## 2대 차량 Fleet 제어
+
+`fleet_dispatcher`는 `agv1`, `agv2`의 Nav2 액션과 상태를 통합합니다.
+
+```text
+/central/dispatch_navigation
+porter_interfaces/action/DispatchNavigation
+
+/central/fleet/agv1/state
+/central/fleet/agv2/state
+porter_interfaces/msg/VehicleState
+
+/central/fleet/zones
+std_msgs/String
+
+/central/fleet/vehicle_markers
+visualization_msgs/MarkerArray
+```
+
+AUTO 명령은 준비된 유휴 차량 중 목표와 가까운 차량을 선택하며 동률이면
+`agv1`을 선택합니다. `vehicle_id`가 지정되면 다른 차량으로 대체하지 않습니다.
+B-1은 한 차량만 점유할 수 있고, 통신이 끊기면 `UNKNOWN`으로 잠긴 상태를
+유지합니다.
+
+`fleet_dispatcher`는 무선 트래픽을 줄이기 위해 기본적으로 고주기
+`/<vehicle_id>/odom`을 구독하지 않고 `/<vehicle_id>/amcl_pose`만 사용합니다.
+초기 위치 설정 전 odom fallback이 꼭 필요할 때만
+`subscribe_odom_fallback:=true`로 실행합니다.
 
 ## `control_gateway`
 
@@ -166,9 +195,33 @@ curl -X POST http://127.0.0.1:8100/api/v1/navigation/pixel-goal \
   -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
   -d '{
     "command_id": "dispatch-001",
+    "vehicle_id": "",
+    "zone_id": "",
     "target": {"x": 320, "y": 300},
     "heading": {"x": 380, "y": 300}
   }'
+```
+
+`vehicle_id`는 빈 문자열(AUTO), `agv1`, `agv2` 중 하나입니다. B-1 주차는
+`mode: "parking_b1"` 또는 `zone_id: "B-1"`을 사용합니다.
+
+비상정지:
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/emergency-stop \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
+  -d '{"vehicle_id":"fleet","enabled":true}'
+```
+
+`fleet` 대신 `agv1` 또는 `agv2`를 지정할 수 있습니다. 해제는
+`"enabled":false`로 요청합니다.
+
+B-1 `UNKNOWN` 잠금은 차량 위치를 확인한 운영자만 해제합니다.
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/zones/b1/clear \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}"
 ```
 
 `command_id`는 재시도 시 같은 명령이 두 번 실행되는 것을 막는 선택값입니다.
