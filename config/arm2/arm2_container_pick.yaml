@@ -9,7 +9,7 @@
     - -44.91
     go_home_on_startup: true
     go_home_on_shutdown: true
-    home_speed: 50
+    home_speed: 40
     home_tolerance_deg: 3.5
     home_timeout_sec: 15.0
     a1_joint_angles_deg:
@@ -19,7 +19,7 @@
     - -67.67
     - 1.04
     - -45.26
-    a1_speed: 30
+    a1_speed: 20
     a2_joint_angles_deg:
     - -28.74
     - 30.85
@@ -27,7 +27,7 @@
     - -74.7
     - 1.22
     - -44.64
-    a2_speed: 30
+    a2_speed: 20
     a3_joint_angles_deg:
     - -79.98
     - 14.85
@@ -35,7 +35,7 @@
     - -71.1
     - 1.13
     - -52.38
-    a3_speed: 30
+    a3_speed: 20
     joint1_sweep_speed: 25
     joint1_sweep_angle_deg: 336.0
     joint1_sweep_tolerance_deg: 3.5
@@ -146,7 +146,7 @@
     stack_segmented_descent_min_fraction: 0.3
     stack_segmented_descent_max_segments: 5
     stack_pose_goal_finish_max_distance_m: 0.075
-    scan_marker_pause_sec: 1.0
+    scan_marker_pause_sec: 2.0
     scan_timeout_sec: 90.0
     prefer_z_last_motion: false
     minimum_stable_samples: 10
