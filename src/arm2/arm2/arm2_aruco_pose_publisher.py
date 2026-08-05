@@ -10,8 +10,14 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
-from tf2_ros import TransformBroadcaster
+from tf2_ros import (
+    Buffer,
+    TransformBroadcaster,
+    TransformException,
+    TransformListener,
+)
 
 
 def rotation_matrix_to_quaternion(matrix):
@@ -59,6 +65,23 @@ def rotation_matrix_to_quaternion(matrix):
     return quaternion / norm
 
 
+def quaternion_to_rotation_matrix(quaternion):
+    """Convert a normalized XYZW quaternion to a 3x3 rotation matrix."""
+    x, y, z, w = np.asarray(quaternion, dtype=np.float64)
+    norm = float(np.linalg.norm([x, y, z, w]))
+    if norm < 1e-12:
+        raise ValueError('Cannot convert a zero quaternion')
+    x, y, z, w = np.asarray([x, y, z, w]) / norm
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),
+         2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z),
+         2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w),
+         1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
 class ArucoPosePublisher(Node):
     """Estimate a configured marker pose using calibrated camera intrinsics."""
 
@@ -78,6 +101,7 @@ class ArucoPosePublisher(Node):
             'pose_topic', '/arm2/gripper_camera/aruco_pose'
         )
         self.declare_parameter('camera_frame_id', '')
+        self.declare_parameter('output_frame_id', 'arm2/base_link')
         self.declare_parameter('marker_frame_id', 'arm2/container_marker')
         self.declare_parameter('marker_id', 0)
         self.declare_parameter('secondary_marker_id', -1)
@@ -128,6 +152,9 @@ class ArucoPosePublisher(Node):
         self.pose_topic = str(self.get_parameter('pose_topic').value)
         self.camera_frame_id = str(
             self.get_parameter('camera_frame_id').value
+        )
+        self.output_frame_id = str(
+            self.get_parameter('output_frame_id').value
         )
         self.marker_frame_id = str(
             self.get_parameter('marker_frame_id').value
@@ -189,6 +216,8 @@ class ArucoPosePublisher(Node):
             )
             self.detector = None
         self.bridge = CvBridge()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.camera_matrix = None
         self.distortion = None
@@ -197,6 +226,7 @@ class ArucoPosePublisher(Node):
         self.invalid_info_warning_count = 0
         self.last_detected_ids = None
         self.detected_once = False
+        self.last_transform_warning_ns = 0
 
         half_size = self.marker_size * 0.5
         self.object_points = np.array([
@@ -243,7 +273,8 @@ class ArucoPosePublisher(Node):
             f'size={self.marker_size:g} m on {self.image_topic}'
         )
         self.get_logger().info(
-            f'Publishing marker TF: camera -> {self.marker_frame_id}'
+            f'Publishing marker TF: {self.output_frame_id} -> '
+            f'{self.marker_frame_id}'
         )
         if self.secondary_marker_id >= 0:
             self.get_logger().info(
@@ -461,8 +492,36 @@ class ArucoPosePublisher(Node):
             return
 
         rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-        quaternion = rotation_matrix_to_quaternion(rotation_matrix)
         translation = translation_vector.reshape(3)
+
+        try:
+            camera_transform = self.tf_buffer.lookup_transform(
+                self.output_frame_id, camera_frame, Time()
+            )
+        except TransformException as exc:
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self.last_transform_warning_ns >= 5_000_000_000:
+                self.get_logger().warning(
+                    f'Cannot transform detected marker from {camera_frame} '
+                    f'to {self.output_frame_id}: {exc}'
+                )
+                self.last_transform_warning_ns = now_ns
+            return
+
+        camera_translation = np.array([
+            camera_transform.transform.translation.x,
+            camera_transform.transform.translation.y,
+            camera_transform.transform.translation.z,
+        ], dtype=np.float64)
+        camera_rotation = quaternion_to_rotation_matrix([
+            camera_transform.transform.rotation.x,
+            camera_transform.transform.rotation.y,
+            camera_transform.transform.rotation.z,
+            camera_transform.transform.rotation.w,
+        ])
+        translation = camera_translation + camera_rotation @ translation
+        rotation_matrix = camera_rotation @ rotation_matrix
+        quaternion = rotation_matrix_to_quaternion(rotation_matrix)
 
         transform = TransformStamped()
         transform.header.stamp = (
@@ -470,7 +529,7 @@ class ArucoPosePublisher(Node):
             if self.use_node_time_for_pose
             else image_message.header.stamp
         )
-        transform.header.frame_id = camera_frame
+        transform.header.frame_id = self.output_frame_id
         transform.child_frame_id = marker_frame_id
         transform.transform.translation.x = float(translation[0])
         transform.transform.translation.y = float(translation[1])

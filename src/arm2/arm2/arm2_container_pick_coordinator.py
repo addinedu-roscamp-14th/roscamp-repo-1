@@ -6,6 +6,8 @@ import math
 import threading
 import time
 
+from builtin_interfaces.msg import Duration
+from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped
 from arm2_interfaces.srv import TransferById
 import numpy as np
@@ -25,6 +27,7 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
+from trajectory_msgs.msg import JointTrajectoryPoint
 
 from .arm2_joint_limits import JOINT_LIMITS_DEG
 
@@ -32,14 +35,16 @@ try:
     from moveit_msgs.action import ExecuteTrajectory, MoveGroup
     from moveit_msgs.msg import (
         Constraints,
+        JointConstraint,
         MoveItErrorCodes,
         OrientationConstraint,
         PositionConstraint,
     )
-    from moveit_msgs.srv import GetCartesianPath
+    from moveit_msgs.srv import GetCartesianPath, GetPositionIK
 except ImportError:
     ExecuteTrajectory = None
     GetCartesianPath = None
+    GetPositionIK = None
     MoveGroup = None
 
 
@@ -190,6 +195,34 @@ def visual_servo_within_tolerance(
 def wrap_degrees(angle):
     """Wrap an angle to [-180, 180)."""
     return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def duration_message(seconds):
+    """Convert positive fractional seconds to a ROS Duration message."""
+    seconds = float(seconds)
+    whole_seconds = int(seconds)
+    nanoseconds = int(round((seconds - whole_seconds) * 1_000_000_000))
+    if nanoseconds >= 1_000_000_000:
+        whole_seconds += 1
+        nanoseconds -= 1_000_000_000
+    return Duration(sec=whole_seconds, nanosec=nanoseconds)
+
+
+def trajectory_joint_travel_degrees(start, trajectory, joint_name):
+    """Return cumulative travel for one named trajectory joint."""
+    names = list(trajectory.joint_trajectory.joint_names)
+    if joint_name not in names:
+        return math.inf
+    joint_index = names.index(joint_name)
+    previous = float(start)
+    travel = 0.0
+    for point in trajectory.joint_trajectory.points:
+        if len(point.positions) <= joint_index:
+            return math.inf
+        following = float(point.positions[joint_index])
+        travel += abs(math.degrees(following - previous))
+        previous = following
+    return travel
 
 
 def wrap_symmetric_degrees(angle, symmetry_degrees):
@@ -577,6 +610,15 @@ class ContainerPickCoordinator(Node):
         self.lift_search_step = float(
             self.get_parameter('lift_search_step_m').value
         )
+        self.bad_pick_branch_j2 = float(
+            self.get_parameter('bad_pick_branch_j2_deg').value
+        )
+        self.bad_pick_branch_j3 = float(
+            self.get_parameter('bad_pick_branch_j3_deg').value
+        )
+        self.bad_pick_branch_tolerance = float(
+            self.get_parameter('bad_pick_branch_tolerance_deg').value
+        )
         self.stack_container_height = float(
             self.get_parameter('stack_container_height_m').value
         )
@@ -690,6 +732,12 @@ class ContainerPickCoordinator(Node):
         self.moveit_planning_attempts = int(
             self.get_parameter('moveit_planning_attempts').value
         )
+        self.ik_timeout = float(
+            self.get_parameter('ik_timeout_sec').value
+        )
+        self.motion_ik_timeout = float(
+            self.get_parameter('motion_ik_timeout_sec').value
+        )
         self.moveit_velocity_scale = float(
             self.get_parameter('moveit_velocity_scale').value
         )
@@ -717,6 +765,12 @@ class ContainerPickCoordinator(Node):
         self.moveit_state_settle = float(
             self.get_parameter('moveit_state_settle_sec').value
         )
+        self.stack_preflight_joint_margin = math.radians(float(
+            self.get_parameter('stack_preflight_joint_margin_deg').value
+        ))
+        self.max_j6_trajectory_travel = float(
+            self.get_parameter('max_j6_trajectory_travel_deg').value
+        )
         self.scan_marker_pause = float(
             self.get_parameter('scan_marker_pause_sec').value
         )
@@ -725,6 +779,28 @@ class ContainerPickCoordinator(Node):
         )
         self.prefer_z_last_motion = bool(
             self.get_parameter('prefer_z_last_motion').value
+        )
+        zone_j1_values = self._vector_parameter(
+            'destination_zone_j1_deg', 3
+        )
+        self.destination_zone_j1 = {
+            f'A-{index + 1}': math.radians(float(value))
+            for index, value in enumerate(zone_j1_values)
+        }
+        self.j2_fallback_min_tcp_height = float(
+            self.get_parameter('j2_fallback_min_tcp_height_m').value
+        )
+        self.j3_fallback_min_tcp_height = float(
+            self.get_parameter('j3_fallback_min_tcp_height_m').value
+        )
+        self.release_verify_xy_tolerance = float(
+            self.get_parameter('release_verify_xy_tolerance_m').value
+        )
+        self.release_verify_z_tolerance = float(
+            self.get_parameter('release_verify_z_tolerance_m').value
+        )
+        self.release_verify_yaw_tolerance = float(
+            self.get_parameter('release_verify_yaw_tolerance_deg').value
         )
 
         if self.minimum_samples < 3:
@@ -789,6 +865,18 @@ class ContainerPickCoordinator(Node):
             )
         if self.cartesian_max_shortfall < 0.0:
             raise ValueError('cartesian_max_shortfall_m must be non-negative')
+        if self.ik_timeout <= 0.0:
+            raise ValueError('ik_timeout_sec must be positive')
+        if self.motion_ik_timeout <= 0.0:
+            raise ValueError('motion_ik_timeout_sec must be positive')
+        if self.stack_preflight_joint_margin < 0.0:
+            raise ValueError(
+                'stack_preflight_joint_margin_deg must be non-negative'
+            )
+        if self.max_j6_trajectory_travel <= 0.0:
+            raise ValueError(
+                'max_j6_trajectory_travel_deg must be positive'
+            )
         if any(
             scale < 0.0 or scale >= 1.0
             for scale in self.grasp_yaw_fallback_scales
@@ -831,10 +919,36 @@ class ContainerPickCoordinator(Node):
             raise ValueError(
                 'stack_pose_goal_finish_max_distance_m must be positive'
             )
+        if not 0.0 < self.bad_pick_branch_tolerance <= 30.0:
+            raise ValueError(
+                'bad_pick_branch_tolerance_deg must be within (0, 30]'
+            )
         if self.scan_marker_pause < 0.5:
             raise ValueError('scan_marker_pause_sec must be at least 0.5')
         if self.scan_timeout <= 0.0:
             raise ValueError('scan_timeout_sec must be positive')
+        if not (
+            self.workspace_min[2]
+            <= self.j2_fallback_min_tcp_height
+            <= self.workspace_max[2]
+        ):
+            raise ValueError(
+                'j2_fallback_min_tcp_height_m must be inside Z workspace'
+            )
+        if not (
+            self.workspace_min[2]
+            <= self.j3_fallback_min_tcp_height
+            <= self.workspace_max[2]
+        ):
+            raise ValueError(
+                'j3_fallback_min_tcp_height_m must be inside Z workspace'
+            )
+        if (
+            self.release_verify_xy_tolerance <= 0.0
+            or self.release_verify_z_tolerance <= 0.0
+            or self.release_verify_yaw_tolerance <= 0.0
+        ):
+            raise ValueError('release verification tolerances must be positive')
         lift_distance_candidates(
             self.stack_approach_clearance,
             self.stack_minimum_approach_clearance,
@@ -924,7 +1038,9 @@ class ContainerPickCoordinator(Node):
         self.robot = None
         self.move_group_client = None
         self.cartesian_path_client = None
+        self.position_ik_client = None
         self.execute_trajectory_client = None
+        self.follow_joint_trajectory_client = None
         self.gripper_open_client = None
         self.gripper_close_client = None
         self.stop_robot_client = None
@@ -938,6 +1054,13 @@ class ContainerPickCoordinator(Node):
         self.scan_state_client = None
         self.current_moveit_goal = None
         self.moveit_goal_lock = threading.Lock()
+        self.joint_state_lock = threading.Lock()
+        self.latest_joint_positions = None
+        self.latest_joint_state_time = None
+        self.j2_fallback_used = False
+        self.j3_fallback_used = False
+        self.ik_seed_fallback_index = 0
+        self.ik_seed_fallback_solutions = set()
         self.last_status_text = ''
         self.add_on_set_parameters_callback(
             self._on_tuning_parameters_changed
@@ -1024,6 +1147,12 @@ class ContainerPickCoordinator(Node):
             )
         self.create_timer(0.1, self.update_tracking)
         self.create_timer(1.0, self._republish_status)
+        self.create_subscription(
+            JointState,
+            '/arm2/joint_states',
+            self._joint_state_callback,
+            10,
+        )
 
         if self.execute_motion and self.motion_backend == 'direct':
             self._connect_robot()
@@ -1276,9 +1405,12 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter(
             'pregrasp_test_keep_current_orientation', True
         )
-        self.declare_parameter('lift_after_pick_m', 0.08)
-        self.declare_parameter('minimum_lift_after_pick_m', 0.05)
+        self.declare_parameter('lift_after_pick_m', 0.14)
+        self.declare_parameter('minimum_lift_after_pick_m', 0.14)
         self.declare_parameter('lift_search_step_m', 0.02)
+        self.declare_parameter('bad_pick_branch_j2_deg', -62.31)
+        self.declare_parameter('bad_pick_branch_j3_deg', 85.69)
+        self.declare_parameter('bad_pick_branch_tolerance_deg', 12.0)
         self.declare_parameter('stack_container_height_m', 0.035)
         self.declare_parameter('stack_approach_clearance_m', 0.08)
         self.declare_parameter(
@@ -1343,6 +1475,8 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('moveit_orientation_tolerance_deg', 7.0)
         self.declare_parameter('moveit_planning_time_sec', 15.0)
         self.declare_parameter('moveit_planning_attempts', 30)
+        self.declare_parameter('ik_timeout_sec', 0.3)
+        self.declare_parameter('motion_ik_timeout_sec', 3.0)
         self.declare_parameter('moveit_velocity_scale', 0.35)
         self.declare_parameter('moveit_acceleration_scale', 0.25)
         self.declare_parameter('cartesian_max_step_m', 0.005)
@@ -1352,9 +1486,19 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('cartesian_max_speed_mps', 0.04)
         self.declare_parameter('cartesian_max_joint_jump_deg', 20.0)
         self.declare_parameter('moveit_state_settle_sec', 0.4)
+        self.declare_parameter('stack_preflight_joint_margin_deg', 0.7)
+        self.declare_parameter('max_j6_trajectory_travel_deg', 170.0)
         self.declare_parameter('scan_marker_pause_sec', 0.5)
         self.declare_parameter('scan_timeout_sec', 90.0)
         self.declare_parameter('prefer_z_last_motion', False)
+        self.declare_parameter(
+            'destination_zone_j1_deg', [16.96, -28.74, -79.98]
+        )
+        self.declare_parameter('j2_fallback_min_tcp_height_m', 0.12)
+        self.declare_parameter('j3_fallback_min_tcp_height_m', 0.12)
+        self.declare_parameter('release_verify_xy_tolerance_m', 0.01)
+        self.declare_parameter('release_verify_z_tolerance_m', 0.008)
+        self.declare_parameter('release_verify_yaw_tolerance_deg', 3.0)
 
     def _vector_parameter(self, name, length):
         values = np.asarray(self.get_parameter(name).value, dtype=np.float64)
@@ -1387,8 +1531,16 @@ class ContainerPickCoordinator(Node):
         self.execute_trajectory_client = ActionClient(
             self, ExecuteTrajectory, self.execute_trajectory_action
         )
+        self.follow_joint_trajectory_client = ActionClient(
+            self,
+            FollowJointTrajectory,
+            '/arm2/arm_group_controller/follow_joint_trajectory',
+        )
         self.cartesian_path_client = self.create_client(
             GetCartesianPath, self.compute_cartesian_path_service
+        )
+        self.position_ik_client = self.create_client(
+            GetPositionIK, '/arm2/compute_ik'
         )
         self.gripper_open_client = self.create_client(
             Trigger, '/arm2/gripper/open'
@@ -2268,7 +2420,7 @@ class ContainerPickCoordinator(Node):
         self.motion_thread.start()
         response.success = True
         response.message = (
-            'Scanning destinations along HOME-A1-A2-A3-A2-A1-HOME'
+            'Scanning destinations along HOME-A1-A2-A3, then returning home'
         )
         return response
 
@@ -2343,17 +2495,17 @@ class ContainerPickCoordinator(Node):
     def _scan_destination_route(self, specs, required_count):
         """Visit home/A poses and lock stable destination marker poses."""
         route = (
-            ('HOME', self.return_home_client),
-            ('A-1', self.go_a1_client),
-            ('A-2', self.go_a2_client),
-            ('A-3', self.go_a3_client),
-            ('A-2', self.go_a2_client),
-            ('A-1', self.go_a1_client),
-            ('HOME', self.return_home_client),
+            ('HOME', self.return_home_client, 'always'),
+            ('A-1', self.go_a1_client, 'always'),
+            ('A-2', self.go_a2_client, 'always'),
+            ('A-3', self.go_a3_client, 'always'),
+            ('A-2', self.go_a2_client, 'if_missing'),
+            ('A-1', self.go_a1_client, 'if_missing'),
+            ('HOME', self.return_home_client, 'if_missing'),
         )
         if any(
             client is None or not client.wait_for_service(timeout_sec=3.0)
-            for _name, client in route
+            for _name, client, _scan_mode in route
         ):
             return None, 'destination route service is unavailable'
 
@@ -2363,9 +2515,22 @@ class ContainerPickCoordinator(Node):
             for _label, _frame, history in specs:
                 history.clear()
 
-        for route_index, (pose_name, client) in enumerate(route, start=1):
+        for route_index, (pose_name, client, scan_mode) in enumerate(
+            route, start=1
+        ):
             if self.stop_event.is_set():
                 return None, 'destination route stopped'
+            required_missing = any(
+                locked[index] is None for index in range(required_count)
+            )
+            scan_here = (
+                scan_mode == 'always'
+                or (scan_mode == 'if_missing' and required_missing)
+            )
+            if not scan_here:
+                self.tracking_suspended.set()
+            else:
+                self.tracking_suspended.clear()
             self.publish_status(
                 f'DESTINATION SCAN: route {route_index}/{len(route)} '
                 f'moving to {pose_name}'
@@ -2375,6 +2540,13 @@ class ContainerPickCoordinator(Node):
                 f'destination route {pose_name}',
                 timeout=self.motion_timeout + 5.0,
             )
+            if not scan_here:
+                self.publish_status(
+                    f'DESTINATION SCAN: route {route_index}/{len(route)} '
+                    f'at {pose_name}; all required IDs saved, '
+                    'return scan skipped'
+                )
+                continue
             with self.history_lock:
                 for index, (_label, _frame, history) in enumerate(specs):
                     if locked[index] is None:
@@ -2441,8 +2613,8 @@ class ContainerPickCoordinator(Node):
         self.motion_thread.start()
         response.success = True
         response.message = (
-            f'Scanning container ID {source_marker_id} and trailer ID 9/10, '
-            'then loading the selected container'
+            f'Scanning container ID {source_marker_id} and trailer ID 9/10 '
+            'along HOME-A1-A2-A3, then loading the selected container'
         )
         return response
 
@@ -2509,7 +2681,7 @@ class ContainerPickCoordinator(Node):
                 self.marker_histories[destination_id],
             ),
         )
-        locked, reason = self._scan_named_markers(specs)
+        locked, reason = self._scan_id_transfer_route(specs)
         if locked is None:
             self.publish_status(
                 f'ID {source_id} -> ID {destination_id} FAILED: {reason}'
@@ -2557,6 +2729,84 @@ class ContainerPickCoordinator(Node):
         finally:
             self.tracking_suspended.clear()
 
+    def _scan_id_transfer_route(self, specs):
+        """Lock both ID-transfer markers along the fixed A-zone route."""
+        route = (
+            ('HOME', self.return_home_client),
+            ('A-1', self.go_a1_client),
+            ('A-2', self.go_a2_client),
+            ('A-3', self.go_a3_client),
+            ('A-2', self.go_a2_client),
+            ('A-1', self.go_a1_client),
+        )
+        if any(
+            client is None or not client.wait_for_service(timeout_sec=3.0)
+            for _name, client in route
+        ):
+            return None, 'ID transfer route service is unavailable'
+
+        locked = [None] * len(specs)
+        with self.history_lock:
+            for _label, frame, history in specs:
+                history.clear()
+                self.scan_locked_frames.discard(frame)
+
+        for route_index, (pose_name, client) in enumerate(route, start=1):
+            if self.stop_event.is_set():
+                return None, 'ID transfer route stopped'
+            self.tracking_suspended.clear()
+            self.publish_status(
+                f'ID TRANSFER SCAN: route {route_index}/{len(route)} '
+                f'moving to {pose_name}'
+            )
+            self._call_scan_service(
+                client,
+                f'ID transfer route {pose_name}',
+                timeout=self.motion_timeout + 5.0,
+            )
+            with self.history_lock:
+                for index, (_label, _frame, history) in enumerate(specs):
+                    if locked[index] is None:
+                        history.clear()
+
+            deadline = time.monotonic() + self.scan_marker_pause + 2.0
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.05):
+                    return None, 'ID transfer route stopped'
+                for index, (label, frame, history) in enumerate(specs):
+                    if locked[index] is not None:
+                        continue
+                    pose, _reason = self.stable_marker_pose(
+                        history=history,
+                        yaw_only=True,
+                    )
+                    if pose is None:
+                        continue
+                    locked[index] = (
+                        np.array(pose[0], dtype=np.float64),
+                        np.array(pose[1], dtype=np.float64),
+                    )
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'ID TRANSFER SCAN: {label} saved at {pose_name}'
+                    )
+                if all(pose is not None for pose in locked):
+                    self.publish_status(
+                        'ID TRANSFER SCAN: both requested IDs saved; '
+                        'remaining route skipped'
+                    )
+                    return tuple(locked), 'ID transfer markers locked'
+
+        missing = [
+            label for (label, _frame, _history), pose
+            in zip(specs, locked) if pose is None
+        ]
+        return None, (
+            'HOME-A1-A2-A3-A2-A1 route ended before detecting '
+            + ', '.join(missing)
+        )
+
     def execute_loading_transfer(self, source_marker_id):
         """Scan a selected source and trailer, then execute the transfer."""
         specs = [(
@@ -2572,11 +2822,7 @@ class ContainerPickCoordinator(Node):
             )
             for marker_id, frame in self.trailer_frames.items()
         )
-        locked, reason = self._scan_named_markers(
-            tuple(specs),
-            required_indices=(0,),
-            any_of_indices=(1, 2),
-        )
+        locked, reason = self._scan_trailer_route(tuple(specs))
         if locked is None:
             self.publish_status(
                 f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
@@ -2645,6 +2891,82 @@ class ContainerPickCoordinator(Node):
             )
         finally:
             self.tracking_suspended.clear()
+
+    def _scan_trailer_route(self, specs):
+        """Visit HOME/A1/A2/A3 and lock one source plus either trailer."""
+        route = (
+            ('HOME', self.return_home_client),
+            ('A-1', self.go_a1_client),
+            ('A-2', self.go_a2_client),
+            ('A-3', self.go_a3_client),
+        )
+        if any(
+            client is None or not client.wait_for_service(timeout_sec=3.0)
+            for _name, client in route
+        ):
+            return None, 'trailer scan route service is unavailable'
+
+        locked = [None] * len(specs)
+        with self.history_lock:
+            for _label, frame, history in specs:
+                history.clear()
+                self.scan_locked_frames.discard(frame)
+
+        for route_index, (pose_name, client) in enumerate(route, start=1):
+            if self.stop_event.is_set():
+                return None, 'trailer scan route stopped'
+            self.publish_status(
+                f'TRAILER SCAN: route {route_index}/{len(route)} '
+                f'moving to {pose_name}'
+            )
+            self._call_scan_service(
+                client,
+                f'trailer scan route {pose_name}',
+                timeout=self.motion_timeout + 5.0,
+            )
+            with self.history_lock:
+                for index, (_label, _frame, history) in enumerate(specs):
+                    if locked[index] is None:
+                        history.clear()
+
+            deadline = time.monotonic() + self.scan_marker_pause + 2.0
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.05):
+                    return None, 'trailer scan route stopped'
+                for index, (label, frame, history) in enumerate(specs):
+                    if locked[index] is not None:
+                        continue
+                    pose, _reason = self.stable_marker_pose(
+                        history=history,
+                        yaw_only=True,
+                    )
+                    if pose is None:
+                        continue
+                    locked[index] = (
+                        np.array(pose[0], dtype=np.float64),
+                        np.array(pose[1], dtype=np.float64),
+                    )
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'TRAILER SCAN: {label} saved at {pose_name}'
+                    )
+                if grouped_marker_locks_satisfied(
+                    locked,
+                    required_indices=(0,),
+                    any_of_indices=(1, 2),
+                ):
+                    return tuple(locked), 'trailer route markers locked'
+
+        missing = []
+        if locked[0] is None:
+            missing.append(specs[0][0])
+        if locked[1] is None and locked[2] is None:
+            missing.append('trailer ID 9/10')
+        return None, (
+            'HOME-A1-A2-A3 route ended before detecting '
+            + ', '.join(missing)
+        )
 
     def start_saved_destination_transfer(
         self, _request, response, destination_name
@@ -3330,24 +3652,70 @@ class ContainerPickCoordinator(Node):
         marker_history=None,
         marker_id=0,
     ):
-        grasp, pregrasp = initial_targets
+        grasp, pregrasp = map(copy.deepcopy, initial_targets)
         self.publish_status('PICK: opening gripper')
         self.command_gripper(open_gripper=True)
         self.publish_status('PICK: moving to pregrasp')
-        if self.prefer_z_last_motion:
-            self.move_to_pose_z_last(
-                pregrasp,
-                keep_current_orientation=(
-                    self.pregrasp_test_keep_orientation
-                ),
+
+        def move_to_pick_pregrasp():
+            if self.prefer_z_last_motion:
+                self.move_to_pose_z_last(
+                    pregrasp,
+                    keep_current_orientation=(
+                        self.pregrasp_test_keep_orientation
+                    ),
+                    require_preferred_pick_branch=True,
+                )
+            else:
+                self.move_to_pose(
+                    pregrasp,
+                    keep_current_orientation=(
+                        self.pregrasp_test_keep_orientation
+                    ),
+                    require_preferred_pick_branch=True,
+                )
+
+        try:
+            move_to_pick_pregrasp()
+        except RuntimeError as initial_pregrasp_error:
+            if (
+                self.stop_event.is_set()
+                or abs(self.container_yaw_symmetry - 180.0) > 1e-6
+            ):
+                raise
+            for pose in (grasp, pregrasp):
+                rpy = quaternion_to_rpy_degrees([
+                    pose.pose.orientation.x,
+                    pose.pose.orientation.y,
+                    pose.pose.orientation.z,
+                    pose.pose.orientation.w,
+                ])
+                rotation = quaternion_from_rpy_degrees(
+                    rpy[0], rpy[1], wrap_degrees(rpy[2] + 180.0)
+                )
+                (
+                    pose.pose.orientation.x,
+                    pose.pose.orientation.y,
+                    pose.pose.orientation.z,
+                    pose.pose.orientation.w,
+                ) = map(float, rotation)
+            fallback_yaw = quaternion_to_rpy_degrees([
+                pregrasp.pose.orientation.x,
+                pregrasp.pose.orientation.y,
+                pregrasp.pose.orientation.z,
+                pregrasp.pose.orientation.w,
+            ])[2]
+            self.publish_status(
+                'PICK: primary pregrasp yaw unreachable; retrying '
+                f'180deg-equivalent yaw {fallback_yaw:.2f}deg'
             )
-        else:
-            self.move_to_pose(
-                pregrasp,
-                keep_current_orientation=(
-                    self.pregrasp_test_keep_orientation
-                ),
-            )
+            try:
+                move_to_pick_pregrasp()
+            except RuntimeError as fallback_error:
+                raise RuntimeError(
+                    f'primary pregrasp failed: {initial_pregrasp_error}; '
+                    f'180deg-equivalent pregrasp failed: {fallback_error}'
+                ) from fallback_error
         if (
             self.visual_servo_enabled
             and marker_frame is not None
@@ -3365,7 +3733,10 @@ class ContainerPickCoordinator(Node):
             )
         if self.pregrasp_test_keep_orientation:
             self.publish_status('PICK: aligning at pregrasp')
-            self.move_to_pose(pregrasp)
+            self.move_to_pose(
+                pregrasp,
+                require_preferred_pick_branch=True,
+            )
         if (
             not self.visual_servo_enabled
             and self.refresh_marker_before_descent
@@ -3381,38 +3752,99 @@ class ContainerPickCoordinator(Node):
                 'PICK: marker refresh skipped; using locked base target'
             )
         self.publish_status('PICK: descending to grasp pose')
+        self.avoid_known_bad_pick_branch(grasp)
         try:
             self.move_cartesian_to_pose(
-                grasp, allow_segmented=allow_segmented_descent
+                grasp,
+                allow_segmented=allow_segmented_descent,
+                prefer_j2_branch_fallback=allow_segmented_descent,
             )
         except CartesianPlanningError as initial_error:
-            remaining_distance = self._cartesian_request_distance(grasp)
-            can_finish_with_pose_goal = (
-                allow_segmented_descent
-                and initial_error.executed_segments > 0
-                and remaining_distance is not None
-                and remaining_distance
-                <= self.stack_pose_goal_finish_max_distance
-            )
-            if can_finish_with_pose_goal:
+            if (
+                initial_error.executed_segments == 0
+                and 'ik_only=1.000' in str(initial_error)
+                and 'no_joint_jump=' in str(initial_error)
+                and self.try_opposite_ik_branch(
+                    grasp, 'PICK vertical descent'
+                )
+            ):
                 self.publish_status(
-                    'PICK: finishing locked grasp pose without marker: '
-                    f'remaining={remaining_distance * 1000.0:.1f}mm'
+                    'PICK: retrying vertical descent on opposite J2 branch'
                 )
-                self.move_to_pose(grasp)
-            elif not allow_yaw_fallback:
-                raise
+                self.move_cartesian_to_pose(
+                    grasp,
+                    allow_segmented=allow_segmented_descent,
+                    prefer_j2_branch_fallback=allow_segmented_descent,
+                )
+                initial_error = None
+            if initial_error is None:
+                pass
             else:
-                grasp = self.move_with_yaw_fallbacks(
-                    grasp, pregrasp, initial_error
+                remaining_distance = self._cartesian_request_distance(grasp)
+                can_finish_with_pose_goal = (
+                    allow_segmented_descent
+                    and initial_error.executed_segments > 0
+                    and remaining_distance is not None
+                    and remaining_distance
+                    <= self.stack_pose_goal_finish_max_distance
                 )
+                if can_finish_with_pose_goal:
+                    self.publish_status(
+                        'PICK: finishing locked grasp pose without marker: '
+                        f'remaining={remaining_distance * 1000.0:.1f}mm'
+                    )
+                    self.move_to_pose(grasp)
+                elif not allow_yaw_fallback:
+                    raise initial_error
+                else:
+                    grasp = self.move_with_yaw_fallbacks(
+                        grasp, pregrasp, initial_error
+                    )
         self.publish_status('PICK: closing gripper')
         self.command_gripper(open_gripper=False)
         self.publish_status('PICK: finding vertical lift path')
         self.move_adaptive_cartesian_lift(grasp)
         return grasp
 
-    def publish_pick_target(self, label, grasp):
+    def avoid_known_bad_pick_branch(self, grasp):
+        """Leave a measured bad J2/J3 branch before grasp descent."""
+        if self.motion_backend != 'moveit':
+            return
+        with self.joint_state_lock:
+            joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+        j2_deg = math.degrees(float(joints[1]))
+        j3_deg = math.degrees(float(joints[2]))
+        is_bad_branch = (
+            abs(j2_deg - self.bad_pick_branch_j2)
+            <= self.bad_pick_branch_tolerance
+            and abs(j3_deg - self.bad_pick_branch_j3)
+            <= self.bad_pick_branch_tolerance
+        )
+        if not is_bad_branch:
+            return
+        self.publish_status(
+            'PICK: known bad pregrasp branch rejected: '
+            f'J2={j2_deg:.1f}deg, J3={j3_deg:.1f}deg; '
+            'switching J2 and J3 together before descent'
+        )
+        if self._try_opposite_j2_j3_branch('PICK known bad branch'):
+            return
+        raise RuntimeError(
+            'known bad pick branch detected and no safe IK solution with '
+            'both J2 and J3 reversed was found'
+        )
+
+    def publish_pick_target(self, label, grasp, marker_id=0):
         yaw = quaternion_to_rpy_degrees([
             grasp.pose.orientation.x,
             grasp.pose.orientation.y,
@@ -3420,7 +3852,7 @@ class ContainerPickCoordinator(Node):
             grasp.pose.orientation.w,
         ])[2]
         self.publish_status(
-            f'{label}: ID 0 grasp target '
+            f'{label}: ID {marker_id} grasp target '
             f'x={grasp.pose.position.x:.4f}, '
             f'y={grasp.pose.position.y:.4f}, '
             f'z={grasp.pose.position.z:.4f}, yaw={yaw:.2f}deg'
@@ -3431,16 +3863,25 @@ class ContainerPickCoordinator(Node):
             return
         self.tracking_suspended.set()
         try:
+            self.j2_fallback_used = False
+            self.j3_fallback_used = False
+            self.ik_seed_fallback_index = 0
+            self.ik_seed_fallback_solutions = set()
             source_targets, release, approach = targets
             self.publish_status(
                 'STACK: using locked initial ID 0 and ID 1 poses'
             )
             source_targets = copy.deepcopy(source_targets)
             self.publish_pick_target('STACK', source_targets[0])
-            self._perform_pick(
+            picked_grasp = self._perform_pick(
                 source_targets,
                 allow_yaw_fallback=False,
                 allow_segmented_descent=True,
+            )
+            self.raise_to_common_clearance_before_j1(release)
+            self.move_joint1_toward_destination(picked_grasp, release)
+            transit_approach = (
+                self.move_to_destination_radius_at_clearance(release)
             )
             destination_yaw = quaternion_to_rpy_degrees([
                 release.pose.orientation.x,
@@ -3456,11 +3897,25 @@ class ContainerPickCoordinator(Node):
                 release,
                 approach.pose.orientation,
                 'STACK release',
+                alignment_pose=transit_approach,
             )
+            try:
+                self.verify_release_pose(release, 'STACK release')
+            except RuntimeError:
+                self.publish_status(
+                    'STACK: release verification failed; retreating '
+                    'without opening gripper'
+                )
+                self.move_segmented_cartesian_with_pose_finish(
+                    approach, 'STACK verification retreat'
+                )
+                raise
             self.publish_status('STACK: opening gripper')
             self.command_gripper(open_gripper=True)
             self.publish_status('STACK: retreating vertically')
-            self.move_cartesian_to_pose(approach)
+            self.move_segmented_cartesian_with_pose_finish(
+                approach, 'STACK retreat'
+            )
             self.publish_status('STACK: returning to home')
             self.command_return_home()
             self.publish_status('STACK: completed ID 0 onto ID 1')
@@ -3485,16 +3940,31 @@ class ContainerPickCoordinator(Node):
         if not self.motion_lock.acquire(blocking=False):
             return
         try:
+            self.j2_fallback_used = False
+            self.j3_fallback_used = False
+            self.ik_seed_fallback_index = 0
+            self.ik_seed_fallback_solutions = set()
             source_targets, release, approach = targets
             self.publish_status('TRANSFER: moving to saved container pose')
-            self.publish_pick_target('TRANSFER', source_targets[0])
-            self._perform_pick(
+            self.publish_pick_target(
+                'TRANSFER', source_targets[0], marker_id=source_marker_id
+            )
+            picked_grasp = self._perform_pick(
                 copy.deepcopy(source_targets),
                 allow_yaw_fallback=False,
                 allow_segmented_descent=True,
                 marker_frame=self.source_frames[source_marker_id],
                 marker_history=self.marker_histories[source_marker_id],
                 marker_id=source_marker_id,
+            )
+            self.raise_to_common_clearance_before_j1(release)
+            self.move_joint1_toward_destination(
+                picked_grasp,
+                release,
+                destination_name=destination_name,
+            )
+            transit_approach = (
+                self.move_to_destination_radius_at_clearance(release)
             )
             self.tracking_suspended.set()
             destination_yaw = quaternion_to_rpy_degrees([
@@ -3511,7 +3981,21 @@ class ContainerPickCoordinator(Node):
                 release,
                 approach.pose.orientation,
                 f'{destination_name} release',
+                alignment_pose=transit_approach,
             )
+            try:
+                self.verify_release_pose(
+                    release, f'{destination_name} release'
+                )
+            except RuntimeError:
+                self.publish_status(
+                    f'TRANSFER: {destination_name} release verification '
+                    'failed; retreating without opening gripper'
+                )
+                self.move_segmented_cartesian_with_pose_finish(
+                    approach, f'{destination_name} verification retreat'
+                )
+                raise
             self.publish_status(
                 f'TRANSFER: releasing container at {destination_name}'
             )
@@ -3519,7 +4003,9 @@ class ContainerPickCoordinator(Node):
             self.publish_status(
                 f'TRANSFER: retreating from {destination_name}'
             )
-            self.move_cartesian_to_pose(approach)
+            self.move_segmented_cartesian_with_pose_finish(
+                approach, f'{destination_name} retreat'
+            )
             if count_stack:
                 with self.stack_level_lock:
                     self.placed_stack_count += 1
@@ -3553,11 +4039,236 @@ class ContainerPickCoordinator(Node):
             self.tracking_suspended.clear()
             self.motion_lock.release()
 
+    def raise_to_common_clearance_before_j1(self, release):
+        """Reach the source/destination common safe Z before rotating J1."""
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_z = float(current.transform.translation.z)
+        destination_z = (
+            float(release.pose.position.z)
+            + self.stack_approach_clearance
+        )
+        common_z = max(current_z, destination_z)
+        if current_z >= common_z - 0.003:
+            return
+        vertical = copy.deepcopy(release)
+        vertical.pose.position.x = float(current.transform.translation.x)
+        vertical.pose.position.y = float(current.transform.translation.y)
+        vertical.pose.position.z = common_z
+        vertical.pose.orientation = copy.deepcopy(
+            current.transform.rotation
+        )
+        self.publish_status(
+            'TRANSFER: raising to common destination clearance before J1: '
+            f'extra={(common_z - current_z) * 1000.0:.1f}mm'
+        )
+        try:
+            self.move_segmented_cartesian_with_pose_finish(
+                vertical, 'TRANSFER pre-J1 clearance rise'
+            )
+            return
+        except CartesianPlanningError as initial_error:
+            if initial_error.executed_segments > 0:
+                raise
+            initial_failure = str(initial_error)
+
+        current_rpy = quaternion_to_rpy_degrees([
+            current.transform.rotation.x,
+            current.transform.rotation.y,
+            current.transform.rotation.z,
+            current.transform.rotation.w,
+        ])
+        failures = [f'fixed orientation: {initial_failure}']
+        for roll_adjustment, pitch_adjustment in (
+            (0.0, 5.0), (0.0, -5.0),
+            (5.0, 0.0), (-5.0, 0.0),
+            (0.0, 10.0), (0.0, -10.0),
+            (10.0, 0.0), (-10.0, 0.0),
+            (5.0, 5.0), (5.0, -5.0),
+            (-5.0, 5.0), (-5.0, -5.0),
+        ):
+            candidate = copy.deepcopy(vertical)
+            rotation = quaternion_from_rpy_degrees(
+                current_rpy[0] + roll_adjustment,
+                current_rpy[1] + pitch_adjustment,
+                current_rpy[2],
+            )
+            (
+                candidate.pose.orientation.x,
+                candidate.pose.orientation.y,
+                candidate.pose.orientation.z,
+                candidate.pose.orientation.w,
+            ) = map(float, rotation)
+            self.publish_status(
+                'TRANSFER: retrying clearance rise with bounded tilt: '
+                f'roll={roll_adjustment:+.0f}deg, '
+                f'pitch={pitch_adjustment:+.0f}deg'
+            )
+            try:
+                self.move_segmented_cartesian_with_pose_finish(
+                    candidate, 'TRANSFER bounded-tilt clearance rise'
+                )
+                return
+            except CartesianPlanningError as exc:
+                if exc.executed_segments > 0:
+                    raise
+                failures.append(
+                    f'roll {roll_adjustment:+.0f}/'
+                    f'pitch {pitch_adjustment:+.0f}: {exc}'
+                )
+        if self.try_opposite_ik_branch(
+            release, 'TRANSFER pre-J1 clearance rise'
+        ):
+            return self.raise_to_common_clearance_before_j1(release)
+        raise RuntimeError(
+            'No safe pre-J1 clearance rise within 10deg tilt: '
+            + '; '.join(failures)
+        )
+
+    def move_to_destination_radius_at_clearance(self, release):
+        """Match destination XY at safe Z without rotating the wrist."""
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        destination_z = (
+            float(release.pose.position.z)
+            + self.stack_approach_clearance
+        )
+        transit_z = max(
+            float(current.transform.translation.z), destination_z
+        )
+        orientation = copy.deepcopy(current.transform.rotation)
+
+        if float(current.transform.translation.z) < transit_z - 0.003:
+            vertical = copy.deepcopy(release)
+            vertical.pose.position.x = float(
+                current.transform.translation.x
+            )
+            vertical.pose.position.y = float(
+                current.transform.translation.y
+            )
+            vertical.pose.position.z = transit_z
+            vertical.pose.orientation = copy.deepcopy(orientation)
+            self.publish_status(
+                'TRANSFER: restoring configured clearance after J1: '
+                f'{self.stack_approach_clearance * 1000.0:.0f}mm'
+            )
+            self.move_segmented_cartesian_with_pose_finish(
+                vertical, 'TRANSFER clearance rise'
+            )
+
+        radial = copy.deepcopy(release)
+        radial.pose.position.z = transit_z
+        radial.pose.orientation = copy.deepcopy(orientation)
+        radial_translation = np.array([
+            radial.pose.position.x,
+            radial.pose.position.y,
+            radial.pose.position.z,
+        ])
+        if not self.in_workspace(radial_translation):
+            raise RuntimeError(
+                'destination radial waypoint outside workspace: '
+                f'{np.round(radial_translation, 4).tolist()}'
+            )
+        self.publish_status(
+            'TRANSFER: matching destination XY radius at safe height '
+            'while holding wrist orientation'
+        )
+        current_rpy = quaternion_to_rpy_degrees([
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w,
+        ])
+        radial_failures = []
+        radial_aligned = False
+        yaw_candidates = (
+            0.0, 5.0, -5.0, 10.0, -10.0, 15.0, -15.0,
+            30.0, -30.0, 45.0, -45.0, 90.0, -90.0, 180.0,
+        )
+        orientation_candidates = [
+            (yaw, 0.0, 0.0) for yaw in yaw_candidates
+        ]
+        orientation_candidates.extend(
+            (yaw, roll, pitch)
+            for yaw in (0.0, 45.0, 90.0)
+            for roll, pitch in (
+                (0.0, -5.0), (0.0, 5.0),
+                (0.0, -10.0), (0.0, 10.0),
+                (-5.0, 0.0), (5.0, 0.0),
+            )
+        )
+        for yaw_adjustment, roll_adjustment, pitch_adjustment in (
+            orientation_candidates
+        ):
+            candidate = copy.deepcopy(radial)
+            candidate_rotation = quaternion_from_rpy_degrees(
+                current_rpy[0] + roll_adjustment,
+                current_rpy[1] + pitch_adjustment,
+                wrap_degrees(current_rpy[2] + yaw_adjustment),
+            )
+            (
+                candidate.pose.orientation.x,
+                candidate.pose.orientation.y,
+                candidate.pose.orientation.z,
+                candidate.pose.orientation.w,
+            ) = map(float, candidate_rotation)
+            try:
+                # This is a loaded horizontal transit. Never enter a partial
+                # XY move that can strand the arm between destination zones.
+                self.move_cartesian_to_pose(
+                    candidate,
+                    allow_segmented=False,
+                )
+                radial = candidate
+                radial_aligned = True
+                self.publish_status(
+                    'TRANSFER: destination radius matched with wrist '
+                    f'yaw={yaw_adjustment:+.0f}deg, '
+                    f'roll={roll_adjustment:+.0f}deg, '
+                    f'pitch={pitch_adjustment:+.0f}deg'
+                )
+                break
+            except CartesianPlanningError as exc:
+                if exc.executed_segments > 0:
+                    raise
+                radial_failures.append(
+                    f'yaw {yaw_adjustment:+.0f}/'
+                    f'roll {roll_adjustment:+.0f}/'
+                    f'pitch {pitch_adjustment:+.0f}deg: {exc}'
+                )
+        if not radial_aligned:
+            if self.try_opposite_ik_branch(
+                release, 'TRANSFER radial alignment'
+            ):
+                return self.move_to_destination_radius_at_clearance(
+                    release
+                )
+            raise RuntimeError(
+                'No Cartesian radial path at safe height with bounded wrist '
+                'yaw changes: ' + '; '.join(radial_failures)
+            )
+
+        return radial
+
     def move_to_reachable_stack_approach(
         self,
         release,
         orientation,
         excluded_yaw_offsets=None,
+        alignment_pose=None,
+        descent_orientation=None,
     ):
         """Find a reachable clearance and yaw without changing target XYZ."""
         failures = []
@@ -3568,12 +4279,50 @@ class ContainerPickCoordinator(Node):
             orientation.z,
             orientation.w,
         ])
-        for clearance in lift_distance_candidates(
-            self.stack_approach_clearance,
-            self.stack_minimum_approach_clearance,
-            self.stack_approach_search_step,
-        ):
-            for yaw_offset in self.stack_yaw_fallback_offsets:
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_yaw = quaternion_to_rpy_degrees([
+            current.transform.rotation.x,
+            current.transform.rotation.y,
+            current.transform.rotation.z,
+            current.transform.rotation.w,
+        ])[2]
+        yaw_offsets = sorted(
+            self.stack_yaw_fallback_offsets,
+            key=lambda offset: abs(wrap_degrees(
+                base_rpy[2] + offset - current_yaw
+            )),
+        )
+        self.publish_status(
+            'STACK: yaw candidates ordered for minimum wrist rotation: '
+            + ', '.join(f'{offset:+.0f}deg' for offset in yaw_offsets)
+        )
+        if alignment_pose is None:
+            approach_candidates = [
+                (
+                    clearance,
+                    None,
+                )
+                for clearance in lift_distance_candidates(
+                    self.stack_approach_clearance,
+                    self.stack_minimum_approach_clearance,
+                    self.stack_approach_search_step,
+                )
+            ]
+        else:
+            clearance = (
+                float(alignment_pose.pose.position.z)
+                - float(release.pose.position.z)
+            )
+            approach_candidates = [(clearance, alignment_pose)]
+        for clearance, fixed_approach in approach_candidates:
+            for yaw_offset in yaw_offsets:
                 if yaw_offset in excluded_yaw_offsets:
                     continue
                 candidate_rotation = quaternion_from_rpy_degrees(
@@ -3581,8 +4330,11 @@ class ContainerPickCoordinator(Node):
                     base_rpy[1],
                     wrap_degrees(base_rpy[2] + yaw_offset),
                 )
-                approach = copy.deepcopy(release)
-                approach.pose.position.z += clearance
+                approach = copy.deepcopy(
+                    release if fixed_approach is None else fixed_approach
+                )
+                if fixed_approach is None:
+                    approach.pose.position.z += clearance
                 (
                     approach.pose.orientation.x,
                     approach.pose.orientation.y,
@@ -3603,10 +4355,26 @@ class ContainerPickCoordinator(Node):
                 self.publish_status(
                     'STACK: trying approach '
                     f'yaw offset {yaw_offset:+.0f} deg, '
-                    f'clearance {clearance * 100.0:.1f} cm'
+                    f'clearance {clearance * 100.0:.1f} cm '
+                    'with prioritized J2/J3 branches'
                 )
                 try:
-                    if self.prefer_z_last_motion:
+                    if self.motion_backend == 'moveit':
+                        exact_approach = copy.deepcopy(approach)
+                        exact_approach.pose.orientation = copy.deepcopy(
+                            descent_orientation or approach.pose.orientation
+                        )
+                        solution, exact_approach = (
+                            self._preflight_stack_approach_and_descent(
+                                approach,
+                                exact_approach,
+                                release,
+                                'STACK approach',
+                            )
+                        )
+                        self._execute_planned_joint_goal(solution)
+                        approach = exact_approach
+                    elif self.prefer_z_last_motion:
                         self.move_to_pose_z_last(approach)
                     else:
                         self.move_to_pose(approach)
@@ -3625,6 +4393,8 @@ class ContainerPickCoordinator(Node):
                     retryable = (
                         'code=99999' in error
                         or 'code=-4' in error
+                        or 'IK branch passed plan-only validation' in error
+                        or 'passed descent preflight' in error
                     )
                     if not retryable:
                         raise
@@ -3641,8 +4411,372 @@ class ContainerPickCoordinator(Node):
             + '; '.join(failures)
         )
 
-    def move_to_reachable_stack_release(self, release, orientation, label):
-        """Select a yaw that supports both approach and vertical descent."""
+    def _request_pose_ik(self, target, seed):
+        """Return one collision-free IK solution seeded by six joints."""
+        request = GetPositionIK.Request()
+        ik_request = request.ik_request
+        ik_request.group_name = self.moveit_group
+        ik_request.ik_link_name = self.moveit_ee_link
+        ik_request.avoid_collisions = True
+        ik_request.timeout = duration_message(self.ik_timeout)
+        ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+        ik_request.robot_state.joint_state.position = [
+            float(value) for value in seed
+        ]
+        ik_request.pose_stamped = copy.deepcopy(target)
+        ik_request.pose_stamped.header.frame_id = self.base_frame
+        ik_request.pose_stamped.header.stamp = Time().to_msg()
+        future = self.position_ik_client.call_async(request)
+        self._wait_future(future, 5.0)
+        response = future.result()
+        if (
+            response is None
+            or response.error_code.val != MoveItErrorCodes.SUCCESS
+        ):
+            return None
+        solution_map = dict(zip(
+            response.solution.joint_state.name,
+            response.solution.joint_state.position,
+        ))
+        if any(name not in solution_map for name in JOINT_NAMES):
+            return None
+        return np.array(
+            [solution_map[name] for name in JOINT_NAMES],
+            dtype=np.float64,
+        )
+
+    def _preflight_vertical_descent(self, start_joints, release):
+        """Validate descent across expected physical joint tracking error."""
+        test_states = [('nominal', np.array(start_joints, dtype=np.float64))]
+        margin = self.stack_preflight_joint_margin
+        if margin > 0.0:
+            # Vertical placement reachability is dominated by the shoulder
+            # and elbow tracking error.  Other joints retain the controller's
+            # normal goal tolerance and must not reject an otherwise valid
+            # descent merely because the hardware cannot settle to sub-degree
+            # accuracy on every axis.
+            for joint_index in (1, 2):
+                for sign in (-1.0, 1.0):
+                    perturbed = np.array(start_joints, dtype=np.float64)
+                    perturbed[joint_index] += sign * margin
+                    lower, upper = JOINT_LIMITS_DEG[joint_index]
+                    perturbed[joint_index] = min(
+                        max(perturbed[joint_index], math.radians(lower)),
+                        math.radians(upper),
+                    )
+                    test_states.append((
+                        f'J{joint_index + 1}{sign:+.0f}', perturbed
+                    ))
+
+        minimum_fraction = 1.0
+        minimum_label = 'nominal'
+        for state_label, state in test_states:
+            request = GetCartesianPath.Request()
+            request.header = copy.deepcopy(release.header)
+            request.header.frame_id = self.base_frame
+            request.header.stamp = Time().to_msg()
+            request.start_state.is_diff = True
+            request.start_state.joint_state.name = list(JOINT_NAMES)
+            request.start_state.joint_state.position = [
+                float(value) for value in state
+            ]
+            request.group_name = self.moveit_group
+            request.link_name = self.moveit_ee_link
+            request.waypoints = [copy.deepcopy(release.pose)]
+            request.max_step = self.cartesian_max_step
+            request.jump_threshold = 0.0
+            request.prismatic_jump_threshold = 0.0
+            request.revolute_jump_threshold = self.cartesian_joint_jump
+            request.avoid_collisions = True
+            request.max_velocity_scaling_factor = self.moveit_velocity_scale
+            request.max_acceleration_scaling_factor = (
+                self.moveit_acceleration_scale
+            )
+            request.cartesian_speed_limited_link = self.moveit_ee_link
+            request.max_cartesian_speed = self.cartesian_max_speed
+            response = self._compute_cartesian_path(request)
+            if (
+                response is None
+                or response.error_code.val != MoveItErrorCodes.SUCCESS
+            ):
+                return False, f'{state_label}=planner error'
+            if response.fraction < minimum_fraction:
+                minimum_fraction = response.fraction
+                minimum_label = state_label
+            if response.fraction < self.cartesian_min_fraction:
+                return False, (
+                    f'{state_label} margin fraction={response.fraction:.3f}'
+                )
+            if not response.solution.joint_trajectory.points:
+                return False, f'{state_label}=empty Cartesian path'
+            j6_travel = trajectory_joint_travel_degrees(
+                state[5], response.solution, JOINT_NAMES[5]
+            )
+            if j6_travel > self.max_j6_trajectory_travel:
+                return False, (
+                    f'{state_label} J6 path travel={j6_travel:.1f}deg '
+                    f'exceeds {self.max_j6_trajectory_travel:.1f}deg'
+                )
+        return True, (
+            f'robust fraction={minimum_fraction:.3f} at {minimum_label}'
+        )
+
+    def _preflight_stack_approach_and_descent(
+        self,
+        branch_approach,
+        exact_approach,
+        release,
+        context,
+    ):
+        """Select a branch and 180-degree-equivalent release orientation."""
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+        if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(
+                'MoveIt /arm2/compute_cartesian_path service is unavailable'
+            )
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+
+        # For placement, prefer the elbow-out J3-positive families so the
+        # third link stays away from the gripper/container during descent.
+        # Elbow-in J3-negative solutions remain available as fallbacks.
+        branch_patterns = (
+            ('place preferred elbow-out (J2-/J3+)', -1.0, 1.0),
+            ('place elbow-out (J2+/J3+)', 1.0, 1.0),
+            ('place fallback elbow-in (J2-/J3-)', -1.0, -1.0),
+            ('place fallback elbow-in (J2+/J3-)', 1.0, -1.0),
+        )
+        exact_rpy = quaternion_to_rpy_degrees([
+            exact_approach.pose.orientation.x,
+            exact_approach.pose.orientation.y,
+            exact_approach.pose.orientation.z,
+            exact_approach.pose.orientation.w,
+        ])
+        equivalent_approaches = []
+        for symmetry_offset in (0.0, 180.0):
+            candidate = copy.deepcopy(exact_approach)
+            rotation = quaternion_from_rpy_degrees(
+                exact_rpy[0],
+                exact_rpy[1],
+                wrap_degrees(exact_rpy[2] + symmetry_offset),
+            )
+            (
+                candidate.pose.orientation.x,
+                candidate.pose.orientation.y,
+                candidate.pose.orientation.z,
+                candidate.pose.orientation.w,
+            ) = map(float, rotation)
+            equivalent_approaches.append((symmetry_offset, candidate))
+        failures = []
+        for label, j2_sign, j3_sign in branch_patterns:
+            for magnitude in (30.0, 60.0, 90.0):
+                seed = current_joints.copy()
+                for joint_index, sign in ((1, j2_sign), (2, j3_sign)):
+                    lower, upper = JOINT_LIMITS_DEG[joint_index]
+                    seed[joint_index] = math.radians(min(
+                        max(sign * magnitude, lower + 1.0), upper - 1.0
+                    ))
+                branch_solution = self._request_pose_ik(
+                    branch_approach, seed
+                )
+                if branch_solution is None:
+                    continue
+                j2_deg = math.degrees(float(branch_solution[1]))
+                j3_deg = math.degrees(float(branch_solution[2]))
+                if j2_deg * j2_sign < 5.0 or j3_deg * j3_sign < 5.0:
+                    continue
+                exact_solutions = []
+                for symmetry_offset, candidate in equivalent_approaches:
+                    exact_solution = self._request_pose_ik(
+                        candidate, branch_solution
+                    )
+                    if exact_solution is None:
+                        failures.append(
+                            f'{label}: yaw{symmetry_offset:+.0f} IK failed'
+                        )
+                        continue
+                    j6_travel = abs(math.degrees(float(
+                        exact_solution[5] - current_joints[5]
+                    )))
+                    exact_solutions.append((
+                        j6_travel,
+                        symmetry_offset,
+                        candidate,
+                        exact_solution,
+                    ))
+                exact_solutions.sort(key=lambda item: item[0])
+                for (
+                    j6_travel,
+                    symmetry_offset,
+                    candidate,
+                    exact_solution,
+                ) in exact_solutions:
+                    if j6_travel > 170.0:
+                        failures.append(
+                            f'{label}: yaw{symmetry_offset:+.0f} direct '
+                            f'J6 travel {j6_travel:.1f}deg'
+                        )
+                        continue
+                    try:
+                        self._execute_planned_joint_goal(
+                            exact_solution, plan_only=True
+                        )
+                    except RuntimeError as exc:
+                        failures.append(
+                            f'{label}: yaw{symmetry_offset:+.0f} {exc}'
+                        )
+                        continue
+                    candidate_release = copy.deepcopy(release)
+                    candidate_release.pose.orientation = copy.deepcopy(
+                        candidate.pose.orientation
+                    )
+                    descent_ok, descent_detail = (
+                        self._preflight_vertical_descent(
+                            exact_solution, candidate_release
+                        )
+                    )
+                    if not descent_ok:
+                        failures.append(
+                            f'{label}: yaw{symmetry_offset:+.0f} descent '
+                            f'{descent_detail}'
+                        )
+                        continue
+                    self.publish_status(
+                        f'{context}: preflight passed {label}, '
+                        f'equivalent yaw {symmetry_offset:+.0f}deg: '
+                        f'J2={math.degrees(float(exact_solution[1])):.1f}deg, '
+                        f'J3={math.degrees(float(exact_solution[2])):.1f}deg, '
+                        f'J6 travel={j6_travel:.1f}deg, {descent_detail}'
+                    )
+                    return exact_solution, candidate
+            failures.append(f'{label}: no complete approach/descent')
+        raise RuntimeError(
+            f'no {context} IK branch passed descent preflight: '
+            + '; '.join(failures)
+        )
+
+    def _move_to_pose_with_j2_j3_branch_priority(self, target, context):
+        """Plan a target pose using explicit J2/J3 branch priority."""
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+
+        # Preferred branch first, then reverse J3, J2, and both.  Multiple
+        # magnitudes help the numerical IK solver reach the requested family
+        # without weakening the sign check applied to its returned solution.
+        branch_patterns = (
+            ('J2+/J3-', 1.0, -1.0),
+            ('J3 opposite (J2+/J3+)', 1.0, 1.0),
+            ('J2 opposite (J2-/J3-)', -1.0, -1.0),
+            ('J2+J3 opposite (J2-/J3+)', -1.0, 1.0),
+        )
+        seed_magnitudes = (30.0, 60.0, 90.0)
+        failures = []
+        for label, j2_sign, j3_sign in branch_patterns:
+            for magnitude in seed_magnitudes:
+                seed = current_joints.copy()
+                for joint_index, sign in ((1, j2_sign), (2, j3_sign)):
+                    lower, upper = JOINT_LIMITS_DEG[joint_index]
+                    seed_deg = min(
+                        max(sign * magnitude, lower + 1.0),
+                        upper - 1.0,
+                    )
+                    seed[joint_index] = math.radians(seed_deg)
+
+                request = GetPositionIK.Request()
+                ik_request = request.ik_request
+                ik_request.group_name = self.moveit_group
+                ik_request.ik_link_name = self.moveit_ee_link
+                ik_request.avoid_collisions = True
+                ik_request.timeout = duration_message(
+                    self.motion_ik_timeout
+                )
+                ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+                ik_request.robot_state.joint_state.position = [
+                    float(value) for value in seed
+                ]
+                ik_request.pose_stamped = copy.deepcopy(target)
+                ik_request.pose_stamped.header.frame_id = self.base_frame
+                ik_request.pose_stamped.header.stamp = Time().to_msg()
+                future = self.position_ik_client.call_async(request)
+                self._wait_future(future, 5.0)
+                response = future.result()
+                if (
+                    response is None
+                    or response.error_code.val != MoveItErrorCodes.SUCCESS
+                ):
+                    continue
+                solution_map = dict(zip(
+                    response.solution.joint_state.name,
+                    response.solution.joint_state.position,
+                ))
+                if any(name not in solution_map for name in JOINT_NAMES):
+                    continue
+                solution = np.array(
+                    [solution_map[name] for name in JOINT_NAMES],
+                    dtype=np.float64,
+                )
+                solution_j2_deg = math.degrees(float(solution[1]))
+                solution_j3_deg = math.degrees(float(solution[2]))
+                if (
+                    solution_j2_deg * j2_sign < 5.0
+                    or solution_j3_deg * j3_sign < 5.0
+                ):
+                    continue
+                try:
+                    self._execute_planned_joint_goal(
+                        solution,
+                        plan_only=True,
+                    )
+                except RuntimeError as exc:
+                    failures.append(f'{label}: {exc}')
+                    continue
+                self.publish_status(
+                    f'{context}: selected planned J2/J3 branch '
+                    f'{label}: J2={solution_j2_deg:.1f}deg, '
+                    f'J3={solution_j3_deg:.1f}deg'
+                )
+                self._execute_planned_joint_goal(solution)
+                return
+            failures.append(f'{label}: no valid planned IK solution')
+        raise RuntimeError(
+            f'no {context} IK branch passed plan-only validation: '
+            + '; '.join(failures)
+        )
+
+    def move_to_reachable_stack_release(
+        self,
+        release,
+        orientation,
+        label,
+        alignment_pose=None,
+    ):
+        """Use fallback yaw only for approach, then place at exact yaw."""
+        desired_release_orientation = copy.deepcopy(
+            release.pose.orientation
+        )
         excluded_yaw_offsets = set()
         descent_failures = []
         while len(excluded_yaw_offsets) < len(
@@ -3652,15 +4786,62 @@ class ContainerPickCoordinator(Node):
                 release,
                 orientation,
                 excluded_yaw_offsets=excluded_yaw_offsets,
+                alignment_pose=alignment_pose,
+                descent_orientation=desired_release_orientation,
+            )
+            exact_approach = copy.deepcopy(approach)
+            exact_approach.pose.orientation = copy.deepcopy(
+                release.pose.orientation
             )
             self.publish_status(
-                f'{label}: testing vertical descent with '
-                f'yaw offset {yaw_offset:+.0f} deg'
+                f'{label}: approach yaw {yaw_offset:+.0f} deg selected; '
+                'aligning exact destination yaw before descent'
             )
             try:
-                self.move_segmented_descent_with_pose_finish(release, label)
+                self.move_to_pose(exact_approach)
+            except RuntimeError as exc:
+                descent_failures.append(
+                    f'approach yaw {yaw_offset:+.0f}deg exact-yaw '
+                    f'alignment: {exc}'
+                )
+                excluded_yaw_offsets.add(yaw_offset)
+                self.publish_status(
+                    f'{label}: exact destination yaw is not reachable from '
+                    f'approach yaw {yaw_offset:+.0f} deg; trying next branch'
+                )
+                continue
+            # Keep the 180-degree-equivalent orientation selected by
+            # preflight. Restoring desired_release_orientation here makes the
+            # real descent differ from the validated path and can force J3/J6
+            # onto the opposite IK branch.
+            release.pose.orientation = copy.deepcopy(
+                exact_approach.pose.orientation
+            )
+            approach = exact_approach
+            self.publish_status(
+                f'{label}: testing vertical descent at exact destination yaw'
+            )
+            try:
+                self.move_segmented_cartesian_with_pose_finish(
+                    release,
+                    label,
+                    prefer_j2_branch_fallback=True,
+                )
                 return approach
             except CartesianPlanningError as exc:
+                if (
+                    exc.executed_segments == 0
+                    and 'ik_only=1.000' in str(exc)
+                    and 'no_joint_jump=' in str(exc)
+                    and self.try_opposite_ik_branch(
+                        release, f'{label} vertical descent'
+                    )
+                ):
+                    self.publish_status(
+                        f'{label}: retrying vertical descent on opposite '
+                        'J2 branch'
+                    )
+                    continue
                 descent_failures.append(
                     f'yaw {yaw_offset:+.0f}deg: {exc}'
                 )
@@ -3671,16 +4852,27 @@ class ContainerPickCoordinator(Node):
                     'retreating and trying the next yaw'
                 )
                 if exc.executed_segments > 0:
-                    self.move_cartesian_to_pose(approach)
+                    self.move_segmented_cartesian_with_pose_finish(
+                        approach, f'{label} retry retreat'
+                    )
         raise RuntimeError(
             f'No yaw supports the complete vertical descent for {label}: '
             + '; '.join(descent_failures)
         )
 
-    def move_segmented_descent_with_pose_finish(self, target, label):
-        """Descend in safe Cartesian segments, then finish a short remainder."""
+    def move_segmented_cartesian_with_pose_finish(
+        self,
+        target,
+        label,
+        prefer_j2_branch_fallback=False,
+    ):
+        """Move in safe Cartesian segments, then finish a short remainder."""
         try:
-            self.move_cartesian_to_pose(target, allow_segmented=True)
+            self.move_cartesian_to_pose(
+                target,
+                allow_segmented=True,
+                prefer_j2_branch_fallback=prefer_j2_branch_fallback,
+            )
         except CartesianPlanningError as exc:
             remaining_distance = self._cartesian_request_distance(target)
             can_finish_with_pose_goal = (
@@ -3692,10 +4884,65 @@ class ContainerPickCoordinator(Node):
             if not can_finish_with_pose_goal:
                 raise
             self.publish_status(
-                f'{label}: finishing short remaining descent with pose goal: '
+                f'{label}: finishing short Cartesian remainder with pose goal: '
                 f'remaining={remaining_distance * 1000.0:.1f}mm'
             )
             self.move_to_pose(target)
+
+    def verify_release_pose(self, target, label):
+        """Refuse to release unless the measured TCP reached the target."""
+        try:
+            current = self.buffer.lookup_transform(
+                target.header.frame_id,
+                self.moveit_ee_link,
+                Time(),
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'{label}: current TCP transform unavailable: {exc}'
+            ) from exc
+        dx = float(current.transform.translation.x) - float(
+            target.pose.position.x
+        )
+        dy = float(current.transform.translation.y) - float(
+            target.pose.position.y
+        )
+        dz = abs(
+            float(current.transform.translation.z)
+            - float(target.pose.position.z)
+        )
+        xy_error = math.hypot(dx, dy)
+        actual_yaw = quaternion_to_rpy_degrees([
+            current.transform.rotation.x,
+            current.transform.rotation.y,
+            current.transform.rotation.z,
+            current.transform.rotation.w,
+        ])[2]
+        target_yaw = quaternion_to_rpy_degrees([
+            target.pose.orientation.x,
+            target.pose.orientation.y,
+            target.pose.orientation.z,
+            target.pose.orientation.w,
+        ])[2]
+        yaw_error = abs(wrap_degrees(actual_yaw - target_yaw))
+        self.publish_status(
+            f'{label}: release verification xy={xy_error * 1000.0:.1f}mm, '
+            f'z={dz * 1000.0:.1f}mm, yaw={yaw_error:.1f}deg'
+        )
+        if (
+            xy_error > self.release_verify_xy_tolerance
+            or dz > self.release_verify_z_tolerance
+            or yaw_error > self.release_verify_yaw_tolerance
+        ):
+            raise RuntimeError(
+                f'{label}: release pose outside tolerance: '
+                f'xy={xy_error * 1000.0:.1f}mm '
+                f'(max {self.release_verify_xy_tolerance * 1000.0:.1f}mm), '
+                f'z={dz * 1000.0:.1f}mm '
+                f'(max {self.release_verify_z_tolerance * 1000.0:.1f}mm), '
+                f'yaw={yaw_error:.1f}deg '
+                f'(max {self.release_verify_yaw_tolerance:.1f}deg)'
+            )
 
     def move_with_yaw_fallbacks(self, grasp, pregrasp, initial_error):
         """Retry descent with progressively reduced marker-yaw following."""
@@ -3762,7 +5009,12 @@ class ContainerPickCoordinator(Node):
         finally:
             self.motion_lock.release()
 
-    def move_to_pose(self, pose, keep_current_orientation=False):
+    def move_to_pose(
+        self,
+        pose,
+        keep_current_orientation=False,
+        require_preferred_pick_branch=False,
+    ):
         if self.stop_event.is_set():
             raise RuntimeError('pick stopped')
         translation = np.array([
@@ -3773,7 +5025,30 @@ class ContainerPickCoordinator(Node):
         if not self.in_workspace(translation):
             raise RuntimeError(f'motion target outside workspace: {translation}')
         if self.motion_backend == 'moveit':
-            self._move_to_pose_moveit(pose, keep_current_orientation)
+            if require_preferred_pick_branch:
+                target = copy.deepcopy(pose)
+                if keep_current_orientation:
+                    try:
+                        current = self.buffer.lookup_transform(
+                            self.base_frame, self.moveit_ee_link, Time()
+                        )
+                    except TransformException as exc:
+                        raise RuntimeError(
+                            f'current TCP transform unavailable: {exc}'
+                        ) from exc
+                    target.pose.orientation = copy.deepcopy(
+                        current.transform.rotation
+                    )
+                self._move_to_pose_with_j2_j3_branch_priority(
+                    target,
+                    'PICK pregrasp',
+                )
+                return
+            self._move_to_pose_moveit(
+                pose,
+                keep_current_orientation,
+                False,
+            )
             return
         rpy = quaternion_to_rpy_degrees([
             pose.pose.orientation.x,
@@ -3834,7 +5109,10 @@ class ContainerPickCoordinator(Node):
         raise RuntimeError('robot motion timed out')
 
     def move_to_pose_z_last(
-        self, target, keep_current_orientation=False
+        self,
+        target,
+        keep_current_orientation=False,
+        require_preferred_pick_branch=False,
     ):
         """Delay only descent; upward targets use the normal direct move."""
         try:
@@ -3848,7 +5126,11 @@ class ContainerPickCoordinator(Node):
         current_z = float(current.transform.translation.z)
         target_z = float(target.pose.position.z)
         if target_z >= current_z - 0.003:
-            self.move_to_pose(target, keep_current_orientation)
+            self.move_to_pose(
+                target,
+                keep_current_orientation,
+                require_preferred_pick_branch,
+            )
             return
         intermediate = copy.deepcopy(target)
         intermediate.pose.position.z = current_z
@@ -3865,7 +5147,11 @@ class ContainerPickCoordinator(Node):
             self.get_logger().warning(
                 'Z-last intermediate is outside workspace; using direct move'
             )
-            self.move_to_pose(target, keep_current_orientation)
+            self.move_to_pose(
+                target,
+                keep_current_orientation,
+                require_preferred_pick_branch,
+            )
             return
         self.publish_status(
             'MOTION: moving XY/orientation first at current Z '
@@ -3875,6 +5161,9 @@ class ContainerPickCoordinator(Node):
             self.move_to_pose(
                 intermediate,
                 keep_current_orientation=keep_current_orientation,
+                require_preferred_pick_branch=(
+                    require_preferred_pick_branch
+                ),
             )
         except RuntimeError as exc:
             if self.stop_event.is_set():
@@ -3882,7 +5171,11 @@ class ContainerPickCoordinator(Node):
             self.get_logger().warning(
                 f'Z-last intermediate failed; using direct move: {exc}'
             )
-            self.move_to_pose(target, keep_current_orientation)
+            self.move_to_pose(
+                target,
+                keep_current_orientation,
+                require_preferred_pick_branch,
+            )
             return
         descent = copy.deepcopy(target)
         if keep_current_orientation:
@@ -3890,9 +5183,16 @@ class ContainerPickCoordinator(Node):
                 intermediate.pose.orientation
             )
         self.publish_status('MOTION: descending Z last at target XY')
-        self.move_cartesian_to_pose(descent)
+        self.move_segmented_cartesian_with_pose_finish(
+            descent, 'MOTION Z-last descent'
+        )
 
-    def _move_to_pose_moveit(self, pose, keep_current_orientation):
+    def _move_to_pose_moveit(
+        self,
+        pose,
+        keep_current_orientation,
+        require_preferred_pick_branch=False,
+    ):
         target = copy.deepcopy(pose)
         if keep_current_orientation:
             try:
@@ -3905,7 +5205,10 @@ class ContainerPickCoordinator(Node):
                 ) from exc
             target.pose.orientation = current.transform.rotation
             try:
-                self._execute_moveit_pose_goal(target)
+                self._execute_moveit_pose_goal(
+                    target,
+                    require_preferred_pick_branch,
+                )
                 return
             except RuntimeError as exc:
                 if self.stop_event.is_set():
@@ -3914,9 +5217,16 @@ class ContainerPickCoordinator(Node):
                     'MoveIt failed with current TCP orientation; retrying '
                     f'the taught grasp orientation: {exc}'
                 )
-        self._execute_moveit_pose_goal(pose)
+        self._execute_moveit_pose_goal(
+            pose,
+            require_preferred_pick_branch,
+        )
 
-    def _execute_moveit_pose_goal(self, target):
+    def _execute_moveit_pose_goal(
+        self,
+        target,
+        require_preferred_pick_branch=False,
+    ):
         if not self.move_group_client.wait_for_server(timeout_sec=5.0):
             raise RuntimeError('MoveIt /arm2/move_action server is unavailable')
 
@@ -3953,7 +5263,10 @@ class ContainerPickCoordinator(Node):
         request.workspace_parameters.max_corner.z = float(
             self.workspace_max[2]
         )
-        request.goal_constraints = [self._moveit_pose_constraints(target)]
+        request.goal_constraints = [self._moveit_pose_constraints(
+            target,
+            require_preferred_pick_branch,
+        )]
 
         goal.planning_options.plan_only = False
         goal.planning_options.look_around = False
@@ -4013,7 +5326,604 @@ class ContainerPickCoordinator(Node):
         except Exception:
             pass
 
-    def _moveit_pose_constraints(self, pose):
+    def _joint_state_callback(self, message):
+        """Cache a complete, name-ordered arm joint state."""
+        positions = dict(zip(message.name, message.position))
+        if any(name not in positions for name in JOINT_NAMES):
+            return
+        with self.joint_state_lock:
+            self.latest_joint_positions = np.array(
+                [positions[name] for name in JOINT_NAMES],
+                dtype=np.float64,
+            )
+            self.latest_joint_state_time = time.monotonic()
+
+    def move_joint1_toward_destination(
+        self,
+        source_pose,
+        destination_pose,
+        destination_name=None,
+    ):
+        """Rotate J1 first so the lifted arm faces its destination zone."""
+        if self.motion_backend != 'moveit':
+            raise RuntimeError('J1-priority transfer requires MoveIt')
+        source_bearing = math.atan2(
+            source_pose.pose.position.y,
+            source_pose.pose.position.x,
+        )
+        destination_bearing = math.atan2(
+            destination_pose.pose.position.y,
+            destination_pose.pose.position.x,
+        )
+        bearing_delta = math.atan2(
+            math.sin(destination_bearing - source_bearing),
+            math.cos(destination_bearing - source_bearing),
+        )
+        with self.joint_state_lock:
+            positions = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            positions is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+
+        destination_zone = None
+        if destination_name:
+            parts = str(destination_name).split('-')
+            if len(parts) >= 2 and parts[0] == 'A':
+                destination_zone = f'A-{parts[1]}'
+        if destination_zone in self.destination_zone_j1:
+            target_j1 = self.destination_zone_j1[destination_zone]
+            heading_description = (
+                f'zone={destination_zone}, '
+                f'target={math.degrees(target_j1):.1f}deg'
+            )
+        else:
+            target_j1 = float(positions[0] + bearing_delta)
+            heading_description = (
+                f'bearing delta={math.degrees(bearing_delta):.1f}deg'
+            )
+        lower = math.radians(JOINT_LIMITS_DEG[0][0])
+        upper = math.radians(JOINT_LIMITS_DEG[0][1])
+        candidates = [
+            target_j1 - 2.0 * math.pi,
+            target_j1,
+            target_j1 + 2.0 * math.pi,
+        ]
+        valid = [value for value in candidates if lower <= value <= upper]
+        if not valid:
+            raise RuntimeError(
+                'J1 destination bearing is outside joint limits: '
+                f'{math.degrees(target_j1):.1f}deg'
+            )
+        positions[0] = min(
+            valid,
+            key=lambda value: abs(value - positions[0]),
+        )
+        self.publish_status(
+            'TRANSFER: facing destination before place IK while holding '
+            f'J2-J6: {heading_description}'
+        )
+        self._execute_moveit_joint_goal(positions)
+
+    def _execute_moveit_joint_goal(self, positions):
+        """Execute a trajectory whose J2-J6 positions remain constant."""
+        if not self.follow_joint_trajectory_client.wait_for_server(
+            timeout_sec=5.0
+        ):
+            raise RuntimeError('arm trajectory controller is unavailable')
+        with self.joint_state_lock:
+            start = self.latest_joint_positions.copy()
+        delta = abs(float(positions[0] - start[0]))
+        duration_sec = max(1.0, math.degrees(delta) / 20.0)
+        start_point = JointTrajectoryPoint()
+        start_point.positions = [float(value) for value in start]
+        start_point.time_from_start = Duration(sec=0, nanosec=100000000)
+        target_point = JointTrajectoryPoint()
+        target_point.positions = [float(value) for value in positions]
+        whole_seconds = int(duration_sec)
+        target_point.time_from_start = Duration(
+            sec=whole_seconds,
+            nanosec=int((duration_sec - whole_seconds) * 1e9),
+        )
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(JOINT_NAMES)
+        goal.trajectory.points = [start_point, target_point]
+
+        goal_future = self.follow_joint_trajectory_client.send_goal_async(goal)
+        self._wait_future(goal_future, 5.0)
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError('controller rejected the J1-only trajectory')
+        with self.moveit_goal_lock:
+            self.current_moveit_goal = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            self._wait_future(
+                result_future,
+                duration_sec + self.motion_timeout + 10.0,
+                goal_handle,
+            )
+            wrapped_result = result_future.result()
+            if wrapped_result is None:
+                raise RuntimeError('controller returned no J1 result')
+            result = wrapped_result.result
+            if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+                raise RuntimeError(
+                    'J1-only trajectory failed: '
+                    f'code={result.error_code}, '
+                    f'message={result.error_string}'
+                )
+            if self.stop_event.wait(self.moveit_state_settle):
+                raise RuntimeError('pick stopped')
+        finally:
+            with self.moveit_goal_lock:
+                self.current_moveit_goal = None
+
+    def _try_opposite_j2_j3_branch(self, context):
+        """Keep the TCP pose while reversing both J2 and J3 signs."""
+        try:
+            current_pose = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_tcp_z = float(current_pose.transform.translation.z)
+        minimum_height = max(
+            self.j2_fallback_min_tcp_height,
+            self.j3_fallback_min_tcp_height,
+        )
+        if current_tcp_z < minimum_height:
+            self.publish_status(
+                f'{context}: opposite J2+J3 fallback blocked; TCP Z '
+                f'{current_tcp_z * 1000.0:.1f}mm is below '
+                f'{minimum_height * 1000.0:.1f}mm'
+            )
+            return False
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+
+        current_j2_deg = math.degrees(float(current_joints[1]))
+        current_j3_deg = math.degrees(float(current_joints[2]))
+        seed = current_joints.copy()
+        seed[1] = math.radians(
+            -max(30.0, abs(current_j2_deg))
+            if current_j2_deg >= 0.0
+            else max(30.0, abs(current_j2_deg))
+        )
+        seed[2] = math.radians(
+            -max(30.0, abs(current_j3_deg))
+            if current_j3_deg >= 0.0
+            else max(30.0, abs(current_j3_deg))
+        )
+        request = GetPositionIK.Request()
+        ik_request = request.ik_request
+        ik_request.group_name = self.moveit_group
+        ik_request.ik_link_name = self.moveit_ee_link
+        ik_request.avoid_collisions = True
+        ik_request.timeout = duration_message(self.motion_ik_timeout)
+        ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+        ik_request.robot_state.joint_state.position = [
+            float(value) for value in seed
+        ]
+        ik_request.pose_stamped.header.frame_id = self.base_frame
+        ik_request.pose_stamped.header.stamp = Time().to_msg()
+        ik_request.pose_stamped.pose.position.x = float(
+            current_pose.transform.translation.x
+        )
+        ik_request.pose_stamped.pose.position.y = float(
+            current_pose.transform.translation.y
+        )
+        ik_request.pose_stamped.pose.position.z = float(
+            current_pose.transform.translation.z
+        )
+        ik_request.pose_stamped.pose.orientation = copy.deepcopy(
+            current_pose.transform.rotation
+        )
+        future = self.position_ik_client.call_async(request)
+        self._wait_future(future, 5.0)
+        response = future.result()
+        self.j2_fallback_used = True
+        self.j3_fallback_used = True
+        if (
+            response is None
+            or response.error_code.val != MoveItErrorCodes.SUCCESS
+        ):
+            self.publish_status(
+                f'{context}: no opposite J2+J3 IK solution found'
+            )
+            return False
+        solution_map = dict(zip(
+            response.solution.joint_state.name,
+            response.solution.joint_state.position,
+        ))
+        if any(name not in solution_map for name in JOINT_NAMES):
+            raise RuntimeError(
+                'opposite J2+J3 IK returned incomplete joints'
+            )
+        solution = np.array(
+            [solution_map[name] for name in JOINT_NAMES],
+            dtype=np.float64,
+        )
+        solution_j2_deg = math.degrees(float(solution[1]))
+        solution_j3_deg = math.degrees(float(solution[2]))
+        both_opposite = (
+            abs(current_j2_deg) >= 5.0
+            and abs(current_j3_deg) >= 5.0
+            and abs(solution_j2_deg) >= 5.0
+            and abs(solution_j3_deg) >= 5.0
+            and current_j2_deg * solution_j2_deg < 0.0
+            and current_j3_deg * solution_j3_deg < 0.0
+        )
+        if not both_opposite:
+            self.publish_status(
+                f'{context}: IK did not reverse both joints: '
+                f'J2 {current_j2_deg:.1f}->{solution_j2_deg:.1f}deg, '
+                f'J3 {current_j3_deg:.1f}->{solution_j3_deg:.1f}deg'
+            )
+            return False
+        self.publish_status(
+            f'{context}: switching both joints at safe height: '
+            f'J2 {current_j2_deg:.1f}->{solution_j2_deg:.1f}deg, '
+            f'J3 {current_j3_deg:.1f}->{solution_j3_deg:.1f}deg'
+        )
+        self._execute_planned_joint_goal(solution)
+        return True
+
+    def try_opposite_ik_branch(self, release, context):
+        """Try unused opposite-sign J3, then J2 IK branches."""
+        if self.motion_backend != 'moveit':
+            return False
+        if not self.j3_fallback_used and self._try_opposite_joint_branch(
+            2,
+            'J3',
+            'j3_fallback_used',
+            self.j3_fallback_min_tcp_height,
+            context,
+        ):
+            return True
+        if not self.j2_fallback_used and self._try_opposite_joint_branch(
+            1,
+            'J2',
+            'j2_fallback_used',
+            self.j2_fallback_min_tcp_height,
+            context,
+        ):
+            return True
+        return self._try_multi_seed_ik_branch(context)
+
+    def _try_multi_seed_ik_branch(self, context):
+        """Try additional J3-priority seeds without persistent storage."""
+        seed_patterns = (
+            (2, 20.0), (2, -20.0),
+            (2, 40.0), (2, -40.0),
+            (2, 60.0), (2, -60.0),
+            (1, 20.0), (1, -20.0),
+            (1, 40.0), (1, -40.0),
+        )
+        try:
+            current_pose = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_tcp_z = float(current_pose.transform.translation.z)
+        minimum_height = max(
+            self.j2_fallback_min_tcp_height,
+            self.j3_fallback_min_tcp_height,
+        )
+        if current_tcp_z < minimum_height:
+            self.publish_status(
+                f'{context}: multi-seed IK fallback blocked; TCP Z '
+                f'{current_tcp_z * 1000.0:.1f}mm is below '
+                f'{minimum_height * 1000.0:.1f}mm'
+            )
+            return False
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+
+        while self.ik_seed_fallback_index < len(seed_patterns):
+            joint_index, offset_deg = seed_patterns[
+                self.ik_seed_fallback_index
+            ]
+            self.ik_seed_fallback_index += 1
+            joint_label = f'J{joint_index + 1}'
+            seed = current_joints.copy()
+            seed_deg = math.degrees(float(seed[joint_index])) + offset_deg
+            lower, upper = JOINT_LIMITS_DEG[joint_index]
+            seed_deg = min(max(seed_deg, lower + 1.0), upper - 1.0)
+            seed[joint_index] = math.radians(seed_deg)
+
+            request = GetPositionIK.Request()
+            ik_request = request.ik_request
+            ik_request.group_name = self.moveit_group
+            ik_request.ik_link_name = self.moveit_ee_link
+            ik_request.avoid_collisions = True
+            ik_request.timeout = duration_message(self.motion_ik_timeout)
+            ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+            ik_request.robot_state.joint_state.position = [
+                float(value) for value in seed
+            ]
+            ik_request.pose_stamped.header.frame_id = self.base_frame
+            ik_request.pose_stamped.header.stamp = Time().to_msg()
+            ik_request.pose_stamped.pose.position.x = float(
+                current_pose.transform.translation.x
+            )
+            ik_request.pose_stamped.pose.position.y = float(
+                current_pose.transform.translation.y
+            )
+            ik_request.pose_stamped.pose.position.z = float(
+                current_pose.transform.translation.z
+            )
+            ik_request.pose_stamped.pose.orientation = copy.deepcopy(
+                current_pose.transform.rotation
+            )
+            future = self.position_ik_client.call_async(request)
+            self._wait_future(future, 5.0)
+            response = future.result()
+            if (
+                response is None
+                or response.error_code.val != MoveItErrorCodes.SUCCESS
+            ):
+                continue
+            solution_map = dict(zip(
+                response.solution.joint_state.name,
+                response.solution.joint_state.position,
+            ))
+            if any(name not in solution_map for name in JOINT_NAMES):
+                continue
+            solution = np.array(
+                [solution_map[name] for name in JOINT_NAMES],
+                dtype=np.float64,
+            )
+            branch_change_deg = max(
+                abs(math.degrees(float(solution[index] - current_joints[index])))
+                for index in (1, 2)
+            )
+            signature = tuple(
+                round(math.degrees(float(solution[index])), 1)
+                for index in (1, 2, 5)
+            )
+            if (
+                branch_change_deg < 10.0
+                or signature in self.ik_seed_fallback_solutions
+            ):
+                continue
+            self.ik_seed_fallback_solutions.add(signature)
+            self.publish_status(
+                f'{context}: trying dynamic IK seed {joint_label} '
+                f'{offset_deg:+.0f}deg; solution J2/J3/J6='
+                f'{signature}'
+            )
+            self._execute_planned_joint_goal(solution)
+            return True
+        self.publish_status(
+            f'{context}: all dynamic J3/J2 IK seeds exhausted'
+        )
+        return False
+
+    def _try_opposite_joint_branch(
+        self,
+        joint_index,
+        joint_label,
+        used_attribute,
+        minimum_tcp_height,
+        context,
+    ):
+        """Switch once to an opposite-sign IK branch at safe height."""
+        if getattr(self, used_attribute):
+            return False
+        try:
+            current_pose = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_tcp_z = float(current_pose.transform.translation.z)
+        if current_tcp_z < minimum_tcp_height:
+            self.publish_status(
+                f'{context}: opposite-{joint_label} fallback blocked; TCP Z '
+                f'{current_tcp_z * 1000.0:.1f}mm is below '
+                f'{minimum_tcp_height * 1000.0:.1f}mm'
+            )
+            return False
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+
+        request = GetPositionIK.Request()
+        ik_request = request.ik_request
+        ik_request.group_name = self.moveit_group
+        ik_request.ik_link_name = self.moveit_ee_link
+        ik_request.avoid_collisions = True
+        ik_request.timeout = duration_message(self.motion_ik_timeout)
+        ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+        seed = current_joints.copy()
+        current_joint_deg = math.degrees(
+            float(current_joints[joint_index])
+        )
+        seed_joint_deg = (
+            -max(30.0, abs(current_joint_deg))
+            if current_joint_deg >= 0.0
+            else max(30.0, abs(current_joint_deg))
+        )
+        seed[joint_index] = math.radians(seed_joint_deg)
+        ik_request.robot_state.joint_state.position = [
+            float(value) for value in seed
+        ]
+        ik_request.pose_stamped.header.frame_id = self.base_frame
+        ik_request.pose_stamped.header.stamp = Time().to_msg()
+        ik_request.pose_stamped.pose.position.x = float(
+            current_pose.transform.translation.x
+        )
+        ik_request.pose_stamped.pose.position.y = float(
+            current_pose.transform.translation.y
+        )
+        ik_request.pose_stamped.pose.position.z = float(
+            current_pose.transform.translation.z
+        )
+        ik_request.pose_stamped.pose.orientation = copy.deepcopy(
+            current_pose.transform.rotation
+        )
+        future = self.position_ik_client.call_async(request)
+        self._wait_future(future, 5.0)
+        response = future.result()
+        if (
+            response is None
+            or response.error_code.val != MoveItErrorCodes.SUCCESS
+        ):
+            self.publish_status(
+                f'{context}: no opposite-{joint_label} IK solution found'
+            )
+            setattr(self, used_attribute, True)
+            return False
+        solution_map = dict(zip(
+            response.solution.joint_state.name,
+            response.solution.joint_state.position,
+        ))
+        if any(name not in solution_map for name in JOINT_NAMES):
+            raise RuntimeError(
+                f'opposite-{joint_label} IK returned incomplete joints'
+            )
+        solution = np.array(
+            [solution_map[name] for name in JOINT_NAMES],
+            dtype=np.float64,
+        )
+        solution_joint_deg = math.degrees(
+            float(solution[joint_index])
+        )
+        opposite = (
+            abs(current_joint_deg) >= 5.0
+            and abs(solution_joint_deg) >= 5.0
+            and current_joint_deg * solution_joint_deg < 0.0
+        )
+        setattr(self, used_attribute, True)
+        if not opposite:
+            self.publish_status(
+                f'{context}: IK solver returned the same {joint_label} '
+                f'branch ({current_joint_deg:.1f}deg -> '
+                f'{solution_joint_deg:.1f}deg)'
+            )
+            return False
+        self.publish_status(
+            f'{context}: switching to opposite {joint_label} branch at '
+            f'safe height: {current_joint_deg:.1f}deg -> '
+            f'{solution_joint_deg:.1f}deg'
+        )
+        self._execute_planned_joint_goal(solution)
+        return True
+
+    def _execute_planned_joint_goal(self, positions, plan_only=False):
+        """Collision-check, and optionally execute, a MoveIt joint goal."""
+        if not self.move_group_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/move_action server is unavailable')
+        goal = MoveGroup.Goal()
+        request = goal.request
+        request.group_name = self.moveit_group
+        request.num_planning_attempts = self.moveit_planning_attempts
+        request.allowed_planning_time = self.moveit_planning_time
+        request.max_velocity_scaling_factor = self.moveit_velocity_scale
+        request.max_acceleration_scaling_factor = (
+            self.moveit_acceleration_scale
+        )
+        request.start_state.is_diff = True
+        constraints = Constraints()
+        tolerance = math.radians(0.5)
+        for name, position in zip(JOINT_NAMES, positions):
+            joint = JointConstraint()
+            joint.joint_name = name
+            joint.position = float(position)
+            joint.tolerance_above = tolerance
+            joint.tolerance_below = tolerance
+            joint.weight = 1.0
+            constraints.joint_constraints.append(joint)
+        request.goal_constraints = [constraints]
+        goal.planning_options.plan_only = bool(plan_only)
+        goal.planning_options.replan = True
+        goal.planning_options.replan_attempts = 2
+        goal.planning_options.replan_delay = 0.2
+        goal.planning_options.planning_scene_diff.is_diff = True
+        goal.planning_options.planning_scene_diff.robot_state.is_diff = True
+        goal_future = self.move_group_client.send_goal_async(goal)
+        self._wait_future(goal_future, self.moveit_planning_time + 5.0)
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            mode = 'plan-only' if plan_only else 'execution'
+            raise RuntimeError(f'MoveIt rejected joint-goal {mode}')
+        with self.moveit_goal_lock:
+            self.current_moveit_goal = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            self._wait_future(
+                result_future,
+                self.moveit_planning_time + self.motion_timeout + 60.0,
+                goal_handle,
+            )
+            wrapped_result = result_future.result()
+            if wrapped_result is None:
+                raise RuntimeError('MoveIt returned no joint-goal result')
+            result = wrapped_result.result
+            if result.error_code.val != MoveItErrorCodes.SUCCESS:
+                mode = 'plan-only' if plan_only else 'execution'
+                raise RuntimeError(
+                    f'MoveIt joint-goal {mode} failed: '
+                    f'code={result.error_code.val}'
+                )
+        finally:
+            with self.moveit_goal_lock:
+                self.current_moveit_goal = None
+
+    def _moveit_pose_constraints(
+        self,
+        pose,
+        require_preferred_pick_branch=False,
+    ):
         constraints = Constraints()
         position = PositionConstraint()
         position.header = pose.header
@@ -4046,10 +5956,31 @@ class ContainerPickCoordinator(Node):
         orientation.weight = 1.0
         constraints.position_constraints = [position]
         constraints.orientation_constraints = [orientation]
+        if require_preferred_pick_branch:
+            # The measured reliable grasp family uses J2 positive and J3
+            # negative. Encode those signs in the goal itself so MoveIt does
+            # not execute a known-bad pregrasp and try to recover afterward.
+            for joint_index, allowed_lower, allowed_upper in (
+                (1, 5.0, JOINT_LIMITS_DEG[1][1]),
+                (2, JOINT_LIMITS_DEG[2][0], -5.0),
+            ):
+                midpoint_deg = (allowed_lower + allowed_upper) / 2.0
+                half_range_deg = (allowed_upper - allowed_lower) / 2.0
+                joint = JointConstraint()
+                joint.joint_name = JOINT_NAMES[joint_index]
+                joint.position = math.radians(midpoint_deg)
+                joint.tolerance_above = math.radians(half_range_deg)
+                joint.tolerance_below = math.radians(half_range_deg)
+                joint.weight = 1.0
+                constraints.joint_constraints.append(joint)
         return constraints
 
     def move_cartesian_to_pose(
-        self, target, allow_segmented=False, segment_count=0
+        self,
+        target,
+        allow_segmented=False,
+        segment_count=0,
+        prefer_j2_branch_fallback=False,
     ):
         """Execute a collision-checked straight TCP path to one waypoint."""
         if self.motion_backend != 'moveit':
@@ -4102,6 +6033,24 @@ class ContainerPickCoordinator(Node):
                 'Cartesian planning failed: '
                 f'code={response.error_code.val}, message={detail}'
             )
+        with self.joint_state_lock:
+            current_j6 = (
+                None if self.latest_joint_positions is None
+                else float(self.latest_joint_positions[5])
+            )
+        if current_j6 is None:
+            raise CartesianPlanningError(
+                'Cannot validate Cartesian J6 travel without joint state'
+            )
+        j6_travel = trajectory_joint_travel_degrees(
+            current_j6, response.solution, JOINT_NAMES[5]
+        )
+        if j6_travel > self.max_j6_trajectory_travel:
+            raise CartesianPlanningError(
+                f'Cartesian J6 path travel {j6_travel:.1f}deg exceeds '
+                f'{self.max_j6_trajectory_travel:.1f}deg limit',
+                executed_segments=segment_count,
+            )
         acceptable = cartesian_path_acceptable(
             response.fraction,
             requested_distance,
@@ -4123,6 +6072,24 @@ class ContainerPickCoordinator(Node):
                 )
             )
             if can_execute_segment:
+                if prefer_j2_branch_fallback and segment_count == 0:
+                    diagnostics = self._diagnose_cartesian_limits(request)
+                    if (
+                        'ik_only=1.000' in diagnostics
+                        and 'no_joint_jump=' in diagnostics
+                    ):
+                        shortfall_mm = (
+                            requested_distance
+                            * (1.0 - response.fraction)
+                            * 1000.0
+                        )
+                        raise CartesianPlanningError(
+                            'Cartesian path rejected before partial descent: '
+                            f'fraction={response.fraction:.3f}, '
+                            f'shortfall={shortfall_mm:.1f}mm; '
+                            f'{diagnostics}',
+                            executed_segments=segment_count,
+                        )
                 progress_mm = (
                     requested_distance * response.fraction * 1000.0
                 )
@@ -4143,6 +6110,9 @@ class ContainerPickCoordinator(Node):
                         target,
                         allow_segmented=True,
                         segment_count=segment_count + 1,
+                        prefer_j2_branch_fallback=(
+                            prefer_j2_branch_fallback
+                        ),
                     )
                 except CartesianPlanningError as exc:
                     exc.executed_segments = max(
@@ -4290,14 +6260,56 @@ class ContainerPickCoordinator(Node):
         ):
             lift = copy.deepcopy(grasp)
             lift.pose.position.z += distance
-            try:
-                self.move_cartesian_to_pose(lift)
-                self.publish_status(
-                    f'PICK: lifted container {distance * 100.0:.1f} cm'
+            lift_error = None
+            while True:
+                try:
+                    self.move_cartesian_to_pose(lift, allow_segmented=True)
+                    self.publish_status(
+                        f'PICK: lifted container {distance * 100.0:.1f} cm'
+                    )
+                    return
+                except CartesianPlanningError as exc:
+                    lift_error = exc
+                    branch_discontinuity = (
+                        'ik_only=1.000' in str(exc)
+                        and 'no_joint_jump=' in str(exc)
+                    )
+                    if branch_discontinuity and self.try_opposite_ik_branch(
+                        lift, 'PICK vertical lift'
+                    ):
+                        self.publish_status(
+                            'PICK: retrying vertical lift after opposite '
+                            'joint-branch switch'
+                        )
+                        continue
+                    break
+            if lift_error is not None:
+                remaining_distance = self._cartesian_request_distance(lift)
+                can_finish_with_pose_goal = (
+                    lift_error.executed_segments > 0
+                    and remaining_distance is not None
+                    and remaining_distance
+                    <= self.stack_pose_goal_finish_max_distance
                 )
-                return
-            except CartesianPlanningError as exc:
-                failures.append(f'{distance:.3f}m: {exc}')
+                if can_finish_with_pose_goal:
+                    self.publish_status(
+                        'PICK: finishing short remaining vertical lift with '
+                        'pose goal: '
+                        f'remaining={remaining_distance * 1000.0:.1f}mm'
+                    )
+                    try:
+                        self.move_to_pose(lift)
+                        self.publish_status(
+                            f'PICK: lifted container '
+                            f'{distance * 100.0:.1f} cm'
+                        )
+                        return
+                    except RuntimeError as finish_exc:
+                        failures.append(
+                            f'{distance:.3f}m pose finish: {finish_exc}'
+                        )
+                        continue
+                failures.append(f'{distance:.3f}m: {lift_error}')
                 self.get_logger().warning(
                     f'Lift {distance * 100.0:.1f} cm is not feasible; '
                     'trying a shorter path'

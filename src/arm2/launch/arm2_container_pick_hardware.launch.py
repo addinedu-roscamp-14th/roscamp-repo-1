@@ -25,9 +25,12 @@ def generate_launch_description():
         DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('baud_rate', default_value='1000000'),
-        DeclareLaunchArgument('trajectory_speed', default_value='100'),
+        DeclareLaunchArgument('trajectory_speed', default_value='70'),
         DeclareLaunchArgument(
-            'goal_correction_speed', default_value='100'
+            'goal_correction_speed', default_value='70'
+        ),
+        DeclareLaunchArgument(
+            'goal_correction_period_sec', default_value='0.5'
         ),
         DeclareLaunchArgument('goal_tolerance_deg', default_value='2.5'),
         DeclareLaunchArgument('goal_timeout_sec', default_value='15.0'),
@@ -58,7 +61,10 @@ def generate_launch_description():
             'goal_correction_speed': ParameterValue(
                 LaunchConfiguration('goal_correction_speed'), value_type=int
             ),
-            'goal_correction_period_sec': 1.0,
+            'goal_correction_period_sec': ParameterValue(
+                LaunchConfiguration('goal_correction_period_sec'),
+                value_type=float,
+            ),
             'gripper_speed': 50,
         }],
     )

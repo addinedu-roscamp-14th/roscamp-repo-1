@@ -364,6 +364,10 @@ ros2 launch arm2 arm2_container_pick_moveit.launch.py \
 
 launch 직후 한 번만 목적지 스캔을 실행합니다. 로봇은
 `HOME → A-1 → A-2 → A-3 → A-2 → A-1 → HOME` 순서로 이동합니다.
+목적지 스캔과 저장은 먼저 `HOME → A-1 → A-2 → A-3` 구간에서 실행합니다.
+ID 11~16이 모두 저장됐으면 `A-3 → A-2 → A-1 → HOME` 복귀 구간에서는
+다시 스캔하지 않습니다. 누락된 ID가 있을 때만 복귀 자세에서 추가 스캔하며,
+복귀 도중 모든 필수 ID가 저장되면 이후 자세부터 스캔을 중지합니다.
 각 자세에서 이동 중 샘플을 버리고 정지 상태로 ID 11, 12, 13, 14, 15, 16을
 1초 이상 안정화한 뒤 최초 자세를 저장합니다. 이동 중 ID 9 또는 ID 10
 트레일러가 안정적으로 보이면 해당 자세도 저장합니다.
@@ -534,7 +538,7 @@ adaptive_goal_correction_joints: [4_Joint]
 adaptive_goal_correction_tolerance_deg: 0.5
 adaptive_goal_correction_gain: 1.0
 adaptive_goal_correction_max_total_deg: 3.0
-adaptive_goal_correction_max_attempts: 4
+adaptive_goal_correction_max_attempts: 5
 ```
 
 매 보정 시 실제 `목표-실제` 잔차를 직전 명령에 더하되 원래 MoveIt 목표에서
