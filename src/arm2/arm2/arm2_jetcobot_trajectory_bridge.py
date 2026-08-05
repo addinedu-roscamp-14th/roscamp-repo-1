@@ -132,7 +132,7 @@ class JetCobotTrajectoryBridge(Node):
             'adaptive_goal_correction_joints', ['2_Joint', '3_Joint']
         )
         self.declare_parameter(
-            'adaptive_goal_correction_tolerance_deg', 0.7
+            'adaptive_goal_correction_tolerance_deg', 0.9
         )
         self.declare_parameter('adaptive_goal_correction_gain', 1.0)
         self.declare_parameter(

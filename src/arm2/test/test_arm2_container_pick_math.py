@@ -363,6 +363,8 @@ def test_cartesian_shortfall_is_bounded_in_metres():
     assert cartesian_path_acceptable(0.955, 0.08, 0.97, 0.90, 0.005)
     assert not cartesian_path_acceptable(0.955, 0.18, 0.97, 0.90, 0.005)
     assert not cartesian_path_acceptable(0.89, 0.01, 0.97, 0.90, 0.005)
+    assert cartesian_path_acceptable(0.80, 0.0045, 0.97, 0.90, 0.005)
+    assert not cartesian_path_acceptable(0.20, 0.0045, 0.97, 0.90, 0.005)
 
 
 def test_visual_servo_step_applies_gain_and_xy_norm_limit():

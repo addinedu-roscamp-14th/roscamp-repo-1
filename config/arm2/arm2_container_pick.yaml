@@ -48,7 +48,7 @@
     adaptive_goal_correction_joints:
     - 2_Joint
     - 3_Joint
-    adaptive_goal_correction_tolerance_deg: 0.7
+    adaptive_goal_correction_tolerance_deg: 0.9
     adaptive_goal_correction_gain: 1.0
     adaptive_goal_correction_max_total_deg: 7.0
     adaptive_goal_correction_max_attempts: 5
@@ -74,8 +74,8 @@
     - 0.01
     - -0.02
     id_transfer_pick_correction_xyz_m:
-    - -0.02
-    - -0.01
+    - -0.015
+    - 0.005
     - -0.02
     place_correction_xyz_m:
     - 0.0
@@ -86,8 +86,8 @@
     - -0.01
     - -0.005
     id_transfer_correction_xyz_m:
-    - -0.001
-    - -0.014
+    - -0.011
+    - 0.006
     - -0.005
     trailer_correction_xyz_m:
     - -0.05
@@ -127,8 +127,10 @@
     visual_servo_marker_loss_timeout_sec: 2.0
     visual_servo_settle_sec: 0.6
     pregrasp_test_keep_current_orientation: false
+    # 집은 위치와 무관한 base_link 기준 TCP 절대 상승 높이(Z).
     lift_after_pick_m: 0.14
-    minimum_lift_after_pick_m: 0.14
+    # 부분 상승 허용 시에도 TCP 절대 Z가 이 높이 이상이어야 한다.
+    minimum_lift_after_pick_m: 0.10
     bad_pick_branch_j2_deg: -62.31
     bad_pick_branch_j3_deg: 85.69
     bad_pick_branch_tolerance_deg: 12.0
@@ -220,5 +222,5 @@
     cartesian_max_speed_mps: 0.03
     cartesian_max_joint_jump_deg: 15.0
     moveit_state_settle_sec: 0.1
-    stack_preflight_joint_margin_deg: 0.7
+    stack_preflight_joint_margin_deg: 0.9
     max_j6_trajectory_travel_deg: 170.0

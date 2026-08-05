@@ -325,7 +325,7 @@ class ArucoPosePublisher(Node):
                 parameters=self.detector_parameters,
             )
         detected_ids = (
-            tuple(int(value) for value in ids.flatten())
+            tuple(sorted(int(value) for value in ids.flatten()))
             if ids is not None else ()
         )
         if detected_ids != self.last_detected_ids:
