@@ -2562,12 +2562,34 @@ class ContainerPickCoordinator(Node):
                     if locked[index] is None:
                         history.clear()
 
-            deadline = (
-                time.monotonic() + self.scan_marker_pause + 2.0
+            zone_started = time.monotonic()
+            deadline = zone_started + self.scan_marker_pause + 2.0
+            hard_deadline = (
+                zone_started + 2.0 * self.scan_marker_pause + 4.0
             )
+            stabilization_hold_announced = False
             while time.monotonic() < deadline:
                 if self.stop_event.wait(0.05):
                     return None, 'destination route stopped'
+                visible_but_unlocked = any(
+                    locked[index] is None
+                    and self._history_sample_count(specs[index][2]) > 0
+                    for index in range(required_count)
+                )
+                if visible_but_unlocked:
+                    if not stabilization_hold_announced:
+                        self.publish_status(
+                            'DESTINATION SCAN: required marker visible at '
+                            f'{pose_name}; holding until its pose is stable'
+                        )
+                        stabilization_hold_announced = True
+                    deadline = min(
+                        hard_deadline,
+                        max(
+                            deadline,
+                            time.monotonic() + self.scan_marker_pause + 0.5,
+                        ),
+                    )
                 for index, (label, frame, history) in enumerate(specs):
                     if locked[index] is not None:
                         continue
@@ -2596,7 +2618,7 @@ class ContainerPickCoordinator(Node):
         ]
         if missing:
             return None, (
-                'route ended before detecting ' + ', '.join(missing)
+                'route ended before stabilizing ' + ', '.join(missing)
             )
         return tuple(locked), 'destination route completed'
 

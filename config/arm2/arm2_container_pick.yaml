@@ -90,7 +90,8 @@
     - 0.006
     - -0.005
     trailer_correction_xyz_m:
-    - -0.05
+    # Trailer marker red axis (+X): previous -50mm + requested 20mm.
+    - -0.03
     - 0.0
     - 0.0
     grasp_offset_rpy_deg:
