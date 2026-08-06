@@ -2,7 +2,9 @@
 
 from collections import deque
 import copy
+import json
 import math
+from pathlib import Path
 import threading
 import time
 
@@ -524,6 +526,9 @@ class ContainerPickCoordinator(Node):
         self.trailer_correction = self._vector_parameter(
             'trailer_correction_xyz_m', 3
         )
+        self.trailer_a3_pick_correction = self._vector_parameter(
+            'trailer_a3_pick_correction_xyz_m', 3
+        )
         self.grasp_rpy = self._vector_parameter('grasp_offset_rpy_deg', 3)
         self.grasp_rotation = quaternion_from_rpy_degrees(*self.grasp_rpy)
         self.reference_marker_yaw = float(
@@ -748,6 +753,12 @@ class ContainerPickCoordinator(Node):
         self.motion_ik_timeout = float(
             self.get_parameter('motion_ik_timeout_sec').value
         )
+        self.preferred_pick_seed_j2_j6 = np.radians(
+            self._vector_parameter('preferred_pick_seed_j2_j6_deg', 5)
+        )
+        self.preferred_place_seed_j2_j6 = np.radians(
+            self._vector_parameter('preferred_place_seed_j2_j6_deg', 5)
+        )
         self.moveit_velocity_scale = float(
             self.get_parameter('moveit_velocity_scale').value
         )
@@ -812,6 +823,21 @@ class ContainerPickCoordinator(Node):
         self.release_verify_yaw_tolerance = float(
             self.get_parameter('release_verify_yaw_tolerance_deg').value
         )
+        self.pick_profile_xy_merge = float(
+            self.get_parameter('pick_profile_xy_merge_m').value
+        )
+        self.pick_profile_z_merge = float(
+            self.get_parameter('pick_profile_z_merge_m').value
+        )
+        self.pick_profile_yaw_merge = float(
+            self.get_parameter('pick_profile_yaw_merge_deg').value
+        )
+        self.pick_profile_max_entries = int(
+            self.get_parameter('pick_profile_max_entries').value
+        )
+        self.pick_profile_cache_path = str(
+            self.get_parameter('pick_profile_cache_path').value
+        ).strip()
 
         if self.minimum_samples < 3:
             raise ValueError('minimum_stable_samples must be at least 3')
@@ -959,6 +985,13 @@ class ContainerPickCoordinator(Node):
             or self.release_verify_yaw_tolerance <= 0.0
         ):
             raise ValueError('release verification tolerances must be positive')
+        if (
+            self.pick_profile_xy_merge <= 0.0
+            or self.pick_profile_z_merge <= 0.0
+            or self.pick_profile_yaw_merge <= 0.0
+            or self.pick_profile_max_entries < 1
+        ):
+            raise ValueError('pick profile cache limits must be positive')
         lift_distance_candidates(
             self.stack_approach_clearance,
             self.stack_minimum_approach_clearance,
@@ -1043,6 +1076,16 @@ class ContainerPickCoordinator(Node):
         self.serial_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.motion_thread = None
+        # Active only while one ID-to-ID transfer is being planned.  It lets
+        # a previously proven route be tried first without changing J1 or
+        # bypassing any IK, collision, or Cartesian preflight checks.
+        self.active_id_transfer_pair = None
+        self.active_source_scan_zone = None
+        # Successful pick profiles are keyed by source/destination IDs and
+        # scan zone.  A cached profile only changes candidate order; every
+        # IK, collision, joint-branch, and Cartesian descent check still runs.
+        self.pick_success_profiles = []
+        self._load_pick_success_profiles()
         self.stack_level_lock = threading.Lock()
         self.placed_stack_count = 0
         self.robot = None
@@ -1381,6 +1424,9 @@ class ContainerPickCoordinator(Node):
             'id_transfer_correction_xyz_m', [0.0, 0.0, 0.0]
         )
         self.declare_parameter('trailer_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter(
+            'trailer_a3_pick_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
         self.declare_parameter('container_yaw_symmetry_deg', 360.0)
@@ -1487,6 +1533,16 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('moveit_planning_attempts', 30)
         self.declare_parameter('ik_timeout_sec', 0.3)
         self.declare_parameter('motion_ik_timeout_sec', 3.0)
+        # Warm-start IK from the last proven arm shape. J1 is deliberately
+        # omitted because it must follow the current source/destination.
+        self.declare_parameter(
+            'preferred_pick_seed_j2_j6_deg',
+            [-10.1, -124.9, 50.6, 6.1, -7.0],
+        )
+        self.declare_parameter(
+            'preferred_place_seed_j2_j6_deg',
+            [12.2, -112.0, 13.3, 6.4, -35.9],
+        )
         self.declare_parameter('moveit_velocity_scale', 0.35)
         self.declare_parameter('moveit_acceleration_scale', 0.25)
         self.declare_parameter('cartesian_max_step_m', 0.005)
@@ -1509,6 +1565,14 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('release_verify_xy_tolerance_m', 0.01)
         self.declare_parameter('release_verify_z_tolerance_m', 0.008)
         self.declare_parameter('release_verify_yaw_tolerance_deg', 3.0)
+        self.declare_parameter('pick_profile_xy_merge_m', 0.03)
+        self.declare_parameter('pick_profile_z_merge_m', 0.01)
+        self.declare_parameter('pick_profile_yaw_merge_deg', 15.0)
+        self.declare_parameter('pick_profile_max_entries', 30)
+        self.declare_parameter(
+            'pick_profile_cache_path',
+            'config/arm2/pick_success_profiles.json',
+        )
 
     def _vector_parameter(self, name, length):
         values = np.asarray(self.get_parameter(name).value, dtype=np.float64)
@@ -2775,6 +2839,8 @@ class ContainerPickCoordinator(Node):
             stack_name = destination_zone
             destination_correction = self.saved_destination_correction
         try:
+            self.active_id_transfer_pair = (source_id, destination_id)
+            self.active_source_scan_zone = scan_zone
             source_targets, reason = self.calculate_targets_from_marker_pose(
                 source_pose,
                 orientation_mode=self.stack_source_orientation_mode,
@@ -2812,6 +2878,7 @@ class ContainerPickCoordinator(Node):
                 source_marker_id=source_id,
                 align_source_before_pick=True,
                 source_scan_zone=scan_zone,
+                source_bearing_xy=source_pose[0][:2],
             )
         except Exception as exc:
             self.publish_status(
@@ -2821,6 +2888,8 @@ class ContainerPickCoordinator(Node):
                 f'ID {source_id} -> ID {destination_id}'
             )
         finally:
+            self.active_id_transfer_pair = None
+            self.active_source_scan_zone = None
             self.tracking_suspended.clear()
 
     def _scan_id_transfer_route(self, specs):
@@ -2840,6 +2909,7 @@ class ContainerPickCoordinator(Node):
             return None, 'ID transfer route service is unavailable'
 
         locked = [None] * len(specs)
+        source_scan_zone = None
         with self.history_lock:
             for _label, frame, history in specs:
                 history.clear()
@@ -2905,6 +2975,8 @@ class ContainerPickCoordinator(Node):
                         np.array(pose[0], dtype=np.float64),
                         np.array(pose[1], dtype=np.float64),
                     )
+                    if index == 0:
+                        source_scan_zone = pose_name
                     with self.history_lock:
                         self.scan_locked_frames.add(frame)
                     self.publish_status(
@@ -2916,7 +2988,7 @@ class ContainerPickCoordinator(Node):
                         'remaining route skipped'
                     )
                     return (
-                        (tuple(locked), pose_name),
+                        (tuple(locked), source_scan_zone),
                         'ID transfer markers locked',
                     )
 
@@ -2944,12 +3016,13 @@ class ContainerPickCoordinator(Node):
             )
             for marker_id, frame in self.trailer_frames.items()
         )
-        locked, reason = self._scan_trailer_route(tuple(specs))
-        if locked is None:
+        scan_result, reason = self._scan_trailer_route(tuple(specs))
+        if scan_result is None:
             self.publish_status(
                 f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
             )
             return
+        locked, source_scan_zone = scan_result
         # Freeze both accepted base-frame poses for the complete operation.
         # Re-observing either marker from the moving wrist camera must not
         # change the pick or trailer target after this point.
@@ -2961,9 +3034,20 @@ class ContainerPickCoordinator(Node):
         trailer_pose = copy.deepcopy(locked[selected_offset])
         trailer_marker_id = tuple(self.trailer_frames)[selected_offset - 1]
         try:
+            source_pick_correction = self.pick_correction
+            if source_scan_zone == 'A-3':
+                source_pick_correction = (
+                    self.pick_correction
+                    + self.trailer_a3_pick_correction
+                )
+                self.publish_status(
+                    'TRAILER LOAD: applying A-3-only pick correction '
+                    f'{self.trailer_a3_pick_correction.tolist()}'
+                )
             source_targets, reason = self.calculate_targets_from_marker_pose(
                 source_pose,
                 orientation_mode=self.stack_source_orientation_mode,
+                pick_correction=source_pick_correction,
             )
             if source_targets is None:
                 self.publish_status(
@@ -3029,6 +3113,7 @@ class ContainerPickCoordinator(Node):
             return None, 'trailer scan route service is unavailable'
 
         locked = [None] * len(specs)
+        source_scan_zone = None
         with self.history_lock:
             for _label, frame, history in specs:
                 history.clear()
@@ -3068,6 +3153,8 @@ class ContainerPickCoordinator(Node):
                         np.array(pose[0], dtype=np.float64),
                         np.array(pose[1], dtype=np.float64),
                     )
+                    if index == 0:
+                        source_scan_zone = pose_name
                     with self.history_lock:
                         self.scan_locked_frames.add(frame)
                     self.publish_status(
@@ -3078,7 +3165,10 @@ class ContainerPickCoordinator(Node):
                     required_indices=(0,),
                     any_of_indices=(1, 2),
                 ):
-                    return tuple(locked), 'trailer route markers locked'
+                    return (
+                        (tuple(locked), source_scan_zone),
+                        'trailer route markers locked',
+                    )
 
         missing = []
         if locked[0] is None:
@@ -3765,6 +3855,149 @@ class ContainerPickCoordinator(Node):
         finally:
             self.motion_lock.release()
 
+    def _load_pick_success_profiles(self):
+        """Load a bounded cache; malformed entries never block startup."""
+        if not self.pick_profile_cache_path:
+            return
+        path = Path(self.pick_profile_cache_path)
+        if not path.exists():
+            return
+        try:
+            raw_profiles = json.loads(path.read_text(encoding='utf-8'))
+            profiles = []
+            for raw in raw_profiles:
+                position = np.asarray(raw['position'], dtype=np.float64)
+                seed = np.asarray(raw['seed_j2_j6'], dtype=np.float64)
+                if (
+                    position.shape != (3,)
+                    or seed.shape != (5,)
+                    or not np.all(np.isfinite(position))
+                    or not np.all(np.isfinite(seed))
+                ):
+                    continue
+                profiles.append({
+                    'position': position,
+                    'yaw_deg': float(raw['yaw_deg']),
+                    'zone': str(raw['zone']),
+                    'yaw_offset_deg': float(raw['yaw_offset_deg']),
+                    'height_offset_m': float(raw['height_offset_m']),
+                    'approach_mode': str(
+                        raw.get('approach_mode', 'vertical')
+                    ),
+                    'oblique_dx_m': float(raw.get('oblique_dx_m', 0.0)),
+                    'oblique_dy_m': float(raw.get('oblique_dy_m', 0.0)),
+                    'seed_j2_j6': seed,
+                    'last_used': time.monotonic(),
+                })
+            self.pick_success_profiles.extend(
+                profiles[-self.pick_profile_max_entries:]
+            )
+            self.get_logger().info(
+                'Loaded successful-pick pose profiles: '
+                f'{len(self.pick_success_profiles)}'
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.get_logger().warning(
+                f'Ignoring invalid pick profile cache {path}: {exc}'
+            )
+
+    def _save_pick_success_profiles(self):
+        """Atomically persist the bounded successful-pick pose cache."""
+        if not self.pick_profile_cache_path:
+            return
+        path = Path(self.pick_profile_cache_path)
+        temporary = path.with_suffix(path.suffix + '.tmp')
+        payload = [{
+            'position': profile['position'].tolist(),
+            'yaw_deg': profile['yaw_deg'],
+            'zone': profile['zone'],
+            'yaw_offset_deg': profile['yaw_offset_deg'],
+            'height_offset_m': profile['height_offset_m'],
+            'approach_mode': profile.get('approach_mode', 'vertical'),
+            'oblique_dx_m': profile.get('oblique_dx_m', 0.0),
+            'oblique_dy_m': profile.get('oblique_dy_m', 0.0),
+            'seed_j2_j6': profile['seed_j2_j6'].tolist(),
+        } for profile in self.pick_success_profiles]
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, indent=2), encoding='utf-8'
+            )
+            temporary.replace(path)
+        except OSError as exc:
+            self.get_logger().warning(
+                f'Could not persist pick profile cache {path}: {exc}'
+            )
+
+    def _matching_pick_profile(self, position, yaw, zone):
+        """Return the nearest successful profile for a similar pick pose."""
+        matches = []
+        for profile in self.pick_success_profiles:
+            if profile['zone'] != zone:
+                continue
+            delta = np.asarray(profile['position']) - position
+            xy_distance = float(np.linalg.norm(delta[:2]))
+            z_distance = abs(float(delta[2]))
+            yaw_distance = abs(wrap_degrees(profile['yaw_deg'] - yaw))
+            if (
+                xy_distance > self.pick_profile_xy_merge
+                or z_distance > self.pick_profile_z_merge
+                or yaw_distance > self.pick_profile_yaw_merge
+            ):
+                continue
+            score = (
+                xy_distance / self.pick_profile_xy_merge
+                + z_distance / self.pick_profile_z_merge
+                + yaw_distance / self.pick_profile_yaw_merge
+            )
+            matches.append((score, profile))
+        if not matches:
+            return None
+        profile = min(matches, key=lambda item: item[0])[1]
+        profile['last_used'] = time.monotonic()
+        return profile
+
+    def _store_pick_success_profile(
+        self,
+        position,
+        yaw,
+        zone,
+        yaw_offset,
+        height_offset,
+        approach_mode='vertical',
+        oblique_dx=0.0,
+        oblique_dy=0.0,
+    ):
+        """Update a similar profile or add one bounded LRU cache entry."""
+        profile = self._matching_pick_profile(position, yaw, zone)
+        new_values = {
+            'position': np.asarray(position, dtype=np.float64).copy(),
+            'yaw_deg': float(yaw),
+            'zone': zone,
+            'yaw_offset_deg': float(yaw_offset),
+            'height_offset_m': float(height_offset),
+            'approach_mode': str(approach_mode),
+            'oblique_dx_m': float(oblique_dx),
+            'oblique_dy_m': float(oblique_dy),
+            'seed_j2_j6': self.preferred_pick_seed_j2_j6.copy(),
+            'last_used': time.monotonic(),
+        }
+        if profile is not None:
+            profile.update(new_values)
+            self._save_pick_success_profiles()
+            return 'updated similar profile'
+        if len(self.pick_success_profiles) >= self.pick_profile_max_entries:
+            oldest_index = min(
+                range(len(self.pick_success_profiles)),
+                key=lambda index: self.pick_success_profiles[index][
+                    'last_used'
+                ],
+            )
+            self.pick_success_profiles.pop(oldest_index)
+        self.pick_success_profiles.append(new_values)
+        self._save_pick_success_profiles()
+        return 'stored new profile'
+
     def _perform_pick(
         self,
         initial_targets,
@@ -3776,16 +4009,57 @@ class ContainerPickCoordinator(Node):
         search_higher_pregrasp=False,
     ):
         grasp, pregrasp = map(copy.deepcopy, initial_targets)
+        nominal_position = np.array([
+            grasp.pose.position.x,
+            grasp.pose.position.y,
+            grasp.pose.position.z,
+        ], dtype=np.float64)
+        nominal_yaw = quaternion_to_rpy_degrees([
+            grasp.pose.orientation.x,
+            grasp.pose.orientation.y,
+            grasp.pose.orientation.z,
+            grasp.pose.orientation.w,
+        ])[2]
+        profile_zone = self.active_source_scan_zone
+        cached_profile = None
+        if profile_zone is not None:
+            cached_profile = self._matching_pick_profile(
+                nominal_position, nominal_yaw, profile_zone
+            )
+            if cached_profile is not None:
+                cached_seed = cached_profile.get('seed_j2_j6')
+                if cached_seed is not None:
+                    self.preferred_pick_seed_j2_j6 = np.array(
+                        cached_seed, dtype=np.float64
+                    )
+                self.publish_status(
+                    'PICK: prioritizing nearest cached safe pose for '
+                    f'zone={profile_zone}, '
+                    f'mode={cached_profile.get("approach_mode", "vertical")}, '
+                    f'yaw={cached_profile["yaw_offset_deg"]:+.0f}deg, '
+                    'pregrasp='
+                    f'{cached_profile["height_offset_m"] * 1000.0:.0f}mm'
+                )
         self.publish_status('PICK: opening gripper')
         self.command_gripper(open_gripper=True)
         self.publish_status('PICK: moving to pregrasp')
 
-        def move_to_pick_pregrasp(base_pregrasp):
+        def move_to_pick_pregrasp(base_pregrasp, yaw_offset):
             nonlocal pregrasp
-            height_offsets = (
+            height_offsets = list(
                 (0.0, 0.02, 0.04, 0.06)
                 if search_higher_pregrasp else (0.0,)
             )
+            if (
+                cached_profile is not None
+                and abs(
+                    cached_profile['yaw_offset_deg'] - yaw_offset
+                ) <= 1e-6
+            ):
+                preferred_height = cached_profile['height_offset_m']
+                if preferred_height in height_offsets:
+                    height_offsets.remove(preferred_height)
+                    height_offsets.insert(0, preferred_height)
             failures = []
             for height_offset in height_offsets:
                 candidate = copy.deepcopy(base_pregrasp)
@@ -3829,7 +4103,7 @@ class ContainerPickCoordinator(Node):
                             'PICK: selected higher pregrasp '
                             f'+{height_offset * 100.0:.0f}cm'
                         )
-                    return
+                    return height_offset
                 except RuntimeError as exc:
                     if self.stop_event.is_set():
                         raise
@@ -3841,15 +4115,44 @@ class ContainerPickCoordinator(Node):
         nominal_grasp = copy.deepcopy(grasp)
         nominal_pregrasp = copy.deepcopy(pregrasp)
         yaw_offsets = [0.0]
+        if abs(self.container_yaw_symmetry - 180.0) <= 1e-6:
+            # The equivalent wrist orientation is often much easier for IK.
+            # Test it immediately after the exact marker yaw instead of only
+            # after every small yaw deviation has timed out.
+            yaw_offsets.append(180.0)
         if search_higher_pregrasp:
             # Near the edge of the workspace, an exact marker yaw can force
-            # the vertical descent through an IK branch discontinuity.  Test
-            # small, symmetric grasp-yaw deviations before the 180-degree
-            # equivalent and execute only a candidate whose complete descent
-            # passed preflight.
+            # the vertical descent through an IK branch discontinuity. Test
+            # small symmetric deviations after the equivalent 180-degree
+            # wrist orientation; execute only a candidate whose complete
+            # descent passed preflight.
             yaw_offsets.extend((15.0, -15.0, 30.0, -30.0))
-        if abs(self.container_yaw_symmetry - 180.0) <= 1e-6:
-            yaw_offsets.append(180.0)
+        if cached_profile is not None:
+            preferred_yaw = cached_profile['yaw_offset_deg']
+            if preferred_yaw in yaw_offsets:
+                yaw_offsets.remove(preferred_yaw)
+                yaw_offsets.insert(0, preferred_yaw)
+            if cached_profile.get('approach_mode') == 'oblique':
+                # This pose already proved that vertical approaches waste the
+                # full yaw search. Revalidate the successful oblique profile
+                # first; its IK/collision/descent checks are still complete.
+                yaw_offsets = []
+                self.publish_status(
+                    'PICK: cached pose uses a short oblique approach; '
+                    'skipping vertical candidate ordering'
+                )
+        if (
+            self.active_id_transfer_pair == (6, 4)
+            and self.active_source_scan_zone == 'A-1'
+        ):
+            # The proven 6 -> 4 pick did not use a vertical pregrasp at any
+            # yaw.  It succeeded with the nominal yaw and a short +X oblique
+            # approach, handled immediately by the fallback block below.
+            yaw_offsets = []
+            self.publish_status(
+                'PICK: prioritizing proven ID 6 -> 4 nominal-yaw '
+                'short oblique profile'
+            )
 
         yaw_failures = []
         selected = False
@@ -3888,8 +4191,23 @@ class ContainerPickCoordinator(Node):
                     f'(target={candidate_yaw:.2f}deg)'
                 )
             try:
-                move_to_pick_pregrasp(candidate_pregrasp)
+                selected_height = move_to_pick_pregrasp(
+                    candidate_pregrasp, yaw_offset
+                )
                 selected = True
+                if profile_zone is not None:
+                    cache_result = self._store_pick_success_profile(
+                        nominal_position,
+                        nominal_yaw,
+                        profile_zone,
+                        yaw_offset,
+                        selected_height,
+                    )
+                    self.publish_status(
+                        'PICK: cached fully validated safe pose: '
+                        f'{cache_result}, zone={profile_zone}, '
+                        f'entries={len(self.pick_success_profiles)}'
+                    )
                 if yaw_offset != 0.0:
                     self.publish_status(
                         'PICK: selected preflight-safe grasp yaw offset '
@@ -3906,12 +4224,23 @@ class ContainerPickCoordinator(Node):
             # the last few centimetres on a shallow diagonal.  The same
             # bottom-up IK and full Cartesian preflight are still required,
             # so this does not relax the joint-jump protection.
-            oblique_offsets = (
+            oblique_offsets = [
                 (0.010, 0.0),
                 (-0.010, 0.0),
                 (0.0, 0.010),
                 (0.0, -0.010),
-            )
+            ]
+            if (
+                cached_profile is not None
+                and cached_profile.get('approach_mode') == 'oblique'
+            ):
+                preferred_oblique = (
+                    cached_profile.get('oblique_dx_m', 0.0),
+                    cached_profile.get('oblique_dy_m', 0.0),
+                )
+                if preferred_oblique in oblique_offsets:
+                    oblique_offsets.remove(preferred_oblique)
+                    oblique_offsets.insert(0, preferred_oblique)
             grasp = copy.deepcopy(nominal_grasp)
             for dx, dy in oblique_offsets:
                 candidate_pregrasp = copy.deepcopy(nominal_grasp)
@@ -3956,6 +4285,22 @@ class ContainerPickCoordinator(Node):
                         )
                     pregrasp = candidate_pregrasp
                     selected = True
+                    if profile_zone is not None:
+                        cache_result = self._store_pick_success_profile(
+                            nominal_position,
+                            nominal_yaw,
+                            profile_zone,
+                            yaw_offset=0.0,
+                            height_offset=0.025,
+                            approach_mode='oblique',
+                            oblique_dx=dx,
+                            oblique_dy=dy,
+                        )
+                        self.publish_status(
+                            'PICK: cached validated oblique pose: '
+                            f'{cache_result}, zone={profile_zone}, '
+                            f'entries={len(self.pick_success_profiles)}'
+                        )
                     self.publish_status(
                         'PICK: selected preflight-safe short oblique '
                         f'approach dx={dx * 1000.0:+.0f}mm, '
@@ -4061,8 +4406,21 @@ class ContainerPickCoordinator(Node):
                     )
         self.publish_status('PICK: closing gripper')
         self.command_gripper(open_gripper=False)
+        self.publish_status(
+            'PICK: retreating along the validated grasp approach'
+        )
+        try:
+            self.move_cartesian_to_pose(
+                pregrasp,
+                allow_segmented=False,
+            )
+        except CartesianPlanningError as exc:
+            raise RuntimeError(
+                'validated grasp-path retreat failed before vertical lift: '
+                f'{exc}'
+            ) from exc
         self.publish_status('PICK: finding vertical lift path')
-        self.move_adaptive_cartesian_lift(grasp)
+        self.move_adaptive_cartesian_lift(pregrasp)
         return grasp
 
     def avoid_known_bad_pick_branch(self, grasp):
@@ -4196,6 +4554,7 @@ class ContainerPickCoordinator(Node):
         source_marker_id=0,
         align_source_before_pick=False,
         source_scan_zone=None,
+        source_bearing_xy=None,
     ):
         """Move a scan-locked container to one locked destination."""
         if not self.motion_lock.acquire(blocking=False):
@@ -4212,7 +4571,9 @@ class ContainerPickCoordinator(Node):
             )
             if align_source_before_pick:
                 self.move_joint1_toward_source(
-                    source_targets[0], source_scan_zone
+                    source_targets[0],
+                    source_scan_zone,
+                    source_bearing_xy=source_bearing_xy,
                 )
             picked_grasp = self._perform_pick(
                 copy.deepcopy(source_targets),
@@ -4565,6 +4926,13 @@ class ContainerPickCoordinator(Node):
                 base_rpy[2] + offset - current_yaw
             )),
         )
+        # Placement is tied to destination ID 4, so its proven approach is
+        # reusable after any source has been lifted and radially aligned.
+        # Picking, in contrast, is additionally keyed by the source zone.
+        proven_6_to_4 = self.active_id_transfer_pair == (6, 4)
+        if proven_6_to_4 and 180.0 in yaw_offsets:
+            yaw_offsets.remove(180.0)
+            yaw_offsets.insert(0, 180.0)
         self.publish_status(
             'STACK: yaw candidates ordered for minimum wrist rotation: '
             + ', '.join(f'{offset:+.0f}deg' for offset in yaw_offsets)
@@ -4587,6 +4955,15 @@ class ContainerPickCoordinator(Node):
                 - float(release.pose.position.z)
             )
             approach_candidates = [(clearance, alignment_pose)]
+        if proven_6_to_4:
+            # This exact route repeatedly failed every vertical approach and
+            # succeeded with the short -X oblique profile.  Go directly to
+            # that fully preflighted search; normal routes retain the broad
+            # vertical-first search.
+            approach_candidates = []
+            self.publish_status(
+                'STACK: prioritizing proven ID 6 -> 4 short oblique profile'
+            )
         for clearance, fixed_approach in approach_candidates:
             for yaw_offset in yaw_offsets:
                 if yaw_offset in excluded_yaw_offsets:
@@ -4686,12 +5063,16 @@ class ContainerPickCoordinator(Node):
                     base_rpy[1],
                     wrap_degrees(base_rpy[2] + yaw_offset),
                 )
-                for dx, dy in (
+                oblique_offsets = [
                     (0.010, 0.0),
                     (-0.010, 0.0),
                     (0.0, 0.010),
                     (0.0, -0.010),
-                ):
+                ]
+                if proven_6_to_4:
+                    oblique_offsets.remove((-0.010, 0.0))
+                    oblique_offsets.insert(0, (-0.010, 0.0))
+                for dx, dy in oblique_offsets:
                     approach = copy.deepcopy(release)
                     approach.pose.position.x += dx
                     approach.pose.position.y += dy
@@ -4916,6 +5297,28 @@ class ContainerPickCoordinator(Node):
             ('place fallback elbow-in (J2-/J3-)', -1.0, -1.0),
             ('place fallback elbow-in (J2+/J3-)', 1.0, -1.0),
         )
+        preferred_seed = current_joints.copy()
+        preferred_seed[1:] = self.preferred_place_seed_j2_j6
+        preferred_j2_sign = 1.0 if preferred_seed[1] >= 0.0 else -1.0
+        preferred_j3_sign = 1.0 if preferred_seed[2] >= 0.0 else -1.0
+        branch_seed_groups = [(
+            'last successful J2-J6 priority',
+            preferred_j2_sign,
+            preferred_j3_sign,
+            (preferred_seed,),
+        )]
+        branch_seed_groups.extend(
+            (
+                label,
+                j2_sign,
+                j3_sign,
+                tuple(
+                    self._branch_seed(current_joints, j2_sign, j3_sign, magnitude)
+                    for magnitude in (30.0, 60.0, 90.0)
+                ),
+            )
+            for label, j2_sign, j3_sign in branch_patterns
+        )
         exact_rpy = quaternion_to_rpy_degrees([
             exact_approach.pose.orientation.x,
             exact_approach.pose.orientation.y,
@@ -4938,14 +5341,8 @@ class ContainerPickCoordinator(Node):
             ) = map(float, rotation)
             equivalent_approaches.append((symmetry_offset, candidate))
         failures = []
-        for label, j2_sign, j3_sign in branch_patterns:
-            for magnitude in (30.0, 60.0, 90.0):
-                seed = current_joints.copy()
-                for joint_index, sign in ((1, j2_sign), (2, j3_sign)):
-                    lower, upper = JOINT_LIMITS_DEG[joint_index]
-                    seed[joint_index] = math.radians(min(
-                        max(sign * magnitude, lower + 1.0), upper - 1.0
-                    ))
+        for label, j2_sign, j3_sign, seeds in branch_seed_groups:
+            for seed in seeds:
                 branch_solution = self._request_pose_ik(
                     branch_approach, seed
                 )
@@ -5018,12 +5415,24 @@ class ContainerPickCoordinator(Node):
                         f'J3={math.degrees(float(exact_solution[2])):.1f}deg, '
                         f'J6 travel={j6_travel:.1f}deg, {descent_detail}'
                     )
+                    self.preferred_place_seed_j2_j6 = exact_solution[1:].copy()
                     return exact_solution, candidate
             failures.append(f'{label}: no complete approach/descent')
         raise RuntimeError(
             f'no {context} IK branch passed descent preflight: '
             + '; '.join(failures)
         )
+
+    @staticmethod
+    def _branch_seed(current_joints, j2_sign, j3_sign, magnitude):
+        """Build a conventional J2/J3 seed while preserving J1/J4-J6."""
+        seed = current_joints.copy()
+        for joint_index, sign in ((1, j2_sign), (2, j3_sign)):
+            lower, upper = JOINT_LIMITS_DEG[joint_index]
+            seed[joint_index] = math.radians(min(
+                max(sign * magnitude, lower + 1.0), upper - 1.0
+            ))
+        return seed
 
     def _move_to_pose_with_j2_j3_branch_priority(
         self,
@@ -5058,18 +5467,31 @@ class ContainerPickCoordinator(Node):
             ('close-side fallback (J2+/J3+)', 1.0, 1.0),
             ('last close-side fallback (J2-/J3+)', -1.0, 1.0),
         )
-        seed_magnitudes = (30.0, 60.0, 90.0)
+        preferred_seed = current_joints.copy()
+        preferred_seed[1:] = self.preferred_pick_seed_j2_j6
+        preferred_j2_sign = 1.0 if preferred_seed[1] >= 0.0 else -1.0
+        preferred_j3_sign = 1.0 if preferred_seed[2] >= 0.0 else -1.0
+        branch_seed_groups = [(
+            'last successful J2-J6 priority',
+            preferred_j2_sign,
+            preferred_j3_sign,
+            (preferred_seed,),
+        )]
+        branch_seed_groups.extend(
+            (
+                label,
+                j2_sign,
+                j3_sign,
+                tuple(
+                    self._branch_seed(current_joints, j2_sign, j3_sign, magnitude)
+                    for magnitude in (30.0, 60.0, 90.0)
+                ),
+            )
+            for label, j2_sign, j3_sign in branch_patterns
+        )
         failures = []
-        for label, j2_sign, j3_sign in branch_patterns:
-            for magnitude in seed_magnitudes:
-                seed = current_joints.copy()
-                for joint_index, sign in ((1, j2_sign), (2, j3_sign)):
-                    lower, upper = JOINT_LIMITS_DEG[joint_index]
-                    seed_deg = min(
-                        max(sign * magnitude, lower + 1.0),
-                        upper - 1.0,
-                    )
-                    seed[joint_index] = math.radians(seed_deg)
+        for label, j2_sign, j3_sign, seeds in branch_seed_groups:
+            for seed in seeds:
 
                 # When validating a pick descent, solve the final grasp first
                 # and use that exact branch as the seed for the pregrasp.  A
@@ -5116,7 +5538,7 @@ class ContainerPickCoordinator(Node):
                     )
                     continue
                 try:
-                    self._execute_planned_joint_goal(
+                    validated_trajectory = self._execute_planned_joint_goal(
                         solution,
                         plan_only=True,
                     )
@@ -5153,7 +5575,14 @@ class ContainerPickCoordinator(Node):
                         if descent_detail is not None else ''
                     )
                 )
-                self._execute_planned_joint_goal(solution)
+                self.preferred_pick_seed_j2_j6 = solution[1:].copy()
+                self.publish_status(
+                    f'{context}: executing the already validated trajectory'
+                )
+                self._execute_cartesian_trajectory(
+                    validated_trajectory,
+                    label='validated joint trajectory',
+                )
                 return
             failures.append(f'{label}: no valid planned IK solution')
         raise RuntimeError(
@@ -5813,19 +6242,25 @@ class ContainerPickCoordinator(Node):
         )
         self._execute_moveit_joint_goal(positions)
 
-    def move_joint1_toward_source(self, source_pose, scan_zone=None):
-        """Face the source zone while preserving the safe scan posture."""
+    def move_joint1_toward_source(
+        self, source_pose, scan_zone=None, source_bearing_xy=None
+    ):
+        """Face the exact source marker while preserving J2-J6."""
         if self.motion_backend != 'moveit':
             raise RuntimeError('J1-priority pick requires MoveIt')
-        if scan_zone in self.destination_zone_j1:
-            target_j1 = self.destination_zone_j1[scan_zone]
-            target_description = f'zone={scan_zone}'
+        if source_bearing_xy is None:
+            source_x = float(source_pose.pose.position.x)
+            source_y = float(source_pose.pose.position.y)
         else:
-            target_j1 = math.atan2(
-                source_pose.pose.position.y,
-                source_pose.pose.position.x,
-            )
-            target_description = 'marker bearing'
+            source_xy = np.asarray(source_bearing_xy, dtype=np.float64)
+            if source_xy.shape != (2,) or not np.all(np.isfinite(source_xy)):
+                raise RuntimeError('source marker bearing XY is invalid')
+            source_x, source_y = map(float, source_xy)
+        target_j1 = math.atan2(source_y, source_x)
+        target_description = (
+            f'source marker bearing in {scan_zone or "unknown zone"}: '
+            f'x={source_x:.4f}m, y={source_y:.4f}m'
+        )
         with self.joint_state_lock:
             positions = (
                 None if self.latest_joint_positions is None
@@ -5855,12 +6290,17 @@ class ContainerPickCoordinator(Node):
         current_j1 = float(positions[0])
         positions[0] = min(valid, key=lambda value: abs(value - current_j1))
         self.publish_status(
-            'TRANSFER: holding source zone before pick IK with J2-J6 fixed: '
+            'TRANSFER: facing exact source marker before pick IK with '
+            'J2-J6 fixed: '
             f'{target_description}, '
             f'current={math.degrees(current_j1):.1f}deg, '
             f'target={math.degrees(float(positions[0])):.1f}deg'
         )
         self._execute_moveit_joint_goal(positions)
+        self.publish_status(
+            'TRANSFER: exact-source J1 alignment completed; '
+            'starting pick IK from the updated joint state'
+        )
 
     def _execute_moveit_joint_goal(self, positions):
         """Execute a trajectory whose J2-J6 positions remain constant."""
@@ -6373,6 +6813,12 @@ class ContainerPickCoordinator(Node):
                     f'MoveIt joint-goal {mode} failed: '
                     f'code={result.error_code.val}'
                 )
+            if plan_only:
+                if not result.planned_trajectory.joint_trajectory.points:
+                    raise RuntimeError(
+                        'MoveIt plan-only result contains no trajectory'
+                    )
+                return copy.deepcopy(result.planned_trajectory)
         finally:
             with self.moveit_goal_lock:
                 self.current_moveit_goal = None
@@ -6611,7 +7057,9 @@ class ContainerPickCoordinator(Node):
 
         self._execute_cartesian_trajectory(response.solution)
 
-    def _execute_cartesian_trajectory(self, trajectory):
+    def _execute_cartesian_trajectory(
+        self, trajectory, label='Cartesian trajectory'
+    ):
         if not self.execute_trajectory_client.wait_for_server(
             timeout_sec=5.0
         ):
@@ -6624,7 +7072,7 @@ class ContainerPickCoordinator(Node):
         self._wait_future(goal_future, 5.0)
         goal_handle = goal_future.result()
         if goal_handle is None or not goal_handle.accepted:
-            raise RuntimeError('MoveIt rejected Cartesian trajectory')
+            raise RuntimeError(f'MoveIt rejected {label}')
         with self.moveit_goal_lock:
             self.current_moveit_goal = goal_handle
         try:
@@ -6636,12 +7084,12 @@ class ContainerPickCoordinator(Node):
             )
             wrapped_result = result_future.result()
             if wrapped_result is None:
-                raise RuntimeError('Cartesian execution returned no result')
+                raise RuntimeError(f'{label} execution returned no result')
             error = wrapped_result.result.error_code
             if error.val != MoveItErrorCodes.SUCCESS:
                 detail = error.message or 'no detail'
                 raise RuntimeError(
-                    'Cartesian execution failed: '
+                    f'{label} execution failed: '
                     f'code={error.val}, message={detail}'
                 )
             if self.stop_event.wait(self.moveit_state_settle):

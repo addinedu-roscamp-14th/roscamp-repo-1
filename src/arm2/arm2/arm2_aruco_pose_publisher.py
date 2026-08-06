@@ -141,6 +141,7 @@ class ArucoPosePublisher(Node):
         self.declare_parameter('max_reprojection_error_px', 3.0)
         self.declare_parameter('publish_annotated', True)
         self.declare_parameter('use_node_time_for_pose', False)
+        self.declare_parameter('detected_ids_log_period_sec', 2.0)
 
         self.image_topic = str(self.get_parameter('image_topic').value)
         self.camera_info_topic = str(
@@ -195,11 +196,16 @@ class ArucoPosePublisher(Node):
         self.use_node_time_for_pose = bool(
             self.get_parameter('use_node_time_for_pose').value
         )
+        self.detected_ids_log_period = float(
+            self.get_parameter('detected_ids_log_period_sec').value
+        )
 
         if self.marker_size <= 0.0:
             raise ValueError('marker_size_m must be greater than zero')
         if self.max_reprojection_error <= 0.0:
             raise ValueError('max_reprojection_error_px must be greater than zero')
+        if self.detected_ids_log_period < 0.0:
+            raise ValueError('detected_ids_log_period_sec must be non-negative')
         if not hasattr(cv2.aruco, dictionary_name):
             raise ValueError(f'Unknown ArUco dictionary: {dictionary_name}')
 
@@ -225,6 +231,7 @@ class ArucoPosePublisher(Node):
         self.missing_info_warning_count = 0
         self.invalid_info_warning_count = 0
         self.last_detected_ids = None
+        self.last_detected_ids_log_ns = 0
         self.detected_once = False
         self.last_transform_warning_ns = 0
 
@@ -329,8 +336,18 @@ class ArucoPosePublisher(Node):
             if ids is not None else ()
         )
         if detected_ids != self.last_detected_ids:
-            if detected_ids:
+            now_ns = self.get_clock().now().nanoseconds
+            log_period_ns = int(self.detected_ids_log_period * 1e9)
+            if (
+                detected_ids
+                and (
+                    log_period_ns == 0
+                    or now_ns - self.last_detected_ids_log_ns
+                    >= log_period_ns
+                )
+            ):
                 self.get_logger().info(f'Detected ArUco IDs: {detected_ids}')
+                self.last_detected_ids_log_ns = now_ns
             self.last_detected_ids = detected_ids
 
         selected_corners = None

@@ -1,6 +1,7 @@
 /arm2/arm2_jetcobot_trajectory_bridge:
   ros__parameters:
-    speed: 70
+    # Smooth physical trajectory profile.
+    speed: 50
     home_joint_angles_deg:
     - 90.17
     - 1.23
@@ -42,7 +43,9 @@
     joint1_sweep_tolerance_deg: 3.5
     joint1_sweep_duration_sec: 20.0
     max_j6_trajectory_travel_deg: 170.0
-    command_rate_hz: 20.0
+    # JetCobot treats dense send_angles updates like repeated short moves.
+    # A moderate stream rate reduces stop-and-go motion and serial queuing.
+    command_rate_hz: 15.0
     joint_state_limit_clamp_tolerance_deg: 0.5
     adaptive_goal_correction_enabled: true
     adaptive_goal_correction_joints:
@@ -53,8 +56,8 @@
     adaptive_goal_correction_gain: 1.0
     adaptive_goal_correction_max_total_deg: 7.0
     adaptive_goal_correction_max_attempts: 5
-    goal_correction_speed: 70
-    goal_correction_period_sec: 0.5
+    goal_correction_speed: 35
+    goal_correction_period_sec: 0.4
 /arm2/arm2_container_pick_coordinator:
   ros__parameters:
     base_frame: arm2/base_link
@@ -94,6 +97,14 @@
     # Trailer marker red axis (+X): previous -50mm + requested 20mm.
     - -0.03
     - 0.0
+    - 0.0
+    # Trailer-load services only: when the source is found in A-3, move the
+    # pick target 20 mm along the red axis (+X, image downward) and 30 mm
+    # opposite the green axis (-Y, image-left direction).
+    # A-1 and A-2 continue to use pick_correction_xyz_m unchanged.
+    trailer_a3_pick_correction_xyz_m:
+    - 0.02
+    - -0.03
     - 0.0
     grasp_offset_rpy_deg:
     - 179.226
@@ -166,9 +177,16 @@
     - -79.98
     j2_fallback_min_tcp_height_m: 0.12
     j3_fallback_min_tcp_height_m: 0.12
-    release_verify_xy_tolerance_m: 0.01
-    release_verify_z_tolerance_m: 0.008
+    release_verify_xy_tolerance_m: 0.012
+    release_verify_z_tolerance_m: 0.01
     release_verify_yaw_tolerance_deg: 3.0
+    # Successful-pick pose cache: similar poses update one entry instead of
+    # growing duplicates. The cache is bounded and only changes search order.
+    pick_profile_xy_merge_m: 0.03
+    pick_profile_z_merge_m: 0.01
+    pick_profile_yaw_merge_deg: 15.0
+    pick_profile_max_entries: 30
+    pick_profile_cache_path: config/arm2/pick_success_profiles.json
     minimum_stable_samples: 10
     max_translation_std_m: 0.0015
     max_rotation_spread_deg: 10.0
@@ -213,16 +231,23 @@
     moveit_orientation_tolerance_deg: 5.0
     moveit_planning_time_sec: 10.0
     ik_timeout_sec: 0.3
-    motion_ik_timeout_sec: 3.0
+    # Per-seed timeout. Multiple seeds, yaw candidates and the oblique
+    # fallback remain enabled, so failed IK branches no longer stall for 3 s.
+    motion_ik_timeout_sec: 1.0
+    # Successful 6 -> 4 transfer arm shapes. J1 is always taken from the
+    # current target direction; these J2-J6 values are IK seeds only.
+    preferred_pick_seed_j2_j6_deg: [-10.1, -124.9, 50.6, 6.1, -7.0]
+    preferred_place_seed_j2_j6_deg: [12.2, -112.0, 13.3, 6.4, -35.9]
     moveit_planning_attempts: 20
-    moveit_velocity_scale: 0.30
-    moveit_acceleration_scale: 0.15
+    moveit_velocity_scale: 0.20
+    moveit_acceleration_scale: 0.08
     cartesian_max_step_m: 0.001
     cartesian_min_fraction: 0.97
     cartesian_absolute_min_fraction: 0.9
     cartesian_max_shortfall_m: 0.005
-    cartesian_max_speed_mps: 0.03
+    cartesian_max_speed_mps: 0.02
     cartesian_max_joint_jump_deg: 15.0
-    moveit_state_settle_sec: 0.1
+    # Keep only a short synchronization pause between completed MoveIt stages.
+    moveit_state_settle_sec: 0.05
     stack_preflight_joint_margin_deg: 0.9
     max_j6_trajectory_travel_deg: 170.0

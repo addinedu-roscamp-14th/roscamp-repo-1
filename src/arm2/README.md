@@ -254,6 +254,7 @@ place_correction_xyz_m: [0.0, 0.0, 0.0]
 saved_destination_correction_xyz_m: [-0.02, -0.01, -0.005]
 id_transfer_correction_xyz_m: [0.02, 0.0, 0.0]
 trailer_correction_xyz_m: [-0.05, 0.0, 0.0]
+trailer_a3_pick_correction_xyz_m: [0.02, -0.03, 0.0]
 ```
 
 - `grasp_offset_xyz_m`: 마커 기준 자세에서 가르친 파지 오프셋입니다.
@@ -278,6 +279,10 @@ trailer_correction_xyz_m: [-0.05, 0.0, 0.0]
   `/arm2/load_id8_to_trailer`까지의 트레일러 놓기에만 적용됩니다. 따라서
   `[-0.05, 0.0, 0.0]`은 ID 9/10 마커가 회전해도 항상 빨간 축 반대 방향으로
   50 mm 이동합니다.
+- `trailer_a3_pick_correction_xyz_m`: 위 트레일러 적재 서비스가 소스
+  컨테이너를 A-3에서 발견했을 때의 집기점에만 추가됩니다. 현재 값은 이미지
+  기준 아래쪽인 빨간 축(`+X`) 20 mm와 왼쪽인 초록 축 반대(`-Y`) 30 mm이며,
+  Z 보정은 없습니다. A-1/A-2의 기존 `pick_correction_xyz_m`은 변경하지 않습니다.
 - `container_yaw_symmetry_deg: 180.0`: 직사각형 컨테이너의 0도와 180도를
   동일한 파지 자세와 동일한 XYZ 보정 방향으로 처리합니다. 45도와 90도
   회전은 그대로 추종합니다.
@@ -307,6 +312,37 @@ RQt Parameter Reconfigure에서 위 파라미터를 바꾸는 경우에는 로�
 기준 마커 yaw를 측정하고 `offsets_configured: true`로 변경해야 합니다.
 
 ## MoveIt namespace
+
+ID와 무관하게 `(스캔 구역, 집기 XYZ, 마커 yaw)`가 가까운 마지막 성공 집기
+yaw, pregrasp 높이와 J2~J6 IK seed를 노드 실행 중 캐시합니다. 기본 중복 기준은
+XY 30 mm, Z 10 mm, yaw 15도이며 이 범위 안의 성공 자세는 새 항목을 만들지 않고
+기존 항목을 갱신합니다. 최대 30개만 LRU 방식으로 유지합니다. 캐시 후보도 IK,
+충돌, 관절 분기 및 Cartesian 하강 검증을 모두 다시 거치며, 실패하면 기존 전체
+후보 탐색으로 자동 복귀합니다. 성공 프로파일은 기본적으로
+`config/arm2/pick_success_profiles.json`에 원자적으로 저장되어 노드 재시작 후에도
+재사용됩니다.
+
+수직 yaw 후보가 모두 실패하고 짧은 사선 접근이 성공한 경우에는 접근 방식과
+`dx/dy`도 프로파일에 저장합니다. 다음 유사 자세에서는 수직 후보 전체 탐색을
+건너뛰고 저장된 사선 접근을 먼저 완전 검증합니다.
+
+ArUco 검출 ID 목록 로그는 기본 2초에 한 번 이하로 제한됩니다. 카메라 검출과 pose/TF
+발행 주기는 낮추지 않으며 터미널 출력만 제한합니다. 필요하면
+`detected_ids_log_period_sec` 파라미터로 조정합니다.
+
+선호 J2/J3 분기 탐색에서 `plan-only`로 충돌 검증을 통과한 관절 trajectory는
+실행 직전에 같은 목표를 다시 계획하지 않고 그대로 실행합니다. MoveIt의 시작 자세
+허용 오차 검증과 실행 상태 확인은 그대로 적용되며, 시작 자세가 달라진 trajectory는
+실행 단계에서 거부됩니다.
+
+집기 IK는 각 seed에 최대 1초를 사용하고, 실패하면 다음 seed/yaw/접근 후보로
+넘어갑니다. 180도 대칭 파지 후보는 정확 yaw 다음에 우선 검사합니다. 충돌 검사,
+Cartesian 하강 검증과 전체 사선 접근 fallback은 그대로 유지됩니다.
+
+`/arm2/transfer_by_id`는 첫 번째 인자인 `source_id`의 저장된 실제 base-frame
+`(x, y)` 좌표로 `atan2(y, x)` 방향을 계산합니다. 스캔 완료 후 구역의 고정 각도가
+아니라 source 마커 자체를 바라보도록 J1을 먼저 이동하고 J2~J6은 유지한 뒤, 갱신된
+실제 관절 상태에서 집기 IK 계산을 시작합니다.
 
 `arm2_moveit.launch.py`는 공용 JetCobot 설정을 불러온 뒤 두 번째 로봇의 링크를
 `arm2/`로 접두사 처리하고 MoveIt 전체를 `/arm2` namespace에서 실행합니다.
