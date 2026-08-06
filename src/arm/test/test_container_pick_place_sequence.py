@@ -4,12 +4,12 @@ import threading
 from types import SimpleNamespace
 
 from arm.container_pick_coordinator import (
-    CartesianPlanningError,
     apply_radial_xy_offset,
+    CartesianPlanningError,
 )
 from arm.container_pick_place_coordinator import (
-    ContainerPickPlaceCoordinator,
     alternative_ik_seeds,
+    ContainerPickPlaceCoordinator,
     validated_joint_angles_degrees,
 )
 
@@ -40,6 +40,97 @@ def test_observation_joint_pose_rejects_limit_violation():
     """A fixed observation pose cannot exceed physical joint limits."""
     with pytest.raises(ValueError, match='J2'):
         validated_joint_angles_degrees([0.0, 180.0, 0.0, 0.0, 0.0, 0.0])
+
+
+def test_direct_observation_joint_pose_uses_robot_api():
+    """Direct observation motion sends and verifies controller angles."""
+    coordinator = object.__new__(ContainerPickPlaceCoordinator)
+    coordinator.motion_backend = 'direct'
+    coordinator.serial_lock = threading.Lock()
+    coordinator.stop_event = threading.Event()
+    coordinator.motion_timeout = 1.0
+    coordinator.moveit_state_settle = 0.0
+    coordinator.observation_joint_tolerance = 1.0
+    coordinator.speed = 5
+    coordinator.publish_status = lambda text: None
+    target = [1.0, 20.0, -30.0, -40.0, 10.0, -50.0]
+
+    class Robot:
+        def __init__(self):
+            self.sent = None
+
+        def send_angles(self, angles, speed):
+            self.sent = (angles, speed)
+
+        def get_angles(self):
+            return target
+
+    coordinator.robot = Robot()
+
+    coordinator.move_to_observation_joint_pose(target)
+
+    assert coordinator.robot.sent == (target, 5)
+
+
+def test_second_view_can_lock_pick_and_place_together():
+    """Both missing roles can be acquired at the second observation pose."""
+    coordinator = object.__new__(ContainerPickPlaceCoordinator)
+    coordinator.stop_event = threading.Event()
+    coordinator.stabilization_timeout = 1.0
+    coordinator.clear_observation_history = lambda role: None
+    coordinator.publish_status = lambda text: None
+    targets = {'pick': object(), 'place': object()}
+    coordinator.calculate_role_targets = (
+        lambda role, validate_workspace: (targets[role], 'targets valid')
+    )
+
+    locked, reason = coordinator.wait_for_role_targets(('pick', 'place'))
+
+    assert reason == 'all requested markers locked'
+    assert locked == targets
+
+
+def test_direct_sequence_lifts_back_to_verified_approach_poses():
+    """Direct pick/place retraces each already-reached vertical approach."""
+    coordinator = object.__new__(ContainerPickPlaceCoordinator)
+    coordinator.motion_backend = 'direct'
+    coordinator.pregrasp_test_keep_orientation = False
+    coordinator.place_keep_current_orientation = False
+    coordinator.minimum_lift_after_pick = 0.05
+    coordinator.minimum_lift_after_place = 0.05
+    coordinator.publish_status = lambda text: None
+    pose_moves = []
+    vertical_moves = []
+    gripper_commands = []
+    coordinator.move_to_pose = lambda pose, **kwargs: pose_moves.append(
+        (pose, kwargs.get('minimum_safe_z'))
+    )
+    coordinator.move_cartesian_to_pose = vertical_moves.append
+    coordinator.command_gripper = (
+        lambda open_gripper: gripper_commands.append(open_gripper)
+    )
+
+    def pose(z):
+        return SimpleNamespace(pose=SimpleNamespace(
+            position=SimpleNamespace(z=z)
+        ))
+
+    grasp, pregrasp = pose(0.10), pose(0.20)
+    place, preplace = pose(0.11), pose(0.19)
+
+    coordinator._execute_pick_and_place_locked(
+        (grasp, pregrasp), (place, preplace)
+    )
+
+    assert [item[0] for item in pose_moves] == [
+        pregrasp, pregrasp, preplace, preplace
+    ]
+    assert pose_moves[0][1] is None
+    assert pose_moves[1][1] == pytest.approx(0.15)
+    assert pose_moves[2][1] is None
+    assert pose_moves[3][1] == pytest.approx(0.16)
+    assert vertical_moves == [grasp, place]
+    assert gripper_commands == [True, False, True]
 
 
 def test_motion_workspace_check_runs_after_observation_lock():

@@ -127,6 +127,7 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
             'second_observation_joint_angles_deg',
             [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         )
+        self.declare_parameter('first_observation_timeout_sec', 3.0)
         self.declare_parameter('observation_joint_tolerance_deg', 1.0)
         self.declare_parameter('startup_joint_state_timeout_sec', 20.0)
         self.declare_parameter('place_ik_branch_attempts', 24)
@@ -192,6 +193,13 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
                 ).value
             )
         )
+        self.first_observation_timeout = float(
+            self.get_parameter('first_observation_timeout_sec').value
+        )
+        if self.first_observation_timeout <= 0.0:
+            raise ValueError(
+                'first_observation_timeout_sec must be positive'
+            )
         self.observation_joint_tolerance = float(
             self.get_parameter('observation_joint_tolerance_deg').value
         )
@@ -264,8 +272,13 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
         self.joint_state_ready = threading.Event()
         self.latest_joint_positions = None
         self.latest_joint_lock = threading.Lock()
+        joint_state_topic = (
+            '/arm/joint_states'
+            if self.motion_backend == 'direct'
+            else '/joint_states'
+        )
         self.create_subscription(
-            JointState, '/joint_states', self.on_joint_state, 10
+            JointState, joint_state_topic, self.on_joint_state, 10
         )
         self.publish_status(
             'P&P ready: pick='
@@ -291,10 +304,7 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
         except TransformException as exc:
             error = str(exc)
             now = time.monotonic()
-            if (
-                error != self.last_place_tracking_error
-                or now - self.last_place_tracking_error_time >= 5.0
-            ):
+            if now - self.last_place_tracking_error_time >= 5.0:
                 self.get_logger().warning(
                     'Cannot collect place marker sample: '
                     f'{self.base_frame} -> {self.place_marker_frame}: {error}'
@@ -469,7 +479,7 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
             self.history.clear()
         with self.place_history_lock:
             self.place_history.clear()
-        deadline = time.monotonic() + self.stabilization_timeout
+        deadline = time.monotonic() + self.first_observation_timeout
         reasons = ('no pick samples', 'no place samples')
         last_report = ''
         last_report_time = 0.0
@@ -503,42 +513,115 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
             f'pick=({reasons[0]}), place=({reasons[1]})'
         )
 
-    def wait_for_role_target(self, role):
-        """Lock a fresh observation of the requested marker role."""
-        self.clear_observation_history(role)
+    def wait_for_role_targets(self, roles):
+        """Lock fresh observations for every requested marker role."""
+        requested_roles = tuple(roles)
+        if not requested_roles:
+            raise ValueError('at least one marker role is required')
+        for role in requested_roles:
+            self.clear_observation_history(role)
         deadline = time.monotonic() + self.stabilization_timeout
-        reason = 'no samples'
+        locked = {}
+        reasons = {role: 'no samples' for role in requested_roles}
         last_report = ''
         last_report_time = 0.0
         while time.monotonic() < deadline:
             if self.stop_event.wait(0.2):
                 return None, 'pick and place stopped'
-            targets, reason = self.calculate_role_targets(
-                role, validate_workspace=False
-            )
-            if targets is not None:
-                return targets, f'{role} marker locked'
-            now = time.monotonic()
-            if reason != last_report or now - last_report_time >= 1.0:
-                self.publish_status(
-                    f'P&P SECOND VIEW: waiting for {role}: {reason}'
+            for role in requested_roles:
+                if role in locked:
+                    continue
+                targets, reason = self.calculate_role_targets(
+                    role, validate_workspace=False
                 )
-                last_report = reason
+                reasons[role] = reason
+                if targets is not None:
+                    locked[role] = targets
+                    self.publish_status(
+                        f'P&P SECOND VIEW: {role} marker locked'
+                    )
+            if len(locked) == len(requested_roles):
+                return locked, 'all requested markers locked'
+            report = ', '.join(
+                f'{role}=({reasons[role]})'
+                for role in requested_roles
+                if role not in locked
+            )
+            now = time.monotonic()
+            if report != last_report or now - last_report_time >= 1.0:
+                self.publish_status(
+                    f'P&P SECOND VIEW: waiting: {report}'
+                )
+                last_report = report
                 last_report_time = now
-        return None, f'second {role} marker did not stabilize: {reason}'
+        detail = ', '.join(
+            f'{role}=({reasons[role]})'
+            for role in requested_roles
+            if role not in locked
+        )
+        return None, f'second-view markers did not stabilize: {detail}'
+
+    def wait_for_role_target(self, role):
+        """Lock one fresh marker role (compatibility wrapper)."""
+        targets, reason = self.wait_for_role_targets((role,))
+        if targets is None:
+            return None, reason
+        return targets[role], f'{role} marker locked'
 
     def move_to_observation_joint_pose(self, angles_degrees):
-        """Plan and execute a collision-checked MoveIt joint goal."""
-        if self.motion_backend != 'moveit':
+        """Move to an observation joint pose using the selected backend."""
+        angles = validated_joint_angles_degrees(angles_degrees)
+        if self.motion_backend == 'direct':
+            target = [float(value) for value in angles]
+            with self.serial_lock:
+                self.robot.send_angles(target, self.speed)
+            deadline = time.monotonic() + self.motion_timeout
+            last_report_time = 0.0
+            last_measured = None
+            last_error = None
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.2):
+                    raise RuntimeError('pick and place stopped')
+                with self.serial_lock:
+                    measured = self.robot.get_angles()
+                if not (
+                    isinstance(measured, (list, tuple))
+                    and len(measured) == 6
+                ):
+                    continue
+                last_measured = [float(value) for value in measured]
+                error = max(
+                    abs(float(actual) - expected)
+                    for actual, expected in zip(measured, target)
+                )
+                last_error = error
+                if error <= self.observation_joint_tolerance:
+                    self.publish_status(
+                        'P&P: direct observation pose reached '
+                        f'(max joint error={error:.2f}deg)'
+                    )
+                    if self.stop_event.wait(self.moveit_state_settle):
+                        raise RuntimeError('pick and place stopped')
+                    return
+                now = time.monotonic()
+                if now - last_report_time >= 1.0:
+                    self.publish_status(
+                        'P&P: waiting for direct observation pose: '
+                        f'max joint error={error:.2f}deg, '
+                        f'measured={np.round(last_measured, 2).tolist()}'
+                    )
+                    last_report_time = now
             raise RuntimeError(
-                'observation joint poses require motion_backend=moveit'
+                'direct observation joint motion timed out: '
+                f'limit={self.observation_joint_tolerance:.2f}deg, '
+                f'last_error={last_error}, measured={last_measured}'
             )
+
         if MoveGroup is None or JointConstraint is None:
             raise RuntimeError('moveit_msgs is unavailable')
         if not self.move_group_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError('MoveIt /move_action server is unavailable')
 
-        angles = validated_joint_angles_degrees(angles_degrees)
         constraints = Constraints()
         tolerance = math.radians(self.observation_joint_tolerance)
         for name, angle in zip(JOINT_NAMES, angles):
@@ -609,10 +692,6 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
         if not self.allow_full_pick or not self.offsets_configured:
             response.success = False
             response.message = 'Full motion or offsets are not enabled'
-            return response
-        if self.motion_backend != 'moveit':
-            response.success = False
-            response.message = 'Observation joint poses require MoveIt'
             return response
         if not self.first_observation_pose_configured:
             response.success = False
@@ -694,8 +773,8 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
                 raise RuntimeError(
                     'timed out waiting for complete /joint_states'
                 )
-            # Let MoveIt's current-state monitor consume the same hardware
-            # stream before sending the first planning/execution request.
+            # Let the TF/current-state consumers receive the same hardware
+            # stream before sending the first motion request.
             if self.stop_event.wait(0.5):
                 raise RuntimeError('pick and place stopped')
 
@@ -710,13 +789,23 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
             # coordinates remain valid after the eye-in-hand camera moves.
             self.publish_status('P&P FIRST VIEW: waiting for one marker')
             first, reason = self.wait_for_first_target()
+            targets_by_role = {}
             if first is None:
-                raise RuntimeError(reason)
-            first_role, first_targets = first
-            second_role = self.other_role(first_role)
-            self.publish_status(
-                f'P&P FIRST VIEW: {first_role} marker locked'
-            )
+                if self.stop_event.is_set():
+                    raise RuntimeError(reason)
+                required_second_roles = ('pick', 'place')
+                self.publish_status(
+                    'P&P FIRST VIEW: no marker found within '
+                    f'{self.first_observation_timeout:.1f}s; '
+                    'continuing to second observation pose'
+                )
+            else:
+                first_role, first_targets = first
+                targets_by_role[first_role] = first_targets
+                required_second_roles = (self.other_role(first_role),)
+                self.publish_status(
+                    f'P&P FIRST VIEW: {first_role} marker locked'
+                )
 
             self.publish_status(
                 'P&P: moving to second observation joint pose'
@@ -724,14 +813,12 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
             self.move_to_observation_joint_pose(
                 self.second_observation_joint_angles
             )
-            second_targets, reason = self.wait_for_role_target(second_role)
-            if second_targets is None:
+            second_targets_by_role, reason = self.wait_for_role_targets(
+                required_second_roles
+            )
+            if second_targets_by_role is None:
                 raise RuntimeError(reason)
-
-            targets_by_role = {
-                first_role: first_targets,
-                second_role: second_targets,
-            }
+            targets_by_role.update(second_targets_by_role)
             self.publish_status(
                 'P&P: sequential pick/place targets locked'
             )
@@ -807,12 +894,24 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
             )
         self.publish_status('P&P PICK: closing gripper')
         self.command_gripper(open_gripper=False)
-        self._move_adaptive_lift(
-            grasp,
-            self.lift_after_pick,
-            self.minimum_lift_after_pick,
-            'P&P PICK',
-        )
+        if self.motion_backend == 'direct':
+            self.publish_status(
+                'P&P PICK: lifting back to verified approach height'
+            )
+            self.move_to_pose(
+                pregrasp,
+                minimum_safe_z=(
+                    grasp.pose.position.z
+                    + self.minimum_lift_after_pick
+                ),
+            )
+        else:
+            self._move_adaptive_lift(
+                grasp,
+                self.lift_after_pick,
+                self.minimum_lift_after_pick,
+                'P&P PICK',
+            )
 
         self.publish_status('P&P PLACE: moving above target')
         self.move_to_pose(
@@ -831,12 +930,24 @@ class ContainerPickPlaceCoordinator(ContainerPickCoordinator):
             )
         self.publish_status('P&P PLACE: opening gripper')
         self.command_gripper(open_gripper=True)
-        self._move_adaptive_lift(
-            place,
-            self.lift_after_place,
-            self.minimum_lift_after_place,
-            'P&P PLACE',
-        )
+        if self.motion_backend == 'direct':
+            self.publish_status(
+                'P&P PLACE: lifting back to verified approach height'
+            )
+            self.move_to_pose(
+                preplace,
+                minimum_safe_z=(
+                    place.pose.position.z
+                    + self.minimum_lift_after_place
+                ),
+            )
+        else:
+            self._move_adaptive_lift(
+                place,
+                self.lift_after_place,
+                self.minimum_lift_after_place,
+                'P&P PLACE',
+            )
         self.publish_status('P&P: completed')
 
     def move_place_with_alternate_ik(

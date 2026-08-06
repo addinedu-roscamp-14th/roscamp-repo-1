@@ -1,0 +1,74 @@
+/arm/homography_pick_place:
+  ros__parameters:
+    base_frame: arm/base_link
+    command_frame: arm/controller_coords
+    pick_marker_frame: arm/pick_marker
+    place_marker_frame: arm/place_marker
+    pick_marker_id: 2
+    place_marker_id: 8
+
+    calibration_file: calibration_results/floor_calibration.yaml
+
+    # Every pose is visited once in this order. Detections are classified only
+    # against the surface assigned to that pose, never from measured joints.
+    stations_json: >-
+      [{"name":"station_agv",
+        "calibration_surface":"agv",
+        "joint_angles_deg":[15.38,35.59,-2.81,-90.96,4.13,-37.26],
+        "timeout_sec":3.0},
+       {"name":"station_a",
+        "calibration_surface":"station",
+        "joint_angles_deg":[-86.39,57.12,-15.46,-88.15,7.99,-36.82],
+        "timeout_sec":5.0}]
+
+    observation_settle_sec: 1.0
+    observation_speed: 10
+    observation_joint_tolerance_deg: 3.0
+    observation_correction_attempts: 2
+
+    minimum_stable_samples: 7
+    max_translation_std_m: 0.003
+    max_yaw_spread_deg: 5.0
+    max_marker_age_sec: 1.0
+
+    # Floor is selected by residual to z = ax + by + c learned from each
+    # floor's calibration XYZ samples.
+    maximum_floor_error_m: 0.010
+    minimum_floor_separation_m: 0.015
+
+    # Reject H extrapolation and corrected coordinates outside taught areas.
+    # Expanded by 10 mm for the current end-to-end workspace test.
+    maximum_h_extrapolation_m: 0.025
+    command_area_margin_m: 0.020
+
+    safe_z_m: 0.220
+    # Generate 220, 210, 200, then 190 mm independently for Pick and Place,
+    # and use the lowest candidate retaining 20 mm over its taught descend Z.
+    safe_z_lowering_step_m: 0.010
+    maximum_safe_z_lowering_steps: 3
+    minimum_safe_clearance_m: 0.020
+    # Pick retains the tested tool-frame correction. Place aligns the
+    # parallel gripper directly with the detected marker yaw.
+    marker_yaw_offset_deg: -45.0
+    place_marker_yaw_offset_deg: 0.0
+
+    serial_port: /dev/ttyUSB0
+    baud_rate: 1000000
+    observation_motion_timeout_sec: 20.0
+    motion_timeout_sec: 20.0
+    coordinate_poll_interval_sec: 0.1
+    coordinate_required_stable_samples: 3
+    # Place gripper opens only after is_moving()==0 is stable three times.
+    place_stop_poll_interval_sec: 0.1
+    place_stop_required_samples: 3
+    place_stop_timeout_sec: 10.0
+    speed: 20
+    gripper_open_value: 100
+    gripper_closed_value: 20
+    gripper_speed: 50
+    gripper_wait_sec: 1.0
+    joint_state_rate_hz: 10.0
+
+    # Temporary end-to-end test tolerance. Tighten after motion validation.
+    position_tolerance_m: 0.020
+    angle_tolerance_deg: 6.0

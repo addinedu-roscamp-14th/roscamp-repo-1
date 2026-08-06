@@ -1,15 +1,16 @@
 """Tests for container pick transform calculations."""
 
+import threading
 from types import SimpleNamespace
 
 from arm.container_pick_coordinator import (
-    ContainerPickCoordinator,
     apply_vertical_pick_offsets,
     cartesian_path_acceptable,
     compose_fixed_base_pose,
     compose_pose,
     compose_symmetric_yaw_follow_poses,
     compose_yaw_follow_pose,
+    ContainerPickCoordinator,
     inverted_l_workspace_contains,
     joint_trajectory_metrics,
     lift_distance_candidates,
@@ -20,6 +21,80 @@ from arm.container_pick_coordinator import (
 import numpy as np
 
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+
+def test_direct_pose_move_uses_send_coords_without_preflight_ik():
+    """Direct Cartesian motion is delegated to the JetCobot controller."""
+    coordinator = object.__new__(ContainerPickCoordinator)
+    coordinator.stop_event = threading.Event()
+    coordinator.motion_backend = 'direct'
+    coordinator.serial_lock = threading.Lock()
+    coordinator.speed = 5
+    coordinator.motion_timeout = 1.0
+    coordinator.direct_pose_verification = True
+    coordinator.direct_xy_tolerance = 0.005
+    coordinator.direct_position_tolerance = 0.015
+    coordinator.direct_angle_tolerance = 6.0
+    coordinator.in_workspace = lambda translation: True
+    coordinator.publish_status = lambda text: None
+
+    class Robot:
+        def __init__(self):
+            self.command = None
+
+        def send_coords(self, coords, speed, mode):
+            self.command = (coords, speed, mode)
+
+        def get_coords(self):
+            return [100.0, -150.0, 200.0, 0.0, 0.0, 0.0]
+
+    coordinator.robot = Robot()
+    pose = SimpleNamespace(pose=SimpleNamespace(
+        position=SimpleNamespace(x=0.1, y=-0.15, z=0.2),
+        orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+    ))
+
+    coordinator.move_to_pose(pose)
+
+    assert coordinator.robot.command == (
+        [100.0, -150.0, 200.0, 0.0, 0.0, 0.0],
+        5,
+        0,
+    )
+
+
+def test_direct_pose_can_ignore_error_after_motion_stops():
+    """End-to-end testing can log pose error without blocking the sequence."""
+    coordinator = object.__new__(ContainerPickCoordinator)
+    coordinator.stop_event = threading.Event()
+    coordinator.motion_backend = 'direct'
+    coordinator.serial_lock = threading.Lock()
+    coordinator.speed = 5
+    coordinator.motion_timeout = 1.0
+    coordinator.direct_pose_verification = False
+    coordinator.in_workspace = lambda translation: True
+    coordinator.publish_status = lambda text: None
+
+    class Robot:
+        def __init__(self):
+            self.moving = iter((1, 0, 0, 0))
+
+        def send_coords(self, coords, speed, mode):
+            pass
+
+        def is_moving(self):
+            return next(self.moving)
+
+        def get_coords(self):
+            return [80.0, -130.0, 170.0, 3.0, 2.0, 1.0]
+
+    coordinator.robot = Robot()
+    pose = SimpleNamespace(pose=SimpleNamespace(
+        position=SimpleNamespace(x=0.1, y=-0.15, z=0.2),
+        orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+    ))
+
+    coordinator.move_to_pose(pose)
 
 
 def test_compose_pose_rotates_marker_offset():

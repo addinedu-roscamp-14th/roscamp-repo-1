@@ -24,8 +24,6 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
-from ._joint_limits import JOINT_LIMITS_DEG
-
 try:
     from moveit_msgs.action import ExecuteTrajectory, MoveGroup
     from moveit_msgs.msg import (
@@ -394,6 +392,24 @@ class ContainerPickCoordinator(Node):
         self.motion_timeout = float(
             self.get_parameter('motion_timeout_sec').value
         )
+        self.direct_position_tolerance = float(
+            self.get_parameter('direct_position_tolerance_m').value
+        )
+        self.direct_pose_verification = bool(
+            self.get_parameter('direct_pose_verification').value
+        )
+        self.direct_xy_tolerance = float(
+            self.get_parameter('direct_xy_tolerance_m').value
+        )
+        self.direct_angle_tolerance = float(
+            self.get_parameter('direct_angle_tolerance_deg').value
+        )
+        if self.direct_position_tolerance <= 0.0:
+            raise ValueError('direct_position_tolerance_m must be positive')
+        if self.direct_xy_tolerance <= 0.0:
+            raise ValueError('direct_xy_tolerance_m must be positive')
+        if self.direct_angle_tolerance <= 0.0:
+            raise ValueError('direct_angle_tolerance_deg must be positive')
         self.stabilization_timeout = float(
             self.get_parameter('stabilization_timeout_sec').value
         )
@@ -610,6 +626,10 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('baud_rate', 1000000)
         self.declare_parameter('speed', 10)
         self.declare_parameter('motion_timeout_sec', 15.0)
+        self.declare_parameter('direct_pose_verification', True)
+        self.declare_parameter('direct_xy_tolerance_m', 0.005)
+        self.declare_parameter('direct_position_tolerance_m', 0.015)
+        self.declare_parameter('direct_angle_tolerance_deg', 6.0)
         self.declare_parameter('stabilization_timeout_sec', 12.0)
         self.declare_parameter('max_joint_delta_deg', 60.0)
         self.declare_parameter('gripper_open_value', 100)
@@ -702,10 +722,7 @@ class ContainerPickCoordinator(Node):
         except TransformException as exc:
             error = str(exc)
             now = time.monotonic()
-            if (
-                error != self.last_tracking_error
-                or now - self.last_tracking_error_time >= 5.0
-            ):
+            if now - self.last_tracking_error_time >= 5.0:
                 self.get_logger().warning(
                     'Cannot collect marker sample: '
                     f'{self.base_frame} -> {self.marker_frame}: {error}'
@@ -1346,7 +1363,12 @@ class ContainerPickCoordinator(Node):
         finally:
             self.motion_lock.release()
 
-    def move_to_pose(self, pose, keep_current_orientation=False):
+    def move_to_pose(
+        self,
+        pose,
+        keep_current_orientation=False,
+        minimum_safe_z=None,
+    ):
         if self.stop_event.is_set():
             raise RuntimeError('pick stopped')
         translation = np.array([
@@ -1366,56 +1388,125 @@ class ContainerPickCoordinator(Node):
             pose.pose.orientation.w,
         ])
         coords = [*(translation * 1000.0), *rpy]
-        with self.serial_lock:
-            current = self.robot.get_angles()
-            target_orientation = coords[3:].copy()
-            if keep_current_orientation:
+        if keep_current_orientation:
+            with self.serial_lock:
                 current_coords = self.robot.get_coords()
-                if not isinstance(current_coords, (list, tuple)) or len(
-                    current_coords
-                ) != 6:
-                    raise RuntimeError(
-                        f'Failed to read current TCP pose: {current_coords}'
-                    )
-                coords[3:] = [float(value) for value in current_coords[3:]]
-            solution = self.robot.solve_inv_kinematics(coords, current)
-            if keep_current_orientation and not (
-                isinstance(solution, (list, tuple)) and len(solution) == 6
+            if not (
+                isinstance(current_coords, (list, tuple))
+                and len(current_coords) == 6
             ):
-                coords[3:] = target_orientation
-                self.get_logger().warning(
-                    'IK failed with current TCP orientation; retrying the '
-                    'taught grasp orientation at pregrasp'
+                raise RuntimeError(
+                    f'Failed to read current controller pose: {current_coords}'
                 )
-                solution = self.robot.solve_inv_kinematics(coords, current)
-        if not isinstance(solution, (list, tuple)) or len(solution) != 6:
-            raise RuntimeError(f'IK failed for target {coords}')
-        if not isinstance(current, (list, tuple)) or len(current) != 6:
-            raise RuntimeError(f'Failed to read current joints: {current}')
-        deltas = [
-            abs(float(target) - float(start))
-            for target, start in zip(solution, current)
-        ]
-        if max(deltas) > self.max_joint_delta:
-            raise RuntimeError(
-                f'IK branch jump rejected: deltas={np.round(deltas, 1).tolist()}'
-            )
-        for index, (angle, limits) in enumerate(zip(solution, JOINT_LIMITS_DEG)):
-            if not limits[0] <= float(angle) <= limits[1]:
-                raise RuntimeError(f'IK J{index + 1} outside limits: {angle}')
+            coords[3:] = [float(value) for value in current_coords[3:]]
+
+        self.publish_status(
+            'DIRECT send_coords -> '
+            f'{np.round(coords, 3).tolist()}'
+        )
         with self.serial_lock:
-            self.robot.send_angles([float(value) for value in solution], self.speed)
+            self.robot.send_coords(
+                [float(value) for value in coords],
+                self.speed,
+                0,
+            )
         deadline = time.monotonic() + self.motion_timeout
+        if not self.direct_pose_verification:
+            stopped_samples = 0
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.1):
+                    raise RuntimeError('pick stopped')
+                with self.serial_lock:
+                    moving = self.robot.is_moving()
+                if moving == 1:
+                    stopped_samples = 0
+                    continue
+                if moving == 0:
+                    stopped_samples += 1
+                    if stopped_samples < 3:
+                        continue
+                    with self.serial_lock:
+                        measured = self.robot.get_coords()
+                    self.publish_status(
+                        'DIRECT motion stopped; pose error ignored: '
+                        f'target={np.round(coords, 2).tolist()}, '
+                        f'actual={measured}'
+                    )
+                    return
+                stopped_samples = 0
+            raise RuntimeError(
+                'direct send_coords motion did not stop before timeout'
+            )
+
+        last_report_time = 0.0
+        last_measured = None
+        last_xy_error = None
+        last_z_error = None
+        last_angle_error = None
         while time.monotonic() < deadline:
             if self.stop_event.wait(0.2):
                 raise RuntimeError('pick stopped')
             with self.serial_lock:
-                measured = self.robot.get_angles()
+                measured = self.robot.get_coords()
             if isinstance(measured, (list, tuple)) and len(measured) == 6:
-                error = max(abs(float(a) - float(b)) for a, b in zip(measured, solution))
-                if error <= 2.0:
+                last_measured = [float(value) for value in measured]
+                last_xy_error = max(
+                    abs(actual - target)
+                    for actual, target in zip(
+                        last_measured[:2], coords[:2]
+                    )
+                )
+                last_z_error = abs(last_measured[2] - coords[2])
+                last_angle_error = max(
+                    abs(wrap_degrees(actual - target))
+                    for actual, target in zip(
+                        last_measured[3:], coords[3:]
+                    )
+                )
+                xy_reached = (
+                    last_xy_error
+                    <= self.direct_xy_tolerance * 1000.0
+                )
+                if minimum_safe_z is None:
+                    z_reached = (
+                        last_z_error
+                        <= self.direct_position_tolerance * 1000.0
+                    )
+                else:
+                    z_reached = (
+                        last_measured[2] >= float(minimum_safe_z) * 1000.0
+                    )
+                if (
+                    xy_reached
+                    and z_reached
+                    and last_angle_error <= self.direct_angle_tolerance
+                ):
                     return
-        raise RuntimeError('robot motion timed out')
+                now = time.monotonic()
+                if now - last_report_time >= 1.0:
+                    z_detail = (
+                        f'z_error={last_z_error:.1f}mm'
+                        if minimum_safe_z is None
+                        else (
+                            f'z={last_measured[2]:.1f}mm/'
+                            f'safe_z>={float(minimum_safe_z) * 1000.0:.1f}mm'
+                        )
+                    )
+                    self.publish_status(
+                        'DIRECT waiting: '
+                        f'xy_error={last_xy_error:.1f}mm, '
+                        f'{z_detail}, '
+                        f'angle_error={last_angle_error:.1f}deg, '
+                        f'actual={np.round(last_measured, 2).tolist()}'
+                    )
+                    last_report_time = now
+        raise RuntimeError(
+            'direct send_coords motion timed out: '
+            f'target={np.round(coords, 3).tolist()}, '
+            f'xy_error={last_xy_error}, z_error={last_z_error}, '
+            f'minimum_safe_z={minimum_safe_z}, '
+            f'angle_error={last_angle_error}, actual={last_measured}'
+        )
 
     def _move_to_pose_moveit(self, pose, keep_current_orientation):
         target = copy.deepcopy(pose)
