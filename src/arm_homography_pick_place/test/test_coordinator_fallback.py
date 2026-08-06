@@ -42,6 +42,7 @@ def make_coordinator(floors):
     coordinator.safe_z = 0.220
     coordinator.yaw_offset = -45.0
     coordinator.place_yaw_offset = 0.0
+    coordinator.cross_station_place_yaw_offset = -45.0
     coordinator.serial_lock = threading.Lock()
     coordinator.stop_event = threading.Event()
     coordinator.statuses = []
@@ -97,8 +98,8 @@ def test_planning_skips_ik_and_starts_with_combined_approach(floors):
                for text in coordinator.statuses)
 
 
-def test_pick_and_place_use_minimum_rotation_symmetric_yaws(floors):
-    """Place yaw flips 180 degrees instead of rotating from the Pick yaw."""
+def test_same_station_place_uses_zero_yaw_offset(floors):
+    """A same-station Place aligns with marker yaw modulo 180 degrees."""
     coordinator = make_coordinator(floors)
     targets = make_targets(floors)
     targets['place'] = replace(targets['place'], yaw_deg=86.0)
@@ -110,7 +111,38 @@ def test_pick_and_place_use_minimum_rotation_symmetric_yaws(floors):
     assert steps[5].pose[5] == pytest.approx(-94.0)
     assert steps[6].pose[5] == pytest.approx(-94.0)
     assert steps[8].pose[5] == pytest.approx(-94.0)
+    assert any('cross_station=False' in text
+               for text in coordinator.statuses)
     assert any('place_offset=0.00' in text for text in coordinator.statuses)
+
+
+@pytest.mark.parametrize(
+    ('pick_station', 'place_station'),
+    (
+        ('station_agv', 'station_a'),
+        ('station_a', 'station_agv'),
+    ),
+)
+def test_cross_station_place_uses_minus_45_degree_offset(
+    floors, pick_station, place_station
+):
+    """Crossing AGV/station applies the dedicated Place correction."""
+    coordinator = make_coordinator(floors)
+    targets = make_targets(floors)
+    targets['pick'] = replace(targets['pick'], station=pick_station)
+    targets['place'] = replace(
+        targets['place'], station=place_station, yaw_deg=86.0
+    )
+
+    steps = coordinator.select_feasible_plan(targets)
+
+    assert steps[5].pose[5] == pytest.approx(-139.0)
+    assert steps[6].pose[5] == pytest.approx(-139.0)
+    assert steps[8].pose[5] == pytest.approx(-139.0)
+    assert any('cross_station=True' in text
+               for text in coordinator.statuses)
+    assert any('place_offset=-45.00' in text
+               for text in coordinator.statuses)
 
 
 def test_pick_is_split_only_after_combined_controller_move_fails(floors):

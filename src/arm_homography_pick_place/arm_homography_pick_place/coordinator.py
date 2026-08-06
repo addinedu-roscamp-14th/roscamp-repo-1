@@ -114,6 +114,9 @@ class HomographyPickPlace(Node):
         self.place_yaw_offset = float(
             self.parameter('place_marker_yaw_offset_deg')
         )
+        self.cross_station_place_yaw_offset = float(
+            self.parameter('cross_station_place_yaw_offset_deg')
+        )
         self.position_tolerance = float(
             self.parameter('position_tolerance_m')
         )
@@ -246,6 +249,9 @@ class HomographyPickPlace(Node):
         self.declare_parameter('minimum_safe_clearance_m', 0.020)
         self.declare_parameter('marker_yaw_offset_deg', -45.0)
         self.declare_parameter('place_marker_yaw_offset_deg', 0.0)
+        self.declare_parameter(
+            'cross_station_place_yaw_offset_deg', -45.0
+        )
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
         self.declare_parameter('baud_rate', 1000000)
         self.declare_parameter('observation_motion_timeout_sec', 20.0)
@@ -641,8 +647,13 @@ class HomographyPickPlace(Node):
         pick_yaw, pick_branch, pick_rotation = select_symmetric_yaw(
             pick_nominal_yaw, current_yaw
         )
+        cross_station = pick.station != place.station
+        applied_place_offset = (
+            self.cross_station_place_yaw_offset
+            if cross_station else self.place_yaw_offset
+        )
         place_nominal_yaw = wrap_degrees(
-            place.yaw_deg + self.place_yaw_offset
+            place.yaw_deg + applied_place_offset
         )
         place_yaw, place_branch, place_rotation = select_symmetric_yaw(
             place_nominal_yaw, pick_yaw
@@ -662,7 +673,8 @@ class HomographyPickPlace(Node):
             f'pick_branch={pick_branch:.0f}, '
             f'pick_rotation={pick_rotation:.2f}, '
             f'place_nominal={place_nominal_yaw:.2f}, '
-            f'place_offset={self.place_yaw_offset:.2f}, '
+            f'cross_station={cross_station}, '
+            f'place_offset={applied_place_offset:.2f}, '
             f'place_selected={place_yaw:.2f}, '
             f'place_branch={place_branch:.0f}, '
             f'place_rotation_from_pick={place_rotation:.2f}; '

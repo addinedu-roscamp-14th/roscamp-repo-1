@@ -17,7 +17,8 @@ Cartesian 동작은 `send_coords`를 한 번 전송한 뒤 `get_coords`로 직�
   `[15.38, 35.59, -2.81, -90.96, 4.13, -37.26]`
 - 관찰 순서: `station_agv(3초) -> station_a(5초)`
 - Pick nominal tool yaw: `wrap(aruco_yaw - 45도)`
-- Place nominal tool yaw: `wrap(aruco_yaw)`
+- 같은 station Place yaw: `wrap(aruco_yaw)`
+- AGV↔station 교차 Place yaw: `wrap(aruco_yaw - 45도)`
 - Safe Z: `0.220 m`
 - Pick/Place XY offset: 없음
 - Parallel-gripper symmetric yaw selection: 활성화
@@ -67,8 +68,9 @@ Pick과 Place에는 XY 오프셋을 적용하지 않습니다. 평행 그리퍼�
 각 nominal yaw에 대해 다음 두 후보를 비교합니다.
 
 ```text
-Pick candidate 1  = wrap(marker_yaw - 45도)
-Place candidate 1 = wrap(marker_yaw)
+Pick candidate 1               = wrap(marker_yaw - 45도)
+Same-station Place candidate 1 = wrap(marker_yaw)
+Cross-station Place candidate 1 = wrap(marker_yaw - 45도)
 candidate 2 = wrap(candidate 1 + 180도)
 ```
 
