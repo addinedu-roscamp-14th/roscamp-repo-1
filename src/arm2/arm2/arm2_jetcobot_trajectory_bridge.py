@@ -129,7 +129,8 @@ class JetCobotTrajectoryBridge(Node):
         self.declare_parameter('goal_correction_period_sec', 1.0)
         self.declare_parameter('adaptive_goal_correction_enabled', True)
         self.declare_parameter(
-            'adaptive_goal_correction_joints', ['2_Joint', '3_Joint']
+            'adaptive_goal_correction_joints',
+            ['1_Joint', '2_Joint', '3_Joint'],
         )
         self.declare_parameter(
             'adaptive_goal_correction_tolerance_deg', 0.9
@@ -587,6 +588,7 @@ class JetCobotTrajectoryBridge(Node):
             last_correction = 0.0
             correction_attempts = 0
             correction_command = list(final_degrees)
+            nonadaptive_error_since = None
             last_actual = None
             last_errors = None
             while time.monotonic() < deadline:
@@ -622,6 +624,35 @@ class JetCobotTrajectoryBridge(Node):
                         )
                         result.error_string = 'trajectory completed'
                         return result
+                    if (
+                        self.adaptive_goal_correction_enabled
+                        and adaptive_reached
+                        and error > self.goal_tolerance
+                    ):
+                        # Sending correction_command again cannot reduce an
+                        # error that belongs only to non-adaptive joints.
+                        # Allow one second for mechanical settling, then exit
+                        # instead of repeating an unchanged command until the
+                        # goal timeout expires.
+                        now = time.monotonic()
+                        if nonadaptive_error_since is None:
+                            nonadaptive_error_since = now
+                        elif (
+                            now - nonadaptive_error_since
+                            >= max(1.0, self.goal_correction_period)
+                        ):
+                            self.get_logger().warning(
+                                'Final goal remains outside tolerance only '
+                                'on non-adaptive joints; stopping unchanged '
+                                'correction retries: '
+                                f'max_error={error:.2f}deg, '
+                                'errors='
+                                f'{[round(value, 2) for value in errors]}'
+                            )
+                            break
+                        time.sleep(0.2)
+                        continue
+                    nonadaptive_error_since = None
                     now = time.monotonic()
                     if now - last_correction >= self.goal_correction_period:
                         if (

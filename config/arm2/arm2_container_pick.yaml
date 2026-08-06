@@ -46,6 +46,7 @@
     joint_state_limit_clamp_tolerance_deg: 0.5
     adaptive_goal_correction_enabled: true
     adaptive_goal_correction_joints:
+    - 1_Joint
     - 2_Joint
     - 3_Joint
     adaptive_goal_correction_tolerance_deg: 0.9

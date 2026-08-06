@@ -525,23 +525,26 @@ home_joint_angles_deg: [93.86, 13.27, -25.91, -59.85, 3.15, -43.33]
 이 값은 startup/shutdown home에만 적용합니다. 작업공간 전체에서 일정한 관절
 오프셋이라고 검증되지 않았으므로 MoveIt 궤적 목표에는 전역으로 더하지 않습니다.
 
-### MoveIt 최종 J4 제한 폐루프 보정
+### MoveIt 최종 관절 제한 폐루프 보정
 
 A-1/A-2/A-3에서 각 3회 측정한 J4의 `목표-실제` 평균 오차는 각각
 `1.11°`, `1.23°`, `1.06°`였고 반복 범위는 최대 `0.08°`였습니다. 이 결과에
-따라 계획 경로는 변경하지 않고 MoveIt 궤적의 마지막 목표점에서만 J4를
-폐루프 보정합니다.
+따라 계획 경로는 변경하지 않고 MoveIt 궤적의 마지막 목표점에서 선택한 관절을
+폐루프 보정합니다. 현재 운용 설정은 구역을 바라보는 J1 회전의 부하 오차와
+픽/플레이스 자세의 J2/J3 오차를 함께 보정합니다.
 
 ```yaml
 adaptive_goal_correction_enabled: true
-adaptive_goal_correction_joints: [4_Joint]
-adaptive_goal_correction_tolerance_deg: 0.5
+adaptive_goal_correction_joints: [1_Joint, 2_Joint, 3_Joint]
+adaptive_goal_correction_tolerance_deg: 0.9
 adaptive_goal_correction_gain: 1.0
-adaptive_goal_correction_max_total_deg: 3.0
+adaptive_goal_correction_max_total_deg: 7.0
 adaptive_goal_correction_max_attempts: 5
 ```
 
 매 보정 시 실제 `목표-실제` 잔차를 직전 명령에 더하되 원래 MoveIt 목표에서
-최대 ±3°까지만 허용합니다. 네 번 안에 J4 잔차가 0.5° 이하로 수렴하지 않거나
-보정 명령이 관절 한계를 벗어나면 trajectory를 성공 처리하지 않습니다. 다른
-관절은 측정 위치에 따라 오차 방향과 크기가 달라 J4 보정 대상에 포함하지 않습니다.
+최대 ±7°까지만 허용합니다. 다섯 번 안에 대상 관절 잔차가 0.9° 이하로
+수렴하지 않거나 보정 명령이 관절 한계를 벗어나면 trajectory를 성공 처리하지
+않습니다. 대상 관절은 모두 허용 범위에 들어왔는데 비대상 관절 오차만 남은
+경우에는 1초간 기계적 안정화를 확인한 뒤, 효과 없는 동일 명령을 timeout까지
+반복하지 않고 실패 처리합니다.
