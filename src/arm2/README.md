@@ -253,6 +253,7 @@ id_transfer_pick_correction_xyz_m: [-0.02, -0.01, -0.02]
 place_correction_xyz_m: [0.0, 0.0, 0.0]
 saved_destination_correction_xyz_m: [-0.02, -0.01, -0.005]
 id_transfer_correction_xyz_m: [0.02, 0.0, 0.0]
+id_transfer_a2_place_correction_xyz_m: [-0.015, 0.0, 0.0]
 trailer_correction_xyz_m: [-0.05, 0.0, 0.0]
 trailer_a3_pick_correction_xyz_m: [0.02, -0.03, 0.0]
 ```
@@ -275,6 +276,9 @@ trailer_a3_pick_correction_xyz_m: [0.02, -0.03, 0.0]
 - `id_transfer_correction_xyz_m`: `/arm2/transfer_by_id`로 컨테이너 사이를
   옮길 때만 적용됩니다. `[-0.03, 0.0, 0.0]`은 목적지 마커의 빨간 축
   반대 방향으로 30 mm 이동합니다.
+- `id_transfer_a2_place_correction_xyz_m`: 같은 서비스의 목적지 컨테이너가
+  A-2에서 검출된 경우 놓기점에만 추가됩니다. 현재 값은 목적지 마커의 빨간 축
+  반대(`-X`) 방향 15 mm입니다. 집기와 A-1/A-3 놓기는 바뀌지 않습니다.
 - `trailer_correction_xyz_m`: `/arm2/load_id0_to_trailer`부터
   `/arm2/load_id8_to_trailer`까지의 트레일러 놓기에만 적용됩니다. 따라서
   `[-0.05, 0.0, 0.0]`은 ID 9/10 마커가 회전해도 항상 빨간 축 반대 방향으로

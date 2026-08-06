@@ -93,6 +93,13 @@
     - -0.011
     - 0.006
     - -0.005
+    # /arm2/transfer_by_id destination detected in A-2 only: move the place
+    # target 15 mm opposite the marker red axis (-X). Pick and other zones
+    # keep their existing corrections.
+    id_transfer_a2_place_correction_xyz_m:
+    - -0.015
+    - 0.0
+    - 0.0
     trailer_correction_xyz_m:
     # Trailer marker red axis (+X): previous -50mm + requested 20mm.
     - -0.03

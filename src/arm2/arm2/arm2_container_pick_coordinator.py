@@ -523,6 +523,9 @@ class ContainerPickCoordinator(Node):
         self.id_transfer_correction = self._vector_parameter(
             'id_transfer_correction_xyz_m', 3
         )
+        self.id_transfer_a2_place_correction = self._vector_parameter(
+            'id_transfer_a2_place_correction_xyz_m', 3
+        )
         self.trailer_correction = self._vector_parameter(
             'trailer_correction_xyz_m', 3
         )
@@ -1422,6 +1425,9 @@ class ContainerPickCoordinator(Node):
         )
         self.declare_parameter(
             'id_transfer_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter(
+            'id_transfer_a2_place_correction_xyz_m', [0.0, 0.0, 0.0]
         )
         self.declare_parameter('trailer_correction_xyz_m', [0.0, 0.0, 0.0])
         self.declare_parameter(
@@ -2825,13 +2831,22 @@ class ContainerPickCoordinator(Node):
                 f'ID {source_id} -> ID {destination_id} FAILED: {reason}'
             )
             return
-        locked, scan_zone = scan_result
+        locked, source_scan_zone, destination_scan_zone = scan_result
         self.tracking_suspended.set()
         source_pose = copy.deepcopy(locked[0])
         destination_pose = copy.deepcopy(locked[1])
         if destination_zone is None:
             stack_name = f'ID-{destination_id}'
             destination_correction = self.id_transfer_correction
+            if destination_scan_zone == 'A-2':
+                destination_correction = (
+                    destination_correction
+                    + self.id_transfer_a2_place_correction
+                )
+                self.publish_status(
+                    'ID TRANSFER: applying A-2-only place correction '
+                    f'{self.id_transfer_a2_place_correction.tolist()}'
+                )
         else:
             self.saved_destination_poses[destination_zone] = copy.deepcopy(
                 destination_pose
@@ -2840,7 +2855,7 @@ class ContainerPickCoordinator(Node):
             destination_correction = self.saved_destination_correction
         try:
             self.active_id_transfer_pair = (source_id, destination_id)
-            self.active_source_scan_zone = scan_zone
+            self.active_source_scan_zone = source_scan_zone
             source_targets, reason = self.calculate_targets_from_marker_pose(
                 source_pose,
                 orientation_mode=self.stack_source_orientation_mode,
@@ -2877,7 +2892,7 @@ class ContainerPickCoordinator(Node):
                 saved_stack_name=stack_name,
                 source_marker_id=source_id,
                 align_source_before_pick=True,
-                source_scan_zone=scan_zone,
+                source_scan_zone=source_scan_zone,
                 source_bearing_xy=source_pose[0][:2],
             )
         except Exception as exc:
@@ -2910,6 +2925,7 @@ class ContainerPickCoordinator(Node):
 
         locked = [None] * len(specs)
         source_scan_zone = None
+        destination_scan_zone = None
         with self.history_lock:
             for _label, frame, history in specs:
                 history.clear()
@@ -2977,6 +2993,8 @@ class ContainerPickCoordinator(Node):
                     )
                     if index == 0:
                         source_scan_zone = pose_name
+                    elif index == 1:
+                        destination_scan_zone = pose_name
                     with self.history_lock:
                         self.scan_locked_frames.add(frame)
                     self.publish_status(
@@ -2988,7 +3006,11 @@ class ContainerPickCoordinator(Node):
                         'remaining route skipped'
                     )
                     return (
-                        (tuple(locked), source_scan_zone),
+                        (
+                            tuple(locked),
+                            source_scan_zone,
+                            destination_scan_zone,
+                        ),
                         'ID transfer markers locked',
                     )
 
