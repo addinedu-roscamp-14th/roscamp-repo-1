@@ -106,7 +106,7 @@ ros2 launch arm_homography_pick_place homography_pick_place.launch.py \
   serial_port:=/dev/ttyUSB0 \
   video_device:=/dev/video2 \
   pick_id:=2 \
-  place_id:=8 \
+  place_id:=9 \
   marker_size_m:=0.020
 ```
 
@@ -140,7 +140,7 @@ ros2 service call /arm/homography_pick_place/stop \
 ros2 topic echo /arm/homography_pick_place/status
 ```
 
-중앙제어용 작업 상태:
+작업 상태 호출 (topic):
 
 ```bash
 ros2 topic echo /arm/homography_pick_place/work_state \
