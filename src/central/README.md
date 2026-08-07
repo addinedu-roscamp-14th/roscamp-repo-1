@@ -45,16 +45,55 @@ AUTO 요청에서는 현재 점유 차량을 후보에서 제외합니다. 중�
 점유 차량의 통신이 끊기면 안전을 위해 `UNKNOWN`으로 잠긴 상태를 유지합니다.
 B-1 점유 차량이 B-1 이외의 목적지 명령을 받으면 최종 이동이나 구역 대기점 이동
 전에 Nav2 `Spin`으로 왼쪽 `90°` 제자리 회전합니다. 회전 액션이 성공해야 다음
-단계로 넘어가며, 회전이 끝나면 `DriveOnHeading`으로 차량 전방 `0.10m`를 직진한
+단계로 넘어가며, 회전이 끝나면 `DriveOnHeading`으로 차량 전방 `0.30m`를 직진한
 뒤 최종 목적지 경로를 시작합니다. 기본 각도는 `b1_exit_left_turn_deg`, 직진
 거리는 `b1_exit_forward_distance_m`, 직진 속도는
 `b1_exit_forward_speed_mps`(기본 `0.05m/s`)로 관리합니다. 각 동작 제한 시간은
-`b1_exit_behavior_timeout_sec`(기본 `10초`)입니다. 회전 또는 직진이 실패하면 최종
+`b1_exit_behavior_timeout_sec`(기본 `20초`)입니다. 회전 또는 직진이 실패하면 최종
 목적지 경로를 시작하지 않습니다. `Spin` 성공 후에도 AMCL map 헤딩을 검사하며,
 `b1_exit_turn_tolerance_deg`(기본 `5도`)를 벗어나면 잔여 각도를 최대 두 번
 추가 보정합니다. B-1 잠금이 위치 오차로 먼저 해제되는 경우를 위해 B-1 목표
 `b1_exit_detection_radius_m`(기본 `0.35m`) 안의 차량에도 같은 이탈 시퀀스를
 적용합니다.
+중앙 노드를 재시작한 경우에도 `b1_zone_map_x`, `b1_zone_map_y`로 등록된 B-1
+기준점과 각 차량의 최신 AMCL 위치를 비교해 B-1 점유 차량을 복원합니다. 따라서
+메모리 잠금이 없어도 B-1 반경 안에 있는 명령 대상 차량에는 같은 이탈 시퀀스가
+적용됩니다. 현재 지도 기본값은 `(1.294, -0.087)`입니다.
+실시간 LLM이 같은 목적지를 새 command ID로 반복 보내더라도, 동일 차량의 진행 중
+목표와 최종 위치 `0.12m` 및 헤딩 `20도` 이내이면 기존 작업에 병합합니다. 따라서
+B-1 이탈 회전과 전진이 중간에 재시작되지 않으며, 실제로 다른 목적지만 현재 작업을
+선점합니다. 허용치는 `duplicate_goal_distance_m`와
+`duplicate_goal_yaw_tolerance_deg`로 조정합니다.
+
+## 자동 후진 주차
+
+각 차량은 공유 없이 자기 전용 주차 스팟만 사용합니다: `agv1`은
+`park_red`(구역 `PARK1`), `agv2`는 `parking_yellow`(구역 `PARK2`)입니다
+(`drive/params/parking_spots.yaml`). 서로 다른 자리라서 B-1/A처럼 FIFO 대기가
+필요 없고, 항상 자기 자리로만 갑니다. `parking_yellow`의 approach 좌표와 두
+yaw 값은 AGV2에서 측정한 전용 캘리브레이션 값입니다.
+
+`fleet_dispatcher`는 두 가지 경로로 주차를 트리거합니다.
+
+- **유휴 자동 주차**: 차량이 `auto_park_idle_sec`(기본 `20초`) 이상 READY 상태로
+  가만히 있으면(바쁘지도, 이미 자기 자리에 주차돼 있지도 않으면) 자동으로
+  자기 전용 스팟으로 후진 주차를 시작합니다. `auto_park_check_interval_sec`
+  (기본 `3초`)마다 재확인합니다. `auto_park_idle_sec:=0`으로 끌 수 있습니다.
+- **명시적 명령**: `/central/fleet/park_request`(`std_msgs/String`, `data`에
+  `agv1`/`agv2`/빈 문자열)를 publish하면 즉시 해당(또는 유휴 중 아무) 차량을
+  주차시킵니다. `control_gateway`의 `POST /api/v1/navigation/park`가 이 토픽으로
+  중계합니다.
+
+실제 후진 동작은 `drive` 패키지의 `parking_new` 노드(`/{vehicle_id}/park_in_spot`
+액션)가 수행하며, `multi_vehicle_nav.launch.py`에서 각 차량 네임스페이스로 자동
+실행됩니다(`start_parking_supervisor:=false`로 끌 수 있음).
+
+주차가 완료된 차량에 다른 목적지 명령이 들어오면 일반 Nav2 경로를 보내기 전에
+`DriveOnHeading`으로 현재 차량 전방을 따라 반드시 `0.20m` 직진합니다. 이 출차가
+성공한 뒤에만 주차 구역 잠금을 해제하고 목적지 경로를 시작합니다. 거리와 속도는
+각각 `park_exit_forward_distance_m`(기본 `0.20`)와
+`park_exit_forward_speed_mps`(기본 `0.05`)로 조정합니다. 중앙 노드를 재시작해도
+차량이 자기 주차 기준점 근처에 있으면 같은 출차 절차를 적용합니다.
 
 ## YOLO 차량 충돌 감독
 

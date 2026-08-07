@@ -6,14 +6,23 @@ from pathlib import Path
 import time
 
 from drive.action import ParkInSpot
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import Pose, PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
 import rclpy
 from rclpy.action import ActionClient, ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
+from tf2_ros import Buffer, TransformException, TransformListener
 import yaml
 
 
@@ -74,6 +83,8 @@ class ParkingActionServer(Node):
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
         self.declare_parameter('amcl_pose_topic', 'amcl_pose')
         self.declare_parameter('frame_id', 'map')
+        self.declare_parameter('base_frame_id', 'base_footprint')
+        self.declare_parameter('tf_lookup_timeout_sec', 0.2)
         self.declare_parameter('wait_for_nav_timeout_sec', 10.0)
         self.declare_parameter('approach_result_timeout_sec', 120.0)
         self.declare_parameter('reverse_speed', 0.095344)
@@ -92,6 +103,12 @@ class ParkingActionServer(Node):
         self.declare_parameter('goal_checker_id', 'general_goal_checker')
         self.declare_parameter('strict_yaw_goal_tolerance', 0.05)
         self.declare_parameter('intermediate_yaw_goal_tolerance', 6.283185307)
+        self.declare_parameter('final_alignment_tolerance', 0.06)
+        self.declare_parameter('final_alignment_max_speed', 0.30)
+        self.declare_parameter('final_alignment_min_speed', 0.08)
+        self.declare_parameter('final_alignment_kp', 1.5)
+        self.declare_parameter('final_alignment_rate_hz', 20.0)
+        self.declare_parameter('final_alignment_timeout_sec', 8.0)
 
         self.parking_spots_yaml = self.resolve_path(
             str(self.get_parameter('parking_spots_yaml').value)
@@ -100,6 +117,13 @@ class ParkingActionServer(Node):
         self.cmd_vel_topic = str(self.get_parameter('cmd_vel_topic').value)
         self.amcl_pose_topic = str(self.get_parameter('amcl_pose_topic').value)
         self.frame_id = str(self.get_parameter('frame_id').value)
+        self.base_frame_id = self.resolve_vehicle_frame(
+            str(self.get_parameter('base_frame_id').value)
+        )
+        self.tf_lookup_timeout = max(
+            0.0,
+            float(self.get_parameter('tf_lookup_timeout_sec').value),
+        )
         self.wait_for_nav_timeout = float(
             self.get_parameter('wait_for_nav_timeout_sec').value
         )
@@ -151,38 +175,105 @@ class ParkingActionServer(Node):
         self.intermediate_yaw_goal_tolerance = float(
             self.get_parameter('intermediate_yaw_goal_tolerance').value
         )
+        self.final_alignment_tolerance = max(
+            0.01,
+            float(self.get_parameter('final_alignment_tolerance').value),
+        )
+        self.final_alignment_max_speed = max(
+            0.01,
+            float(self.get_parameter('final_alignment_max_speed').value),
+        )
+        self.final_alignment_min_speed = min(
+            self.final_alignment_max_speed,
+            max(
+                0.01,
+                float(self.get_parameter('final_alignment_min_speed').value),
+            ),
+        )
+        self.final_alignment_kp = max(
+            0.01,
+            float(self.get_parameter('final_alignment_kp').value),
+        )
+        self.final_alignment_rate = max(
+            1.0,
+            float(self.get_parameter('final_alignment_rate_hz').value),
+        )
+        self.final_alignment_timeout = max(
+            1.0,
+            float(self.get_parameter('final_alignment_timeout_sec').value),
+        )
         self.goal_checker_yaw_param = (
             f'{self.goal_checker_id}.yaw_goal_tolerance'
         )
 
         self.spots = self.load_parking_spots(self.parking_spots_yaml)
         self.latest_pose = None
+        self.latest_pose_received_at = None
         self.last_error_message = ''
+        self.callback_group = ReentrantCallbackGroup()
 
-        self.nav_client = ActionClient(self, NavigateToPose, self.nav_action_name)
+        self.nav_client = ActionClient(
+            self,
+            NavigateToPose,
+            self.nav_action_name,
+            callback_group=self.callback_group,
+        )
+        controller_service_name = self.resolve_node_service(
+            self.controller_server_name,
+            'set_parameters',
+        )
         self.controller_params_client = self.create_client(
             SetParameters,
-            f'/{self.controller_server_name}/set_parameters',
+            controller_service_name,
+            callback_group=self.callback_group,
         )
+        self.controller_params_service_name = controller_service_name
         self.cmd_vel_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        telemetry_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.create_subscription(
             PoseWithCovarianceStamped,
             self.amcl_pose_topic,
             self.on_amcl_pose,
-            10,
+            telemetry_qos,
+            callback_group=self.callback_group,
         )
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.action_server = ActionServer(
             self,
             ParkInSpot,
             'park_in_spot',
             self.execute_callback,
+            callback_group=self.callback_group,
         )
 
         self.get_logger().info(
             f'Parking new action server ready: /park_in_spot; '
             f'spots={sorted(self.spots.keys())}; '
-            f'parking_spots_yaml={self.parking_spots_yaml}'
+            f'parking_spots_yaml={self.parking_spots_yaml}; '
+            f'pose={self.amcl_pose_topic} or TF '
+            f'{self.frame_id}->{self.base_frame_id}'
         )
+
+    def resolve_vehicle_frame(self, frame_id):
+        frame_id = frame_id.strip('/')
+        if '/' in frame_id:
+            return frame_id
+        namespace = self.get_namespace().strip('/')
+        if namespace:
+            return f'{namespace}/{frame_id}'
+        return frame_id
+
+    def resolve_node_service(self, node_name, service_name):
+        node_name = node_name.rstrip('/')
+        if node_name.startswith('/'):
+            return f'{node_name}/{service_name}'
+        return f'{node_name}/{service_name}'
 
     def resolve_path(self, configured_path):
         path = Path(configured_path)
@@ -220,6 +311,27 @@ class ParkingActionServer(Node):
 
     def on_amcl_pose(self, msg):
         self.latest_pose = msg.pose.pose
+        self.latest_pose_received_at = time.monotonic()
+
+    def refresh_pose_from_tf(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.frame_id,
+                self.base_frame_id,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=self.tf_lookup_timeout),
+            )
+        except TransformException:
+            return False
+
+        pose = Pose()
+        pose.position.x = transform.transform.translation.x
+        pose.position.y = transform.transform.translation.y
+        pose.position.z = transform.transform.translation.z
+        pose.orientation = transform.transform.rotation
+        self.latest_pose = pose
+        self.latest_pose_received_at = time.monotonic()
+        return True
 
     def execute_callback(self, goal_handle):
         self.last_error_message = ''
@@ -233,6 +345,11 @@ class ParkingActionServer(Node):
         try:
             approach = self.read_pose_config(spot, 'approach')
             parked = self.read_pose_config(spot, 'parked')
+            reverse_distance = self.read_nonnegative_spot_value(
+                spot,
+                'reverse_distance_m',
+                self.reverse_distance,
+            )
         except (KeyError, TypeError, ValueError) as exc:
             return self.abort(goal_handle, f'Invalid parking spot config: {exc}')
 
@@ -245,9 +362,14 @@ class ParkingActionServer(Node):
         if not self.wait_for_pose(goal_handle, timeout_sec=5.0):
             return self.abort(goal_handle, f'No pose received from {self.amcl_pose_topic}')
 
+        approach_path = self.build_full_approach_path(approach, spot)
+        self.get_logger().info(
+            f'Parking sequence parameters: approach_waypoints={len(approach_path)}, '
+            f'reverse_distance={reverse_distance:.3f} m'
+        )
         reached_approach = self.navigate_approach_path(
             goal_handle,
-            self.build_full_approach_path(approach),
+            approach_path,
         )
 
         if not reached_approach:
@@ -255,6 +377,13 @@ class ParkingActionServer(Node):
             return self.abort(goal_handle, message)
 
         if not self.wait_for_pose(goal_handle, timeout_sec=5.0):
+            return self.abort(goal_handle, f'No pose received from {self.amcl_pose_topic}')
+
+        if not self.align_to_parking_yaw(goal_handle, parked['yaw']):
+            message = self.last_error_message or 'Failed to align parking yaw'
+            return self.abort(goal_handle, message)
+
+        if not self.wait_for_pose(goal_handle, timeout_sec=2.0):
             return self.abort(goal_handle, f'No pose received from {self.amcl_pose_topic}')
 
         approach_error = self.distance_to_pose(approach)
@@ -273,7 +402,7 @@ class ParkingActionServer(Node):
                 f'Approach yaw error is too large: {yaw_error:.3f} rad',
             )
 
-        if not self.reverse_to_parked(goal_handle, parked):
+        if not self.reverse_to_parked(goal_handle, parked, reverse_distance):
             return self.abort(goal_handle, 'Failed while reversing into parking spot')
 
         final_yaw = quaternion_to_yaw(self.latest_pose.orientation)
@@ -299,25 +428,53 @@ class ParkingActionServer(Node):
             'yaw': float(pose['yaw']),
         }
 
-    def build_full_approach_path(self, approach):
+    def read_nonnegative_spot_value(self, spot, key, default):
+        value = float(spot.get(key, default))
+        if value < 0.0:
+            raise ValueError(f'{key} must be non-negative')
+        return value
+
+    def build_full_approach_path(self, approach, spot=None):
         full_path = []
-        pre_approach = self.build_auto_pre_approach(approach)
+        spot = spot or {}
+        pre_approach_distance = self.read_nonnegative_spot_value(
+            spot,
+            'auto_pre_approach_distance_m',
+            self.auto_pre_approach_distance,
+        )
+        pre_approach_angle = math.radians(
+            float(
+                spot.get(
+                    'auto_pre_approach_angle_offset_deg',
+                    math.degrees(self.auto_pre_approach_angle_offset),
+                )
+            )
+        )
+        pre_approach = self.build_auto_pre_approach(
+            approach,
+            distance=pre_approach_distance,
+            angle_offset=pre_approach_angle,
+        )
         if pre_approach is not None:
             full_path.append(pre_approach)
 
         full_path.append(approach)
         return full_path
 
-    def build_auto_pre_approach(self, approach):
-        if self.auto_pre_approach_distance <= 0.0:
+    def build_auto_pre_approach(self, approach, distance=None, angle_offset=None):
+        if distance is None:
+            distance = self.auto_pre_approach_distance
+        if angle_offset is None:
+            angle_offset = self.auto_pre_approach_angle_offset
+        if distance <= 0.0:
             return None
 
         distance = max(
-            self.auto_pre_approach_distance,
+            distance,
             self.auto_pre_approach_min_gap,
         )
         pre_approach_yaw = (
-            approach['yaw'] + math.pi + self.auto_pre_approach_angle_offset
+            approach['yaw'] + math.pi + angle_offset
         )
         return {
             'x': approach['x'] + math.cos(pre_approach_yaw) * distance,
@@ -386,6 +543,28 @@ class ParkingActionServer(Node):
         total = len(approach_path)
         for index, pose in enumerate(approach_path, start=1):
             is_final_approach = index == total
+            tolerance = (
+                self.approach_xy_tolerance
+                if is_final_approach
+                else self.waypoint_xy_tolerance
+            )
+
+            self.refresh_pose_from_tf()
+            if self.latest_pose is not None:
+                distance = self.distance_to_pose(pose)
+                if distance <= tolerance:
+                    self.get_logger().info(
+                        f'Skipping waypoint {index}/{total}: already within '
+                        f'tolerance ({distance:.3f} m <= {tolerance:.3f} m)'
+                    )
+                    self.publish_feedback(
+                        goal_handle,
+                        f'waypoint_{index}_of_{total}_already_reached',
+                        0.10 + 0.45 * (index / max(total, 1)),
+                        target_pose=pose,
+                    )
+                    continue
+
             if is_final_approach:
                 yaw_tolerance = self.strict_yaw_goal_tolerance
             else:
@@ -427,11 +606,6 @@ class ParkingActionServer(Node):
                 self.set_yaw_goal_tolerance(self.strict_yaw_goal_tolerance)
                 return False
 
-            tolerance = (
-                self.approach_xy_tolerance
-                if is_final_approach
-                else self.waypoint_xy_tolerance
-            )
             distance = self.distance_to_pose(pose)
             if distance > tolerance:
                 message = (
@@ -458,7 +632,7 @@ class ParkingActionServer(Node):
         if not self.controller_params_client.wait_for_service(timeout_sec=2.0):
             self.last_error_message = (
                 f'Controller parameter service is not available: '
-                f'/{self.controller_server_name}/set_parameters'
+                f'{self.controller_params_service_name}'
             )
             self.get_logger().error(self.last_error_message)
             return False
@@ -498,15 +672,72 @@ class ParkingActionServer(Node):
         )
         return True
 
-    def reverse_to_parked(self, goal_handle, parked):
+    def align_to_parking_yaw(self, goal_handle, target_yaw):
+        """Close the final yaw error before the open-loop reverse segment."""
+        self.publish_feedback(goal_handle, 'aligning_parking_yaw', 0.58)
+        start_time = time.monotonic()
+        period = 1.0 / self.final_alignment_rate
+        last_error = None
+
+        while rclpy.ok() and time.monotonic() - start_time < self.final_alignment_timeout:
+            if goal_handle.is_cancel_requested:
+                self.stop_robot()
+                self.last_error_message = 'Parking canceled during yaw alignment'
+                return False
+
+            pose_is_fresh = self.refresh_pose_from_tf()
+            if not pose_is_fresh:
+                pose_is_fresh = (
+                    self.latest_pose is not None
+                    and self.latest_pose_received_at is not None
+                    and time.monotonic() - self.latest_pose_received_at <= 0.5
+                )
+            if not pose_is_fresh:
+                self.stop_robot()
+                self.last_error_message = 'No fresh pose during parking yaw alignment'
+                self.get_logger().error(self.last_error_message)
+                return False
+
+            current_yaw = quaternion_to_yaw(self.latest_pose.orientation)
+            error = normalize_angle(target_yaw - current_yaw)
+            last_error = error
+            if abs(error) <= self.final_alignment_tolerance:
+                self.stop_robot()
+                self.get_logger().info(
+                    f'Parking yaw aligned: error={error:.3f} rad, '
+                    f'tolerance={self.final_alignment_tolerance:.3f} rad'
+                )
+                return True
+
+            speed = min(
+                self.final_alignment_max_speed,
+                max(self.final_alignment_min_speed, abs(error) * self.final_alignment_kp),
+            )
+            twist = Twist()
+            twist.angular.z = math.copysign(speed, error)
+            self.cmd_vel_pub.publish(twist)
+            time.sleep(period)
+
+        self.stop_robot()
+        error_text = 'unknown' if last_error is None else f'{last_error:.3f} rad'
+        self.last_error_message = (
+            f'Parking yaw alignment timed out: error={error_text}, '
+            f'timeout={self.final_alignment_timeout:.1f}s'
+        )
+        self.get_logger().error(self.last_error_message)
+        return False
+
+    def reverse_to_parked(self, goal_handle, parked, reverse_distance=None):
         self.publish_feedback(goal_handle, 'reversing', 0.65, target_pose=parked)
+        if reverse_distance is None:
+            reverse_distance = self.reverse_distance
         start_time = time.monotonic()
         period = 1.0 / max(self.reverse_control_rate, 1.0)
-        reverse_duration = self.reverse_distance / max(self.reverse_speed, 1e-6)
+        reverse_duration = reverse_distance / max(self.reverse_speed, 1e-6)
         timeout_sec = min(self.reverse_timeout, reverse_duration + period)
 
         self.get_logger().info(
-            f'Reversing by distance: distance={self.reverse_distance:.3f} m, '
+            f'Reversing by distance: distance={reverse_distance:.3f} m, '
             f'speed={self.reverse_speed:.4f} m/s, duration={reverse_duration:.2f} s'
         )
 
@@ -562,7 +793,13 @@ class ParkingActionServer(Node):
         while rclpy.ok() and time.monotonic() - start_time < timeout_sec:
             if goal_handle.is_cancel_requested:
                 return False
-            if self.latest_pose is not None:
+            if self.refresh_pose_from_tf():
+                return True
+            if (
+                self.latest_pose is not None
+                and self.latest_pose_received_at is not None
+                and self.latest_pose_received_at >= start_time
+            ):
                 return True
             time.sleep(0.05)
         return False

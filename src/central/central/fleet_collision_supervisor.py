@@ -133,6 +133,18 @@ def closest_predicted_approach(first, second, times):
     return distances[index], float(times[index])
 
 
+def fresh_position(position, age, maximum_age):
+    """Return the position as a 2-vector when it is present, fresh and finite."""
+    if position is None or age is None:
+        return None
+    if not math.isfinite(float(age)) or float(age) > float(maximum_age):
+        return None
+    value = np.asarray(position, dtype=float)
+    if value.shape != (2,) or not np.all(np.isfinite(value)):
+        return None
+    return value
+
+
 def select_fresh_position(
     vision_position,
     vision_age,
@@ -141,19 +153,18 @@ def select_fresh_position(
     max_vision_age,
     max_fleet_age,
 ):
-    """Prefer physical vision and fall back to a fresh AMCL fleet pose."""
-    candidates = (
-        ('vision', vision_position, vision_age, max_vision_age),
-        ('fleet', fleet_position, fleet_age, max_fleet_age),
-    )
-    for source, position, age, maximum_age in candidates:
-        if position is None or age is None:
-            continue
-        if not math.isfinite(float(age)) or float(age) > float(maximum_age):
-            continue
-        value = np.asarray(position, dtype=float)
-        if value.shape == (2,) and np.all(np.isfinite(value)):
-            return value.copy(), source
+    """Prefer physical vision and fall back to a fresh AMCL fleet pose.
+
+    Vision stays first even when it disagrees with the fleet pose: it is a
+    direct observation, while AMCL can sit at its default initial_pose without
+    ever saying so. _warn_on_identity_mismatch reports the disagreement.
+    """
+    vision = fresh_position(vision_position, vision_age, max_vision_age)
+    fleet = fresh_position(fleet_position, fleet_age, max_fleet_age)
+    if vision is not None:
+        return vision.copy(), 'vision'
+    if fleet is not None:
+        return fleet.copy(), 'fleet'
     return None, 'missing'
 
 
@@ -181,6 +192,9 @@ class FleetCollisionSupervisor(Node):
         self.declare_parameter('release_separation_m', 0.30)
         self.declare_parameter('release_stable_sec', 0.8)
         self.declare_parameter('minimum_hold_sec', 0.5)
+        self.declare_parameter('max_hold_sec', 10.0)
+        self.declare_parameter('identity_mismatch_m', 0.45)
+        self.declare_parameter('hold_transition_timeout_sec', 2.0)
         self.declare_parameter('nominal_plan_speed_mps', 0.12)
         self.declare_parameter('max_prediction_speed_mps', 0.35)
         self.declare_parameter('velocity_filter_alpha', 0.35)
@@ -188,8 +202,13 @@ class FleetCollisionSupervisor(Node):
         self.declare_parameter('motion_threshold_mps', 0.015)
         self.declare_parameter('preferred_priority_vehicle', 'agv1')
         self.declare_parameter('update_rate_hz', 10.0)
-        self.declare_parameter('agv1_labels', ['car_yellow'])
-        self.declare_parameter('agv2_labels', ['car_blue', 'car_bule'])
+        # agv1 carries the blue cargo box and agv2 the yellow one, matching the
+        # YOLO classes and pinky.urdf.xacro. 'car_bule' is the misspelled class
+        # the model actually emits for blue. Swapping these makes the
+        # supervisor measure one robot's detection against the other's fleet
+        # pose, which reads as a near-zero separation and latches a hold.
+        self.declare_parameter('agv1_labels', ['car_bule', 'car_blue'])
+        self.declare_parameter('agv2_labels', ['car_yellow'])
 
         self.homography = self._load_homography(
             str(self.get_parameter('calibration_yaml').value)
@@ -218,6 +237,13 @@ class FleetCollisionSupervisor(Node):
         )
         self.minimum_hold_sec = float(
             self.get_parameter('minimum_hold_sec').value
+        )
+        self.max_hold_sec = float(self.get_parameter('max_hold_sec').value)
+        self.identity_mismatch_m = float(
+            self.get_parameter('identity_mismatch_m').value
+        )
+        self.hold_transition_timeout_sec = float(
+            self.get_parameter('hold_transition_timeout_sec').value
         )
         self.nominal_plan_speed = float(
             self.get_parameter('nominal_plan_speed_mps').value
@@ -273,6 +299,7 @@ class FleetCollisionSupervisor(Node):
         self.held_vehicle = ''
         self._hold_transport = ''
         self._hold_transition = False
+        self._hold_transition_started_at = None
         self._hold_started_at = None
         self._release_safe_since = None
         self._last_error = ''
@@ -335,7 +362,11 @@ class FleetCollisionSupervisor(Node):
             'YOLO collision supervisor ready: '
             f'stop={self.minimum_separation:.2f}m, '
             f'release={self.release_separation:.2f}m, '
-            f'horizon={self.horizon:.1f}s'
+            + (
+                'measuring the separation right now (no prediction)'
+                if self.horizon <= 0.0
+                else f'closest approach predicted over {self.horizon:.1f}s'
+            )
         )
 
     @staticmethod
@@ -351,19 +382,29 @@ class FleetCollisionSupervisor(Node):
         positive = {
             'max_detection_age_sec': self.max_detection_age,
             'max_fleet_pose_age_sec': self.max_fleet_pose_age,
-            'prediction_horizon_sec': self.horizon,
             'prediction_step_sec': self.step,
             'minimum_separation_m': self.minimum_separation,
             'release_separation_m': self.release_separation,
             'update_rate_hz': rate,
+            'hold_transition_timeout_sec': self.hold_transition_timeout_sec,
+            'max_hold_sec': self.max_hold_sec,
+            'identity_mismatch_m': self.identity_mismatch_m,
         }
         invalid = [name for name, value in positive.items() if value <= 0.0]
         if invalid:
             raise ValueError(f'parameters must be positive: {invalid}')
+        # 0.0 is meaningful: hold on the separation measured right now instead
+        # of the closest approach predicted along both planned paths. The
+        # predictive form stops vehicles while they are still far apart, which
+        # in a workspace this size leaves them unable to pass each other.
+        if self.horizon < 0.0:
+            raise ValueError('prediction_horizon_sec must be non-negative')
         if self.release_separation <= self.minimum_separation:
             raise ValueError(
                 'release_separation_m must exceed minimum_separation_m'
             )
+        if self.max_hold_sec <= self.minimum_hold_sec:
+            raise ValueError('max_hold_sec must exceed minimum_hold_sec')
         if self.preferred_priority not in VEHICLE_IDS:
             raise ValueError('preferred_priority_vehicle must be agv1 or agv2')
         if not 0.0 < self.velocity_alpha <= 1.0:
@@ -505,6 +546,52 @@ class FleetCollisionSupervisor(Node):
         )
         return response
 
+    @staticmethod
+    def identity_mismatch_distance(
+        vision_position,
+        vision_age,
+        fleet_position,
+        fleet_age,
+        max_vision_age,
+        max_fleet_age,
+    ):
+        """Distance between a vehicle's own two position sources, if both fresh."""
+        vision = fresh_position(vision_position, vision_age, max_vision_age)
+        fleet = fresh_position(fleet_position, fleet_age, max_fleet_age)
+        if vision is None or fleet is None:
+            return None
+        return float(np.linalg.norm(vision - fleet))
+
+    def _warn_on_identity_mismatch(
+        self, vehicle_id, vision_position, vision_age, fleet_position, fleet_age
+    ):
+        """Catch a detector label mapped to the wrong vehicle.
+
+        The two sources track the same robot, so they must roughly agree. When
+        the label map is swapped they instead point at different robots, the
+        supervisor reads a near-zero separation between the two vehicles and
+        latches a hold that the release threshold can never clear.
+        """
+        distance = self.identity_mismatch_distance(
+            vision_position,
+            vision_age,
+            fleet_position,
+            fleet_age,
+            self.max_detection_age,
+            self.max_fleet_pose_age,
+        )
+        if distance is None or distance <= self.identity_mismatch_m:
+            return
+        self.get_logger().error(
+            f'{vehicle_id}: vision detection is {distance:.2f}m from its own '
+            f'fleet pose (limit {self.identity_mismatch_m:.2f}m). Either AMCL '
+            f'is still at its default initial_pose and never localised, or '
+            f'agv1_labels/agv2_labels no longer match the YOLO colour classes. '
+            f'Navigation goals for {vehicle_id} will go to the wrong place '
+            f'until this agrees.',
+            throttle_duration_sec=5.0,
+        )
+
     def _evaluate(self):
         now = time.monotonic()
         with self._lock:
@@ -533,6 +620,13 @@ class FleetCollisionSupervisor(Node):
                         self.max_fleet_pose_age,
                     )
                 )
+                self._warn_on_identity_mismatch(
+                    vehicle_id,
+                    track.position,
+                    vision_age,
+                    motion.fleet_position,
+                    fleet_age,
+                )
             positions_fresh = all(
                 positions[vehicle_id] is not None
                 for vehicle_id in VEHICLE_IDS
@@ -557,6 +651,22 @@ class FleetCollisionSupervisor(Node):
                         f'{self._tracking_error}',
                         throttle_duration_sec=5.0,
                     )
+                # A hold must not outlive the tracking that justifies it. The
+                # only release below this point needs fresh positions, so
+                # without this a vehicle held just as tracking degrades -- it
+                # stops, so vision may well lose it -- never gets resumed.
+                # Disabling the supervisor retries here too, in case the
+                # release from _set_enabled found the service unavailable.
+                if self.held_vehicle:
+                    held_duration = now - float(self._hold_started_at or now)
+                    if not self.enabled or held_duration >= self.max_hold_sec:
+                        self.get_logger().error(
+                            f'Releasing {self.held_vehicle} after '
+                            f'{held_duration:.1f}s without confirmed '
+                            'separation: '
+                            + (self._tracking_error or 'supervisor disabled')
+                        )
+                        self._request_hold(self.held_vehicle, False)
                 self._publish_status(now, positions_fresh)
                 return
 
@@ -638,6 +748,15 @@ class FleetCollisionSupervisor(Node):
 
     def _select_yield_vehicle(self, moving):
         first, second = VEHICLE_IDS
+
+        # The B-1 occupant must be able to clear the single-entry loading
+        # zone before another AGV approaches it.  Give that vehicle right of
+        # way even when both vehicles currently own different zone locks.
+        first_in_b1 = self.motion[first].locked_zone == 'B-1'
+        second_in_b1 = self.motion[second].locked_zone == 'B-1'
+        if first_in_b1 != second_in_b1:
+            return second if first_in_b1 else first
+
         if moving[first] != moving[second]:
             return first if moving[first] else second
 
@@ -649,9 +768,27 @@ class FleetCollisionSupervisor(Node):
         priority = self.preferred_priority
         return second if priority == first else first
 
+    @staticmethod
+    def _hold_transition_is_stuck(started_at, timeout_sec, now=None):
+        """Detect a hold/release service call that never got a response."""
+        now = time.monotonic() if now is None else now
+        pending_sec = now - float(started_at or now)
+        return pending_sec >= timeout_sec, pending_sec
+
     def _request_hold(self, vehicle_id, enabled):
         if self._hold_transition:
-            return
+            stuck, pending_sec = self._hold_transition_is_stuck(
+                self._hold_transition_started_at,
+                self.hold_transition_timeout_sec,
+            )
+            if not stuck:
+                return
+            self.get_logger().error(
+                'Previous hold/release service call never completed after '
+                f'{pending_sec:.1f}s; clearing the stuck transition so '
+                'hold/release evaluation can resume in real time'
+            )
+            self._hold_transition = False
         client, transport = self._select_hold_client(vehicle_id, enabled)
         service_name = f'/{vehicle_id}/{transport}' if transport else ''
         if client is None:
@@ -675,6 +812,7 @@ class FleetCollisionSupervisor(Node):
         request = SetBool.Request()
         request.data = bool(enabled)
         self._hold_transition = True
+        self._hold_transition_started_at = time.monotonic()
         future = client.call_async(request)
         future.add_done_callback(
             lambda result, vid=vehicle_id, state=bool(enabled), mode=transport:
@@ -711,6 +849,7 @@ class FleetCollisionSupervisor(Node):
         now = time.monotonic()
         with self._lock:
             self._hold_transition = False
+            self._hold_transition_started_at = None
             if success and enabled:
                 self.held_vehicle = vehicle_id
                 self._hold_transport = transport

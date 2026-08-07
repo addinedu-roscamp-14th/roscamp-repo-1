@@ -208,7 +208,6 @@ Visualization Manager:
       Enabled: true
       Name: Fleet Vehicles
       Namespaces:
-        fleet_vehicle: true
         fleet_vehicle_label: true
       Topic:
         Depth: 5

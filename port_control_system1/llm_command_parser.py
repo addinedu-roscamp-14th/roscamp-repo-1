@@ -35,6 +35,18 @@ from typing import Dict, List, Optional
 MODEL_NAME = os.environ.get("LOCAL_LLM_MODEL", "gemma4:31b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://agent.sds.codes")
 
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer without making dashboard startup fragile."""
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+LLM_NUM_CTX = _positive_int_env("LOCAL_LLM_NUM_CTX", 8192)
+
 _SYSTEM_PROMPT_TEMPLATE = """당신은 항만 자율주행 로봇 시스템의 자연어 명령 해석기입니다.
 사용자가 어떤 언어로 말하든, 어떤 동의어/약어를 쓰든 아래 "등록된 이름" 목록 중
 정확히 일치하는 이름으로 매핑해야 합니다.
@@ -67,7 +79,7 @@ C는 D로") 각각을 별도 action으로 배열에 전부 넣으세요. 서로 
 "빠져나오면", "도착한 뒤" 같은 순서 표현이 있으면 반드시 서로 다른 action으로
 나누고, 조건을 만족하는 순서대로 배열하세요.
 
-각 action은 아래 8가지 형식 중 하나입니다:
+각 action은 아래 9가지 형식 중 하나입니다:
 
 1) 등록부의 화물 위치만 관리하는 행정 명령:
 {{"type": "cargo_single", "item": "<화물명>", "destination": "<등록된 위치명>"}}
@@ -111,9 +123,13 @@ source_detection_index, B-1을 destination_detection_index로 지정해야 합�
 검출 JSON에 없는 객체를 만들어내지 마세요.
 목적지가 영상에 보이는 구역이나 객체라는 의미가 있으면 표현이 짧거나 포괄적이어도
 visual_navigation을 사용하세요. 예를 들어 "항구로 보내", "상차하러 가", "하역 위치로",
-"A구역에 대기", "주차해"는 각각 현재 영상에 검출된 대응 구역을 목적지로 해석하세요.
+"A구역에 대기"는 각각 현재 영상에 검출된 대응 구역을 목적지로 해석하세요.
 단, 목적지나 이동 의도가 모두 없는 "차량 보여줘", "B-1이 뭐야" 같은 질문은
 unknown을 반환하세요.
+"주차해줘", "주차시켜", "주차장으로 보내"처럼 목적지를 특정 검출 구역이 아니라
+그냥 "주차"라고만 말하면 visual_navigation이 아니라 9번 park_command를 쓰세요.
+"항구에 주차해", "항구 주차"처럼 B-1을 명시하면 그건 B-1 목적지이므로
+visual_navigation을 그대로 쓰세요.
 `B-1`은 항구 상차·하차 전용 주차 구역입니다. "B-1로 차를 보내줘"처럼 B-1을
 목적지로 지정하면 반드시 B-1 검출의 detection_index를 사용한 visual_navigation을
 반환하세요. B-1의 실제 주차 좌표와 방향은 제어 코드가 결정하므로 approach_side는
@@ -141,7 +157,16 @@ heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 �
 영상이 없거나 목표를 안전하게 특정할 수 없으면 좌표를 추측하지 말고 unknown을
 반환하세요.
 
-8) 위 어느 것에도 해당하지 않는 경우:
+8) 사용자가 영상 속 특정 구역이 아니라 지정된 실제 주차 스팟(후진 주차)으로
+보내라고 말한 경우:
+{{"type": "park_command", "vehicle_id": "<agv1|agv2 또는 빈 문자열>"}}
+
+"주차해줘", "주차시켜", "주차장으로 보내", "park"처럼 목적지를 영상 속 구역
+(B-1, A-1/A-2/A-3 등)으로 특정하지 않고 그냥 주차 자체를 지시하면 이 타입을
+쓰세요. 차량을 색상/번호로 지칭했으면 vehicle_id를 채우고, 안 했으면 빈
+문자열로 두어 유휴 차량이 자동으로 선택되게 하세요.
+
+9) 위 어느 것에도 해당하지 않는 경우:
 {{"type": "unknown", "reason": "<간단한 이유>"}}
 
 주의:
@@ -206,6 +231,11 @@ heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 �
   {{"type": "visual_transfer", "source_detection_index": 2,
     "destination_detection_index": 0, "vehicle_id": ""}}
 ]}}
+
+사용자: "노란 차 주차해줘"
+{{"actions": [
+  {{"type": "park_command", "vehicle_id": "agv1"}}
+]}}
 """
 
 
@@ -266,6 +296,7 @@ _SEQUENCE_TERMS = (
 )
 _VEHICLE_NAVIGATION_TYPES = {
     'visual_navigation', 'pixel_navigation', 'visual_transfer',
+    'park_command',
 }
 
 
@@ -409,6 +440,13 @@ def normalize_navigation_result(
                         )
                     )
                     continue
+        if action_type == 'park_command':
+            repaired = dict(action)
+            repaired['vehicle_id'] = _infer_vehicle_id(
+                command, repaired.get('vehicle_id')
+            )
+            normalized_actions.append(repaired)
+            continue
         if action_type != 'visual_navigation':
             normalized_actions.append(action)
             continue
@@ -639,9 +677,6 @@ def _infer_target_detection(command, detections, action=None):
         if label in labels and any(alias in text for alias in aliases):
             return labels[label]
 
-    if '주차' in text and 'B-1' in labels:
-        return labels['B-1']
-
     for label, detection in labels.items():
         normalized = label.lower()
         if normalized not in {'car_yellow', 'car_blue'} and normalized in text:
@@ -724,7 +759,7 @@ def parse_command_with_llm(
     """
     자연어 명령을 로컬 Ollama 모델로 해석해서 구조화된 dict로 반환합니다.
     반환 형식은 항상 {"actions": [action, ...]} 이며, 각 action은
-    _SYSTEM_PROMPT_TEMPLATE에 정의된 8가지 type 중 하나입니다.
+    _SYSTEM_PROMPT_TEMPLATE에 정의된 9가지 type 중 하나입니다.
     (한 문장에 지시가 여러 개 섞여 있으면 actions에 여러 개가 들어옵니다)
 
     실패(패키지 미설치, Ollama 서버 미실행, 모델 미설치, JSON 파싱 실패 등) 시
@@ -769,7 +804,12 @@ def parse_command_with_llm(
             user_message,
         ],
         format="json",   # Ollama가 유효한 JSON만 내놓도록 강제 (지원하는 모델 기준)
-        options={"temperature": 0},  # 항상 같은 해석이 나오도록 (일관성 우선)
+        options={
+            "temperature": 0,
+            # The VLM prompt includes the image and detection context, so the
+            # Ollama default of 4096 tokens is too small for normal requests.
+            "num_ctx": LLM_NUM_CTX,
+        },
     )
 
     try:

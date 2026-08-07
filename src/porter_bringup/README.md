@@ -480,7 +480,9 @@ curl http://127.0.0.1:8000/detections
 | 인자 | 기본값 | 기능 |
 | --- | --- | --- |
 | `central_ip` | 필수 | 중앙제어 노트북 IP |
+| `video_port` | `8000` | `dashboard_stream_node` HTTP 포트 (중앙 `config/dashboard/dashboard.yaml`의 `port`와 일치해야 함) |
 | `python_executable` | `~/.venv/bin/python` | GUI 실행 Python |
 | `api_token` | `PORT_CONTROL_API_TOKEN` | 중앙제어 API 토큰 |
 | `ollama_host` | `http://agent.sds.codes` | VLM 서버 (팀 공유, 로컬로 바꾸려면 `http://127.0.0.1:11434` 지정) |
 | `llm_model` | `gemma4:31b` | 비전 모델 이름 |
+| `llm_num_ctx` | `8192` | 이미지·YOLO JSON을 포함한 VLM 요청의 Ollama 컨텍스트 크기 |

@@ -5,12 +5,24 @@ fleet_collision_supervisor:
     minimum_detection_confidence: 0.60
     max_detection_age_sec: 1.5
     max_fleet_pose_age_sec: 1.5
-    prediction_horizon_sec: 3.0
+    # 0.0 = hold on the separation measured right now. The predictive form
+    # (e.g. 3.0) takes the closest approach along both planned paths over the
+    # next few seconds, which stops the vehicles while they are still metres
+    # apart and leaves them unable to pass each other in a space this size.
+    # Raise it again only with the separations below re-tuned to match.
+    prediction_horizon_sec: 0.0
     prediction_step_sec: 0.1
     minimum_separation_m: 0.22
     release_separation_m: 0.30
     release_stable_sec: 0.8
     minimum_hold_sec: 0.5
+    # Release a hold even when tracking degrades. Holding a vehicle stops it,
+    # which is when vision tends to lose it, and the normal release path needs
+    # a fresh position for both vehicles.
+    max_hold_sec: 10.0
+    # Warn when a vehicle's detection disagrees with its own AMCL pose by this
+    # much: either the labels below are swapped or AMCL never localised.
+    identity_mismatch_m: 0.45
     nominal_plan_speed_mps: 0.12
     max_prediction_speed_mps: 0.35
     velocity_filter_alpha: 0.35
@@ -18,5 +30,10 @@ fleet_collision_supervisor:
     motion_threshold_mps: 0.015
     preferred_priority_vehicle: agv1
     update_rate_hz: 10.0
-    agv1_labels: [car_yellow]
-    agv2_labels: [car_blue, car_bule]
+    # agv1 carries the blue cargo box, agv2 the yellow one -- matching the
+    # cargo_box colours in pinky.urdf.xacro. 'car_bule' is the misspelled
+    # class the model actually emits for blue. Swapping these makes the
+    # supervisor measure one robot's detection against the other's fleet pose,
+    # which reads as a near-zero separation and latches a hold.
+    agv1_labels: [car_bule, car_blue]
+    agv2_labels: [car_yellow]

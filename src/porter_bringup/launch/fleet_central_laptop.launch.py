@@ -6,7 +6,9 @@ from launch.actions import (
     ExecuteProcess,
     GroupAction,
     IncludeLaunchDescription,
+    OpaqueFunction,
     SetEnvironmentVariable,
+    UnsetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -14,6 +16,19 @@ from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJ
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+
+def _configure_discovery(context):
+    enabled = LaunchConfiguration('start_discovery_server').perform(context)
+    if enabled.strip().lower() in ('true', '1', 'yes', 'on'):
+        port = LaunchConfiguration('discovery_server_port').perform(context)
+        return [
+            SetEnvironmentVariable(
+                'ROS_DISCOVERY_SERVER',
+                f'127.0.0.1:{port}',
+            )
+        ]
+    return [UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER')]
 
 
 def generate_launch_description():
@@ -58,7 +73,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'b1_exit_forward_distance_m',
-            default_value='0.10',
+            default_value='0.30',
             description='Forward distance after the B-1 left exit turn',
         ),
         DeclareLaunchArgument(
@@ -68,7 +83,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'b1_exit_behavior_timeout_sec',
-            default_value='10.0',
+            default_value='20.0',
             description='Timeout for each B-1 exit behavior action',
         ),
         DeclareLaunchArgument(
@@ -77,9 +92,37 @@ def generate_launch_description():
             description='Radius used to recognize a vehicle at B-1 before exit',
         ),
         DeclareLaunchArgument(
+            'b1_zone_map_x',
+            default_value='1.294',
+            description='B-1 stop position X in the shared map frame',
+        ),
+        DeclareLaunchArgument(
+            'b1_zone_map_y',
+            default_value='-0.087',
+            description='B-1 stop position Y in the shared map frame',
+        ),
+        DeclareLaunchArgument(
             'b1_exit_turn_tolerance_deg',
             default_value='5.0',
             description='Required AMCL yaw accuracy before B-1 forward motion',
+        ),
+        DeclareLaunchArgument(
+            'auto_park_idle_sec',
+            default_value='0.0',
+            description=(
+                'Idle seconds before automatic parking; 0 disables it so '
+                'only a new parking request can start parking'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'park_exit_forward_distance_m',
+            default_value='0.20',
+            description='Mandatory straight distance before leaving a parking spot',
+        ),
+        DeclareLaunchArgument(
+            'park_exit_forward_speed_mps',
+            default_value='0.05',
+            description='Straight-line speed while leaving a parking spot',
         ),
         DeclareLaunchArgument(
             'discovery_server_port',
@@ -112,13 +155,7 @@ def generate_launch_description():
                 LaunchConfiguration('start_discovery_server')
             ),
         ),
-        SetEnvironmentVariable(
-            'ROS_DISCOVERY_SERVER',
-            [
-                '127.0.0.1:',
-                LaunchConfiguration('discovery_server_port'),
-            ],
-        ),
+        OpaqueFunction(function=_configure_discovery),
         GroupAction(
             scoped=True,
             actions=[
@@ -176,8 +213,28 @@ def generate_launch_description():
                     LaunchConfiguration('b1_exit_detection_radius_m'),
                     value_type=float,
                 ),
+                'b1_zone_map_x': ParameterValue(
+                    LaunchConfiguration('b1_zone_map_x'),
+                    value_type=float,
+                ),
+                'b1_zone_map_y': ParameterValue(
+                    LaunchConfiguration('b1_zone_map_y'),
+                    value_type=float,
+                ),
                 'b1_exit_turn_tolerance_deg': ParameterValue(
                     LaunchConfiguration('b1_exit_turn_tolerance_deg'),
+                    value_type=float,
+                ),
+                'auto_park_idle_sec': ParameterValue(
+                    LaunchConfiguration('auto_park_idle_sec'),
+                    value_type=float,
+                ),
+                'park_exit_forward_distance_m': ParameterValue(
+                    LaunchConfiguration('park_exit_forward_distance_m'),
+                    value_type=float,
+                ),
+                'park_exit_forward_speed_mps': ParameterValue(
+                    LaunchConfiguration('park_exit_forward_speed_mps'),
                     value_type=float,
                 ),
                 'zone_release_hysteresis_m': 0.05,

@@ -42,6 +42,8 @@
             <param name="use_sim_time" value="$(var use_sim_time)"/>
             <param name="autostart" value="$(var autostart)"/>
 
+            <remap from="cmd_vel" to="cmd_vel_nav"/>
+
         </composable_node>  
 
         <composable_node pkg="nav2_bt_navigator" plugin="nav2_bt_navigator::BtNavigator" name="bt_navigator">            
@@ -108,6 +110,7 @@
             <param name='log_level' value="$(var log_level)"/>
             <param from="$(var params_file)"/>
             <param name='use_sim_time' value="$(var use_sim_time)"/>
+            <remap from="cmd_vel" to="cmd_vel_nav"/>
         </node>
 
         <node pkg="nav2_bt_navigator" exec="bt_navigator" name="bt_navigator" output="screen">

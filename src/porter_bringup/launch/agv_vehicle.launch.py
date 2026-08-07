@@ -15,6 +15,7 @@ from launch.actions import (
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -81,6 +82,22 @@ def generate_launch_description():
             default_value='8.0',
             description='Wait for hardware TF and sensor topics before Nav2',
         ),
+        DeclareLaunchArgument(
+            'start_parking_supervisor',
+            default_value='true',
+            description='Run the vehicle auto-parking action server',
+        ),
+        DeclareLaunchArgument(
+            'parking_spots_yaml',
+            default_value=PathJoinSubstitution([
+                FindPackageShare('drive'), 'params', 'parking_spots.yaml',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'parking_supervisor_start_delay',
+            default_value='35.0',
+            description='Start parking after the Nav2 component load burst',
+        ),
         OpaqueFunction(function=_configure_discovery),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -119,7 +136,31 @@ def generate_launch_description():
                         'use_composition': LaunchConfiguration(
                             'use_composition'
                         ),
+                        # The top-level vehicle launch starts parking_new
+                        # after Nav2 has finished loading on the Raspberry Pi.
+                        'start_parking_supervisor': 'false',
                     }.items(),
+                ),
+            ],
+        ),
+        TimerAction(
+            period=LaunchConfiguration('parking_supervisor_start_delay'),
+            condition=IfCondition(
+                LaunchConfiguration('start_parking_supervisor')
+            ),
+            actions=[
+                Node(
+                    package='drive',
+                    executable='parking_new',
+                    name='parking_supervisor',
+                    namespace=vehicle_id,
+                    output='screen',
+                    parameters=[{
+                        'parking_spots_yaml': LaunchConfiguration(
+                            'parking_spots_yaml'
+                        ),
+                        'cmd_vel_topic': 'cmd_vel_safe_input',
+                    }],
                 ),
             ],
         ),

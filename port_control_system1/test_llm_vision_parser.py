@@ -74,6 +74,7 @@ def test_image_is_forwarded_to_vlm(monkeypatch):
     user_message = captured['kwargs']['messages'][1]
     system_message = captured['kwargs']['messages'][0]
     assert user_message['images'] == [b'jpeg-bytes']
+    assert captured['kwargs']['options']['num_ctx'] == 8192
     assert '"detection_index":0' in user_message['content']
     assert '"label":"car_blue"' in user_message['content']
     assert (
@@ -159,6 +160,33 @@ def test_broad_harbor_command_recovers_unknown_as_b1_navigation():
             }
         ]
     }
+
+
+def test_park_command_infers_vehicle_id_from_color():
+    result = normalize_navigation_result(
+        '노란 차 주차해줘',
+        {'actions': [{'type': 'park_command', 'vehicle_id': ''}]},
+        DETECTIONS,
+    )
+
+    assert result == {
+        'actions': [
+            {'type': 'park_command', 'vehicle_id': 'agv1'},
+        ]
+    }
+
+
+def test_generic_park_word_is_not_repaired_into_b1_navigation():
+    """'주차' alone must not be recovered as B-1 - that name is reserved
+    for the real parking-spot command now, so an unknown result naming
+    only 'park' (with no zone-specific wording) should stay unknown."""
+    result = normalize_navigation_result(
+        '주차해줘',
+        {'actions': [{'type': 'unknown', 'reason': '목적지 불명확'}]},
+        DETECTIONS,
+    )
+
+    assert result['actions'][0]['type'] == 'unknown'
 
 
 def test_broad_a_zone_command_uses_visible_a_zone():

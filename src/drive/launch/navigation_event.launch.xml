@@ -7,8 +7,8 @@
     <arg name="navigate_through_poses_status_topic" default="/navigate_through_poses/_action/status"/>
     <arg name="frame_id" default="map"/>
     <arg name="start_position_1_id" default="position_1"/>
-    <arg name="start_position_1_x" default="1.694457"/>
-    <arg name="start_position_1_y" default="0.397200"/>
+    <arg name="start_position_1_x" default="1.635463773844374"/>
+    <arg name="start_position_1_y" default="0.16880950610511666"/>
     <arg name="start_position_tolerance_m" default="0.25"/>
     <arg name="area_config_file" default="$(find-pkg-share drive)/params/navigation_areas.yaml"/>
 

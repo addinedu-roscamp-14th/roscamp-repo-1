@@ -2,10 +2,37 @@
 
 from central.control_protocol import (
     CommandValidationError,
+    validate_park_request,
     validate_pixel_goal,
 )
 
 import pytest
+
+
+def test_valid_park_request_is_normalized():
+    request = validate_park_request(
+        {'command_id': 'park-1', 'vehicle_id': '/agv1/'}
+    )
+
+    assert request.command_id == 'park-1'
+    assert request.requested_vehicle_id == 'agv1'
+
+
+def test_park_request_defaults_to_auto_vehicle_selection():
+    request = validate_park_request({})
+
+    assert request.command_id is None
+    assert request.requested_vehicle_id == ''
+
+
+def test_park_request_rejects_unknown_vehicle():
+    with pytest.raises(CommandValidationError, match='vehicle_id'):
+        validate_park_request({'vehicle_id': 'agv3'})
+
+
+def test_park_request_rejects_non_object_payload():
+    with pytest.raises(CommandValidationError, match='JSON object'):
+        validate_park_request('not-an-object')
 
 
 def test_valid_pixel_goal_is_normalized():

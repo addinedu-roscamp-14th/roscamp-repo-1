@@ -66,6 +66,48 @@ def _pixel(
     return Pixel(x=x, y=y)
 
 
+@dataclass(frozen=True)
+class ParkRequest:
+    """Validated request to send one vehicle to the parking spot."""
+
+    command_id: str | None
+    requested_vehicle_id: str
+
+
+def validate_park_request(payload: Any) -> ParkRequest:
+    """Validate an AI/operator request to auto-park one AGV."""
+    if not isinstance(payload, Mapping):
+        raise CommandValidationError('request body must be a JSON object')
+
+    command_id = payload.get('command_id')
+    if command_id is not None:
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise CommandValidationError(
+                'command_id must be a non-empty string'
+            )
+        command_id = command_id.strip()
+        if len(command_id) > 128:
+            raise CommandValidationError(
+                'command_id must not exceed 128 characters'
+            )
+
+    requested_vehicle_id = payload.get('vehicle_id', '')
+    if requested_vehicle_id is None:
+        requested_vehicle_id = ''
+    if not isinstance(requested_vehicle_id, str):
+        raise CommandValidationError('vehicle_id must be a string')
+    requested_vehicle_id = requested_vehicle_id.strip().strip('/')
+    if requested_vehicle_id not in ('', 'agv1', 'agv2'):
+        raise CommandValidationError(
+            'vehicle_id must be empty, agv1, or agv2'
+        )
+
+    return ParkRequest(
+        command_id=command_id,
+        requested_vehicle_id=requested_vehicle_id,
+    )
+
+
 def validate_pixel_goal(
     payload: Any,
     image_width: int,

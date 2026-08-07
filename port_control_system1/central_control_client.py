@@ -99,6 +99,40 @@ class CentralControlClient:
             )
         return body
 
+    def send_park(self, command_id=None, vehicle_id=''):
+        """Ask the fleet to send one AGV (or the next idle one) to park."""
+        command_id = command_id or f'park-{uuid.uuid4()}'
+        headers = {'Content-Type': 'application/json'}
+        if self.token:
+            headers['X-Control-Token'] = self.token
+
+        try:
+            response = requests.post(
+                f'{self.base_url}/api/v1/navigation/park',
+                headers=headers,
+                json={
+                    'command_id': command_id,
+                    'vehicle_id': vehicle_id,
+                },
+                timeout=self.timeout_sec,
+            )
+        except requests.RequestException as exc:
+            raise CentralControlApiError(
+                f'중앙제어 API에 연결할 수 없습니다: {exc}'
+            ) from exc
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = {'detail': response.text.strip() or 'empty response'}
+        if not response.ok:
+            raise CentralControlApiError(
+                '중앙제어 API가 명령을 거부했습니다 '
+                f'(HTTP {response.status_code}): '
+                f'{body.get("detail", body)}'
+            )
+        return body
+
     def status(self):
         """Return both AGV states and the B-1 lock from the gateway."""
         headers = {}

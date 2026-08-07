@@ -4,14 +4,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 from dataclasses import dataclass, field
+import json
 import math
 import threading
 import time
 
 from action_msgs.msg import GoalStatus
+from drive.action import ParkInSpot
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav2_msgs.action import (
     DriveOnHeading,
@@ -33,6 +34,7 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
+from rclpy.task import Future
 from std_msgs.msg import Float32, String
 from std_srvs.srv import SetBool, Trigger
 from visualization_msgs.msg import Marker, MarkerArray
@@ -50,8 +52,46 @@ class VehicleRuntime:
     busy: bool = False
     emergency: bool = False
     current_command_id: str = ''
+    current_target_zone: str = ''
+    current_target_pose: PoseStamped | None = None
     locked_zone: str = ''
     active_nav_goal: object | None = None
+    odom_speed: float = 0.0
+    odom_yaw_rate: float = 0.0
+    last_motion_at: float | None = None
+    b1_exit_turn_completed: bool = False
+    b1_exit_forward_completed: bool = False
+    park_exit_forward_completed: bool = False
+
+
+STALL_MOVING = 'moving'
+STALL_HELD = 'held'
+STALL_RESEND = 'resend'
+STALL_EXHAUSTED = 'exhausted'
+
+
+def classify_motion_stall(
+    stalled_for_sec,
+    stall_timeout_sec,
+    resends_used,
+    max_resends,
+    held,
+):
+    """Decide what to do about a vehicle that accepted a goal but sits still.
+
+    Nav2 accepting a goal says nothing about the vehicle actually moving: a
+    latched safety hold, a wedged controller or a plan that never reaches the
+    wheels all look like a goal quietly in progress. `held` covers the case
+    where something deliberately stopped the vehicle, which is not a stall and
+    must not be answered by re-sending the goal.
+    """
+    if held:
+        return STALL_HELD
+    if stalled_for_sec < stall_timeout_sec:
+        return STALL_MOVING
+    if resends_used >= max_resends:
+        return STALL_EXHAUSTED
+    return STALL_RESEND
 
 
 class FleetDispatcher(Node):
@@ -69,18 +109,53 @@ class FleetDispatcher(Node):
         self.declare_parameter('dispatch_action', '/central/dispatch_navigation')
         self.declare_parameter('telemetry_timeout_sec', 3.0)
         self.declare_parameter('state_publish_rate_hz', 2.0)
-        self.declare_parameter('exclusive_zone_ids', ['B-1', 'A'])
+        # A goal Nav2 accepted can still leave the vehicle standing still.
+        # Watch odometry and re-send the goal rather than waiting out the
+        # action's full timeout with nothing happening.
+        self.declare_parameter('motion_threshold_mps', 0.015)
+        self.declare_parameter('motion_yaw_threshold_rps', 0.05)
+        self.declare_parameter('motion_stall_timeout_sec', 8.0)
+        self.declare_parameter('max_motion_resends', 2)
+        self.declare_parameter('max_park_retries', 2)
+        self.declare_parameter('park_retry_backoff_sec', 2.0)
+        self.declare_parameter(
+            'exclusive_zone_ids', ['B-1', 'A', 'PARK1', 'PARK2']
+        )
         self.declare_parameter('zone_occupancy_radius_m', 0.18)
         self.declare_parameter('zone_release_hysteresis_m', 0.05)
         self.declare_parameter('b1_exit_left_turn_deg', 90.0)
-        self.declare_parameter('b1_exit_forward_distance_m', 0.10)
+        self.declare_parameter('b1_exit_forward_distance_m', 0.30)
         self.declare_parameter('b1_exit_forward_speed_mps', 0.05)
-        self.declare_parameter('b1_exit_behavior_timeout_sec', 10.0)
+        self.declare_parameter('b1_exit_behavior_timeout_sec', 20.0)
         self.declare_parameter('b1_exit_detection_radius_m', 0.35)
         self.declare_parameter('b1_exit_turn_tolerance_deg', 5.0)
         self.declare_parameter('b1_exit_turn_max_corrections', 2)
         self.declare_parameter('b1_exit_pose_update_timeout_sec', 3.0)
         self.declare_parameter('b1_exit_turn_settle_sec', 0.5)
+        self.declare_parameter('b1_zone_map_x', 1.294)
+        self.declare_parameter('b1_zone_map_y', -0.087)
+        # Each vehicle has its own dedicated, non-shared parking spot - no
+        # contention, so no FIFO queueing is needed between agv1 and agv2.
+        self.declare_parameter('agv1_park_spot_id', 'park_red')
+        self.declare_parameter('agv1_park_zone_map_x', 1.673782)
+        self.declare_parameter('agv1_park_zone_map_y', 0.408066)
+        self.declare_parameter('agv2_park_spot_id', 'parking_yellow')
+        self.declare_parameter('agv2_park_zone_map_x', 1.635463773844374)
+        self.declare_parameter('agv2_park_zone_map_y', 0.16880950610511666)
+        self.declare_parameter(
+            'park_request_topic', '/central/fleet/park_request'
+        )
+        # Zero disables idle auto-parking. Parking must be triggered by a
+        # current API request unless an operator explicitly enables this.
+        self.declare_parameter('auto_park_idle_sec', 0.0)
+        self.declare_parameter('auto_park_check_interval_sec', 3.0)
+        self.declare_parameter('park_action_wait_timeout_sec', 10.0)
+        self.declare_parameter('park_exit_forward_distance_m', 0.20)
+        self.declare_parameter('park_exit_forward_speed_mps', 0.05)
+        self.declare_parameter('park_exit_behavior_timeout_sec', 20.0)
+        self.declare_parameter('park_exit_detection_radius_m', 0.25)
+        self.declare_parameter('duplicate_goal_distance_m', 0.12)
+        self.declare_parameter('duplicate_goal_yaw_tolerance_deg', 20.0)
         self.declare_parameter('sequence_dependency_timeout_sec', 300.0)
         self.declare_parameter('subscribe_odom_fallback', False)
 
@@ -93,6 +168,36 @@ class FleetDispatcher(Node):
         self.telemetry_timeout = float(
             self.get_parameter('telemetry_timeout_sec').value
         )
+        self.motion_threshold_mps = float(
+            self.get_parameter('motion_threshold_mps').value
+        )
+        if self.motion_threshold_mps <= 0.0:
+            raise ValueError('motion_threshold_mps must be positive')
+        self.motion_yaw_threshold_rps = float(
+            self.get_parameter('motion_yaw_threshold_rps').value
+        )
+        if self.motion_yaw_threshold_rps <= 0.0:
+            raise ValueError('motion_yaw_threshold_rps must be positive')
+        self.motion_stall_timeout_sec = float(
+            self.get_parameter('motion_stall_timeout_sec').value
+        )
+        if self.motion_stall_timeout_sec <= 0.0:
+            raise ValueError('motion_stall_timeout_sec must be positive')
+        self.max_motion_resends = int(
+            self.get_parameter('max_motion_resends').value
+        )
+        if self.max_motion_resends < 0:
+            raise ValueError('max_motion_resends must be non-negative')
+        self.max_park_retries = int(
+            self.get_parameter('max_park_retries').value
+        )
+        if self.max_park_retries < 0:
+            raise ValueError('max_park_retries must be non-negative')
+        self.park_retry_backoff_sec = float(
+            self.get_parameter('park_retry_backoff_sec').value
+        )
+        if self.park_retry_backoff_sec < 0.0:
+            raise ValueError('park_retry_backoff_sec must be non-negative')
         # Zones a single vehicle occupies exclusively (e.g. B-1 ship loading
         # bay, A shared cargo-bin stop): only one vehicle may hold one at a
         # time, others queue until it leaves.
@@ -156,6 +261,86 @@ class FleetDispatcher(Node):
         )
         if self.b1_exit_turn_settle_sec < 0.0:
             raise ValueError('b1_exit_turn_settle_sec must be non-negative')
+        self.b1_zone_map_x = float(
+            self.get_parameter('b1_zone_map_x').value
+        )
+        self.b1_zone_map_y = float(
+            self.get_parameter('b1_zone_map_y').value
+        )
+        self.park_zone_ids = {'agv1': 'PARK1', 'agv2': 'PARK2'}
+        self.park_spot_ids = {}
+        self.park_zone_map_xy = {}
+        for vehicle_id in ('agv1', 'agv2'):
+            spot_id = str(
+                self.get_parameter(f'{vehicle_id}_park_spot_id').value
+            )
+            if not spot_id:
+                raise ValueError(
+                    f'{vehicle_id}_park_spot_id must not be empty'
+                )
+            self.park_spot_ids[vehicle_id] = spot_id
+            self.park_zone_map_xy[vehicle_id] = (
+                float(
+                    self.get_parameter(f'{vehicle_id}_park_zone_map_x').value
+                ),
+                float(
+                    self.get_parameter(f'{vehicle_id}_park_zone_map_y').value
+                ),
+            )
+        self.park_request_topic = str(
+            self.get_parameter('park_request_topic').value
+        )
+        self.park_exit_forward_distance_m = float(
+            self.get_parameter('park_exit_forward_distance_m').value
+        )
+        if self.park_exit_forward_distance_m <= 0.0:
+            raise ValueError('park_exit_forward_distance_m must be positive')
+        self.park_exit_forward_speed_mps = float(
+            self.get_parameter('park_exit_forward_speed_mps').value
+        )
+        if self.park_exit_forward_speed_mps <= 0.0:
+            raise ValueError('park_exit_forward_speed_mps must be positive')
+        self.park_exit_behavior_timeout_sec = float(
+            self.get_parameter('park_exit_behavior_timeout_sec').value
+        )
+        if self.park_exit_behavior_timeout_sec <= 0.0:
+            raise ValueError('park_exit_behavior_timeout_sec must be positive')
+        self.park_exit_detection_radius_m = float(
+            self.get_parameter('park_exit_detection_radius_m').value
+        )
+        if self.park_exit_detection_radius_m <= 0.0:
+            raise ValueError('park_exit_detection_radius_m must be positive')
+        self.auto_park_idle_sec = float(
+            self.get_parameter('auto_park_idle_sec').value
+        )
+        if self.auto_park_idle_sec < 0.0:
+            raise ValueError('auto_park_idle_sec must be non-negative')
+        self.auto_park_check_interval_sec = float(
+            self.get_parameter('auto_park_check_interval_sec').value
+        )
+        if self.auto_park_check_interval_sec <= 0.0:
+            raise ValueError(
+                'auto_park_check_interval_sec must be positive'
+            )
+        self.park_action_wait_timeout_sec = float(
+            self.get_parameter('park_action_wait_timeout_sec').value
+        )
+        if self.park_action_wait_timeout_sec < 0.0:
+            raise ValueError(
+                'park_action_wait_timeout_sec must be non-negative'
+            )
+        self.duplicate_goal_distance_m = float(
+            self.get_parameter('duplicate_goal_distance_m').value
+        )
+        if self.duplicate_goal_distance_m <= 0.0:
+            raise ValueError('duplicate_goal_distance_m must be positive')
+        self.duplicate_goal_yaw_tolerance_rad = math.radians(float(
+            self.get_parameter('duplicate_goal_yaw_tolerance_deg').value
+        ))
+        if not 0.0 < self.duplicate_goal_yaw_tolerance_rad <= math.pi:
+            raise ValueError(
+                'duplicate_goal_yaw_tolerance_deg must be in (0, 180]'
+            )
         self.sequence_dependency_timeout_sec = float(
             self.get_parameter('sequence_dependency_timeout_sec').value
         )
@@ -182,6 +367,26 @@ class FleetDispatcher(Node):
         }
         self._zone_queue = {zone_id: [] for zone_id in self.exclusive_zone_ids}
         self._zone_target_poses = {}
+        if 'B-1' in self.exclusive_zone_ids:
+            b1_pose = PoseStamped()
+            b1_pose.header.frame_id = 'map'
+            b1_pose.pose.position.x = self.b1_zone_map_x
+            b1_pose.pose.position.y = self.b1_zone_map_y
+            b1_pose.pose.orientation.w = 1.0
+            self._zone_target_poses['B-1'] = b1_pose
+        for vehicle_id, zone_id in self.park_zone_ids.items():
+            if zone_id not in self.exclusive_zone_ids:
+                continue
+            park_x, park_y = self.park_zone_map_xy[vehicle_id]
+            park_pose = PoseStamped()
+            park_pose.header.frame_id = 'map'
+            park_pose.pose.position.x = park_x
+            park_pose.pose.position.y = park_y
+            park_pose.pose.orientation.w = 1.0
+            self._zone_target_poses[zone_id] = park_pose
+        self._startup_zone_recovery_pending = set(
+            self._zone_target_poses
+        )
         self._zone_entered = {
             zone_id: False for zone_id in self.exclusive_zone_ids
         }
@@ -194,6 +399,7 @@ class FleetDispatcher(Node):
         self.nav_waypoint_clients = {}
         self.spin_clients = {}
         self.drive_on_heading_clients = {}
+        self.park_clients = {}
         self.gate_clients = {}
         self.state_publishers = {}
         for vehicle_id in vehicle_ids:
@@ -221,6 +427,12 @@ class FleetDispatcher(Node):
                 f'/{vehicle_id}/drive_on_heading',
                 callback_group=self.callback_group,
             )
+            self.park_clients[vehicle_id] = ActionClient(
+                self,
+                ParkInSpot,
+                f'/{vehicle_id}/park_in_spot',
+                callback_group=self.callback_group,
+            )
             self.gate_clients[vehicle_id] = self.create_client(
                 SetBool,
                 f'/{vehicle_id}/emergency_stop',
@@ -240,12 +452,26 @@ class FleetDispatcher(Node):
                 callback_group=self.callback_group,
             )
 
+        # A vehicle the collision supervisor is holding is standing still on
+        # purpose. Without this the stall watchdog reads that as a wedged goal
+        # and burns its re-sends waiting out a hold it cannot affect.
+        self._collision_held_vehicle = ''
+        self.create_subscription(
+            String,
+            '/central/fleet/collision_status',
+            self._on_collision_status,
+            10,
+            callback_group=self.callback_group,
+        )
         self.zone_publisher = self.create_publisher(
             String, '/central/fleet/zones', 10
         )
         self.marker_publisher = self.create_publisher(
             MarkerArray, '/central/fleet/vehicle_markers', 10
         )
+        # Clear cargo-box markers left by older dispatcher versions once.
+        # Vehicle geometry is rendered exclusively by the namespaced URDF.
+        self._marker_cleanup_pending = True
         self.create_service(
             SetBool,
             '/central/fleet/emergency_stop',
@@ -275,8 +501,33 @@ class FleetDispatcher(Node):
         )
         rate = float(self.get_parameter('state_publish_rate_hz').value)
         self.create_timer(1.0 / rate, self._publish_states)
+
+        self._idle_since = {vehicle_id: None for vehicle_id in vehicle_ids}
+        self.create_subscription(
+            String,
+            self.park_request_topic,
+            self._on_park_request,
+            10,
+            callback_group=self.callback_group,
+        )
+        if self.auto_park_idle_sec > 0.0:
+            self.create_timer(
+                self.auto_park_check_interval_sec,
+                self._check_auto_park,
+                callback_group=self.callback_group,
+            )
+        park_summary = ', '.join(
+            f'{vehicle_id}={self.park_spot_ids[vehicle_id]}'
+            f'@({self.park_zone_map_xy[vehicle_id][0]:.3f}, '
+            f'{self.park_zone_map_xy[vehicle_id][1]:.3f})'
+            for vehicle_id in ('agv1', 'agv2')
+        )
         self.get_logger().info(
-            'Fleet dispatcher ready: vehicles=agv1,agv2, B-1 lock enabled'
+            'Fleet dispatcher ready: vehicles=agv1,agv2, B-1 lock enabled; '
+            f'B-1 reference=({self.b1_zone_map_x:.3f}, '
+            f'{self.b1_zone_map_y:.3f}); park spots: {park_summary}; '
+            f'idle auto-parking='
+            f'{self.auto_park_idle_sec if self.auto_park_idle_sec > 0.0 else "disabled"}'
         )
 
     def _create_vehicle_subscriptions(self, vehicle_id):
@@ -337,12 +588,41 @@ class FleetDispatcher(Node):
     def _on_odom(self, vehicle_id, message):
         with self._lock:
             runtime = self.vehicles[vehicle_id]
-            runtime.telemetry_received_at = time.monotonic()
+            now = time.monotonic()
+            runtime.telemetry_received_at = now
+            # Rotating counts as moving: a recovery spin is progress, not a
+            # stall, and re-sending the goal through it would be wrong.
+            twist = message.twist.twist
+            runtime.odom_speed = math.hypot(
+                float(twist.linear.x), float(twist.linear.y)
+            )
+            runtime.odom_yaw_rate = abs(float(twist.angular.z))
+            if (
+                runtime.odom_speed > self.motion_threshold_mps
+                or runtime.odom_yaw_rate > self.motion_yaw_threshold_rps
+            ):
+                runtime.last_motion_at = now
             if runtime.has_amcl_pose or not self.subscribe_odom_fallback:
                 return
             runtime.pose.header = message.header
             runtime.pose.pose = message.pose.pose
             runtime.pose_received_at = time.monotonic()
+
+    def _on_collision_status(self, message):
+        try:
+            held = str(json.loads(message.data).get('held_vehicle', ''))
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return
+        with self._lock:
+            self._collision_held_vehicle = held
+
+    def _vehicle_is_deliberately_stopped(self, vehicle_id):
+        """Is this vehicle standing still because something stopped it?"""
+        with self._lock:
+            return (
+                self.vehicles[vehicle_id].emergency
+                or self._collision_held_vehicle == vehicle_id
+            )
 
     def _on_battery(self, vehicle_id, attribute, message):
         with self._lock:
@@ -432,6 +712,48 @@ class FleetDispatcher(Node):
             )
             for vehicle_id in vehicle_ids
         )
+
+    def _find_equivalent_active_vehicle(
+        self,
+        requested_vehicle_id,
+        target_zone_id,
+        target_pose,
+    ):
+        """Return the vehicle already executing the same semantic target."""
+        requested = requested_vehicle_id.strip('/')
+        vehicle_ids = [requested] if requested else sorted(self.vehicles)
+        with self._lock:
+            for vehicle_id in vehicle_ids:
+                runtime = self.vehicles[vehicle_id]
+                active_target = runtime.current_target_pose
+                if not runtime.busy or active_target is None:
+                    continue
+                if runtime.current_command_id in self._preempted_commands:
+                    continue
+                if runtime.current_target_zone != target_zone_id:
+                    continue
+                distance = math.hypot(
+                    active_target.pose.position.x - target_pose.pose.position.x,
+                    active_target.pose.position.y - target_pose.pose.position.y,
+                )
+                yaw_error = abs(self._normalize_angle(
+                    self._pose_yaw(active_target) - self._pose_yaw(target_pose)
+                ))
+                if (
+                    distance <= self.duplicate_goal_distance_m
+                    and yaw_error <= self.duplicate_goal_yaw_tolerance_rad
+                ):
+                    return vehicle_id
+        return ''
+
+    def _set_active_target(self, vehicle_id, zone_id, target_pose):
+        with self._lock:
+            runtime = self.vehicles[vehicle_id]
+            runtime.current_target_zone = zone_id
+            runtime.current_target_pose = copy.deepcopy(target_pose)
+            if zone_id == 'B-1':
+                runtime.b1_exit_turn_completed = False
+                runtime.b1_exit_forward_completed = False
 
     def _select_and_reserve_vehicle(
         self,
@@ -644,6 +966,32 @@ class FleetDispatcher(Node):
             )
             return owner
 
+    def _recover_startup_zone_owners(self):
+        """Recover configured zone occupancy once from fresh AMCL poses."""
+        pending = tuple(self._startup_zone_recovery_pending)
+        if not pending:
+            return
+        now = time.monotonic()
+        all_vehicles_ready = all(
+            runtime.has_amcl_pose
+            and runtime.telemetry_received_at is not None
+            and now - runtime.telemetry_received_at <= self.telemetry_timeout
+            for runtime in self.vehicles.values()
+        )
+        for zone_id in pending:
+            with self._lock:
+                owner = self._zone_owner.get(zone_id, '')
+                target_pose = self._zone_target_poses.get(zone_id)
+            if owner:
+                self._startup_zone_recovery_pending.discard(zone_id)
+                continue
+            if target_pose is None:
+                self._startup_zone_recovery_pending.discard(zone_id)
+                continue
+            owner = self._infer_zone_owner_from_pose(zone_id, target_pose)
+            if owner or all_vehicles_ready:
+                self._startup_zone_recovery_pending.discard(zone_id)
+
     def _acquire_zone(self, goal_handle, vehicle_id, command_id, zone_id):
         self._queue_zone_request(vehicle_id, command_id, zone_id)
         return self._wait_for_zone(
@@ -729,7 +1077,11 @@ class FleetDispatcher(Node):
                     or time.monotonic() - runtime.telemetry_received_at
                     > self.telemetry_timeout
                 )
-                if telemetry_lost:
+                # A lock acquired before entering the zone is only a
+                # reservation. It is safe to release after a failed command
+                # even when telemetry is unavailable. Preserve UNKNOWN only
+                # for a vehicle that was confirmed inside the zone.
+                if telemetry_lost and self._zone_entered[zone_id]:
                     self._zone_unknown[zone_id] = True
                 else:
                     self._zone_owner[zone_id] = ''
@@ -766,6 +1118,7 @@ class FleetDispatcher(Node):
         request = goal_handle.request
         result = DispatchNavigation.Result()
         command_id = request.command_id or f'dispatch-{time.time_ns()}'
+        self._recover_startup_zone_owners()
         if request.predecessor_command_id:
             self._publish_dispatch_feedback(
                 goal_handle,
@@ -802,6 +1155,32 @@ class FleetDispatcher(Node):
             request.poses[-1],
         )
         requested_vehicle_id = request.requested_vehicle_id.strip('/')
+        if not request.queue_if_busy and not request.predecessor_command_id:
+            duplicate_vehicle_id = self._find_equivalent_active_vehicle(
+                requested_vehicle_id,
+                request.zone_id,
+                request.poses[-1],
+            )
+            if duplicate_vehicle_id:
+                result.assigned_vehicle_id = duplicate_vehicle_id
+                result.success = True
+                result.message = (
+                    'equivalent destination is already active; '
+                    'existing command retained'
+                )
+                self._publish_dispatch_feedback(
+                    goal_handle,
+                    duplicate_vehicle_id,
+                    'DUPLICATE_ACTIVE_GOAL',
+                    0,
+                )
+                goal_handle.succeed()
+                self._record_command_outcome(command_id, True)
+                self.get_logger().info(
+                    f'Coalesced duplicate {command_id} into the active '
+                    f'{duplicate_vehicle_id} destination'
+                )
+                return result
         if requested_vehicle_id:
             if not request.queue_if_busy:
                 self._preempt_vehicle_commands(requested_vehicle_id)
@@ -892,6 +1271,7 @@ class FleetDispatcher(Node):
             return result
         result.assigned_vehicle_id = vehicle_id
         runtime = self.vehicles[vehicle_id]
+        self._set_active_target(vehicle_id, request.zone_id, request.poses[-1])
         leaving_zone_id = (
             runtime.locked_zone
             if (
@@ -904,35 +1284,85 @@ class FleetDispatcher(Node):
         queued_zone_id = ''
         acquired_target_zone = False
         try:
-            if self._requires_b1_exit_maneuver(runtime, request.zone_id):
+            if self._requires_park_exit_maneuver(runtime, request.zone_id):
                 self._publish_dispatch_feedback(
                     goal_handle,
                     vehicle_id,
-                    'ROTATING_LEFT_BEFORE_B1_EXIT',
+                    'DRIVING_STRAIGHT_OUT_OF_PARKING_SPOT',
                     0,
                 )
                 self.get_logger().info(
-                    f'{vehicle_id} leaving B-1: rotating left '
-                    f'{self.b1_exit_left_turn_deg:.1f}deg in place before '
-                    'translation'
+                    f'{vehicle_id} leaving its parking spot: driving straight '
+                    f'{self.park_exit_forward_distance_m:.2f}m before following '
+                    'the destination path'
                 )
-                turn_success, turn_message = await self._rotate_b1_exit_verified(
+                exit_success, exit_message = await self._drive_straight(
                     goal_handle,
                     vehicle_id,
                     command_id,
-                    math.radians(self.b1_exit_left_turn_deg),
+                    self.park_exit_forward_distance_m,
+                    self.park_exit_forward_speed_mps,
+                    self.park_exit_behavior_timeout_sec,
+                    'parking exit forward motion',
                 )
-                if not turn_success:
+                if not exit_success:
                     if goal_handle.is_cancel_requested:
                         goal_handle.canceled()
                         result.error_code = self.ERROR_CANCELED
                     else:
                         goal_handle.abort()
                         result.error_code = self.ERROR_NAV_FAILED
-                    result.message = turn_message
+                    result.message = exit_message
                     return result
+                with self._lock:
+                    runtime.park_exit_forward_completed = True
+                park_zone_id = self.park_zone_ids[vehicle_id]
+                self._release_zone(vehicle_id, park_zone_id)
+                if leaving_zone_id == park_zone_id:
+                    leaving_zone_id = ''
 
-                if self.b1_exit_forward_distance_m > 0.0:
+            if self._requires_b1_exit_maneuver(runtime, request.zone_id):
+                if not runtime.b1_exit_turn_completed:
+                    self._publish_dispatch_feedback(
+                        goal_handle,
+                        vehicle_id,
+                        'ROTATING_LEFT_BEFORE_B1_EXIT',
+                        0,
+                    )
+                    self.get_logger().info(
+                        f'{vehicle_id} leaving B-1: rotating left '
+                        f'{self.b1_exit_left_turn_deg:.1f}deg in place before '
+                        'translation'
+                    )
+                    turn_success, turn_message = (
+                        await self._rotate_b1_exit_verified(
+                            goal_handle,
+                            vehicle_id,
+                            command_id,
+                            math.radians(self.b1_exit_left_turn_deg),
+                        )
+                    )
+                    if not turn_success:
+                        if goal_handle.is_cancel_requested:
+                            goal_handle.canceled()
+                            result.error_code = self.ERROR_CANCELED
+                        else:
+                            goal_handle.abort()
+                            result.error_code = self.ERROR_NAV_FAILED
+                        result.message = turn_message
+                        return result
+                    with self._lock:
+                        runtime.b1_exit_turn_completed = True
+                else:
+                    self.get_logger().info(
+                        f'{vehicle_id} B-1 left turn already completed; '
+                        'resuming the exit sequence'
+                    )
+
+                if (
+                    self.b1_exit_forward_distance_m > 0.0
+                    and not runtime.b1_exit_forward_completed
+                ):
                     self._publish_dispatch_feedback(
                         goal_handle,
                         vehicle_id,
@@ -961,6 +1391,8 @@ class FleetDispatcher(Node):
                             result.error_code = self.ERROR_NAV_FAILED
                         result.message = forward_message
                         return result
+                    with self._lock:
+                        runtime.b1_exit_forward_completed = True
 
             if request.zone_id in self.exclusive_zone_ids:
                 self._maybe_clear_stale_zone(
@@ -1059,19 +1491,21 @@ class FleetDispatcher(Node):
                 ]
                 client = self.nav_waypoint_clients[vehicle_id]
 
-            send_future = client.send_goal_async(
-                nav_goal,
-                feedback_callback=(
-                    lambda message, count=len(request.poses):
-                    self._relay_feedback(
-                        goal_handle,
-                        vehicle_id,
-                        count,
-                        message,
-                    )
-                ),
-            )
-            nav_handle = await send_future
+            async def send_nav_goal():
+                return await client.send_goal_async(
+                    nav_goal,
+                    feedback_callback=(
+                        lambda message, count=len(request.poses):
+                        self._relay_feedback(
+                            goal_handle,
+                            vehicle_id,
+                            count,
+                            message,
+                        )
+                    ),
+                )
+
+            nav_handle = await send_nav_goal()
             if not nav_handle.accepted:
                 goal_handle.abort()
                 result.error_code = self.ERROR_NAV_REJECTED
@@ -1079,7 +1513,18 @@ class FleetDispatcher(Node):
                 return result
             with self._lock:
                 runtime.active_nav_goal = nav_handle
-            nav_result = await nav_handle.get_result_async()
+            nav_result, nav_handle, stall_message = (
+                await self._await_nav_result_watching_motion(
+                    vehicle_id,
+                    nav_handle,
+                    send_nav_goal,
+                )
+            )
+            if stall_message:
+                goal_handle.abort()
+                result.error_code = self.ERROR_NAV_FAILED
+                result.message = stall_message
+                return result
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
                 result.error_code = self.ERROR_CANCELED
@@ -1115,6 +1560,8 @@ class FleetDispatcher(Node):
             with self._vehicle_condition:
                 runtime.busy = False
                 runtime.current_command_id = ''
+                runtime.current_target_zone = ''
+                runtime.current_target_pose = None
                 runtime.active_nav_goal = None
                 self._preempted_commands.discard(command_id)
                 self._vehicle_condition.notify_all()
@@ -1216,11 +1663,17 @@ class FleetDispatcher(Node):
                 command_id,
                 correction,
             )
-            if not success:
+            if (
+                not success
+                and (
+                    goal_handle.is_cancel_requested
+                    or self._command_preempted(command_id)
+                )
+            ):
                 return False, message
 
             if self.b1_exit_turn_settle_sec > 0.0:
-                await asyncio.sleep(self.b1_exit_turn_settle_sec)
+                await self._sleep_async(self.b1_exit_turn_settle_sec)
             measured_pose = await self._wait_for_new_vehicle_pose(
                 vehicle_id,
                 start_pose_time,
@@ -1245,7 +1698,19 @@ class FleetDispatcher(Node):
                 f'attempt={attempt + 1}'
             )
             if abs(yaw_error) <= self.b1_exit_turn_tolerance_rad:
+                if not success:
+                    self.get_logger().warning(
+                        f'{vehicle_id} Spin action reported failure, but '
+                        'fresh AMCL heading confirms the requested B-1 '
+                        'exit turn; continuing safely'
+                    )
                 return True, ''
+            if not success and abs(yaw_error) > math.radians(45.0):
+                return (
+                    False,
+                    f'{message}; measured heading error remains '
+                    f'{math.degrees(yaw_error):.1f}deg',
+                )
             correction = yaw_error
 
         return (
@@ -1253,6 +1718,89 @@ class FleetDispatcher(Node):
             'B-1 exit rotation did not reach the required heading: '
             f'error={math.degrees(correction):.1f}deg',
         )
+
+    async def _await_nav_result_watching_motion(
+        self,
+        vehicle_id,
+        nav_handle,
+        resend,
+    ):
+        """Await Nav2's result, re-sending the goal if the vehicle never moves.
+
+        Nav2 reports a goal as executing whether or not the wheels turn, so a
+        latched hold or a wedged controller looks identical to normal progress
+        until the action times out minutes later. Returns
+        (result, handle, stall_message); stall_message is empty unless the
+        vehicle stopped moving and the re-sends were used up.
+        """
+        resends_used = 0
+        self._reset_stall_clock(vehicle_id)
+
+        while True:
+            result_future = nav_handle.get_result_async()
+            resend_pending = False
+
+            while not result_future.done():
+                await self._sleep_async(0.2)
+                now = time.monotonic()
+                with self._lock:
+                    runtime = self.vehicles[vehicle_id]
+                    stalled_for = now - (runtime.last_motion_at or now)
+                held = self._vehicle_is_deliberately_stopped(vehicle_id)
+                verdict = classify_motion_stall(
+                    stalled_for_sec=stalled_for,
+                    stall_timeout_sec=self.motion_stall_timeout_sec,
+                    resends_used=resends_used,
+                    max_resends=self.max_motion_resends,
+                    held=held,
+                )
+                if verdict == STALL_MOVING:
+                    continue
+                if verdict == STALL_HELD:
+                    # A hold must not burn the stall budget; the clock starts
+                    # again from the moment the vehicle is released.
+                    self._reset_stall_clock(vehicle_id)
+                    continue
+                if verdict == STALL_EXHAUSTED:
+                    self.get_logger().error(
+                        f'{vehicle_id} has not moved for {stalled_for:.1f}s '
+                        f'after {resends_used} re-send(s); giving up'
+                    )
+                    nav_handle.cancel_goal_async()
+                    return None, nav_handle, (
+                        f'vehicle did not move after {resends_used} re-send(s)'
+                    )
+
+                resends_used += 1
+                self.get_logger().warning(
+                    f'{vehicle_id} accepted the goal but has not moved for '
+                    f'{stalled_for:.1f}s; re-sending '
+                    f'({resends_used}/{self.max_motion_resends})'
+                )
+                # Wait for the cancellation to land. bt_navigator muxes its
+                # navigators and rejects a new goal while one is still
+                # running, so re-sending too early is refused outright.
+                await nav_handle.cancel_goal_async()
+                new_handle = await resend()
+                if new_handle is None or not new_handle.accepted:
+                    return None, nav_handle, 'Nav2 rejected the re-sent goal'
+                nav_handle = new_handle
+                with self._lock:
+                    self.vehicles[vehicle_id].active_nav_goal = nav_handle
+                self._reset_stall_clock(vehicle_id)
+                resend_pending = True
+                break
+
+            # Only the current handle's result counts; the future belonging to
+            # a cancelled handle completes too, and returning it would report
+            # the re-sent goal as cancelled.
+            if resend_pending:
+                continue
+            return result_future.result(), nav_handle, ''
+
+    def _reset_stall_clock(self, vehicle_id):
+        with self._lock:
+            self.vehicles[vehicle_id].last_motion_at = time.monotonic()
 
     async def _wait_for_new_vehicle_pose(
         self,
@@ -1273,8 +1821,30 @@ class FleetDispatcher(Node):
                     )
                 ):
                     return copy.deepcopy(runtime.pose)
-            await asyncio.sleep(0.05)
+            await self._sleep_async(0.05)
         return None
+
+    async def _sleep_async(self, seconds):
+        """Yield a coroutine using an rclpy timer, not an asyncio event loop."""
+        if seconds <= 0.0:
+            return
+        future = Future(executor=self.executor)
+        timer = None
+
+        def wake():
+            if not future.done():
+                future.set_result(True)
+
+        timer = self.create_timer(
+            float(seconds),
+            wake,
+            callback_group=self.callback_group,
+        )
+        try:
+            await future
+        finally:
+            if timer is not None:
+                self.destroy_timer(timer)
 
     async def _drive_forward(
         self,
@@ -1284,20 +1854,38 @@ class FleetDispatcher(Node):
         distance_m,
     ):
         """Drive straight along the vehicle x-axis after the B-1 turn."""
+        return await self._drive_straight(
+            goal_handle,
+            vehicle_id,
+            command_id,
+            distance_m,
+            self.b1_exit_forward_speed_mps,
+            self.b1_exit_behavior_timeout_sec,
+            'B-1 exit forward motion',
+        )
+
+    async def _drive_straight(
+        self,
+        goal_handle,
+        vehicle_id,
+        command_id,
+        distance_m,
+        speed_mps,
+        timeout_sec,
+        phase,
+    ):
+        """Run a forced straight DriveOnHeading motion before Nav2 planning."""
         goal = DriveOnHeading.Goal()
         goal.target.x = float(distance_m)
-        goal.speed = float(self.b1_exit_forward_speed_mps)
-        self._set_duration(
-            goal.time_allowance,
-            self.b1_exit_behavior_timeout_sec,
-        )
+        goal.speed = float(speed_mps)
+        self._set_duration(goal.time_allowance, timeout_sec)
         return await self._execute_behavior(
             goal_handle,
             vehicle_id,
             command_id,
             self.drive_on_heading_clients[vehicle_id],
             goal,
-            'B-1 exit forward motion',
+            phase,
         )
 
     async def _execute_behavior(
@@ -1363,6 +1951,22 @@ class FleetDispatcher(Node):
                 'B-1',
                 radius_m=self.b1_exit_detection_radius_m,
             )
+        )
+
+    def _requires_park_exit_maneuver(self, runtime, target_zone):
+        """Require one straight exit when leaving this vehicle's own spot."""
+        park_zone_id = self.park_zone_ids[runtime.vehicle_id]
+        if (
+            target_zone == park_zone_id
+            or runtime.park_exit_forward_completed
+        ):
+            return False
+        if runtime.locked_zone == park_zone_id:
+            return True
+        return self._vehicle_is_at_zone(
+            runtime,
+            park_zone_id,
+            radius_m=self.park_exit_detection_radius_m,
         )
 
     def _vehicle_is_at_zone(self, runtime, zone_id, radius_m=None):
@@ -1449,6 +2053,184 @@ class FleetDispatcher(Node):
         pose.header.frame_id = source.header.frame_id or 'map'
         pose.pose = source.pose
         return pose
+
+    def _on_park_request(self, message):
+        """Kick off an async park dispatch from a synchronous topic callback."""
+        vehicle_id = str(message.data).strip().strip('/')
+        self.executor.create_task(self._dispatch_park(vehicle_id))
+
+    def _check_auto_park(self):
+        """Send any vehicle that has been idle long enough to its own spot."""
+        now = time.monotonic()
+        to_park = []
+        with self._lock:
+            for vehicle_id, runtime in self.vehicles.items():
+                ready = self._vehicle_ready(vehicle_id)
+                already_parked = (
+                    runtime.locked_zone == self.park_zone_ids[vehicle_id]
+                )
+                if not ready or already_parked:
+                    self._idle_since[vehicle_id] = None
+                    continue
+                if self._idle_since[vehicle_id] is None:
+                    self._idle_since[vehicle_id] = now
+                    continue
+                if now - self._idle_since[vehicle_id] >= self.auto_park_idle_sec:
+                    to_park.append(vehicle_id)
+        for vehicle_id in to_park:
+            self.get_logger().info(
+                f'{vehicle_id} idle for {self.auto_park_idle_sec:.0f}s; '
+                'auto-parking'
+            )
+            self.executor.create_task(self._dispatch_park(vehicle_id))
+
+    async def _dispatch_park(self, requested_vehicle_id):
+        """
+        Reserve a ready vehicle and run its own dedicated ParkInSpot action.
+
+        Each vehicle has its own fixed, non-shared spot (self.park_zone_ids /
+        self.park_spot_ids), so there is never real contention between agv1
+        and agv2 here. Still fire-and-forget: triggered from a topic
+        (explicit "park" command) or the idle watchdog, neither of which
+        holds a cancelable action goal_handle.
+        """
+        requested_vehicle_id = requested_vehicle_id.strip('/')
+        if requested_vehicle_id and requested_vehicle_id not in self.vehicles:
+            self.get_logger().error(
+                f'park request ignored: unknown vehicle_id={requested_vehicle_id!r}'
+            )
+            return
+
+        with self._lock:
+            candidates = (
+                [requested_vehicle_id]
+                if requested_vehicle_id
+                else sorted(self.vehicles)
+            )
+            vehicle_id = next(
+                (
+                    candidate for candidate in candidates
+                    if self._vehicle_ready(candidate)
+                    and self.vehicles[candidate].locked_zone
+                    != self.park_zone_ids[candidate]
+                ),
+                '',
+            )
+            if not vehicle_id:
+                detail_items = []
+                for candidate in candidates:
+                    candidate_runtime = self.vehicles[candidate]
+                    reasons = []
+                    if candidate_runtime.locked_zone == self.park_zone_ids[candidate]:
+                        reasons.append('already parked/zone locked')
+                    if candidate_runtime.busy:
+                        reasons.append('busy')
+                    if not reasons and not self._vehicle_operational(candidate):
+                        reasons.extend(self._vehicle_unready_reasons(candidate))
+                    detail_items.append(
+                        f'{candidate}: {", ".join(reasons or ["unavailable"])}'
+                    )
+                details = '; '.join(detail_items)
+                self.get_logger().warning(
+                    'Park request ignored: no ready, not-already-parked '
+                    f'vehicle available ({details})',
+                    throttle_duration_sec=5.0,
+                )
+                return
+            runtime = self.vehicles[vehicle_id]
+            runtime.busy = True
+            command_id = f'park-{time.time_ns()}'
+            runtime.current_command_id = command_id
+
+        zone_id = self.park_zone_ids[vehicle_id]
+        spot_id = self.park_spot_ids[vehicle_id]
+        acquired_zone = False
+        parking_succeeded = False
+        try:
+            queue_state = self._queue_zone_request(vehicle_id, command_id, zone_id)
+            acquired_zone = queue_state == 'acquired'
+            if queue_state == 'queued':
+                with self._lock:
+                    queue = self._zone_queue[zone_id]
+                    if command_id in queue:
+                        queue.remove(command_id)
+                self.get_logger().error(
+                    f'{vehicle_id} park deferred: {zone_id} unexpectedly '
+                    'occupied by another vehicle'
+                )
+                return
+
+            client = self.park_clients[vehicle_id]
+            if not client.wait_for_server(
+                timeout_sec=self.park_action_wait_timeout_sec
+            ):
+                self.get_logger().error(
+                    f'{vehicle_id} /park_in_spot action server unavailable '
+                    f'after {self.park_action_wait_timeout_sec:.1f}s'
+                )
+                return
+            goal = ParkInSpot.Goal()
+            goal.spot_id = spot_id
+            # Nav2 aborting once mid-parking is routine -- a recovery cycle
+            # runs out, or the controller gives up on a plan -- and the
+            # sequence then stops dead until someone re-issues the command by
+            # hand. Retry it here instead. Each attempt re-plans from wherever
+            # the vehicle actually is, so a partial run is safe to repeat.
+            attempts = 1 + self.max_park_retries
+            for attempt in range(1, attempts + 1):
+                goal_handle = await client.send_goal_async(goal)
+                if not goal_handle.accepted:
+                    self.get_logger().error(
+                        f'{vehicle_id} park_in_spot goal rejected'
+                    )
+                    return
+                with self._lock:
+                    runtime.active_nav_goal = goal_handle
+                park_result = await goal_handle.get_result_async()
+                with self._lock:
+                    runtime.active_nav_goal = None
+                result = park_result.result
+
+                if result.success:
+                    parking_succeeded = True
+                    with self._lock:
+                        runtime.park_exit_forward_completed = False
+                    self.get_logger().info(
+                        f'{vehicle_id} parked at {spot_id} on attempt '
+                        f'{attempt}/{attempts}: {result.message}'
+                    )
+                    break
+
+                if self._command_preempted(command_id):
+                    self.get_logger().info(
+                        f'{vehicle_id} parking superseded by a newer command'
+                    )
+                    break
+                # Retrying into a latched hold just burns the budget; the
+                # vehicle is stopped on purpose and will not move either way.
+                if self._vehicle_is_deliberately_stopped(vehicle_id):
+                    self.get_logger().error(
+                        f'{vehicle_id} parking failed while held: '
+                        f'{result.message}'
+                    )
+                    break
+                if attempt >= attempts:
+                    self.get_logger().error(
+                        f'{vehicle_id} parking failed after {attempts} '
+                        f'attempt(s): {result.message}'
+                    )
+                    break
+                self.get_logger().warning(
+                    f'{vehicle_id} parking attempt {attempt}/{attempts} '
+                    f'failed: {result.message}; retrying'
+                )
+                await self._sleep_async(self.park_retry_backoff_sec)
+        finally:
+            if acquired_zone and not parking_succeeded:
+                self._release_zone(vehicle_id, zone_id)
+            with self._lock:
+                runtime.busy = False
+                runtime.current_command_id = ''
 
     @staticmethod
     def _publish_dispatch_feedback(
@@ -1538,9 +2320,15 @@ class FleetDispatcher(Node):
         return response
 
     def _publish_states(self):
+        self._recover_startup_zone_owners()
         self._refresh_zone_occupancy()
         now = time.monotonic()
         markers = MarkerArray()
+        if self._marker_cleanup_pending:
+            cleanup = Marker()
+            cleanup.action = Marker.DELETEALL
+            markers.markers.append(cleanup)
+            self._marker_cleanup_pending = False
         with self._lock:
             for marker_id, (vehicle_id, runtime) in enumerate(
                 self.vehicles.items()
@@ -1645,6 +2433,12 @@ class FleetDispatcher(Node):
                     - target_pose.pose.position.y,
                 )
                 if distance <= self.zone_occupancy_radius_m:
+                    if not self._zone_entered[zone_id]:
+                        if zone_id == 'B-1':
+                            runtime.b1_exit_turn_completed = False
+                            runtime.b1_exit_forward_completed = False
+                        if zone_id == self.park_zone_ids.get(owner):
+                            runtime.park_exit_forward_completed = False
                     self._zone_entered[zone_id] = True
                     continue
                 if (
@@ -1664,30 +2458,11 @@ class FleetDispatcher(Node):
 
     @staticmethod
     def _vehicle_markers(marker_id, runtime, stamp, online):
-        color = (
-            (0.90, 0.20, 0.16)
-            if runtime.vehicle_id == 'agv1'
-            else (0.12, 0.42, 0.92)
-        )
         alpha = 1.0 if online else 0.35
 
-        body = Marker()
-        body.header.stamp = stamp
-        body.header.frame_id = 'map'
-        body.ns = 'fleet_vehicle'
-        body.id = marker_id * 2
-        body.type = Marker.CUBE
-        body.action = Marker.ADD
-        body.pose = copy.deepcopy(runtime.pose.pose)
-        body.pose.position.z = 0.04
-        body.scale.x = 0.34
-        body.scale.y = 0.14
-        body.scale.z = 0.08
-        body.color.r, body.color.g, body.color.b = color
-        body.color.a = alpha
-
         label = Marker()
-        label.header = body.header
+        label.header.stamp = stamp
+        label.header.frame_id = 'map'
         label.ns = 'fleet_vehicle_label'
         label.id = marker_id * 2 + 1
         label.type = Marker.TEXT_VIEW_FACING
@@ -1701,7 +2476,7 @@ class FleetDispatcher(Node):
         label.color.b = 1.0
         label.color.a = alpha
         label.text = runtime.vehicle_id.upper()
-        return body, label
+        return (label,)
 
 
 def main(args=None):

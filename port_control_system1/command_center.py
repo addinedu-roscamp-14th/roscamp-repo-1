@@ -774,6 +774,34 @@ class CommandPopup(ctk.CTkToplevel):
             )
             return True
 
+        if action_type == "park_command":
+            vehicle_id = self._extract_vehicle_id(action)
+            try:
+                response = CentralControlClient().send_park(
+                    vehicle_id=vehicle_id
+                )
+            except CentralControlApiError as exc:
+                self._log(f"[자동 주차 실패] {exc}")
+                self.result_label.configure(
+                    text=f"[자동 주차 실패] {exc}",
+                    text_color="#EA5455",
+                )
+                return True
+
+            command_id = response.get("command_id", "unknown")
+            self._log(
+                f"[자동 주차 명령 전송] vehicle={vehicle_id or 'AUTO'}, "
+                f"command_id={command_id}"
+            )
+            self.result_label.configure(
+                text=(
+                    "[자동 주차 명령 전송 완료]\n"
+                    f"차량={vehicle_id or '자동배차'}"
+                ),
+                text_color="#28C76F",
+            )
+            return True
+
         # type == "unknown" 이거나 예상 밖의 값이면 처리 못 한 것으로 간주
         return False
 

@@ -29,6 +29,7 @@ from std_srvs.srv import SetBool, Trigger
 
 from .control_protocol import (
     CommandValidationError,
+    validate_park_request,
     validate_pixel_goal,
 )
 
@@ -85,6 +86,9 @@ class CentralControlGateway(Node):
         self.declare_parameter(
             'command_status_topic', '/central/control/status'
         )
+        self.declare_parameter(
+            'park_request_topic', '/central/fleet/park_request'
+        )
         self.declare_parameter('battery_percent_topic', '/battery/percent')
         self.declare_parameter('battery_voltage_topic', '/battery/voltage')
         self.declare_parameter('odom_topic', '/odom')
@@ -108,6 +112,9 @@ class CentralControlGateway(Node):
         )
         self.command_status_topic = str(
             self.get_parameter('command_status_topic').value
+        )
+        self.park_request_topic = str(
+            self.get_parameter('park_request_topic').value
         )
         self.camera_frame_id = str(
             self.get_parameter('camera_frame_id').value
@@ -154,6 +161,11 @@ class CentralControlGateway(Node):
         self.status_publisher = self.create_publisher(
             String,
             self.command_status_topic,
+            10,
+        )
+        self.park_request_publisher = self.create_publisher(
+            String,
+            self.park_request_topic,
             10,
         )
         self.create_subscription(
@@ -447,6 +459,39 @@ class CentralControlGateway(Node):
             'message': response.message,
         }
 
+    def dispatch_park(self, payload):
+        """Validate and publish one auto-park request exactly once."""
+        request = validate_park_request(payload)
+        command_id = request.command_id or str(uuid.uuid4())
+
+        with self._dispatch_lock:
+            if command_id in self._recent_command_ids:
+                return {
+                    'accepted': True,
+                    'duplicate': True,
+                    'command_id': command_id,
+                }
+            if self.park_request_publisher.get_subscription_count() == 0:
+                raise RuntimeError(
+                    'no subscriber on the park request topic; '
+                    'start fleet_dispatcher first'
+                )
+            message = String()
+            message.data = request.requested_vehicle_id
+            self.park_request_publisher.publish(message)
+            self._recent_command_ids.append(command_id)
+
+        self.get_logger().info(
+            f'Accepted park request {command_id}: '
+            f'vehicle_id={request.requested_vehicle_id or "AUTO"}'
+        )
+        return {
+            'accepted': True,
+            'duplicate': False,
+            'command_id': command_id,
+            'vehicle_id': request.requested_vehicle_id or 'AUTO',
+        }
+
     def _point_message(self, x, y, stamp, mode='direct'):
         message = PointStamped()
         message.header.stamp = stamp
@@ -540,6 +585,25 @@ def create_app(
         authorize(x_control_token)
         try:
             return node.dispatch_pixel_goal(payload)
+        except CommandValidationError as exc:
+            raise http_exception_class(
+                status_code=422,
+                detail=str(exc),
+            ) from exc
+        except RuntimeError as exc:
+            raise http_exception_class(
+                status_code=503,
+                detail=str(exc),
+            ) from exc
+
+    @app.post('/api/v1/navigation/park')
+    async def navigation_park(
+        payload: dict,
+        x_control_token: str | None = header_factory(default=None),
+    ):
+        authorize(x_control_token)
+        try:
+            return node.dispatch_park(payload)
         except CommandValidationError as exc:
             raise http_exception_class(
                 status_code=422,
