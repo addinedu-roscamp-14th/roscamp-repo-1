@@ -21,6 +21,8 @@
         "subscribers": [
           "/tf",
           "/tf_static",
+          "/agv[12]/map",
+          "/agv[12]/keepout_filter_mask",
           "/agv[12]/amcl_pose",
           "/agv[12]/odom",
           "/agv[12]/scan",

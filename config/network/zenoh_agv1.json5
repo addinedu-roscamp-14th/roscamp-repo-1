@@ -14,6 +14,8 @@
         "publishers": [
           "/tf",
           "/tf_static",
+          "/agv1/map",
+          "/agv1/keepout_filter_mask",
           "/agv1/amcl_pose",
           "/agv1/odom",
           "/agv1/scan",
