@@ -18,10 +18,22 @@ def generate_launch_description():
     """Start the GUI with streams pointing at the central laptop."""
     workspace = LaunchConfiguration('workspace')
     central_ip = LaunchConfiguration('central_ip')
+    video_port = LaunchConfiguration('video_port')
     python_executable = LaunchConfiguration('python_executable')
     api_token = LaunchConfiguration('api_token')
     ollama_host = LaunchConfiguration('ollama_host')
     llm_model = LaunchConfiguration('llm_model')
+    llm_num_ctx = LaunchConfiguration('llm_num_ctx')
+    realtime_llm_enabled = LaunchConfiguration('realtime_llm_enabled')
+    realtime_llm_interval_sec = LaunchConfiguration(
+        'realtime_llm_interval_sec'
+    )
+    realtime_llm_heartbeat_sec = LaunchConfiguration(
+        'realtime_llm_heartbeat_sec'
+    )
+    realtime_llm_initial_delay_sec = LaunchConfiguration(
+        'realtime_llm_initial_delay_sec'
+    )
 
     dashboard_directory = PathJoinSubstitution([
         workspace,
@@ -50,6 +62,22 @@ def generate_launch_description():
             description='IP address of the central ROS laptop',
         ),
         DeclareLaunchArgument(
+            'video_port',
+            default_value='8000',
+            description=(
+                'dashboard_stream_node HTTP port on the central laptop '
+                '(must match its port: parameter in dashboard.yaml)'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'discovery_server_port',
+            default_value='11811',
+            description=(
+                'Fast DDS discovery server port on the central laptop; must '
+                'match discovery_server_port: in fleet_central_laptop.launch.py'
+            ),
+        ),
+        DeclareLaunchArgument(
             'python_executable',
             default_value=PathJoinSubstitution([
                 workspace,
@@ -69,7 +97,7 @@ def generate_launch_description():
             'ollama_host',
             default_value=EnvironmentVariable(
                 'OLLAMA_HOST',
-                default_value='http://127.0.0.1:11434',
+                default_value='http://agent.sds.codes',
             ),
         ),
         DeclareLaunchArgument(
@@ -79,17 +107,52 @@ def generate_launch_description():
                 default_value='gemma4:31b',
             ),
         ),
+        DeclareLaunchArgument(
+            'llm_num_ctx',
+            default_value=EnvironmentVariable(
+                'LOCAL_LLM_NUM_CTX',
+                default_value='8192',
+            ),
+            description='Ollama context window used for vision requests',
+        ),
+        DeclareLaunchArgument(
+            'realtime_llm_enabled',
+            default_value='true',
+            description='Continuously reassess the latest operator objective',
+        ),
+        DeclareLaunchArgument(
+            'realtime_llm_interval_sec',
+            default_value='2.0',
+            description='Minimum live-scene polling interval',
+        ),
+        DeclareLaunchArgument(
+            'realtime_llm_heartbeat_sec',
+            default_value='5.0',
+            description='Reassess unchanged scenes at this interval',
+        ),
+        DeclareLaunchArgument(
+            'realtime_llm_initial_delay_sec',
+            default_value='5.0',
+            description='Delay before reassessing a newly dispatched command',
+        ),
+        # The fleet discovers over a Fast DDS discovery server on the central
+        # laptop, not multicast. Without this the dashboard comes up on its own
+        # isolated graph and every /central/fleet/* subscription stays silent.
+        SetEnvironmentVariable(
+            'ROS_DISCOVERY_SERVER',
+            [central_ip, ':', LaunchConfiguration('discovery_server_port')],
+        ),
         SetEnvironmentVariable(
             'PORT_CONTROL_CCTV_URL',
-            ['http://', central_ip, ':8000/video'],
+            ['http://', central_ip, ':', video_port, '/video'],
         ),
         SetEnvironmentVariable(
             'PORT_CONTROL_SLAM_URL',
-            ['http://', central_ip, ':8000/slam/video'],
+            ['http://', central_ip, ':', video_port, '/slam/video'],
         ),
         SetEnvironmentVariable(
             'PORT_CONTROL_DETECTIONS_URL',
-            ['http://', central_ip, ':8000/detections'],
+            ['http://', central_ip, ':', video_port, '/detections'],
         ),
         SetEnvironmentVariable(
             'PORT_CONTROL_API_URL',
@@ -113,6 +176,23 @@ def generate_launch_description():
         ),
         SetEnvironmentVariable('OLLAMA_HOST', ollama_host),
         SetEnvironmentVariable('LOCAL_LLM_MODEL', llm_model),
+        SetEnvironmentVariable('LOCAL_LLM_NUM_CTX', llm_num_ctx),
+        SetEnvironmentVariable(
+            'PORT_CONTROL_REALTIME_LLM_ENABLED',
+            realtime_llm_enabled,
+        ),
+        SetEnvironmentVariable(
+            'PORT_CONTROL_REALTIME_LLM_INTERVAL_SEC',
+            realtime_llm_interval_sec,
+        ),
+        SetEnvironmentVariable(
+            'PORT_CONTROL_REALTIME_LLM_HEARTBEAT_SEC',
+            realtime_llm_heartbeat_sec,
+        ),
+        SetEnvironmentVariable(
+            'PORT_CONTROL_REALTIME_LLM_INITIAL_DELAY_SEC',
+            realtime_llm_initial_delay_sec,
+        ),
         ExecuteProcess(
             cmd=[python_executable, dashboard_script],
             cwd=dashboard_directory,

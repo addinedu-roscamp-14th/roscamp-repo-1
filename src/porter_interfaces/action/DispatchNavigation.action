@@ -1,6 +1,11 @@
 string command_id
+string predecessor_command_id
 string requested_vehicle_id
 string zone_id
+bool zone_visually_empty
+bool queue_if_busy
+bool use_waiting_pose
+geometry_msgs/PoseStamped waiting_pose
 geometry_msgs/PoseStamped[] poses
 ---
 bool success

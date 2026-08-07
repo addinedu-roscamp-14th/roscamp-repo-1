@@ -24,11 +24,14 @@ class PixelGoal:
     """Validated target and heading pixels."""
 
     command_id: str | None
+    predecessor_command_id: str
     requested_vehicle_id: str
     zone_id: str
     mode: str
+    queue_if_busy: bool
     target: Pixel
     heading: Pixel
+    zone_visually_empty: bool
 
 
 def _finite_number(value: Any, field_name: str) -> float:
@@ -63,6 +66,48 @@ def _pixel(
     return Pixel(x=x, y=y)
 
 
+@dataclass(frozen=True)
+class ParkRequest:
+    """Validated request to send one vehicle to the parking spot."""
+
+    command_id: str | None
+    requested_vehicle_id: str
+
+
+def validate_park_request(payload: Any) -> ParkRequest:
+    """Validate an AI/operator request to auto-park one AGV."""
+    if not isinstance(payload, Mapping):
+        raise CommandValidationError('request body must be a JSON object')
+
+    command_id = payload.get('command_id')
+    if command_id is not None:
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise CommandValidationError(
+                'command_id must be a non-empty string'
+            )
+        command_id = command_id.strip()
+        if len(command_id) > 128:
+            raise CommandValidationError(
+                'command_id must not exceed 128 characters'
+            )
+
+    requested_vehicle_id = payload.get('vehicle_id', '')
+    if requested_vehicle_id is None:
+        requested_vehicle_id = ''
+    if not isinstance(requested_vehicle_id, str):
+        raise CommandValidationError('vehicle_id must be a string')
+    requested_vehicle_id = requested_vehicle_id.strip().strip('/')
+    if requested_vehicle_id not in ('', 'agv1', 'agv2'):
+        raise CommandValidationError(
+            'vehicle_id must be empty, agv1, or agv2'
+        )
+
+    return ParkRequest(
+        command_id=command_id,
+        requested_vehicle_id=requested_vehicle_id,
+    )
+
+
 def validate_pixel_goal(
     payload: Any,
     image_width: int,
@@ -89,10 +134,27 @@ def validate_pixel_goal(
                 'command_id must not exceed 128 characters'
             )
 
-    mode = payload.get('mode', 'direct')
-    if mode not in ('direct', 'parking_b1'):
+    predecessor_command_id = payload.get('predecessor_command_id', '')
+    if predecessor_command_id is None:
+        predecessor_command_id = ''
+    if not isinstance(predecessor_command_id, str):
         raise CommandValidationError(
-            'mode must be direct or parking_b1'
+            'predecessor_command_id must be a string'
+        )
+    predecessor_command_id = predecessor_command_id.strip()
+    if len(predecessor_command_id) > 128:
+        raise CommandValidationError(
+            'predecessor_command_id must not exceed 128 characters'
+        )
+    if command_id and predecessor_command_id == command_id:
+        raise CommandValidationError(
+            'predecessor_command_id must differ from command_id'
+        )
+
+    mode = payload.get('mode', 'direct')
+    if mode not in ('direct', 'parking_b1', 'parking_a'):
+        raise CommandValidationError(
+            'mode must be direct, parking_b1, or parking_a'
         )
 
     requested_vehicle_id = payload.get('vehicle_id', '')
@@ -114,8 +176,17 @@ def validate_pixel_goal(
     zone_id = zone_id.strip().upper()
     if mode == 'parking_b1' and not zone_id:
         zone_id = 'B-1'
-    if zone_id not in ('', 'B-1'):
-        raise CommandValidationError('zone_id must be empty or B-1')
+    if mode == 'parking_a' and not zone_id:
+        zone_id = 'A'
+    if zone_id not in ('', 'B-1', 'A'):
+        raise CommandValidationError('zone_id must be empty, B-1, or A')
+
+    zone_visually_empty = payload.get('zone_visually_empty', False)
+    if not isinstance(zone_visually_empty, bool):
+        raise CommandValidationError('zone_visually_empty must be a boolean')
+    queue_if_busy = payload.get('queue_if_busy', False)
+    if not isinstance(queue_if_busy, bool):
+        raise CommandValidationError('queue_if_busy must be a boolean')
 
     target = _pixel(
         payload.get('target'),
@@ -141,9 +212,12 @@ def validate_pixel_goal(
 
     return PixelGoal(
         command_id=command_id,
+        predecessor_command_id=predecessor_command_id,
         requested_vehicle_id=requested_vehicle_id,
         zone_id=zone_id,
         mode=mode,
+        queue_if_busy=queue_if_busy,
         target=target,
         heading=heading,
+        zone_visually_empty=zone_visually_empty,
     )

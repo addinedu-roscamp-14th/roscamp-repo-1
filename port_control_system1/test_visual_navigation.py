@@ -5,8 +5,11 @@ import pytest
 from visual_navigation import (
     VisualNavigationError,
     compact_detections,
+    is_reciprocal_zone_exchange,
     resolve_detection_approach,
+    select_nearest_visible_vehicle,
     validate_pixel_navigation,
+    zone_mode_for_label,
 )
 
 
@@ -90,6 +93,35 @@ def test_b1_parking_uses_zone_center_and_segmentation_heading():
     assert heading['y'] == pytest.approx(240.0)
 
 
+def test_a_zone_heading_always_points_image_up():
+    summary = {
+        'detections': [
+            {
+                'label': 'A-2',
+                'confidence': 0.9,
+                'bbox_xyxy': [200, 200, 260, 260],
+            },
+        ],
+    }
+    target, heading, selected = resolve_detection_approach(
+        {'type': 'visual_navigation', 'detection_index': 0, 'approach_side': 'top'},
+        summary,
+        640,
+        480,
+    )
+    assert selected['label'] == 'A-2'
+    assert target == {'x': 230.0, 'y': 230.0}
+    assert heading == {'x': 230.0, 'y': 180.0}
+
+
+def test_a_zone_labels_share_the_same_mode():
+    assert zone_mode_for_label('A-1') == 'parking_a'
+    assert zone_mode_for_label('A-2') == 'parking_a'
+    assert zone_mode_for_label('A-3') == 'parking_a'
+    assert zone_mode_for_label('B-1') == 'parking_b1'
+    assert zone_mode_for_label('car_yellow') == 'direct'
+
+
 def test_b1_parking_is_rejected_when_vehicle_occupies_center():
     summary = {
         'detections': [
@@ -115,3 +147,63 @@ def test_b1_parking_is_rejected_when_vehicle_occupies_center():
             640,
             480,
         )
+
+
+def test_transfer_selects_nearest_live_vehicle_to_source_zone():
+    summary = {
+        'detections': [
+            {
+                'label': 'A-3',
+                'bbox_xyxy': [80, 60, 180, 160],
+            },
+            {
+                'label': 'car_yellow',
+                'bbox_xyxy': [190, 120, 230, 160],
+            },
+            {
+                'label': 'car_blue',
+                'bbox_xyxy': [430, 300, 470, 340],
+            },
+        ]
+    }
+    source = compact_detections(summary)[0]
+
+    assert select_nearest_visible_vehicle(source, summary) == 'agv1'
+    assert (
+        select_nearest_visible_vehicle(source, summary, {'agv2'})
+        == 'agv2'
+    )
+
+
+def test_reciprocal_occupied_zone_exchange_runs_independently():
+    summary = {
+        'detections': [
+            {'label': 'B-1', 'bbox_xyxy': [440, 240, 540, 340]},
+            {'label': 'A-3', 'bbox_xyxy': [100, 80, 180, 160]},
+        ]
+    }
+    actions = [
+        {
+            'type': 'visual_navigation',
+            'detection_index': 0,
+            'approach_side': 'bottom',
+            'vehicle_id': 'agv1',
+        },
+        {
+            'type': 'visual_navigation',
+            'detection_index': 1,
+            'approach_side': 'bottom',
+            'vehicle_id': 'agv2',
+        },
+    ]
+
+    assert is_reciprocal_zone_exchange(
+        actions,
+        summary,
+        'B-1:agv2;A:agv1',
+    )
+    assert not is_reciprocal_zone_exchange(
+        actions,
+        summary,
+        'B-1:FREE;A:agv1',
+    )

@@ -31,13 +31,13 @@ Visualization Manager:
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /agv1/map
+        Value: /central/fleet/shared_map
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /agv1/map_updates
+        Value: /central/fleet/shared_map_updates
       Use Timestamp: false
       Value: true
     - Alpha: 0.45
@@ -53,7 +53,7 @@ Visualization Manager:
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /agv1/keepout_filter_mask
+        Value: /central/fleet/shared_keepout_mask
       Update Topic:
         Depth: 1
         Durability Policy: Volatile
@@ -208,7 +208,6 @@ Visualization Manager:
       Enabled: true
       Name: Fleet Vehicles
       Namespaces:
-        fleet_vehicle: true
         fleet_vehicle_label: true
       Topic:
         Depth: 5

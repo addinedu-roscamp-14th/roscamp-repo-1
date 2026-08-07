@@ -78,6 +78,7 @@ install(
     scripts/battery_publisher
     scripts/led_server
     scripts/cmd_vel_safety_gate
+    scripts/scan_timestamp_filter
   DESTINATION lib/${PROJECT_NAME}
 )
 
