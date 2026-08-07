@@ -23,15 +23,15 @@ import yaml
 
 
 CALIBRATION_FILE = (
-    Path(__file__).parents[3]
-    / 'calibration_results'
+    Path(__file__).parents[1]
+    / 'config'
     / 'floor_calibration.yaml'
 )
 
 
 @pytest.fixture
 def floors():
-    """Load the real calibration generated before this package."""
+    """Load the calibration bundled with this package."""
     return load_floor_calibration(CALIBRATION_FILE)
 
 

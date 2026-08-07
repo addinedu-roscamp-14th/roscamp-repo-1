@@ -1,7 +1,15 @@
 # Arm Homography Pick/Place
 
-실측한 `calibration_results/floor_calibration.yaml`을 읽어 ArUco Pick/Place를
-수행하는 독립 ROS 2 패키지입니다. 기존 Pick/Place 파일은 수정하지 않습니다.
+실측 캘리브레이션과 JetCobot TF 모델을 패키지 안에서 읽어 ArUco Pick/Place를
+수행하는 독립 ROS 2 패키지입니다. 기존 `arm` 패키지는 필요하지 않습니다.
+
+다음 파일을 자체 포함합니다.
+
+- Pick/Place용 dual ArUco 검출기
+- JetCobot 6축 kinematic URDF
+- USB 카메라 intrinsic calibration
+- eye-in-hand static transform calibration
+- floor/AGV homography 및 Pick/Place Z calibration
 
 MoveIt은 사용하지 않습니다. 관찰 자세는 JetCobot `sync_send_angles`, 모든
 Cartesian 동작은 `send_coords`를 한 번 전송한 뒤 `get_coords`로 직접 도착을
@@ -91,7 +99,7 @@ yaw에서 회전량이 작은 후보를 선택합니다. 선택된 yaw는 해당
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install \
-  --packages-select arm arm_homography_pick_place
+  --packages-select arm_homography_pick_place
 source install/setup.bash
 
 ros2 launch arm_homography_pick_place homography_pick_place.launch.py \
@@ -100,6 +108,16 @@ ros2 launch arm_homography_pick_place homography_pick_place.launch.py \
   pick_id:=2 \
   place_id:=8 \
   marker_size_m:=0.020
+```
+
+launch의 기본 경로는 모두 설치된 `arm_homography_pick_place/share` 내부 파일을
+사용합니다. 별도 calibration 경로를 시험할 때만 다음 인자를 덮어쓰면 됩니다.
+
+```bash
+ros2 launch arm_homography_pick_place homography_pick_place.launch.py \
+  camera_info_url:=/path/to/gripper_camera_info.yaml \
+  handeye_calibration_file:=/path/to/eye_in_hand.calib \
+  calibration_file:=/path/to/floor_calibration.yaml
 ```
 
 작업 시작:

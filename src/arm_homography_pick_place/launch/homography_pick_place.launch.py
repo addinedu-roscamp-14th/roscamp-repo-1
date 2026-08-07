@@ -3,36 +3,62 @@
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+import yaml
 
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
-    IncludeLaunchDescription,
     OpaqueFunction,
-    SetEnvironmentVariable,
     SetLaunchConfiguration,
     TimerAction,
 )
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
-def resolve_paths(context):
-    """Resolve camera, hand-eye and calibration paths before node startup."""
+def resolve_runtime(context):
+    """Resolve local files and create the calibrated camera transform."""
     camera_url = LaunchConfiguration('camera_info_url').perform(context)
     if '://' not in camera_url:
         camera_url = Path(camera_url).expanduser().resolve().as_uri()
     calibration_file = Path(
         LaunchConfiguration('calibration_file').perform(context)
     ).expanduser().resolve()
+    handeye_file = Path(
+        LaunchConfiguration('handeye_calibration_file').perform(context)
+    ).expanduser().resolve()
+    with handeye_file.open(encoding='utf-8') as stream:
+        handeye = yaml.safe_load(stream)
+    parameters = handeye['parameters']
+    transform = handeye['transform']
+    translation = transform['translation']
+    rotation = transform['rotation']
+    if parameters['calibration_type'] != 'eye_in_hand':
+        raise ValueError('Only eye_in_hand calibration is supported')
+    handeye_node = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='homography_pick_place_handeye_transform',
+        arguments=[
+            '--x', str(translation['x']),
+            '--y', str(translation['y']),
+            '--z', str(translation['z']),
+            '--qx', str(rotation['x']),
+            '--qy', str(rotation['y']),
+            '--qz', str(rotation['z']),
+            '--qw', str(rotation['w']),
+            '--frame-id', parameters['robot_effector_frame'],
+            '--child-frame-id', parameters['tracking_base_frame'],
+        ],
+    )
     return [
         SetLaunchConfiguration('resolved_camera_info_url', camera_url),
         SetLaunchConfiguration(
             'resolved_calibration_file', str(calibration_file)
         ),
+        handeye_node,
     ]
 
 
@@ -41,14 +67,17 @@ def generate_launch_description():
     package_share = Path(
         get_package_share_directory('arm_homography_pick_place')
     )
-    arm_share = Path(get_package_share_directory('arm'))
-    handeye_share = Path(get_package_share_directory('easy_handeye2'))
+    robot_description = (
+        package_share / 'urdf' / 'jetcobot_kinematics.urdf'
+    ).read_text(encoding='utf-8')
     arguments = [
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('video_device', default_value='/dev/video2'),
         DeclareLaunchArgument(
             'camera_info_url',
-            default_value='config/arm/gripper_camera_info.yaml',
+            default_value=str(
+                package_share / 'config' / 'gripper_camera_info.yaml'
+            ),
         ),
         DeclareLaunchArgument(
             'camera_frame_id',
@@ -59,15 +88,18 @@ def generate_launch_description():
         DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
-            'calibration_name',
-            default_value='jetcobot_eye_in_hand_charuco_flange',
-        ),
-        DeclareLaunchArgument(
-            'calibration_directory', default_value='config/arm'
+            'handeye_calibration_file',
+            default_value=str(
+                package_share
+                / 'config'
+                / 'jetcobot_eye_in_hand_charuco_flange.calib'
+            ),
         ),
         DeclareLaunchArgument(
             'calibration_file',
-            default_value='calibration_results/floor_calibration.yaml',
+            default_value=str(
+                package_share / 'config' / 'floor_calibration.yaml'
+            ),
         ),
         DeclareLaunchArgument(
             'params_file',
@@ -90,25 +122,17 @@ def generate_launch_description():
     ]
 
     # The coordinator owns /dev/ttyUSB0 and publishes measured joints.
-    robot_tf = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            str(arm_share / 'launch' / 'robot_tf.launch.py')
-        ),
-        launch_arguments={
-            'start_hardware_joint_publisher': 'false',
-        }.items(),
-    )
-    calibration_directory = SetEnvironmentVariable(
-        'EASY_HANDEYE2_CALIBRATIONS_DIRECTORY',
-        LaunchConfiguration('calibration_directory'),
-    )
-    handeye = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            str(handeye_share / 'launch' / 'publish.launch.py')
-        ),
-        launch_arguments={
-            'name': LaunchConfiguration('calibration_name')
-        }.items(),
+    robot_tf = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        namespace='arm',
+        output='screen',
+        parameters=[{
+            'robot_description': robot_description,
+            'frame_prefix': 'arm/',
+        }],
+        remappings=[('joint_states', '/arm/joint_states')],
     )
     controller_frame = Node(
         package='tf2_ros',
@@ -189,11 +213,9 @@ def generate_launch_description():
         ],
     )
     return LaunchDescription(arguments + [
-        OpaqueFunction(function=resolve_paths),
-        calibration_directory,
+        OpaqueFunction(function=resolve_runtime),
         robot_tf,
         controller_frame,
-        handeye,
         camera,
         TimerAction(period=1.5, actions=[detector, coordinator]),
     ])

@@ -1,6 +1,6 @@
-"""Gate the existing dual ArUco detector to stationary search windows."""
+"""Gate the package-local dual ArUco detector to stationary search windows."""
 
-from arm.dual_aruco_pose_publisher import DualArucoPosePublisher
+from .dual_aruco_pose_publisher import DualArucoPosePublisher
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -17,7 +17,7 @@ class GatedPickPlaceAruco(DualArucoPosePublisher):
     """Publish marker TF only while the coordinator enables detection."""
 
     def __init__(self):
-        """Create the existing detector with a dedicated enable topic."""
+        """Create the detector with a dedicated enable topic."""
         self.detection_enabled = False
         super().__init__()
         self.create_subscription(

@@ -22,8 +22,8 @@ import pytest
 def floors():
     """Load the calibration used by the coordinator package."""
     path = (
-        Path(__file__).parents[3]
-        / 'calibration_results'
+        Path(__file__).parents[1]
+        / 'config'
         / 'floor_calibration.yaml'
     )
     return load_floor_calibration(path)
