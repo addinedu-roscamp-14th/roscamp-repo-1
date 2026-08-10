@@ -168,10 +168,11 @@ def test_transfer_selects_nearest_live_vehicle_to_source_zone():
     }
     source = compact_detections(summary)[0]
 
-    assert select_nearest_visible_vehicle(source, summary) == 'agv1'
+    # car_yellow sits closest to A-3, and yellow is AMR 2 (agv2).
+    assert select_nearest_visible_vehicle(source, summary) == 'agv2'
     assert (
-        select_nearest_visible_vehicle(source, summary, {'agv2'})
-        == 'agv2'
+        select_nearest_visible_vehicle(source, summary, {'agv1'})
+        == 'agv1'
     )
 
 

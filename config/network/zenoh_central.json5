@@ -16,7 +16,8 @@
       "allow": {
         "publishers": [
           "/agv[12]/initialpose",
-          "/agv[12]/goal_pose"
+          "/agv[12]/goal_pose",
+          "/agv[12]/cmd_vel_manual"
         ],
         "subscribers": [
           "/tf",
@@ -35,7 +36,9 @@
         "service_servers": [],
         "service_clients": [
           "/agv[12]/safety_hold",
-          "/agv[12]/emergency_stop"
+          "/agv[12]/emergency_stop",
+          "/agv[12]/local_costmap/local_costmap/get_parameters",
+          "/agv[12]/local_costmap/local_costmap/set_parameters"
         ],
         "action_servers": [],
         "action_clients": [

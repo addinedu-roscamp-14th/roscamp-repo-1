@@ -18,9 +18,12 @@ _ZONE_MODE_BY_LABEL = {
     **{label: 'parking_a' for label in FIXED_ZONE_LABELS},
 }
 
+# AMR 1 (agv1) carries the blue cargo box, AMR 2 (agv2) the yellow one -
+# matching pinky.urdf.xacro and fleet_collision_supervisor.yaml. This map used
+# to be inverted, which sent colour-addressed commands to the wrong robot.
 VEHICLE_ID_BY_LABEL = {
-    'car_yellow': 'agv1',
-    'car_blue': 'agv2',
+    'car_blue': 'agv1',
+    'car_yellow': 'agv2',
 }
 
 
@@ -229,10 +232,7 @@ def resolve_vehicle_position_swap(
             f'필요합니다: missing={sorted(missing)}'
         )
 
-    vehicle_ids = {
-        'car_yellow': 'agv1',
-        'car_blue': 'agv2',
-    }
+    vehicle_ids = dict(VEHICLE_ID_BY_LABEL)
     opposite_labels = {
         'car_yellow': 'car_blue',
         'car_blue': 'car_yellow',

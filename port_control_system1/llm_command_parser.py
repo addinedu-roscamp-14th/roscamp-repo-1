@@ -73,8 +73,10 @@ C는 D로") 각각을 별도 action으로 배열에 전부 넣으세요. 서로 
 "먼저/그 다음/도착 후/빠져나오면"처럼 앞 작업의 완료가 필요하거나 같은 차량에 여러
 목표를 연속으로 주는 경우에만 "sequential"을 사용하세요. 포괄적인 명령은 필요한
 동작을 차량별 action으로 나누고, 독립 작업은 가능한 한 동시에 수행하세요.
-"모든 차량", "두 대 모두"처럼 전체 차량을 지칭하면 agv1과 agv2 action을 각각
-만들고, 두 action이 독립적이면 execution_mode를 "parallel"로 설정하세요.
+"모든 차량", "두 대 모두", "유휴 차량들", "차량들"처럼 차량을 복수로 지칭하면
+agv1과 agv2 action을 각각 만들고, 두 action이 독립적이면 execution_mode를
+"parallel"로 설정하세요. "유휴 차량들"처럼 조건이 붙어도 어느 차량이 실제로
+유휴인지는 시스템이 판단하므로, 당신은 두 차량 action을 모두 만드세요.
 하나의 action에는 한 차량의 한 이동만 넣으세요. "먼저", "그 다음", "이후",
 "빠져나오면", "도착한 뒤" 같은 순서 표현이 있으면 반드시 서로 다른 action으로
 나누고, 조건을 만족하는 순서대로 배열하세요.
@@ -183,8 +185,8 @@ heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 �
 - 현재 영상의 검출 객체를 언급하면 visual_navigation을 사용하고, 객체가 아닌
   빈 바닥이나 특정 영상 지점일 때만 pixel_navigation을 사용하세요.
 - visual_navigation과 pixel_navigation의 vehicle_id: 사용자가 "1번 차량",
-  "AGV1", "2호차"처럼 직접 명시하거나 "노란 차", "노란색", "yellow car"
-  (=agv1) 또는 "파란 차", "파란색", "blue car"(=agv2)처럼 차량 색상으로
+  "AMR1", "2호차"처럼 직접 명시하거나 "파란 차", "파란색", "blue car"
+  (=agv1) 또는 "노란 차", "노란색", "yellow car"(=agv2)처럼 차량 색상으로
   지칭한 경우에만 "agv1" 또는 "agv2"를 넣으세요. 어떤 차량인지 명시하지
   않았으면 vehicle_id를 빈 문자열("")로 두어 시스템이 자동으로 배차하도록
   하세요. "agv1"/"agv2" 외의 값을 만들어 내지 마세요.
@@ -204,25 +206,25 @@ heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 �
 사용자: "노란 차를 B-1로 보내" (검출 JSON에 B-1이 detection_index=0으로 있는 경우)
 {{"execution_mode": "sequential", "actions": [
   {{"type": "visual_navigation", "detection_index": 0,
-    "approach_side": "bottom", "vehicle_id": "agv1"}}
+    "approach_side": "bottom", "vehicle_id": "agv2"}}
 ]}}
 
 사용자: "노란 차를 A구역으로 보낸 다음 파란 차를 B-1로 보내"
 (검출 JSON에 A-2가 detection_index=1, B-1이 detection_index=0으로 있는 경우)
 {{"execution_mode": "sequential", "actions": [
   {{"type": "visual_navigation", "detection_index": 1,
-    "approach_side": "bottom", "vehicle_id": "agv1"}},
+    "approach_side": "bottom", "vehicle_id": "agv2"}},
   {{"type": "visual_navigation", "detection_index": 0,
-    "approach_side": "bottom", "vehicle_id": "agv2"}}
+    "approach_side": "bottom", "vehicle_id": "agv1"}}
 ]}}
 
 사용자: "노란 차는 A구역으로, 파란 차는 B-1로 보내"
 (두 이동 사이에 선행 조건이 없고 검출 JSON에서 A-2=1, B-1=0인 경우)
 {{"execution_mode": "parallel", "actions": [
   {{"type": "visual_navigation", "detection_index": 1,
-    "approach_side": "bottom", "vehicle_id": "agv1"}},
+    "approach_side": "bottom", "vehicle_id": "agv2"}},
   {{"type": "visual_navigation", "detection_index": 0,
-    "approach_side": "bottom", "vehicle_id": "agv2"}}
+    "approach_side": "bottom", "vehicle_id": "agv1"}}
 ]}}
 
 사용자: "A-3 구역에 있는 컨테이너를 B-1로 옮겨"
@@ -234,7 +236,13 @@ heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 �
 
 사용자: "노란 차 주차해줘"
 {{"actions": [
-  {{"type": "park_command", "vehicle_id": "agv1"}}
+  {{"type": "park_command", "vehicle_id": "agv2"}}
+]}}
+
+사용자: "유휴 차량들은 주차해줘"
+{{"execution_mode": "parallel", "actions": [
+  {{"type": "park_command", "vehicle_id": "agv1"}},
+  {{"type": "park_command", "vehicle_id": "agv2"}}
 ]}}
 """
 
@@ -267,9 +275,17 @@ _SIDE_TERMS = (
     ('top', ('위쪽', '상단', '위로', 'top', 'above')),
     ('bottom', ('아래쪽', '하단', '아래로', 'bottom', 'below')),
 )
+# AMR 1 (agv1) is the blue robot, AMR 2 (agv2) the yellow one - see
+# pinky.urdf.xacro. The colour terms used to be swapped here.
 _VEHICLE_TERMS = (
-    ('agv1', ('agv1', '1번 차량', '1호차', '노란 차', '노란차', '노란색')),
-    ('agv2', ('agv2', '2번 차량', '2호차', '파란 차', '파란차', '파란색')),
+    ('agv1', (
+        'agv1', 'amr1', 'amr 1', '1번 차량', '1호차',
+        '파란 차', '파란차', '파란색',
+    )),
+    ('agv2', (
+        'agv2', 'amr2', 'amr 2', '2번 차량', '2호차',
+        '노란 차', '노란차', '노란색',
+    )),
 )
 _LABEL_ALIASES = {
     'B-1': (
@@ -287,7 +303,12 @@ _TRANSFER_ZONE_LABELS = ('A-1', 'A-2', 'A-3', 'B-1')
 
 _ALL_VEHICLE_TERMS = (
     '모든 차량', '전체 차량', '두 차량', '두 대', '두대', '양쪽 차량',
+    # Plural/idle phrasings ("유휴차량들은 주차해줘") also address the whole
+    # fleet. Fanning out is safe: the dispatcher skips any vehicle that is
+    # busy or already parked, so only the genuinely idle ones move.
+    '유휴 차량', '유휴차량', '차량들', '차들',
     'all vehicles', 'both vehicles', 'both agv',
+    'idle vehicles', 'idle agv',
 )
 _SEQUENCE_TERMS = (
     '먼저', '그 다음', '그다음', '다음에', '이후', '도착한 뒤', '도착 후',

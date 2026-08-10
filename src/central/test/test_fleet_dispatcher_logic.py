@@ -919,3 +919,132 @@ def test_emergency_stop_also_counts_as_deliberately_stopped():
     dispatcher.vehicles['agv2'].emergency = True
 
     assert dispatcher._vehicle_is_deliberately_stopped('agv2')
+
+
+def make_park_exit_dispatcher():
+    dispatcher = make_dispatcher()
+    dispatcher.park_exit_inflation_clear_distance_m = 0.70
+    return dispatcher
+
+
+def _arm_park_exit(dispatcher, vehicle_id, origin=(1.674, 0.408)):
+    runtime = dispatcher.vehicles[vehicle_id]
+    runtime.park_exit_inflation_restore_m = 0.20
+    runtime.park_exit_origin_xy = origin
+    return runtime
+
+
+def _place(runtime, x, y):
+    runtime.pose.pose.position.x = x
+    runtime.pose.pose.position.y = y
+
+
+def test_inflation_stays_relaxed_until_the_vehicle_clears_the_pocket():
+    """Keep it relaxed past the straight leg.
+
+    The measured pocket still reads as a collision 0.20m out, which is where
+    the DriveOnHeading exit ends.
+    """
+    dispatcher = make_park_exit_dispatcher()
+    runtime = _arm_park_exit(dispatcher, 'agv1')
+
+    _place(runtime, 1.474, 0.399)  # 0.20 m out - end of the straight leg
+    dispatcher._check_park_exit_inflation()
+
+    assert dispatcher.executor.tasks == []
+    assert runtime.park_exit_inflation_restore_m == 0.20
+
+
+def test_inflation_is_restored_once_clear_of_the_pocket():
+    dispatcher = make_park_exit_dispatcher()
+    runtime = _arm_park_exit(dispatcher, 'agv1')
+
+    _place(runtime, 0.974, 0.408)  # 0.70 m out
+    dispatcher._check_park_exit_inflation()
+
+    assert len(dispatcher.executor.tasks) == 1
+
+
+def test_a_vehicle_without_a_relaxed_costmap_is_never_restored():
+    """Only a vehicle that actually relaxed its inflation may be restored."""
+    dispatcher = make_park_exit_dispatcher()
+    runtime = _arm_park_exit(dispatcher, 'agv1')
+    _place(runtime, 1.674, 0.408)  # still sitting in the spot
+    # agv2 never started an exit, so it has nothing recorded to put back.
+    _place(dispatcher.vehicles['agv2'], 5.0, 5.0)
+
+    dispatcher._check_park_exit_inflation()
+
+    assert dispatcher.executor.tasks == []
+    assert dispatcher.vehicles['agv2'].park_exit_inflation_restore_m is None
+
+
+class RecordingPublisher:
+    def __init__(self):
+        self.commands = []
+
+    def publish(self, message):
+        self.commands.append(float(message.linear.x))
+
+
+class FakeGoalHandle:
+    def __init__(self, cancel=False):
+        self.is_cancel_requested = cancel
+
+
+def make_open_loop_dispatcher():
+    dispatcher = make_dispatcher()
+    dispatcher.park_exit_open_loop_rate_hz = 20.0
+    dispatcher.park_exit_cmd_publishers = {
+        'agv1': RecordingPublisher(),
+        'agv2': RecordingPublisher(),
+    }
+
+    async def _no_sleep(_seconds):
+        return
+
+    dispatcher._sleep_async = _no_sleep
+    return dispatcher
+
+
+def test_open_loop_exit_drives_forward_then_stops():
+    """Nav2 refuses to leave the pocket, so the exit is a timed cmd_vel move."""
+    dispatcher = make_open_loop_dispatcher()
+
+    _run_to_completion(
+        dispatcher._drive_straight_open_loop(
+            FakeGoalHandle(), 'agv1', 0.20, 0.05, 'parking exit'
+        )
+    )
+
+    commands = dispatcher.park_exit_cmd_publishers['agv1'].commands
+    assert commands, 'no velocity was published'
+    assert all(value == 0.05 for value in commands[:-1])
+    # The gate times out on its own, but the exit must still stop explicitly.
+    assert commands[-1] == 0.0
+
+
+def test_open_loop_exit_stops_on_an_emergency_latch():
+    dispatcher = make_open_loop_dispatcher()
+    dispatcher.vehicles['agv1'].emergency = True
+
+    _run_to_completion(
+        dispatcher._drive_straight_open_loop(
+            FakeGoalHandle(), 'agv1', 0.20, 0.05, 'parking exit'
+        )
+    )
+
+    commands = dispatcher.park_exit_cmd_publishers['agv1'].commands
+    assert commands == [0.0], 'an emergency latch must publish only the stop'
+
+
+def test_open_loop_exit_stops_when_the_goal_is_canceled():
+    dispatcher = make_open_loop_dispatcher()
+
+    _run_to_completion(
+        dispatcher._drive_straight_open_loop(
+            FakeGoalHandle(cancel=True), 'agv1', 0.20, 0.05, 'parking exit'
+        )
+    )
+
+    assert dispatcher.park_exit_cmd_publishers['agv1'].commands == [0.0]
