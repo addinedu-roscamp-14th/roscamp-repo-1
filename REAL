@@ -1,0 +1,172 @@
+  cd ~/poter_ws
+  source /opt/ros/jazzy/setup.bash
+  source install/setup.bash
+
+### 터미널 1 — 로봇팔 실행
+
+ cd ~/poter_ws
+  source /opt/ros/jazzy/setup.bash
+  source install/setup.bash
+
+  ros2 launch arm2 arm2_container_pick_moveit.launch.py \
+      camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
+      video_device:=/dev/arm_camera \
+      calibration_name:=arm2_jetcobot_eye_in_hand_charuco_5x5_v4 \
+      params_file:=config/arm2/arm2_container_pick.yaml \
+      use_node_time_for_pose:=true \
+      marker_id:=0 \
+      stack_marker_id:=11 \
+      marker_size_m:=0.020 \
+      serial_port:=/dev/jetcobot \
+      trajectory_speed:=70 \
+      goal_correction_speed:=70 \
+      goal_tolerance_deg:=3.5 \
+      goal_timeout_sec:=15.0 \
+      use_rviz:=true
+      
+      
+      
+  cd ~/poter_ws
+  source /opt/ros/jazzy/setup.bash
+  source install/setup.bash
+
+  ros2 launch arm2 arm2_container_pick_moveit.launch.py \
+      camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
+      video_device:=/dev/arm_camera \
+      calibration_name:=arm2_jetcobot_eye_in_hand_charuco_5x5_v4 \
+      params_file:=config/arm2/arm2_container_pick.yaml \
+      use_node_time_for_pose:=true \
+      marker_id:=0 \
+      stack_marker_id:=11 \
+      marker_size_m:=0.020 \
+      serial_port:=/dev/jetcobot \
+      trajectory_speed:=50 \
+      goal_correction_speed:=35 \
+      goal_tolerance_deg:=3.5 \
+      goal_timeout_sec:=15.0 \
+      use_rviz:=true
+      
+
+
+  ### 터미널 2 — 목적지 스캔
+
+  로봇 실행 직후 한 번 호출합니다.
+
+  cd ~/poter_ws
+  source install/setup.bash
+
+  ros2 service call /arm2/scan_destinations std_srvs/srv/Trigger "{}"
+
+  스캔 동작:
+
+  - ID 11, 12 → A-1
+  - ID 13, 14 → A-2
+  - ID 15, 16 → A-3
+  - ID 10,9 → 트레일러(보이면 저장)
+  - ID 11~16을 모두 찾으면 ID 10이 없어도 종료
+
+  ### 컨테이너 이송
+
+  초기 위치에서 컨테이너 ID 0, 1, 2, 3, 4, 5, 6, 7, 8 중 보이는 컨테이너를 찾아 옮깁니다.
+
+  A-1-1으로 이송:
+  ros2 service call /arm2/transfer_to_a1_1 std_srvs/srv/Trigger "{}"
+  
+  A-1-2으로 이송:
+  ros2 service call /arm2/transfer_to_a1_2 std_srvs/srv/Trigger "{}"
+  
+  A-2-1으로 이송:
+  ros2 service call /arm2/transfer_to_a2_1 std_srvs/srv/Trigger "{}"
+  
+  A-2-2으로 이송:
+  ros2 service call /arm2/transfer_to_a2_2 std_srvs/srv/Trigger "{}"
+  
+  A-3-1으로 이송:
+  ros2 service call /arm2/transfer_to_a3_1 std_srvs/srv/Trigger "{}"
+  
+  A-3-2으로 이송:
+  ros2 service call /arm2/transfer_to_a3_2 std_srvs/srv/Trigger "{}"
+  
+  
+ ##트레일러 적재
+
+###전체 스캔 후 트레일러위치와 각 ID 스캔 후 트레일러에 적재
+
+  ID0번 트레일러에 적재
+  ros2 service call /arm2/load_id0_to_trailer std_srvs/srv/Trigger "{}"
+  
+  ID1번 트레일러에 적재
+  ros2 service call /arm2/load_id1_to_trailer std_srvs/srv/Trigger "{}"
+  
+  ID2번 트레일러에 적재
+  ros2 service call /arm2/load_id2_to_trailer std_srvs/srv/Trigger "{}"
+  
+  ID3번 트레일러에 적재
+  ros2 service call /arm2/load_id3_to_trailer std_srvs/srv/Trigger "{}"
+  
+  ID4번 트레일러에 적재
+  ros2 service call /arm2/load_id4_to_trailer std_srvs/srv/Trigger "{}"
+  
+  ID5번 트레일러에 적재
+  ros2 service call /arm2/load_id5_to_trailer std_srvs/srv/Trigger "{}"
+  
+  ID6번 트레일러에 적재
+  ros2 service call /arm2/load_id6_to_trailer std_srvs/srv/Trigger "{}"
+  
+  ID7번 트레일러에 적재
+  ros2 service call /arm2/load_id7_to_trailer std_srvs/srv/Trigger "{}"
+  
+  ID8번 트레일러에 적재
+  ros2 service call /arm2/load_id8_to_trailer std_srvs/srv/Trigger "{}"
+  
+  
+  
+  ### 위치 이동
+  
+  초기위치 이동
+  ros2 service call /arm2/go_initial_pose std_srvs/srv/Trigger "{}"
+  
+  A-1 위치 이동
+  ros2 service call /arm2/go_a1_pose std_srvs/srv/Trigger "{}"
+  
+  A-2 위치 이동
+  ros2 service call /arm2/go_a2_pose std_srvs/srv/Trigger "{}"
+  
+  A-3 위치 이동
+  ros2 service call /arm2/go_a3_pose std_srvs/srv/Trigger "{}"
+  
+  
+  
+  ###  테트리스 
+  ex) 6번을 8번에 놓기 
+  
+  cd ~/poter_ws
+  source install/setup.bash
+
+  ros2 service call /arm2/transfer_by_id \
+    arm2_interfaces/srv/TransferById \
+    "{source_id: 6, destination_id: 8}"
+    
+    
+  cd ~/poter_ws
+  source install/setup.bash
+
+  ros2 service call /arm2/transfer_by_id \
+    arm2_interfaces/srv/TransferById \
+    "{source_id: 4, destination_id: 6}"
+    
+    
+  
+  
+
+
+
+  ### 긴급 정지
+
+  ros2 service call /arm2/stop_pick std_srvs/srv/Trigger "{}"
+
+  ### 적재 층수 초기화
+
+  컨테이너를 치운 뒤 다시 1층부터 쌓으려면:
+
+  ros2 service call /arm2/reset_stack_level std_srvs/srv/Trigger "{}"
