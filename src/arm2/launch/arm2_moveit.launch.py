@@ -8,6 +8,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     GroupAction,
     IncludeLaunchDescription,
+    SetLaunchConfiguration,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -35,6 +36,8 @@ def generate_launch_description():
     ) / 'launch'
     use_rviz = LaunchConfiguration('use_rviz')
     namespaced_moveit = GroupAction(actions=[
+        SetLaunchConfiguration('sigterm_timeout', '20.0'),
+        SetLaunchConfiguration('sigkill_timeout', '5.0'),
         PushRosNamespace('arm2'),
         _include(
             launch_directory, 'arm2_static_virtual_joint_tfs.launch.py'

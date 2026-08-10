@@ -1,3 +1,63 @@
+/arm2/arm2_jetcobot_trajectory_bridge:
+  ros__parameters:
+    # Smooth physical trajectory profile.
+    speed: 50
+    home_joint_angles_deg:
+    - 90.17
+    - 1.23
+    - -4.47
+    - -71.54
+    - 1.57
+    - -44.91
+    go_home_on_startup: true
+    go_home_on_shutdown: true
+    home_speed: 40
+    home_tolerance_deg: 3.5
+    home_timeout_sec: 15.0
+    a1_joint_angles_deg:
+    - 16.96
+    - 40.25
+    - -36.37
+    - -67.67
+    - 1.04
+    - -45.26
+    a1_speed: 20
+    a2_joint_angles_deg:
+    - -28.74
+    - 30.85
+    - -13.7
+    - -74.7
+    - 1.22
+    - -44.64
+    a2_speed: 20
+    a3_joint_angles_deg:
+    - -79.98
+    - 14.85
+    - -17.74
+    - -71.1
+    - 1.13
+    - -52.38
+    a3_speed: 20
+    joint1_sweep_speed: 25
+    joint1_sweep_angle_deg: 336.0
+    joint1_sweep_tolerance_deg: 3.5
+    joint1_sweep_duration_sec: 20.0
+    max_j6_trajectory_travel_deg: 170.0
+    # JetCobot treats dense send_angles updates like repeated short moves.
+    # A moderate stream rate reduces stop-and-go motion and serial queuing.
+    command_rate_hz: 15.0
+    joint_state_limit_clamp_tolerance_deg: 0.5
+    adaptive_goal_correction_enabled: true
+    adaptive_goal_correction_joints:
+    - 1_Joint
+    - 2_Joint
+    - 3_Joint
+    adaptive_goal_correction_tolerance_deg: 0.9
+    adaptive_goal_correction_gain: 1.0
+    adaptive_goal_correction_max_total_deg: 7.0
+    adaptive_goal_correction_max_attempts: 5
+    goal_correction_speed: 35
+    goal_correction_period_sec: 0.4
 /arm2/arm2_container_pick_coordinator:
   ros__parameters:
     base_frame: arm2/base_link
@@ -8,24 +68,65 @@
     offsets_configured: true
     use_marker_rotation_for_grasp: false
     grasp_orientation_mode: marker_yaw
-    # 그리퍼 yaw만 컨테이너를 추종하고 XYZ 오프셋은 base_link 방향에 고정합니다.
     rotate_grasp_offset_with_marker_yaw: false
     grasp_offset_xyz_m:
-    - -0.014261
-    - -0.010785
-    - -0.032462
-    # arm2/base_link 기준 고정 보정. 컨테이너 yaw와 함께 회전하지 않습니다.
-    base_correction_xyz_m:
+    - 0.016841
+    - -0.005065
+    - -0.018597
+    pick_correction_xyz_m:
+    - -0.02
+    - 0.01
+    - -0.02
+    # /arm2/transfer_to_a1_1 ... transfer_to_a3_2 pick only:
+    # move 10 mm along the marker red axis (+X, image-down direction).
+    saved_destination_pick_correction_xyz_m:
+    - 0.01
     - 0.0
     - 0.0
+    id_transfer_pick_correction_xyz_m:
+    - -0.015
+    - 0.005
+    - -0.02
+    place_correction_xyz_m:
+    - 0.0
+    - 0.0
+    - 0.0
+    saved_destination_correction_xyz_m:
+    - -0.02
+    - -0.01
+    - -0.005
+    id_transfer_correction_xyz_m:
+    - -0.011
+    - 0.006
+    - -0.005
+    # /arm2/transfer_by_id destination detected in A-2 only: move the place
+    # target 15 mm opposite the marker red axis (-X). Pick and other zones
+    # keep their existing corrections.
+    id_transfer_a2_place_correction_xyz_m:
+    - -0.015
+    - 0.0
+    - 0.0
+    trailer_correction_xyz_m:
+    # Trailer marker red axis (+X): previous -50mm + requested 20mm.
+    - -0.03
+    - 0.0
+    - 0.0
+    # Trailer-load services only: when the source is found in A-3, move the
+    # pick target 20 mm along the red axis (+X, image downward) and 30 mm
+    # opposite the green axis (-Y, image-left direction).
+    # A-1 and A-2 continue to use pick_correction_xyz_m unchanged.
+    trailer_a3_pick_correction_xyz_m:
+    - 0.02
+    - -0.03
     - 0.0
     grasp_offset_rpy_deg:
-    - -180.0
-    - 0.0
-    - -94.071
-    reference_marker_yaw_deg: 2.349
-    # 직사각형 컨테이너와 그리퍼는 180도 회전을 같은 파지 자세로 취급합니다.
+    - 179.226
+    - 6.873
+    - 86.896
+    reference_marker_yaw_deg: -1.728
     container_yaw_symmetry_deg: 180.0
+    # 180도 대칭인 동일 파지 자세 중 현재 손목에서 가까운 해를 선택
+    prefer_current_gripper_yaw: true
     max_yaw_spread_deg: 12.0
     max_container_yaw_delta_deg: 180.0
     grasp_yaw_fallback_scales:
@@ -37,50 +138,97 @@
     grasp_extra_depth_m: 0.0
     grasp_stop_above_m: 0.02
     refresh_marker_before_descent: false
-    pregrasp_test_keep_current_orientation: true
-    lift_after_pick_m: 0.18
-    minimum_lift_after_pick_m: 0.05
+    visual_servo_enabled: false
+    visual_servo_samples: 10
+    visual_servo_xy_tolerance_m: 0.002
+    visual_servo_yaw_tolerance_deg: 2.0
+    visual_servo_xy_gain: 0.6
+    visual_servo_yaw_gain: 0.6
+    visual_servo_max_xy_step_m: 0.005
+    visual_servo_max_yaw_step_deg: 2.0
+    visual_servo_max_initial_error_m: 0.02
+    visual_servo_max_iterations: 5
+    visual_servo_required_consecutive_successes: 3
+    visual_servo_timeout_sec: 10.0
+    visual_servo_marker_loss_timeout_sec: 2.0
+    visual_servo_settle_sec: 0.6
+    pregrasp_test_keep_current_orientation: false
+    # 집은 위치와 무관한 base_link 기준 TCP 절대 상승 높이(Z).
+    lift_after_pick_m: 0.14
+    # 부분 상승 허용 시에도 TCP 절대 Z가 이 높이 이상이어야 한다.
+    minimum_lift_after_pick_m: 0.10
+    bad_pick_branch_j2_deg: -62.31
+    bad_pick_branch_j3_deg: 85.69
+    bad_pick_branch_tolerance_deg: 12.0
     lift_search_step_m: 0.02
     stack_container_height_m: 0.035
     stack_approach_clearance_m: 0.08
-    stack_minimum_approach_clearance_m: 0.03
+    stack_minimum_approach_clearance_m: 0.08
     stack_approach_search_step_m: 0.01
+    stack_yaw_fallback_offsets_deg:
+    - 0.0
+    - 180.0
+    - 15.0
+    - -15.0
+    - 30.0
+    - -30.0
     stack_xy_offset_m:
     - 0.0
     - 0.0
+    stack_z_offset_m: 0.015
+    max_stack_levels: 3
     stack_source_orientation_mode: marker_yaw
-    stack_segmented_descent_min_fraction: 0.65
+    stack_segmented_descent_min_fraction: 0.3
     stack_segmented_descent_max_segments: 5
     stack_pose_goal_finish_max_distance_m: 0.075
-    minimum_stable_samples: 5
-    max_translation_std_m: 0.005
+    scan_marker_pause_sec: 2.0
+    scan_timeout_sec: 90.0
+    prefer_z_last_motion: false
+    destination_zone_j1_deg:
+    - 16.96
+    - -28.74
+    - -79.98
+    j2_fallback_min_tcp_height_m: 0.12
+    j3_fallback_min_tcp_height_m: 0.12
+    release_verify_xy_tolerance_m: 0.012
+    release_verify_z_tolerance_m: 0.01
+    release_verify_yaw_tolerance_deg: 3.0
+    # Successful-pick pose cache: similar poses update one entry instead of
+    # growing duplicates. The cache is bounded and only changes search order.
+    pick_profile_xy_merge_m: 0.03
+    pick_profile_z_merge_m: 0.01
+    pick_profile_yaw_merge_deg: 15.0
+    pick_profile_max_entries: 30
+    pick_profile_cache_path: config/arm2/pick_success_profiles.json
+    minimum_stable_samples: 10
+    max_translation_std_m: 0.0015
     max_rotation_spread_deg: 10.0
     dry_run_max_rotation_spread_deg: 30.0
-    max_marker_age_sec: 3.0
+    max_marker_age_sec: 1.0
     stabilization_timeout_sec: 20.0
     workspace_min_xyz_m:
-    - -0.28
-    - -0.28
+    - -0.3
+    - -0.3
     - -0.025
     workspace_max_xyz_m:
-    - 0.28
-    - 0.28
+    - 0.3
+    - 0.3
     - 0.3
     workspace_xy_shape: inverted_l
     workspace_horizontal_min_xy_m:
-    - -0.28
-    - -0.28
+    - -0.3
+    - -0.3
     workspace_horizontal_max_xy_m:
-    - 0.28
+    - 0.3
     - 0.0
     workspace_vertical_min_xy_m:
-    - 0.0
-    - -0.28
+    - -0.06
+    - -0.3
     workspace_vertical_max_xy_m:
-    - 0.28
-    - 0.28
+    - 0.3
+    - 0.3
     max_joint_delta_deg: 60.0
-    serial_port: /dev/ttyUSB0
+    serial_port: /dev/jetcobot
     baud_rate: 1000000
     speed: 5
     motion_timeout_sec: 30.0
@@ -95,13 +243,24 @@
     moveit_position_tolerance_m: 0.005
     moveit_orientation_tolerance_deg: 5.0
     moveit_planning_time_sec: 10.0
+    ik_timeout_sec: 0.3
+    # Per-seed timeout. Multiple seeds, yaw candidates and the oblique
+    # fallback remain enabled, so failed IK branches no longer stall for 3 s.
+    motion_ik_timeout_sec: 1.0
+    # Successful 6 -> 4 transfer arm shapes. J1 is always taken from the
+    # current target direction; these J2-J6 values are IK seeds only.
+    preferred_pick_seed_j2_j6_deg: [-10.1, -124.9, 50.6, 6.1, -7.0]
+    preferred_place_seed_j2_j6_deg: [12.2, -112.0, 13.3, 6.4, -35.9]
     moveit_planning_attempts: 20
-    moveit_velocity_scale: 0.35
-    moveit_acceleration_scale: 0.25
+    moveit_velocity_scale: 0.20
+    moveit_acceleration_scale: 0.08
     cartesian_max_step_m: 0.001
     cartesian_min_fraction: 0.97
     cartesian_absolute_min_fraction: 0.9
     cartesian_max_shortfall_m: 0.005
-    cartesian_max_speed_mps: 0.04
+    cartesian_max_speed_mps: 0.02
     cartesian_max_joint_jump_deg: 15.0
-    moveit_state_settle_sec: 0.2
+    # Keep only a short synchronization pause between completed MoveIt stages.
+    moveit_state_settle_sec: 0.05
+    stack_preflight_joint_margin_deg: 0.9
+    max_j6_trajectory_travel_deg: 170.0

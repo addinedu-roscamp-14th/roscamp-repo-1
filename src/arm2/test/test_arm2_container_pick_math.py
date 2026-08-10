@@ -2,7 +2,9 @@
 
 from arm2.arm2_container_pick_coordinator import (
     apply_base_frame_correction,
+    apply_marker_yaw_correction,
     apply_vertical_pick_offsets,
+    bounded_visual_servo_step,
     calculate_heading_aligned_stack_poses,
     calculate_stack_poses,
     cartesian_path_acceptable,
@@ -11,12 +13,63 @@ from arm2.arm2_container_pick_coordinator import (
     compose_pose,
     compose_yaw_follow_pose,
     ContainerPickCoordinator,
+    grouped_marker_locks_satisfied,
     inverted_l_workspace_contains,
     lift_distance_candidates,
+    nearest_symmetric_yaw_degrees,
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
+    stack_layer_z_offset,
+    symmetric_marker_yaw_degrees,
+    visual_servo_within_tolerance,
 )
 import numpy as np
+
+
+def test_trailer_scan_requires_source_and_either_trailer():
+    """A load scan accepts trailer ID 9 or 10, but always needs its source."""
+    assert grouped_marker_locks_satisfied(
+        ['source', 'trailer-9', None], (0,), (1, 2)
+    )
+    assert grouped_marker_locks_satisfied(
+        ['source', None, 'trailer-10'], (0,), (1, 2)
+    )
+    assert not grouped_marker_locks_satisfied(
+        [None, 'trailer-9', 'trailer-10'], (0,), (1, 2)
+    )
+    assert not grouped_marker_locks_satisfied(
+        ['source', None, None], (0,), (1, 2)
+    )
+
+
+def test_place_correction_follows_marker_red_axis():
+    """Marker-local -X remains left of the red axis after marker rotation."""
+    correction = [-0.04, 0.0, 0.0]
+    assert np.allclose(
+        apply_marker_yaw_correction([0.2, 0.1, 0.05], correction, 0.0),
+        [0.16, 0.1, 0.05],
+    )
+    assert np.allclose(
+        apply_marker_yaw_correction([0.2, 0.1, 0.05], correction, 90.0),
+        [0.2, 0.06, 0.05],
+        atol=1e-9,
+    )
+
+
+def test_marker_correction_heading_is_identical_after_half_turn():
+    """A rectangular container at yaw+180 uses the same correction axes."""
+    reference = -1.728
+    yaw_a = symmetric_marker_yaw_degrees(12.0, reference, 180.0)
+    yaw_b = symmetric_marker_yaw_degrees(192.0, reference, 180.0)
+    assert np.isclose(yaw_a, yaw_b)
+    correction = [-0.02, -0.015, -0.02]
+    target_a = apply_marker_yaw_correction(
+        [0.1, 0.2, 0.05], correction, yaw_a
+    )
+    target_b = apply_marker_yaw_correction(
+        [0.1, 0.2, 0.05], correction, yaw_b
+    )
+    assert np.allclose(target_a, target_b, atol=1e-9)
 
 
 def test_compose_pose_rotates_marker_offset():
@@ -138,6 +191,31 @@ def test_stack_release_follows_destination_heading():
     )
 
 
+def test_stack_release_applies_positive_base_z_offset():
+    """A positive placement offset raises release and approach equally."""
+    release, approach, _, _ = calculate_heading_aligned_stack_poses(
+        destination_marker=[0.16, -0.10, 0.06],
+        grasp_offset=[-0.014, -0.010, -0.032],
+        grasp_rpy_degrees=[-170.0, 8.0, 120.0],
+        destination_yaw_degrees=30.0,
+        reference_marker_yaw_degrees=30.0,
+        container_height=0.035,
+        approach_clearance=0.08,
+        extra_depth=0.0,
+        xy_offset=[0.0, 0.0],
+        z_offset=0.03,
+    )
+    assert np.isclose(release[2], 0.093)
+    assert np.isclose(approach[2], 0.173)
+
+
+def test_stack_layer_offset_increases_by_container_height():
+    """Every completed placement raises the next layer by one container."""
+    assert np.isclose(stack_layer_z_offset(0.015, 0.035, 0), 0.015)
+    assert np.isclose(stack_layer_z_offset(0.015, 0.035, 1), 0.050)
+    assert np.isclose(stack_layer_z_offset(0.015, 0.035, 2), 0.085)
+
+
 def test_yaw_follow_rotates_grasp_and_xy_offset_only():
     """Marker yaw rotates XY and gripper yaw while retaining roll/pitch."""
     translation, rotation, yaw_delta = compose_yaw_follow_pose(
@@ -206,6 +284,12 @@ def test_rectangular_grasp_keeps_90_degree_heading_change():
     )
 
 
+def test_nearest_symmetric_yaw_minimizes_gripper_rotation():
+    """A 180-degree-equivalent grasp nearest current TCP yaw is selected."""
+    assert nearest_symmetric_yaw_degrees(140.0, -35.0, 180.0) == -40.0
+    assert nearest_symmetric_yaw_degrees(-140.0, 35.0, 180.0) == 40.0
+
+
 def test_yaw_follow_can_keep_base_frame_position_correction():
     """Yaw may follow the marker while an empirical base offset stays fixed."""
     translation, rotation, yaw_delta = compose_yaw_follow_pose(
@@ -246,7 +330,7 @@ def test_base_frame_correction_does_not_rotate_with_marker_yaw():
 
 
 def test_runtime_tuning_vector_rejects_unsafe_values():
-    """RQt tuning must reject malformed and metre-scale offset mistakes."""
+    """Runtime tuning must reject malformed and metre-scale offset mistakes."""
     valid = ContainerPickCoordinator._validated_tuning_vector(
         'grasp_offset_xyz_m',
         [0.006, -0.01, -0.04],
@@ -279,6 +363,38 @@ def test_cartesian_shortfall_is_bounded_in_metres():
     assert cartesian_path_acceptable(0.955, 0.08, 0.97, 0.90, 0.005)
     assert not cartesian_path_acceptable(0.955, 0.18, 0.97, 0.90, 0.005)
     assert not cartesian_path_acceptable(0.89, 0.01, 0.97, 0.90, 0.005)
+    assert cartesian_path_acceptable(0.80, 0.0045, 0.97, 0.90, 0.005)
+    assert not cartesian_path_acceptable(0.20, 0.0045, 0.97, 0.90, 0.005)
+
+
+def test_visual_servo_step_applies_gain_and_xy_norm_limit():
+    """Visual correction scales error and caps the planar step norm."""
+    xy_step, yaw_step = bounded_visual_servo_step(
+        [0.008, -0.004],
+        5.0,
+        xy_gain=0.6,
+        yaw_gain=0.6,
+        max_xy_step=0.005,
+        max_yaw_step_degrees=2.0,
+    )
+
+    assert np.isclose(np.linalg.norm(xy_step), 0.005)
+    assert np.sign(xy_step[0]) == 1
+    assert np.sign(xy_step[1]) == -1
+    assert yaw_step == 2.0
+
+
+def test_visual_servo_tolerance_requires_both_xy_and_yaw():
+    """Convergence requires every planar axis and yaw to be bounded."""
+    assert visual_servo_within_tolerance(
+        [0.0015, -0.0010], 1.5, 0.002, 2.0
+    )
+    assert not visual_servo_within_tolerance(
+        [0.0021, 0.0], 1.5, 0.002, 2.0
+    )
+    assert not visual_servo_within_tolerance(
+        [0.001, 0.0], 2.1, 0.002, 2.0
+    )
 
 
 def test_segmented_descent_requires_safe_progress_and_attempt_budget():
