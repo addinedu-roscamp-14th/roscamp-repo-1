@@ -5,6 +5,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     SetEnvironmentVariable,
+    UnsetEnvironmentVariable,
 )
 from launch.substitutions import (
     EnvironmentVariable,
@@ -34,6 +35,8 @@ def generate_launch_description():
     realtime_llm_initial_delay_sec = LaunchConfiguration(
         'realtime_llm_initial_delay_sec'
     )
+    rmw_implementation = LaunchConfiguration('rmw_implementation')
+    discovery_range = LaunchConfiguration('discovery_range')
 
     dashboard_directory = PathJoinSubstitution([
         workspace,
@@ -135,13 +138,34 @@ def generate_launch_description():
             default_value='5.0',
             description='Delay before reassessing a newly dispatched command',
         ),
-        # The fleet discovers over a Fast DDS discovery server on the central
-        # laptop, not multicast. Without this the dashboard comes up on its own
-        # isolated graph and every /central/fleet/* subscription stays silent.
-        SetEnvironmentVariable(
-            'ROS_DISCOVERY_SERVER',
-            [central_ip, ':', LaunchConfiguration('discovery_server_port')],
+        DeclareLaunchArgument(
+            'rmw_implementation',
+            default_value='rmw_cyclonedds_cpp',
+            description=(
+                'Must match the central stack and the zenoh bridge; a '
+                'different RMW cannot see the graph at all'
+            ),
         ),
+        DeclareLaunchArgument(
+            'discovery_range',
+            default_value='LOCALHOST',
+            description=(
+                'LOCALHOST when the dashboard runs on the central laptop '
+                '(the zenoh bridge carries traffic to the AMRs). Use SUBNET '
+                'only for a dashboard on a separate machine.'
+            ),
+        ),
+        # The fleet now discovers over the zenoh bridge with CycloneDDS, not a
+        # Fast DDS discovery server. The dashboard has to match the rest of the
+        # central stack exactly: a different RMW cannot see the graph at all,
+        # so the GUI came up isolated and every /central/fleet/* subscription
+        # plus /agv*/cmd_vel_manual stayed silent.
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', rmw_implementation),
+        SetEnvironmentVariable(
+            'ROS_AUTOMATIC_DISCOVERY_RANGE',
+            discovery_range,
+        ),
+        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         SetEnvironmentVariable(
             'PORT_CONTROL_CCTV_URL',
             ['http://', central_ip, ':', video_port, '/video'],

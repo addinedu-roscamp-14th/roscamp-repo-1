@@ -12,7 +12,7 @@ parking_spots:
   parking_yellow:
     # Do not reuse park_red's generated pre-approach geometry.
     auto_pre_approach_distance_m: 0.0
-    reverse_distance_m: 0.270135
+    reverse_distance_m: 0.451511
     approach:
       x: 1.3654310509404668
       y: 0.17624451234213756

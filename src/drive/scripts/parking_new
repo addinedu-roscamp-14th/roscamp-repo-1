@@ -88,7 +88,7 @@ class ParkingActionServer(Node):
         self.declare_parameter('wait_for_nav_timeout_sec', 10.0)
         self.declare_parameter('approach_result_timeout_sec', 120.0)
         self.declare_parameter('reverse_speed', 0.095344)
-        self.declare_parameter('reverse_distance_m', 0.476720)
+        self.declare_parameter('reverse_distance_m', 0.658096)
         self.declare_parameter('reverse_control_rate_hz', 10.0)
         self.declare_parameter('reverse_timeout_sec', 20.0)
         self.declare_parameter('parked_xy_tolerance', 0.035)

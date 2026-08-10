@@ -922,10 +922,9 @@ class CommandPopup(ctk.CTkToplevel):
 
         snapshot = RosControlBridge.get_instance().snapshot()
         states = {
-            vehicle_id: state
-            for vehicle_id, state, _battery, emergency, _x, _y
-            in snapshot.fleet_states
-            if not emergency
+            vehicle.vehicle_id: vehicle.state_text
+            for vehicle in snapshot.fleet_states
+            if not vehicle.emergency_stopped
         }
         ready = {
             vehicle_id for vehicle_id, state in states.items()

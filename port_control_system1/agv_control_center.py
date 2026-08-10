@@ -195,9 +195,9 @@ class AGVControlCenter(ctk.CTk):
         if snapshot.ready:
             if snapshot.fleet_states:
                 vehicles = " | ".join(
-                    f"{vehicle_id}:{state}({x:.2f},{y:.2f})"
-                    for vehicle_id, state, _battery, _emergency, x, y
-                    in snapshot.fleet_states
+                    f"{vehicle.vehicle_id}:{vehicle.state_text}"
+                    f"({vehicle.x:.2f},{vehicle.y:.2f})"
+                    for vehicle in snapshot.fleet_states
                 )
                 text = f"{vehicles} | {snapshot.b1_zone}"
             else:

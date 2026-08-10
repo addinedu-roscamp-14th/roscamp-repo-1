@@ -20,6 +20,7 @@ import requests
 from PIL import Image
 
 from cctv_monitor_view import CCTVMonitorView
+from ros_control_bridge import AMR_DISPLAY_NAMES, RosControlBridge
 
 # Tailwind Color Palette
 BG_SURFACE = "#131314"
@@ -33,9 +34,63 @@ ACCENT_BLUE = "#92ccff"
 ACCENT_GREEN = "#61de8a"
 ACCENT_ORANGE = "#ee671c"
 ACCENT_ON_BLUE = "#003351"
+ALERT_RED = "#ff6b6b"
 
 # 기상청(KMA) / 해양조사원(KHOA) API 키 - 팀원이 쓰던 것을 그대로 재사용합니다.
 _WEATHER_API_KEY = "7d6c81a1615ce0a0dccd7e35568f7c3714d3f37ae515ce17e25a065005419ae3"
+
+
+# state_text values published by fleet_dispatcher, with what each one means
+# for an operator. Keep in sync with fleet_dispatcher._publish_vehicle_states.
+_STATE_DESCRIPTIONS = {
+    "READY": ("대기 중 (명령 수신 가능)", ACCENT_GREEN),
+    "BUSY": ("작업 수행 중", ACCENT_BLUE),
+    "EMERGENCY_STOPPED": ("비상정지 상태", ALERT_RED),
+    "OFFLINE": ("오프라인 (텔레메트리 끊김)", ALERT_RED),
+    "WAITING_FOR_INITIAL_POSE": ("초기 위치 대기 (AMCL 미수렴)", ACCENT_ORANGE),
+    "NAV2_INACTIVE": ("Nav2 비활성 (주행 불가)", ACCENT_ORANGE),
+}
+
+
+def _describe_state(vehicle):
+    """Map a raw state_text to an operator-readable label and colour."""
+    description, color = _STATE_DESCRIPTIONS.get(
+        vehicle.state_text, (vehicle.state_text or "알 수 없음", TEXT_PRIMARY)
+    )
+    return f"{description}", color
+
+
+def _stop_reasons(vehicle, snapshot, held_by_collision):
+    """List every distinct reason this vehicle is currently held.
+
+    The operator latch and the collision supervisor's safety_hold are separate
+    mechanisms on the vehicle's cmd_vel gate, so both can be active at once and
+    each needs its own release.
+    """
+    reasons = []
+    if vehicle.emergency_stopped:
+        reasons.append("🚨 운영자 비상정지 (수동 해제 필요)")
+    if held_by_collision:
+        distance = snapshot.collision_distance_m
+        gap = f" · 간격 {distance:.2f}m" if distance is not None else ""
+        transport = snapshot.collision_transport or "safety_hold"
+        reasons.append(f"⛔ 충돌 회피 정지 ({transport}{gap})")
+    if vehicle.state_text == "OFFLINE":
+        reasons.append(
+            f"📡 텔레메트리 {vehicle.telemetry_age_sec:.1f}초 지연"
+        )
+    return reasons
+
+
+def _vehicle_detail(vehicle):
+    """Secondary line: position, zone lock, Nav2 and the running command."""
+    parts = [f"위치 ({vehicle.x:.2f}, {vehicle.y:.2f})"]
+    parts.append("Nav2 준비" if vehicle.nav2_ready else "Nav2 미준비")
+    if vehicle.locked_zone:
+        parts.append(f"점유 구역 {vehicle.locked_zone}")
+    if vehicle.current_command_id:
+        parts.append(f"명령 {vehicle.current_command_id}")
+    return " · ".join(parts)
 
 
 class DashboardView(ctk.CTkFrame):
@@ -81,33 +136,39 @@ class DashboardView(ctk.CTkFrame):
         status_frame.grid(row=0, column=1, rowspan=2, padx=(0, 15), pady=(15, 10), sticky="nsew")
 
         title_frame = ctk.CTkFrame(status_frame, fg_color="transparent")
-        title_frame.pack(fill="x", padx=15, pady=(15, 10))
+        title_frame.pack(side="top", fill="x", padx=15, pady=(15, 10))
         ctk.CTkLabel(title_frame, text="📊 실시간 작동 현황", font=self.font_subtitle, text_color=TEXT_PRIMARY).pack(side="left")
 
+        # Reserve the command row before the cards. pack() hands out space in
+        # call order, so packing this last let a tall status card push the
+        # button clean off the panel.
+        btn_row = ctk.CTkFrame(status_frame, fg_color="transparent")
+        btn_row.pack(side="bottom", fill="x", padx=15, pady=(0, 15))
+
+        self.btn_cmd = ctk.CTkButton(btn_row, text="🗣️ 명령", font=self.font_subtitle, fg_color=ACCENT_BLUE, text_color=ACCENT_ON_BLUE,
+                                     hover_color="#cce5ff", height=40, command=self.open_command_popup)
+        self.btn_cmd.pack(side="left", expand=True, fill="x", padx=(0, 8))
+
+        divider = ctk.CTkFrame(status_frame, height=1, fg_color=BORDER_COLOR)
+        divider.pack(side="bottom", fill="x", padx=15, pady=(0, 10))
+
+        # Cards scroll, so adding detail to a card can never squeeze the
+        # button out again.
+        cards_area = ctk.CTkScrollableFrame(status_frame, fg_color="transparent")
+        cards_area.pack(side="top", fill="both", expand=True)
+
+        self._build_amr_status_card(cards_area)
+
         cards = [
-            ("자율주행 차량 (AGV)", "가동 현황은 '화물 위치 / 배차' 탭 참고"),
             ("안벽 크레인", "6기 가동 중"),
             ("야드 크레인", "12기 가동 중"),
             ("당일 선박 입항", "총 5척 정박 완료"),
         ]
         for title, val in cards:
-            card = ctk.CTkFrame(status_frame, fg_color=BG_CARD, border_width=1, border_color=BORDER_COLOR, corner_radius=8)
-            card.pack(fill="x", padx=15, pady=5, ipady=8)
+            card = ctk.CTkFrame(cards_area, fg_color=BG_CARD, border_width=1, border_color=BORDER_COLOR, corner_radius=8)
+            card.pack(fill="x", padx=5, pady=5, ipady=8)
             ctk.CTkLabel(card, text=title, font=self.font_mini, text_color=TEXT_SECONDARY).pack(anchor="w", padx=10, pady=(0, 2))
             ctk.CTkLabel(card, text=val, font=self.font_body_bold if "가동" in val or "완료" in val else self.font_body, text_color=TEXT_PRIMARY).pack(anchor="w", padx=10)
-
-        # Push buttons to the bottom
-        ctk.CTkFrame(status_frame, fg_color="transparent").pack(expand=True, fill="both")
-
-        divider = ctk.CTkFrame(status_frame, height=1, fg_color=BORDER_COLOR)
-        divider.pack(fill="x", padx=15, pady=(0, 10))
-
-        btn_row = ctk.CTkFrame(status_frame, fg_color="transparent")
-        btn_row.pack(fill="x", padx=15, pady=(0, 15))
-        
-        btn_cmd = ctk.CTkButton(btn_row, text="🗣️ 명령", font=self.font_subtitle, fg_color=ACCENT_BLUE, text_color=ACCENT_ON_BLUE,
-                                hover_color="#cce5ff", height=40, command=self.open_command_popup)
-        btn_cmd.pack(side="left", expand=True, fill="x", padx=(0, 8))
 
         # ==========================================
         # 3. 하단: 기상 및 해양 상황 패널
@@ -151,6 +212,141 @@ class DashboardView(ctk.CTkFrame):
         threading.Thread(target=self.fetch_ocean_khoa, daemon=True).start()
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 자율주행 차량(AMR) 실시간 상태 카드
+    # ------------------------------------------------------------------
+    def _build_amr_status_card(self, parent) -> None:
+        """Live per-AMR state, battery and emergency-stop indicator.
+
+        Fed by RosControlBridge, which subscribes to
+        /central/fleet/<vehicle_id>/state, so this reflects what the fleet
+        dispatcher actually sees rather than a hardcoded summary.
+        """
+        self.ros_bridge = RosControlBridge.get_instance()
+
+        card = ctk.CTkFrame(parent, fg_color=BG_CARD, border_width=1, border_color=BORDER_COLOR, corner_radius=8)
+        card.pack(fill="x", padx=5, pady=5, ipady=8)
+
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkLabel(header, text="자율주행 차량 (AMR)", font=self.font_mini, text_color=TEXT_SECONDARY).pack(side="left")
+        self.lbl_amr_link = ctk.CTkLabel(header, text="ROS 연결 중", font=self.font_mini, text_color=ACCENT_ORANGE)
+        self.lbl_amr_link.pack(side="right")
+
+        self.amr_state_labels = {}
+        self.amr_stop_labels = {}
+        self.amr_detail_labels = {}
+        for vehicle_id, display_name in AMR_DISPLAY_NAMES.items():
+            row = ctk.CTkFrame(card, fg_color=BG_CARD_INNER, corner_radius=6)
+            row.pack(fill="x", padx=10, pady=3, ipady=4)
+            ctk.CTkLabel(row, text=display_name, font=self.font_mini, text_color=TEXT_SECONDARY).pack(anchor="w", padx=8)
+
+            state_label = ctk.CTkLabel(row, text="상태 수신 대기", font=self.font_body, text_color=TEXT_SECONDARY)
+            state_label.pack(anchor="w", padx=8)
+            self.amr_state_labels[vehicle_id] = state_label
+
+            stop_label = ctk.CTkLabel(row, text="", font=self.font_mini, text_color=ALERT_RED, justify="left")
+            self.amr_stop_labels[vehicle_id] = stop_label
+
+            detail_label = ctk.CTkLabel(row, text="", font=self.font_mini, text_color=TEXT_SECONDARY, justify="left")
+            detail_label.pack(anchor="w", padx=8)
+            self.amr_detail_labels[vehicle_id] = detail_label
+
+        self.lbl_estop = ctk.CTkLabel(card, text="비상정지 --", font=self.font_mini, text_color=TEXT_SECONDARY)
+        self.lbl_estop.pack(anchor="w", padx=10, pady=(4, 0))
+
+        self.update_amr_status()
+
+    def update_amr_status(self) -> None:
+        if not self._ui_alive:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        snapshot = self.ros_bridge.snapshot()
+        if snapshot.ready:
+            self.lbl_amr_link.configure(text="ROS 연결됨", text_color=ACCENT_GREEN)
+        elif snapshot.error:
+            self.lbl_amr_link.configure(text="ROS 연결 실패", text_color=ALERT_RED)
+        else:
+            self.lbl_amr_link.configure(text="ROS 연결 중", text_color=ACCENT_ORANGE)
+
+        states = {
+            vehicle.vehicle_id: vehicle for vehicle in snapshot.fleet_states
+        }
+        stopped_names = []
+        for vehicle_id, state_label in self.amr_state_labels.items():
+            stop_label = self.amr_stop_labels[vehicle_id]
+            detail_label = self.amr_detail_labels[vehicle_id]
+            vehicle = states.get(vehicle_id)
+            if vehicle is None:
+                state_label.configure(
+                    text="상태 수신 없음", text_color=TEXT_SECONDARY
+                )
+                stop_label.configure(text="")
+                stop_label.pack_forget()
+                detail_label.configure(text="")
+                continue
+
+            held_by_collision = (
+                snapshot.collision_held_vehicle == vehicle_id
+            )
+            if vehicle.emergency_stopped:
+                stopped_names.append(AMR_DISPLAY_NAMES[vehicle_id])
+
+            state_text, state_color = _describe_state(vehicle)
+            state_label.configure(
+                text=(
+                    f"{state_text} · 배터리 {vehicle.battery_percent:.0f}% "
+                    f"({vehicle.battery_voltage:.1f}V)"
+                ),
+                text_color=state_color,
+            )
+
+            reasons = _stop_reasons(vehicle, snapshot, held_by_collision)
+            if reasons:
+                stop_label.configure(text="\n".join(reasons))
+                stop_label.pack(anchor="w", padx=8)
+            else:
+                # Clear as well as hide: a stale reason must not reappear if
+                # this row is ever re-packed.
+                stop_label.configure(text="")
+                stop_label.pack_forget()
+
+            detail_label.configure(text=_vehicle_detail(vehicle))
+
+        summary = []
+        if snapshot.emergency_active:
+            # emergency_active without any flagged vehicle means the fleet-wide
+            # latch is on but per-vehicle telemetry has not caught up yet.
+            target = ", ".join(stopped_names) if stopped_names else "전체"
+            summary.append(f"🚨 운영자 비상정지 - {target}")
+        if snapshot.collision_held_vehicle:
+            held_name = AMR_DISPLAY_NAMES.get(
+                snapshot.collision_held_vehicle,
+                snapshot.collision_held_vehicle,
+            )
+            summary.append(f"⛔ 충돌 회피 정지 - {held_name}")
+
+        if summary:
+            self.lbl_estop.configure(
+                text=" / ".join(summary), text_color=ALERT_RED
+            )
+        elif snapshot.collision_state:
+            self.lbl_estop.configure(
+                text=f"정지 없음 (충돌 감시 {snapshot.collision_state})",
+                text_color=ACCENT_GREEN,
+            )
+        else:
+            self.lbl_estop.configure(
+                text="정지 없음 (충돌 감시 미연결)", text_color=TEXT_SECONDARY
+            )
+
+        self.after(500, self.update_amr_status)
+
     def open_command_popup(self) -> None:
         from command_center import open_command_popup
         open_command_popup(self)
