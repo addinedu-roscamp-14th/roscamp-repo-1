@@ -6,9 +6,16 @@ import tempfile
 import yaml
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    TimerAction,
+)
+from launch.conditions import IfCondition
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -33,6 +40,23 @@ def _rewrite_frames(value, vehicle_id):
     return value
 
 
+def _rewrite_keepout_topics(params, vehicle_id):
+    """Use absolute filter topics so nested costmap nodes resolve them correctly."""
+    filter_info_topic = f'/{vehicle_id}/costmap_filter_info'
+    mask_topic = f'/{vehicle_id}/keepout_filter_mask'
+
+    for costmap_name in ('local_costmap', 'global_costmap'):
+        costmap = params[costmap_name][costmap_name]['ros__parameters']
+        costmap['keepout_filter']['filter_info_topic'] = filter_info_topic
+
+    mask_server = params['filter_mask_server']['ros__parameters']
+    mask_server['topic_name'] = mask_topic
+
+    info_server = params['costmap_filter_info_server']['ros__parameters']
+    info_server['filter_info_topic'] = filter_info_topic
+    info_server['mask_topic'] = mask_topic
+
+
 def _launch_nav2(context):
     vehicle_id = LaunchConfiguration('vehicle_id').perform(context).strip('/')
     if vehicle_id not in ('agv1', 'agv2'):
@@ -42,6 +66,7 @@ def _launch_nav2(context):
     with source.open('r', encoding='utf-8') as stream:
         params = yaml.safe_load(stream)
     params = _rewrite_frames(params, vehicle_id)
+    _rewrite_keepout_topics(params, vehicle_id)
     # ROS parameter files match fully-qualified node names. Nesting the file
     # under the vehicle namespace makes every Nav2 block apply to /agvX/*.
     params.pop('/**', None)
@@ -65,18 +90,20 @@ def _launch_nav2(context):
                 'map': LaunchConfiguration('map'),
                 'keepout_mask': LaunchConfiguration('keepout_mask'),
                 'params_file': str(generated),
-                'container_name': f'{vehicle_id}_nav2_container',
+                'container_name': 'nav2_container',
+                'container_target': f'/{vehicle_id}/nav2_container',
                 'cmd_vel_output_topic': 'cmd_vel_safe_input',
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'use_composition': LaunchConfiguration('use_composition'),
                 'start_navigation': LaunchConfiguration('start_navigation'),
             }.items(),
-        )
+        ),
     ]
 
 
 def generate_launch_description():
     workspace = LaunchConfiguration('workspace')
+    vehicle_id = LaunchConfiguration('vehicle_id')
     return LaunchDescription([
         DeclareLaunchArgument(
             'vehicle_id',
@@ -109,7 +136,49 @@ def generate_launch_description():
             ]),
         ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
-        DeclareLaunchArgument('use_composition', default_value='False'),
+        DeclareLaunchArgument('use_composition', default_value='True'),
         DeclareLaunchArgument('start_navigation', default_value='True'),
+        DeclareLaunchArgument(
+            'start_parking_supervisor',
+            default_value='True',
+            description='Run the namespaced auto-parking action server',
+        ),
+        DeclareLaunchArgument(
+            'parking_spots_yaml',
+            default_value=PathJoinSubstitution([
+                FindPackageShare('drive'), 'params', 'parking_spots.yaml',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'parking_supervisor_start_delay',
+            default_value='15.0',
+            description=(
+                'Seconds to wait after this launch group starts before '
+                'starting parking_new, so it does not start while the '
+                'Nav2 composable-node burst is still loading'
+            ),
+        ),
         OpaqueFunction(function=_launch_nav2),
+        TimerAction(
+            # Starting alongside the ~12 Nav2 composable nodes overloads the
+            # Pi enough that parking_new dies during rclpy/DDS init with no
+            # captured traceback. Let the composable-node burst finish first.
+            period=LaunchConfiguration('parking_supervisor_start_delay'),
+            condition=IfCondition(LaunchConfiguration('start_parking_supervisor')),
+            actions=[
+                Node(
+                    package='drive',
+                    executable='parking_new',
+                    name='parking_supervisor',
+                    namespace=vehicle_id,
+                    output='screen',
+                    parameters=[{
+                        'parking_spots_yaml': LaunchConfiguration(
+                            'parking_spots_yaml'
+                        ),
+                        'cmd_vel_topic': 'cmd_vel_safe_input',
+                    }],
+                ),
+            ],
+        ),
     ])

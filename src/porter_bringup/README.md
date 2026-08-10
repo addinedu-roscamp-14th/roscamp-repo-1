@@ -9,47 +9,88 @@
 카메라·YOLO, fleet dispatcher, 제어 API와 RViz만 실행하며 Nav2를 중복 실행하지
 않습니다.
 
-### 1. AGV1 컴퓨터
+### 1. 중앙 관제 노트북
 
 ```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=12
-
-ros2 launch porter_bringup agv_vehicle.launch.py \
-  vehicle_id:=agv1 \
-  start_nav2:=true
-```
-
-### 2. AGV2 컴퓨터
-
-```bash
-cd ~/poter_ws
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-export ROS_DOMAIN_ID=12
-
-ros2 launch porter_bringup agv_vehicle.launch.py \
-  vehicle_id:=agv2 \
-  start_nav2:=true
-```
-
-### 3. 중앙 관제 노트북
-
-```bash
-cd ~/poter_ws
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-export ROS_DOMAIN_ID=12
+export ROS_DISCOVERY_SERVER=127.0.0.1:11811
 export PORT_CONTROL_API_TOKEN='porter1234'
 
 ros2 launch porter_bringup fleet_central_laptop.launch.py
 ```
 
+이 launch는 YOLO 기반 `fleet_collision_supervisor`도 기본 실행합니다. 두 차량의
+예상 경로가 가까워지면 한 대의 `safety_hold`만 잠그고 위험 해제 후 기존 Nav2
+목표를 이어서 수행합니다. 점검 토픽은 다음과 같습니다.
+
+```bash
+ros2 topic echo /central/fleet/collision_status
+```
+
+충돌 감독 없이 진단할 때만 다음 인자를 사용합니다.
+
+```bash
+ros2 launch porter_bringup fleet_central_laptop.launch.py \
+  start_collision_supervisor:=false
+```
+
+### 2. AGV1 컴퓨터
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DISCOVERY_SERVER=10.121.206.28:11811
+
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv1 \
+  discovery_server:=$ROS_DISCOVERY_SERVER \
+  start_nav2:=true
+```
+
+### 3. AGV2 컴퓨터
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DISCOVERY_SERVER=10.121.206.28:11811
+
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv2 \
+  discovery_server:=$ROS_DISCOVERY_SERVER \
+  start_nav2:=true
+```
+
+각 차량 launch는 기본적으로 LiDAR 타임스탬프 필터를 사용합니다. Nav2가
+활성화되기 전에 생성됐거나 네트워크/CPU 정체로 0.5초 이상 늦어진 스캔은
+AMCL과 costmap에 전달하지 않습니다. 진단 시 허용 시간을 조정할 수 있습니다.
+
+```bash
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv1 \
+  discovery_server:=$ROS_DISCOVERY_SERVER \
+  scan_max_age_sec:=0.7 \
+  start_nav2:=true
+```
+
+필터는 시스템 시계를 보정하지 않으므로 중앙과 두 차량 모두
+`timedatectl show -p NTPSynchronized`가 `yes`인지 확인해야 합니다.
+
+중앙 launch는 `0.0.0.0:11811`에서 Fast DDS Discovery Server를 함께 실행합니다.
+따라서 중앙 launch를 먼저 실행하고 각 차량의 `discovery_server`에는 중앙
+노트북의 실제 Wi-Fi IP를 넣습니다. 이 설정은 여러 Nav2 프로세스의 멀티캐스트
+검색 트래픽을 줄이고 무선 연결이 반복해서 끊기는 현상을 완화합니다.
+
+별도 터미널에서 `ros2 topic`, `ros2 action`, `rqt`를 실행할 때도 해당 컴퓨터의
+`ROS_DISCOVERY_SERVER`를 위와 같이 먼저 설정해야 합니다. 중앙에서는
+`127.0.0.1:11811`, 차량에서는 `<중앙_노트북_IP>:11811`을 사용합니다.
+
 이 launch는 두 차량을 한 화면에 표시하는 저대역폭 fleet RViz를 함께 실행합니다.
-지도, 차량 위치 마커, 경로만 기본 구독하며 원격 `/scan`, `/odom`,
-`/particle_cloud`, 로봇 모델은 기본 비활성화합니다. 툴바의
+지도, 저주기 차량 위치 마커, 경로와 두 RobotModel을 기본 표시하며 원격
+`/scan`, `/odom`, `/particle_cloud`는 기본 비활성화합니다. 툴바의
 `AGV1 Initial Pose`로 1번 차량을, `AGV2 Initial Pose`로 2번 차량을 실제
 위치와 방향에 맞게 각각 설정합니다. 두 도구는 각각 `/agv1/initialpose`,
 `/agv2/initialpose`에 발행합니다. RViz가 필요 없으면 `use_rviz:=false`를
@@ -68,8 +109,13 @@ ros2 launch porter_bringup fleet_central_laptop.launch.py \
   dashboard_enable_scan:=true
 ```
 
-RViz에서도 `AGV1 Scan`, `AGV2 Scan` 체크는 진단할 때만 켭니다. 체크하는 동안
-해당 LaserScan이 차량에서 중앙 노트북으로 계속 전송됩니다.
+RViz의 실제 RobotModel은 두 대 모두 표시하되 5 Hz로만 갱신됩니다. 모델이
+겹쳐 보이면 두 차량의 초기 위치가 아직 같은 위치로 설정된 것입니다. 툴바의
+차량별 `Initial Pose`를 각각 지정합니다. `Fleet Vehicles`는 RobotModel과
+별개인 2 Hz 경량 차량 마커이므로 항상 두 차량 상태를 확인할 수 있습니다.
+
+`AGV1 Scan`, `AGV2 Scan` 체크는 진단할 때만 켭니다. 체크하는 동안 해당
+LaserScan이 차량에서 중앙 노트북으로 계속 전송됩니다.
 차량별 위치와 상태는 `/central/fleet/agv1/state`,
 `/central/fleet/agv2/state`에서 동시에 관리됩니다.
 
@@ -94,6 +140,16 @@ ros2 topic pub --once /agv2/initialpose \
 초기 pose를 받기 전 차량 상태는 `WAITING_FOR_INITIAL_POSE`이며 중앙 배차 대상에
 포함되지 않습니다.
 
+### 4.1 RViz에서 차량별 수동 목표 전송
+
+중앙 fleet RViz 툴바에는 `2D Goal Pose` 도구가 두 개 있습니다. 첫 번째는
+AGV1의 `/agv1/goal_pose`, 두 번째는 AGV2의 `/agv2/goal_pose`로 발행됩니다.
+이 도구를 선택한 뒤 지도에서 목표 위치를 누르고 드래그해 최종 방향을
+지정하면 중앙 목표 라우터가 각 차량의 namespaced Nav2 액션으로 전달합니다.
+
+- 첫 번째 `2D Goal Pose`: `/agv1/navigate_to_pose`
+- 두 번째 `2D Goal Pose`: `/agv2/navigate_to_pose`
+
 ### 5. AUTO 배차
 
 ```bash
@@ -110,6 +166,48 @@ curl -X POST http://127.0.0.1:8100/api/v1/navigation/pixel-goal \
 
 특정 차량은 `"vehicle_id":"agv1"` 또는 `"agv2"`로 지정합니다. B-1은
 `"mode":"parking_b1"`을 추가합니다.
+일반 새 명령은 해당 차량의 기존 목표를 취소하고 즉시 새 목표로 교체합니다.
+LLM이 포괄적인 요청을 여러 단계로 계획하면 후속 명령에
+`predecessor_command_id`와 `queue_if_busy:true`가 자동으로 붙고, 앞 단계 성공
+후에만 실행됩니다. API에서 의도적으로 기존 작업 뒤에 붙일 때도 같은 두 필드를
+사용합니다.
+
+A-1/A-2/A-3(화물 적재 대기 구역)은 `"mode":"parking_a"`를 추가합니다. 셋 다
+`camera_to_map_bridge`에 고정된 동일한 map pose(`a_zone_map_x`,
+`a_zone_map_y`, `a_zone_map_yaw_deg` 파라미터, 기본값은 카메라 픽셀
+`(157, 262)`를 현재 homography로 변환한 map 좌표
+`(0.16812885, 0.06234431)`, yaw `90°`)에서 차량 헤딩 반대 방향으로
+`a_zone_stop_back_offset_m=0.10m` 이동한 `(0.16812885, -0.03765569)`입니다.
+`target`/`heading` 픽셀 값 자체는 무시됩니다(요청 형식을 맞추기 위한 값만 필요).
+
+B-1과 A 구역 모두 한 번에 한 대만 점유할 수 있는 배타 구역이라 다른 차량은
+바로 진입하지 않습니다. 요청 순서대로 FIFO 대기열에 등록되고, B-1은 최종
+자세 뒤 `0.25m`, A 구역은 뒤 `0.20m` 지점까지 먼저 이동해 대기합니다. 점유
+차량이 다른 목적지로 정상 출차하면 첫 번째 대기 차량이 자동으로 최종 위치에
+진입합니다. 거리는 launch의 `b1_waiting_distance_m`,
+`a_zone_waiting_distance_m`으로 변경할 수 있습니다.
+중앙 노드가 재시작된 경우에도 요청 구역의 최종 map 좌표 반경 `0.18m` 안에
+있는 차량을 최신 AMCL 위치로 찾아 점유 잠금을 복원합니다.
+
+```bash
+ros2 launch porter_bringup fleet_central_laptop.launch.py \
+  b1_waiting_distance_m:=0.25 \
+  a_zone_waiting_distance_m:=0.20
+```
+
+점유하던 차량이 오프라인이 되면 락이 자동으로
+풀리지 않는데, 대시보드가 `"zone_visually_empty":true`를 함께 보내면(현재
+카메라 프레임에 그 구역을 가리는 차량이 없을 때만 true) 텔레메트리로 이미
+오프라인 판정된(`_zone_unknown`) 구역에 한해 자동으로 락이 해제됩니다.
+차량이 아직 온라인이면 화면이 일시적으로 비어 보여도 절대 자동 해제되지
+않습니다. 그래도 꼬였을 때 수동으로 강제 해제하려면:
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/zones/b1/clear \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}"
+curl -X POST http://127.0.0.1:8100/api/v1/zones/a/clear \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}"
+```
 
 ### 상태 확인
 
@@ -142,9 +240,13 @@ curl -X POST http://127.0.0.1:8100/api/v1/emergency-stop \
 - 중앙 dispatcher는 차량별 `/amcl_pose`와 배터리만 지속 구독합니다.
 - 중앙 RViz는 지도, 저주기 차량 마커, 경로만 기본 표시합니다.
 - 웹 SLAM 화면은 `/agv1/map`과 `/agv1/amcl_pose`를 사용합니다.
-- 원격 LaserScan, odom, particle cloud, robot model은 기본 구독하지 않습니다.
+- 원격 LaserScan, odom, particle cloud는 기본 구독하지 않습니다.
+- 두 RobotModel은 저주기 갱신하고 `Fleet Vehicles` 경량 마커를 함께 사용합니다.
 - 차량 내부 Nav2는 기존 `/scan`, `/odom`, TF를 그대로 사용합니다.
 - Nav2의 voxel map 발행과 full costmap 반복 발행은 끕니다.
+- Fast DDS Discovery Server를 사용해 세 컴퓨터 사이의 검색 트래픽을 줄입니다.
+- 물리 차량에서는 중복 `joint_state_publisher`를 실행하지 않습니다.
+- LaserScan은 Best Effort, depth 1로 발행해 오래된 프레임 재전송을 막습니다.
 
 변경 후 중앙 노트북과 두 차량에서 최신 코드를 빌드합니다.
 
@@ -194,7 +296,6 @@ source install/setup.bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=<차량과_같은_번호>
 export PORT_CONTROL_API_TOKEN='porter1234'
 
 ros2 launch porter_bringup central_laptop.launch.py
@@ -247,12 +348,28 @@ python3 -m venv .venv
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=<차량과_같은_번호>
 export PORT_CONTROL_API_TOKEN='porter1234'
 
 ros2 launch porter_bringup dashboard_laptop.launch.py \
   central_ip:=192.168.0.60
 ```
+
+이 launch는 기본적으로 대시보드의 실시간 LLM 관제 에이전트도 켭니다. 사용자가
+명령 창에서 한 번 실행한 목표를 유지하면서 최신 영상, YOLO 검출, 차량 상태와
+구역 점유 변화를 2초 간격으로 확인합니다. 다음 인자로 주기를 조정할 수 있습니다.
+
+```bash
+ros2 launch porter_bringup dashboard_laptop.launch.py \
+  central_ip:=192.168.0.60 \
+  realtime_llm_enabled:=true \
+  realtime_llm_interval_sec:=2.0 \
+  realtime_llm_heartbeat_sec:=5.0 \
+  realtime_llm_initial_delay_sec:=5.0
+```
+
+`realtime_llm_enabled:=false`로 시작해도 GUI 사이드바의 `LLM 실시간 관제`
+스위치로 다시 켤 수 있습니다. 충돌 정지는 LLM 주기보다 빠른 중앙
+`fleet_collision_supervisor`가 별도로 담당합니다.
 
 현재 GUI의 차량 및 로봇팔 제어는 ROS2에 직접 연결되므로 대시보드 노트북도
 차량과 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. 카메라와 SLAM 영상 주소는
@@ -271,7 +388,7 @@ http://<central_ip>:8000/slam/video
 
 ```text
 중앙제어 API: http://<central_ip>:8100
-로컬 Ollama: http://127.0.0.1:11434
+Ollama: http://agent.sds.codes (팀 공유 서버)
 기본 모델: gemma4:31b
 ```
 
@@ -289,7 +406,16 @@ ros2 launch porter_bringup dashboard_laptop.launch.py \
 
 ```text
 현재 영상에서 중앙의 빈 공간으로 이동하고 오른쪽을 바라봐
+노란 차 상차하러 보내줘
+항구에 차량 한 대 배차해
+차량 한 대를 A구역에 대기시켜
 ```
+
+항구·항만·부두·상차·하차·선적·하역은 `B-1`의 포괄 표현으로, A구역·A존·적재
+대기는 현재 검출된 `A-1`/`A-2`/`A-3`의 포괄 표현으로 처리합니다. LLM이
+`unknown`을 반환하거나 검출 인덱스/접근 방향을 생략해도 현재 YOLO JSON에 대응
+구역이 있으면 대시보드가 보완합니다. 검출되지 않은 대상과 이동 금지 명령에는
+임의 좌표를 만들지 않습니다.
 
 처리 흐름:
 
@@ -354,7 +480,9 @@ curl http://127.0.0.1:8000/detections
 | 인자 | 기본값 | 기능 |
 | --- | --- | --- |
 | `central_ip` | 필수 | 중앙제어 노트북 IP |
+| `video_port` | `8000` | `dashboard_stream_node` HTTP 포트 (중앙 `config/dashboard/dashboard.yaml`의 `port`와 일치해야 함) |
 | `python_executable` | `~/.venv/bin/python` | GUI 실행 Python |
 | `api_token` | `PORT_CONTROL_API_TOKEN` | 중앙제어 API 토큰 |
-| `ollama_host` | `http://127.0.0.1:11434` | 로컬 VLM 서버 |
+| `ollama_host` | `http://agent.sds.codes` | VLM 서버 (팀 공유, 로컬로 바꾸려면 `http://127.0.0.1:11434` 지정) |
 | `llm_model` | `gemma4:31b` | 비전 모델 이름 |
+| `llm_num_ctx` | `8192` | 이미지·YOLO JSON을 포함한 VLM 요청의 Ollama 컨텍스트 크기 |

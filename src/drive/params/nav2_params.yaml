@@ -1,9 +1,9 @@
 amcl:
   ros__parameters:
-    alpha1: 0.1
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.1
+    alpha1: 0.3
+    alpha2: 0.3
+    alpha3: 0.5
+    alpha4: 0.3
     alpha5: 0.2
     base_frame_id: "base_footprint"
     beam_skip_distance: 0.5
@@ -12,30 +12,30 @@ amcl:
     do_beamskip: false
     global_frame_id: "map"
     lambda_short: 0.1
-    laser_likelihood_max_dist: 2.0
+    laser_likelihood_max_dist: 0.5
     laser_max_range: 100.0
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
-    max_beams: 60
+    max_beams: 100
     max_particles: 3000
     min_particles: 800
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
-    sigma_hit: 0.15
+    sigma_hit: 0.12
     tf_broadcast: true
-    transform_tolerance: 1.5
-    update_min_a: 0.20
-    update_min_d: 0.10
+    transform_tolerance: 1.0
+    update_min_a: 0.02
+    update_min_d: 0.01
     z_hit: 0.7
-    z_max: 0.05
-    z_rand: 0.3
-    z_short: 0.05
+    z_max: 0.03
+    z_rand: 0.25
+    z_short: 0.02
     scan_topic: scan
     set_initial_pose: true
     initial_pose: [0, 0, 0]
@@ -43,7 +43,7 @@ amcl:
 bt_navigator:
   ros__parameters:
     global_frame: map
-    robot_base_frame: base_footprint
+    robot_base_frame: base_link
     odom_topic: odom
     bt_loop_duration: 10
     default_server_timeout: 20
@@ -81,7 +81,7 @@ controller_server:
       # 기본 주행 및 속도
       desired_linear_vel: 0.1                # [m/s] 목표 기본 직진 속도
       allow_reversing: false                 # 후진 허용 여부 (false: 무조건 전진/제자리 회전으로 해결)
-      max_angular_accel: 2.0                 # [rad/s^2] 최대 각가속도 (회전할 때 얼마나 빨리 가속할지)
+      max_angular_accel: 1.6                 # [rad/s^2] 최대 각가속도 (회전할 때 얼마나 빨리 가속할지)
 
       # 경로 추종 (Lookahead, 시선 두기)
       lookahead_dist: 0.25                   # [m] 기본 전방 주시 거리
@@ -95,7 +95,7 @@ controller_server:
       # 제자리 회전 (고개 먼저 돌리기)
       use_rotate_to_heading: true            # 경로 방향과 로봇 헤딩이 다를 때 제자리 회전 먼저 하기
       rotate_to_heading_min_angle: 0.6       # [rad] 약 34도 이상 차이나면 제자리 회전 모드 진입
-      rotate_to_heading_angular_vel: 0.55    # [rad/s] 제자리 회전할 때의 회전 속도
+      rotate_to_heading_angular_vel: 0.375   # [rad/s] 제자리 회전할 때의 회전 속도
 
       # 커브길 감속 (Regulated)
       use_regulated_linear_velocity_scaling: false  # 급커브에서 속도 줄이기
@@ -114,9 +114,9 @@ controller_server:
 
       # 안전 및 충돌 방지
       use_collision_detection: true          # 현재 위치부터 주시점(Lookahead)까지 충돌 여부 미리 검사
-      max_allowed_time_to_collision_up_to_carrot: 0.5 # 주시점(Carrot)까지 가는 도중 충돌까지 허용되는 최대 시간
+      max_allowed_time_to_collision_up_to_carrot: 0.3 # 주시점(Carrot)까지 가는 도중 충돌까지 허용되는 최대 시간
       max_robot_pose_search_dist: 1.4875     # [m] 전역 경로 상에서 로봇과 가장 가까운 점을 찾을 때 최대 탐색 거리
-      transform_tolerance: 1.5               # [s] TF(좌표계 변환) 데이터 최대 허용 지연 시간
+      transform_tolerance: 0.2               # [s] TF(좌표계 변환) 데이터 최대 허용 지연 시간
 
       # 취소/종료 시 동작
       use_cancel_deceleration: false         # 내비게이션 취소 명령이 들어왔을 때 팍 멈추지 않고 부드럽게 감속할지
@@ -133,7 +133,7 @@ controller_server:
     bond_heartbeat_period: 0.1                   # [s] 시스템 상태 체크(하트비트) 주기
     costmap_update_timeout: 0.3                  # [s] 코스트맵 업데이트가 이 시간 지연되면 멈춤
     enable_stamped_cmd_vel: false                # TwistStamped 메시지 대신 일반 Twist 메시지 사용
-    failure_tolerance: 1.0                       # [s] 제어 계산 실패를 허용하는 시간
+    failure_tolerance: 0.6                       # [s] 지속적인 제어 실패를 빠르게 Recovery로 전달
     publish_zero_velocity: true                  # 목표 도달/취소 시 확실하게 정지하도록 0 속도 명령 발행
     speed_limit_topic: "speed_limit"             # 속도 제한 구역 적용 시 구독할 토픽 이름
     odom_topic: "odom"                           # 현재 속도를 읽어올 오도메트리 토픽
@@ -164,9 +164,12 @@ controller_server:
     progress_checker_plugins: ["progress_checker"]
 
     progress_checker:
-      plugin: "nav2_controller::SimpleProgressChecker"
-      movement_time_allowance: 20.0              # [s] 이 시간 동안 아래 거리만큼 못 움직이면 끼인 것으로 판단
-      required_movement_radius: 0.05             # [m] 위 시간 동안 최소 0.05m 반경은 벗어나야 함 (못 벗어나면 Recovery 실행)
+      # 회전도 진행으로 인정해 정상적인 제자리 회전 중 Recovery에 잘못
+      # 진입하지 않으면서, 차체가 실제로 정체되면 빠르게 복구를 시작한다.
+      plugin: "nav2_controller::PoseProgressChecker"
+      movement_time_allowance: 5.0               # [s] 이 시간 동안 위치/각도 변화가 없으면 Recovery 실행
+      required_movement_radius: 0.025            # [m] 정상 진행으로 인정할 최소 직선 이동량
+      required_movement_angle: 0.10              # [rad] 정상 진행으로 인정할 최소 회전량(약 5.7도)
 
 
 local_costmap:
@@ -183,10 +186,21 @@ local_costmap:
       #robot_radius: 0.22
       footprint: '[[0.172, 0.069], [0.172, -0.069], [-0.04, -0.069], [-0.04, 0.069]]'
       plugins: ["voxel_layer", "inflation_layer"]
+      # Keep the local filter on the exact mask cells. Inflating the filter in
+      # the rolling costmap makes a vehicle parked in a carved pocket unable
+      # to start its mandatory straight exit (DriveOnHeading reports
+      # COLLISION_AHEAD). The global costmap still inflates keepout regions so
+      # planned paths keep their clearance.
+      filters: ["keepout_filter"]
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: True
+        filter_info_topic: "/costmap_filter_info"
+        transform_tolerance: 0.2
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 5.0
-        inflation_radius: 1.0
+        cost_scaling_factor: 10.0
+        inflation_radius: 0.20
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -225,7 +239,7 @@ global_costmap:
       resolution: 0.01
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
-      filters: ["keepout_filter"]
+      filters: ["keepout_filter", "keepout_inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -247,11 +261,17 @@ global_costmap:
         plugin: "nav2_costmap_2d::KeepoutFilter"
         enabled: True
         filter_info_topic: "costmap_filter_info"
-        transform_tolerance: 1.5
+        transform_tolerance: 0.2
+      # Keep global plans away from the keepout edge. Without this second
+      # filter, NavFn can place the robot center directly beside the mask.
+      keepout_inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 6.0
+        inflation_radius: 0.12
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 5.0
-        inflation_radius: 1.0
+        cost_scaling_factor: 20.0
+        inflation_radius: 0.25
       always_send_full_costmap: False
 
 filter_mask_server:
@@ -323,11 +343,11 @@ behavior_server:
     local_frame: odom
     global_frame: map
     robot_base_frame: base_footprint
-    transform_tolerance: 1.5
+    transform_tolerance: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
+    max_rotational_vel: 0.75
     min_rotational_vel: 0.3
-    rotational_acc_lim: 2.0
+    rotational_acc_lim: 1.6
     enable_stamped_cmd_vel: false
 
 waypoint_follower:

@@ -100,11 +100,11 @@ Nav2 action status와 `/amcl_pose`를 감시해 자율주행 시작/종료 이�
 
 시작 시 현재 위치가 `start_position_1_x/y` 반경 `start_position_tolerance_m` 안이면
 `start_type`을 `position_1`로, 아니면 `other`로 발행합니다. 기본 `position_1`은
-`parking_new`의 마지막 고정 후진 기준 추정 좌표인 `x=1.694457`, `y=0.397200`입니다.
+AGV2 `parking_yellow`의 최종 주차 좌표인 `x=1.635464`, `y=0.168810`입니다.
 시작/종료 시 현재 위치가 `params/navigation_areas.yaml`에 등록된 좌표 반경 안인지 검사해
 `current_area`와 `matched_area`를 함께 발행합니다. 기본 area는
 `A:0.192099:0.043845`, `B:0.200000:0.100000`,
-`parking_yellow:1.694457:0.397200`입니다.
+`parking_yellow:1.635464:0.168810`입니다.
 
 ```yaml
 area_tolerance_m: 0.25
@@ -116,8 +116,8 @@ areas:
     x: 0.200000
     y: 0.100000
   parking_yellow:
-    x: 1.694457
-    y: 0.397200
+    x: 1.635463773844374
+    y: 0.16880950610511666
 ```
 
 ```bash
@@ -156,12 +156,13 @@ Nav2 `NavigateToPose` goal로 순차 실행합니다. 마지막 구간은 `parke
 설정: params/parking_spots.yaml
 ```
 
-현재 기본값 기준 자동 pre-approach와 후진 설정:
+현재 AGV1 기본 접근값과 AGV2 캘리브레이션값:
 
 ```text
 approach: x=1.218242, y=0.375254, yaw=-3.095542
 auto pre-approach: x=1.392214, y=0.261071, yaw=-3.095542
-estimated final reverse position: x=1.694457, y=0.397200
+AGV2 approach: x=1.365431, y=0.176245, yaw=-3.136509
+AGV2 parked: x=1.635464, y=0.168810, yaw=-3.098530
 reverse_distance_m: 0.476720       # [m] 약 47.7 cm 고정 후진
 reverse_speed: 0.095344            # [m/s] 약 5.0초 후진
 ```
@@ -324,6 +325,11 @@ reverse_speed: 0.095344            # [m/s] 마지막 후진 속도
 approach_xy_tolerance: 0.05        # [m] approach 위치 확인
 strict_yaw_goal_tolerance: 0.05    # [rad] 최종 approach yaw 허용 오차
 ```
+
+각 주차 위치에는 `auto_pre_approach_distance_m`과 `reverse_distance_m`을
+선택적으로 지정할 수 있습니다. 생략하면 위 노드 기본값을 사용합니다.
+`parking_yellow`는 AGV2에서 측정한 접근 자세로 바로 이동한 뒤 약 `0.270 m`를
+후진하도록 별도로 설정되어 있습니다.
 
 ## 한 번에 실행
 

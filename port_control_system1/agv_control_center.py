@@ -58,6 +58,7 @@ from stream_view import StreamView
 from slam_stream_processor import SlamStreamProcessor
 from settings_view import SettingsView
 from ros_control_bridge import RosControlBridge
+from realtime_llm_agent import RealtimeLLMAgent
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -72,6 +73,8 @@ class AGVControlCenter(ctk.CTk):
         self.configure(fg_color="#131314")
         self.ros_bridge = RosControlBridge.get_instance()
         self.ros_bridge.start()
+        self.realtime_agent = RealtimeLLMAgent.get_instance()
+        self.realtime_agent.start()
 
         # 전체 창을 [좌: 사이드바(고정폭) | 우: 내용 영역(가변폭)] 2열 그리드로 구성
         self.grid_rowconfigure(0, weight=1)
@@ -166,6 +169,17 @@ class AGVControlCenter(ctk.CTk):
         action_frame = ctk.CTkFrame(bottom_frame, fg_color="transparent")
         action_frame.pack(fill="x", padx=16, pady=16)
 
+        self.realtime_agent_var = ctk.BooleanVar(
+            value=self.realtime_agent.snapshot().enabled
+        )
+        ctk.CTkSwitch(
+            action_frame,
+            text="LLM 실시간 관제",
+            variable=self.realtime_agent_var,
+            command=self._toggle_realtime_agent,
+            font=ctk.CTkFont(family="Malgun Gothic", size=12),
+        ).pack(fill="x", pady=(0, 12))
+
         ctk.CTkLabel(action_frame, text="어느 화면에서든 우측 하단\n🗣️ 명령 버튼 이용",
                     font=ctk.CTkFont(family="Malgun Gothic", size=12), text_color="#c4c4c5",
                     justify="center").pack(fill="x", pady=(0, 16))
@@ -199,8 +213,23 @@ class AGVControlCenter(ctk.CTk):
         else:
             text = "ROS 연결 중"
             color = "#f0ad4e"
+        agent = self.realtime_agent.snapshot()
+        agent_text = {
+            'DISABLED': 'AI 꺼짐',
+            'WAITING_FOR_OBJECTIVE': 'AI 목표 대기',
+            'WAITING_FOR_IMAGE': 'AI 영상 대기',
+            'WAITING_FOR_DATA': 'AI 데이터 대기',
+            'EVALUATING': 'AI 판단 중',
+            'MONITORING': 'AI 실시간 관제',
+            'ERROR': 'AI 오류',
+        }.get(agent.state, f'AI {agent.state}')
+        text = f'{text} | {agent_text}'
         self.ros_status_label.configure(text=text, text_color=color)
         self.after(500, self._update_ros_status)
+
+    def _toggle_realtime_agent(self) -> None:
+        """Enable or suspend autonomous VLM reassessment."""
+        self.realtime_agent.set_enabled(self.realtime_agent_var.get())
 
     def activate_emergency_stop(self) -> None:
         """Latch a local ROS cmd_vel stop and show the operator alert."""
@@ -310,6 +339,10 @@ if __name__ == "__main__":
             pass
         try:
             RosControlBridge.get_instance().stop()
+        except Exception:
+            pass
+        try:
+            RealtimeLLMAgent.get_instance().stop()
         except Exception:
             pass
         if hasattr(app, 'current_view') and app.current_view is not None:

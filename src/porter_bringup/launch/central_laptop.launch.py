@@ -26,12 +26,22 @@ def generate_launch_description():
     map_file = LaunchConfiguration('map')
     keepout_mask = LaunchConfiguration('keepout_mask')
     yolo_weights = LaunchConfiguration('yolo_weights')
+    yolo_obb_weights = LaunchConfiguration('yolo_obb_weights')
     calibration_yaml = LaunchConfiguration('calibration_yaml')
     b1_camera_left_offset_m = LaunchConfiguration(
         'b1_camera_left_offset_m'
     )
     b1_camera_down_offset_m = LaunchConfiguration(
         'b1_camera_down_offset_m'
+    )
+    b1_waiting_distance_m = LaunchConfiguration(
+        'b1_waiting_distance_m'
+    )
+    a_zone_waiting_distance_m = LaunchConfiguration(
+        'a_zone_waiting_distance_m'
+    )
+    a_zone_waiting_camera_down_offset_m = LaunchConfiguration(
+        'a_zone_waiting_camera_down_offset_m'
     )
     dashboard_params = LaunchConfiguration('dashboard_params_file')
     dashboard_slam_map_topic = LaunchConfiguration(
@@ -174,6 +184,15 @@ def generate_launch_description():
             ]),
         ),
         DeclareLaunchArgument(
+            'yolo_obb_weights',
+            default_value=PathJoinSubstitution([
+                workspace,
+                'config',
+                'weights',
+                'best1.pt',
+            ]),
+        ),
+        DeclareLaunchArgument(
             'calibration_yaml',
             default_value=PathJoinSubstitution([
                 workspace,
@@ -195,6 +214,21 @@ def generate_launch_description():
             description=(
                 'B-1 parking goal offset along camera-image down, in meters'
             ),
+        ),
+        DeclareLaunchArgument(
+            'b1_waiting_distance_m',
+            default_value='0.25',
+            description='Distance behind the B-1 final pose used while occupied',
+        ),
+        DeclareLaunchArgument(
+            'a_zone_waiting_distance_m',
+            default_value='0.20',
+            description='Distance behind the A-zone final pose used while occupied',
+        ),
+        DeclareLaunchArgument(
+            'a_zone_waiting_camera_down_offset_m',
+            default_value='0.05',
+            description='Additional camera-down offset for the A waiting pose',
         ),
         DeclareLaunchArgument(
             'dashboard_params_file',
@@ -317,6 +351,7 @@ def generate_launch_description():
             condition=IfCondition(start_yolo),
             parameters=[{
                 'weights_path': yolo_weights,
+                'obb_weights_path': yolo_obb_weights,
                 'input_topic': '/image_rect/compressed',
                 'input_is_compressed': True,
             }],
@@ -337,6 +372,18 @@ def generate_launch_description():
                 ),
                 'b1_camera_down_offset_m': ParameterValue(
                     b1_camera_down_offset_m,
+                    value_type=float,
+                ),
+                'b1_waiting_distance_m': ParameterValue(
+                    b1_waiting_distance_m,
+                    value_type=float,
+                ),
+                'a_zone_waiting_distance_m': ParameterValue(
+                    a_zone_waiting_distance_m,
+                    value_type=float,
+                ),
+                'a_zone_waiting_camera_down_offset_m': ParameterValue(
+                    a_zone_waiting_camera_down_offset_m,
                     value_type=float,
                 ),
                 'waypoint_mode': False,

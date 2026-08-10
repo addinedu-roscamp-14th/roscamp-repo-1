@@ -29,8 +29,27 @@ from std_srvs.srv import SetBool, Trigger
 
 from .control_protocol import (
     CommandValidationError,
+    validate_park_request,
     validate_pixel_goal,
 )
+
+
+def _json_safe(value):
+    """
+    Replace NaN/Infinity floats with None (JSON null).
+
+    Starlette's JSONResponse renders with allow_nan=False, so an
+    uninitialized telemetry field (e.g. battery_percent defaults to
+    math.nan before a vehicle reports it) would otherwise raise
+    ValueError and turn the whole response into a 500.
+    """
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _web_dependencies():
@@ -67,6 +86,9 @@ class CentralControlGateway(Node):
         self.declare_parameter(
             'command_status_topic', '/central/control/status'
         )
+        self.declare_parameter(
+            'park_request_topic', '/central/fleet/park_request'
+        )
         self.declare_parameter('battery_percent_topic', '/battery/percent')
         self.declare_parameter('battery_voltage_topic', '/battery/voltage')
         self.declare_parameter('odom_topic', '/odom')
@@ -90,6 +112,9 @@ class CentralControlGateway(Node):
         )
         self.command_status_topic = str(
             self.get_parameter('command_status_topic').value
+        )
+        self.park_request_topic = str(
+            self.get_parameter('park_request_topic').value
         )
         self.camera_frame_id = str(
             self.get_parameter('camera_frame_id').value
@@ -136,6 +161,11 @@ class CentralControlGateway(Node):
         self.status_publisher = self.create_publisher(
             String,
             self.command_status_topic,
+            10,
+        )
+        self.park_request_publisher = self.create_publisher(
+            String,
+            self.park_request_topic,
             10,
         )
         self.create_subscription(
@@ -185,9 +215,14 @@ class CentralControlGateway(Node):
             )
             for vehicle_id in ('agv1', 'agv2')
         }
-        self._clear_b1_client = self.create_client(
-            Trigger, '/central/fleet/clear_b1_lock'
-        )
+        self._clear_zone_clients = {
+            'B-1': self.create_client(
+                Trigger, '/central/fleet/clear_b1_lock'
+            ),
+            'A': self.create_client(
+                Trigger, '/central/fleet/clear_a_lock'
+            ),
+        }
 
         self.get_logger().info(
             f'Central control API: http://{self.host}:{self.port}'
@@ -311,9 +346,14 @@ class CentralControlGateway(Node):
                 message.header.stamp = stamp
                 message.header.frame_id = self.camera_frame_id
                 message.command_id = command_id
+                message.predecessor_command_id = (
+                    goal.predecessor_command_id
+                )
                 message.requested_vehicle_id = goal.requested_vehicle_id
                 message.zone_id = goal.zone_id
                 message.mode = goal.mode
+                message.queue_if_busy = goal.queue_if_busy
+                message.zone_visually_empty = goal.zone_visually_empty
                 message.target_pixel.x = goal.target.x
                 message.target_pixel.y = goal.target.y
                 message.heading_pixel.x = goal.heading.x
@@ -341,6 +381,8 @@ class CentralControlGateway(Node):
         command = {
             'state': 'PIXEL_GOAL_PUBLISHED',
             'command_id': command_id,
+            'predecessor_command_id': goal.predecessor_command_id,
+            'queue_if_busy': goal.queue_if_busy,
             'mode': goal.mode,
             'requested_vehicle_id': goal.requested_vehicle_id or 'AUTO',
             'zone_id': goal.zone_id,
@@ -391,19 +433,64 @@ class CentralControlGateway(Node):
             raise RuntimeError(response.message)
         return {'accepted': True, 'target': target, 'enabled': bool(enabled)}
 
-    def clear_b1_lock(self, timeout_sec=2.0):
-        if not self._clear_b1_client.wait_for_service(timeout_sec=0.25):
-            raise RuntimeError('B-1 clear service is unavailable')
-        future = self._clear_b1_client.call_async(Trigger.Request())
+    _ZONE_URL_ALIASES = {'b1': 'B-1', 'a': 'A'}
+
+    def clear_zone_lock(self, zone_id, timeout_sec=2.0):
+        normalized = self._ZONE_URL_ALIASES.get(
+            zone_id.lower(), zone_id.upper()
+        )
+        client = self._clear_zone_clients.get(normalized)
+        if client is None:
+            raise ValueError(f'unknown zone_id: {zone_id}')
+        if not client.wait_for_service(timeout_sec=0.25):
+            raise RuntimeError(f'{normalized} clear service is unavailable')
+        future = client.call_async(Trigger.Request())
         deadline = time.monotonic() + timeout_sec
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not future.done():
-            raise RuntimeError('B-1 clear service timed out')
+            raise RuntimeError(f'{normalized} clear service timed out')
         response = future.result()
         if not response.success:
             raise RuntimeError(response.message)
-        return {'accepted': True, 'message': response.message}
+        return {
+            'accepted': True,
+            'zone_id': normalized,
+            'message': response.message,
+        }
+
+    def dispatch_park(self, payload):
+        """Validate and publish one auto-park request exactly once."""
+        request = validate_park_request(payload)
+        command_id = request.command_id or str(uuid.uuid4())
+
+        with self._dispatch_lock:
+            if command_id in self._recent_command_ids:
+                return {
+                    'accepted': True,
+                    'duplicate': True,
+                    'command_id': command_id,
+                }
+            if self.park_request_publisher.get_subscription_count() == 0:
+                raise RuntimeError(
+                    'no subscriber on the park request topic; '
+                    'start fleet_dispatcher first'
+                )
+            message = String()
+            message.data = request.requested_vehicle_id
+            self.park_request_publisher.publish(message)
+            self._recent_command_ids.append(command_id)
+
+        self.get_logger().info(
+            f'Accepted park request {command_id}: '
+            f'vehicle_id={request.requested_vehicle_id or "AUTO"}'
+        )
+        return {
+            'accepted': True,
+            'duplicate': False,
+            'command_id': command_id,
+            'vehicle_id': request.requested_vehicle_id or 'AUTO',
+        }
 
     def _point_message(self, x, y, stamp, mode='direct'):
         message = PointStamped()
@@ -433,7 +520,7 @@ class CentralControlGateway(Node):
             key: age is None or age > self.telemetry_stale_timeout
             for key, age in ages.items()
         }
-        return {
+        return _json_safe({
             'status': 'ready',
             'interfaces': {
                 'target_pixel_topic': self.target_pixel_topic,
@@ -449,7 +536,7 @@ class CentralControlGateway(Node):
             'telemetry': telemetry,
             'age_sec': ages,
             'stale': stale,
-        }
+        })
 
 
 def create_app(
@@ -509,6 +596,25 @@ def create_app(
                 detail=str(exc),
             ) from exc
 
+    @app.post('/api/v1/navigation/park')
+    async def navigation_park(
+        payload: dict,
+        x_control_token: str | None = header_factory(default=None),
+    ):
+        authorize(x_control_token)
+        try:
+            return node.dispatch_park(payload)
+        except CommandValidationError as exc:
+            raise http_exception_class(
+                status_code=422,
+                detail=str(exc),
+            ) from exc
+        except RuntimeError as exc:
+            raise http_exception_class(
+                status_code=503,
+                detail=str(exc),
+            ) from exc
+
     @app.post('/api/v1/emergency-stop')
     async def emergency_stop(
         payload: dict,
@@ -526,13 +632,19 @@ def create_app(
                 detail=str(exc),
             ) from exc
 
-    @app.post('/api/v1/zones/b1/clear')
-    async def clear_b1(
+    @app.post('/api/v1/zones/{zone_id}/clear')
+    async def clear_zone(
+        zone_id: str,
         x_control_token: str | None = header_factory(default=None),
     ):
         authorize(x_control_token)
         try:
-            return node.clear_b1_lock()
+            return node.clear_zone_lock(zone_id)
+        except ValueError as exc:
+            raise http_exception_class(
+                status_code=404,
+                detail=str(exc),
+            ) from exc
         except RuntimeError as exc:
             raise http_exception_class(
                 status_code=409,

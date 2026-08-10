@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Latched per-vehicle velocity gate used by the fleet emergency stop."""
+"""Latched per-vehicle velocity gate for emergency and automatic holds."""
 
 import threading
 
@@ -17,11 +17,13 @@ class CmdVelSafetyGate(Node):
         self.declare_parameter('manual_input_topic', 'cmd_vel_manual')
         self.declare_parameter('output_topic', 'cmd_vel')
         self.declare_parameter('emergency_service', 'emergency_stop')
+        self.declare_parameter('safety_hold_service', 'safety_hold')
         self.declare_parameter('command_timeout_sec', 0.5)
         self.declare_parameter('publish_rate_hz', 100.0)
 
         self._lock = threading.Lock()
         self._emergency = False
+        self._safety_hold = False
         self._last_command = Twist()
         self._last_command_time = self.get_clock().now()
         self._timeout = float(self.get_parameter('command_timeout_sec').value)
@@ -42,6 +44,11 @@ class CmdVelSafetyGate(Node):
             SetBool,
             str(self.get_parameter('emergency_service').value),
             self._on_emergency,
+        )
+        self.create_service(
+            SetBool,
+            str(self.get_parameter('safety_hold_service').value),
+            self._on_safety_hold,
         )
         self.create_timer(1.0 / rate, self._publish)
         self.get_logger().info(
@@ -70,12 +77,27 @@ class CmdVelSafetyGate(Node):
         self.get_logger().warning(response.message)
         return response
 
+    def _on_safety_hold(self, request, response):
+        with self._lock:
+            self._safety_hold = bool(request.data)
+            if self._safety_hold:
+                self._last_command_time = self.get_clock().now()
+        self.publisher.publish(Twist())
+        response.success = True
+        response.message = (
+            'automatic safety hold latched'
+            if request.data
+            else 'automatic safety hold released'
+        )
+        self.get_logger().warning(response.message)
+        return response
+
     def _publish(self):
         with self._lock:
             age = (self.get_clock().now() - self._last_command_time).nanoseconds / 1e9
             message = (
                 Twist()
-                if self._emergency or age > self._timeout
+                if self._emergency or self._safety_hold or age > self._timeout
                 else self._last_command
             )
         self.publisher.publish(message)
