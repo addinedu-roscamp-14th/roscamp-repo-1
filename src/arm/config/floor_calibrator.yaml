@@ -1,0 +1,17 @@
+/arm/floor_calibrator:
+  ros__parameters:
+    base_frame: arm/base_link
+    marker_frame: arm/target_marker
+    command_frame: arm/controller_coords
+
+    # Change these at runtime before capturing each sample.
+    # floor uses active_floor 0..3; agv uses active_floor 0..1.
+    active_surface: floor
+    active_floor: 1
+    active_station: station_a
+
+    marker_sample_count: 10
+    marker_sample_window_sec: 2.0
+    max_tf_age_sec: 1.0
+    max_marker_std_m: 0.003
+    ransac_threshold_m: 0.003
