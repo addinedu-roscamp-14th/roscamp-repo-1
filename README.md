@@ -173,6 +173,17 @@ ros2 service list | grep '^/arm2/'
 ros2 topic echo /arm2/transfer_events
 ```
 
+Zenoh 연결 후 서비스 호출은 중앙 `arm_dispatcher`가 담당합니다. 입항 자동화 모드에서는
+ARM2 노트북에서 `/arm2/scan_destinations`를 별도로 호출하지 않아도 됩니다. 중앙
+노트북에서는 다음 명령으로 ARM2 서비스와 최종 작업 이벤트가 전달되는지 확인합니다.
+
+```bash
+export ROS_DOMAIN_ID=12
+ros2 service list | grep '^/arm2/'
+ros2 topic echo /arm2/transfer_events
+ros2 topic echo /central/arms/arm2/state
+```
+
 ARM1은 Domain `15`를 사용하지만 서비스와 이벤트 계약이 확정되기 전까지 중앙
 명령이 비활성화되어 있습니다.
 
@@ -204,12 +215,17 @@ cd ~/poter_ws
 ./scripts/clear_all_holds.sh --cancel-goals
 ```
 
-### 0. 최초 빌드
+## 개별 노드 실행 참고
+
+아래 절은 디버깅과 수동 실행을 위한 참고 명령입니다. 다중 장비 통합 실행에는
+위의 분리 Domain + Zenoh 실행 순서를 사용합니다.
+
+### 최초 빌드
 
 노트북:
 
 ```bash
-colcon build
+colcon build --symlink-install
 source install/setup.bash
 ```
 
