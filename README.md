@@ -32,29 +32,65 @@ sudo ./scripts/setup_ntp_server.sh    # chrony를 로봇 LAN 시간 서버로 �
 
 ### 1. 중앙 관제 노트북
 
+``` bash 
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+sudo ip link set lo multicast on
+ros2 daemon stop
+
+zenoh-bridge-ros2dds \
+  -c config/network/zenoh_central.json5
+```
+
 ```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-export ROS_DISCOVERY_SERVER=127.0.0.1:11811
+
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export PORT_CONTROL_API_TOKEN='porter1234'
 
 ros2 launch porter_bringup fleet_central_laptop.launch.py \
-  video_device:=/dev/video2
+  control_host:=0.0.0.0 \
+  start_discovery_server:=false
 
 ```
 
 ### 2. AGV1
 
+``` bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+sudo ip link set lo multicast on
+ros2 daemon stop
+
+zenoh-bridge-ros2dds \
+  -c config/network/zenoh_agv1.json5 \
+  -e tcp/192.168.5.6:7447
+```
+
 ```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-export ROS_DISCOVERY_SERVER=192.168.5.6:11811
+
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 ros2 launch porter_bringup agv_vehicle.launch.py \
   vehicle_id:=agv1 \
-  discovery_server:=$ROS_DISCOVERY_SERVER \
+  discovery_server:= \
   start_nav2:=true
 ```
 
@@ -64,11 +100,29 @@ ros2 launch porter_bringup agv_vehicle.launch.py \
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-export ROS_DISCOVERY_SERVER=192.168.5.6:11811
+
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+sudo ip link set lo multicast on
+ros2 daemon stop
+
+zenoh-bridge-ros2dds \
+  -c config/network/zenoh_agv2.json5 \
+  -e tcp/192.168.5.6:7447
+```
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 ros2 launch porter_bringup agv_vehicle.launch.py \
   vehicle_id:=agv2 \
-  discovery_server:=$ROS_DISCOVERY_SERVER \
+  discovery_server:= \
   start_nav2:=true
 ```
 
