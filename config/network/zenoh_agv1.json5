@@ -1,0 +1,74 @@
+{
+  "id": "a013",
+  "mode": "client",
+  "scouting": {
+    "multicast": {"enabled": false},
+    "gossip": {"enabled": false}
+  },
+  "plugins": {
+    "ros2dds": {
+      "nodename": "zenoh_bridge_agv1",
+      "domain": 13,
+      "ros_automatic_discovery_range": "LOCALHOST",
+      "allow": {
+        "publishers": [
+          "/tf",
+          "/tf_static",
+          "/agv1/map",
+          "/agv1/keepout_filter_mask",
+          "/agv1/amcl_pose",
+          "/agv1/odom",
+          "/agv1/scan",
+          "/agv1/plan",
+          "/agv1/joint_states",
+          "/agv1/robot_description",
+          "/agv1/battery/percent",
+          "/agv1/battery/voltage"
+        ],
+        "subscribers": [
+          "/agv1/initialpose",
+          "/agv1/goal_pose",
+          "/agv1/cmd_vel_manual"
+        ],
+        "service_servers": [
+          "/agv1/safety_hold",
+          "/agv1/emergency_stop",
+          "/agv1/local_costmap/local_costmap/get_parameters",
+          "/agv1/local_costmap/local_costmap/set_parameters"
+        ],
+        "service_clients": [],
+        "action_servers": [
+          "/agv1/navigate_to_pose",
+          "/agv1/navigate_through_poses",
+          "/agv1/spin",
+          "/agv1/drive_on_heading",
+          "/agv1/park_in_spot"
+        ],
+        "action_clients": []
+      },
+      "pub_max_frequencies": [
+        "/tf=15",
+        "/agv1/scan=5",
+        "/agv1/odom=10",
+        "/agv1/amcl_pose=10",
+        "/agv1/joint_states=5"
+      ],
+      "pub_priorities": [
+        "/agv1/amcl_pose=1:express",
+        "/agv1/odom=1:express",
+        "/tf=2:express",
+        "/agv1/scan=4",
+        "/agv1/plan=4"
+      ],
+      "queries_timeout": {
+        "default": 5.0,
+        "services": 3.0,
+        "actions": {
+          "send_goal": 5.0,
+          "cancel_goal": 5.0,
+          "get_result": 3600.0
+        }
+      }
+    }
+  }
+}

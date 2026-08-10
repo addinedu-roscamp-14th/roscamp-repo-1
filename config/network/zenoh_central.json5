@@ -1,0 +1,64 @@
+{
+  "id": "c012",
+  "mode": "router",
+  "listen": {
+    "endpoints": ["tcp/0.0.0.0:7447"]
+  },
+  "scouting": {
+    "multicast": {"enabled": false},
+    "gossip": {"enabled": false}
+  },
+  "plugins": {
+    "ros2dds": {
+      "nodename": "zenoh_bridge_central",
+      "domain": 12,
+      "ros_automatic_discovery_range": "LOCALHOST",
+      "allow": {
+        "publishers": [
+          "/agv[12]/initialpose",
+          "/agv[12]/goal_pose",
+          "/agv[12]/cmd_vel_manual"
+        ],
+        "subscribers": [
+          "/tf",
+          "/tf_static",
+          "/agv[12]/map",
+          "/agv[12]/keepout_filter_mask",
+          "/agv[12]/amcl_pose",
+          "/agv[12]/odom",
+          "/agv[12]/scan",
+          "/agv[12]/plan",
+          "/agv[12]/joint_states",
+          "/agv[12]/robot_description",
+          "/agv[12]/battery/percent",
+          "/agv[12]/battery/voltage"
+        ],
+        "service_servers": [],
+        "service_clients": [
+          "/agv[12]/safety_hold",
+          "/agv[12]/emergency_stop",
+          "/agv[12]/local_costmap/local_costmap/get_parameters",
+          "/agv[12]/local_costmap/local_costmap/set_parameters"
+        ],
+        "action_servers": [],
+        "action_clients": [
+          "/agv[12]/navigate_to_pose",
+          "/agv[12]/navigate_through_poses",
+          "/agv[12]/spin",
+          "/agv[12]/drive_on_heading",
+          "/agv[12]/park_in_spot"
+        ]
+      },
+      "queries_timeout": {
+        "default": 5.0,
+        "transient_local_subscribers": 3.0,
+        "services": 3.0,
+        "actions": {
+          "send_goal": 5.0,
+          "cancel_goal": 5.0,
+          "get_result": 3600.0
+        }
+      }
+    }
+  }
+}

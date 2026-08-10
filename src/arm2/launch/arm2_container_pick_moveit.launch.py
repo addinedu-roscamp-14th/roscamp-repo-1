@@ -4,11 +4,27 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    SetLaunchConfiguration,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+
+def resolve_params_file(context):
+    """Resolve and validate the coordinator YAML before nodes are started."""
+    configured = LaunchConfiguration('params_file').perform(context)
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f'arm2 params file not found: {path}')
+    return [SetLaunchConfiguration('resolved_params_file', str(path))]
 
 
 def generate_launch_description():
@@ -23,7 +39,11 @@ def generate_launch_description():
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
+        DeclareLaunchArgument('stack_marker_id', default_value='1'),
         DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument(
+            'stack_container_height_m', default_value='0.035'
+        ),
         DeclareLaunchArgument(
             'use_node_time_for_pose', default_value='true'
         ),
@@ -81,6 +101,7 @@ def generate_launch_description():
             'video_device': LaunchConfiguration('video_device'),
             'camera_info_url': LaunchConfiguration('camera_info_url'),
             'marker_id': LaunchConfiguration('marker_id'),
+            'secondary_marker_id': LaunchConfiguration('stack_marker_id'),
             'marker_size_m': LaunchConfiguration('marker_size_m'),
             'marker_frame_id': 'arm2/container_marker',
             'use_node_time_for_pose': LaunchConfiguration(
@@ -103,17 +124,22 @@ def generate_launch_description():
         namespace='arm2',
         output='screen',
         parameters=[
-            LaunchConfiguration('params_file'),
+            LaunchConfiguration('resolved_params_file'),
             {
                 'base_frame': 'arm2/base_link',
                 'moveit_ee_link': 'arm2/TCP',
                 'execute_motion': True,
                 'motion_backend': 'moveit',
+                'stack_container_height_m': ParameterValue(
+                    LaunchConfiguration('stack_container_height_m'),
+                    value_type=float,
+                ),
             },
         ],
     )
 
     return LaunchDescription(arguments + [
+        OpaqueFunction(function=resolve_params_file),
         moveit,
         bridge,
         camera,

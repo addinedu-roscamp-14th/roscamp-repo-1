@@ -1,0 +1,184 @@
+"""Start one namespaced Nav2 stack with vehicle-specific TF frames."""
+
+from pathlib import Path
+import tempfile
+
+import yaml
+
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    TimerAction,
+)
+from launch.conditions import IfCondition
+from launch.launch_description_sources import AnyLaunchDescriptionSource
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+
+
+def _rewrite_frames(value, vehicle_id):
+    if isinstance(value, dict):
+        rewritten = {}
+        for key, child in value.items():
+            child = _rewrite_frames(child, vehicle_id)
+            if key == 'base_frame_id':
+                child = f'{vehicle_id}/base_footprint'
+            elif key == 'odom_frame_id':
+                child = f'{vehicle_id}/odom'
+            elif key == 'robot_base_frame':
+                suffix = 'base_link' if child == 'base_link' else 'base_footprint'
+                child = f'{vehicle_id}/{suffix}'
+            elif key in ('local_frame', 'global_frame') and child == 'odom':
+                child = f'{vehicle_id}/odom'
+            rewritten[key] = child
+        return rewritten
+    if isinstance(value, list):
+        return [_rewrite_frames(item, vehicle_id) for item in value]
+    return value
+
+
+def _rewrite_keepout_topics(params, vehicle_id):
+    """Use absolute filter topics so nested costmap nodes resolve them correctly."""
+    filter_info_topic = f'/{vehicle_id}/costmap_filter_info'
+    mask_topic = f'/{vehicle_id}/keepout_filter_mask'
+
+    for costmap_name in ('local_costmap', 'global_costmap'):
+        costmap = params[costmap_name][costmap_name]['ros__parameters']
+        costmap['keepout_filter']['filter_info_topic'] = filter_info_topic
+
+    mask_server = params['filter_mask_server']['ros__parameters']
+    mask_server['topic_name'] = mask_topic
+
+    info_server = params['costmap_filter_info_server']['ros__parameters']
+    info_server['filter_info_topic'] = filter_info_topic
+    info_server['mask_topic'] = mask_topic
+
+
+def _launch_nav2(context):
+    vehicle_id = LaunchConfiguration('vehicle_id').perform(context).strip('/')
+    if vehicle_id not in ('agv1', 'agv2'):
+        raise ValueError('vehicle_id must be agv1 or agv2')
+
+    source = Path(LaunchConfiguration('params_file').perform(context))
+    with source.open('r', encoding='utf-8') as stream:
+        params = yaml.safe_load(stream)
+    params = _rewrite_frames(params, vehicle_id)
+    _rewrite_keepout_topics(params, vehicle_id)
+    # ROS parameter files match fully-qualified node names. Nesting the file
+    # under the vehicle namespace makes every Nav2 block apply to /agvX/*.
+    params.pop('/**', None)
+    params = {vehicle_id: params}
+    generated = Path(tempfile.gettempdir()) / f'porter_nav2_{vehicle_id}.yaml'
+    with generated.open('w', encoding='utf-8') as stream:
+        yaml.safe_dump(params, stream, sort_keys=False)
+
+    return [
+        IncludeLaunchDescription(
+            AnyLaunchDescriptionSource(
+                PathJoinSubstitution([
+                    FindPackageShare('drive'),
+                    'launch',
+                    'bringup_launch.xml',
+                ])
+            ),
+            launch_arguments={
+                'namespace': vehicle_id,
+                'workspace': LaunchConfiguration('workspace'),
+                'map': LaunchConfiguration('map'),
+                'keepout_mask': LaunchConfiguration('keepout_mask'),
+                'params_file': str(generated),
+                'container_name': 'nav2_container',
+                'container_target': f'/{vehicle_id}/nav2_container',
+                'cmd_vel_output_topic': 'cmd_vel_safe_input',
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+                'use_composition': LaunchConfiguration('use_composition'),
+                'start_navigation': LaunchConfiguration('start_navigation'),
+            }.items(),
+        ),
+    ]
+
+
+def generate_launch_description():
+    workspace = LaunchConfiguration('workspace')
+    vehicle_id = LaunchConfiguration('vehicle_id')
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            'vehicle_id',
+            description='Vehicle namespace: agv1 or agv2',
+            choices=['agv1', 'agv2'],
+        ),
+        DeclareLaunchArgument(
+            'workspace',
+            default_value=PathJoinSubstitution([
+                EnvironmentVariable('HOME'),
+                'poter_ws',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'map',
+            default_value=PathJoinSubstitution([
+                workspace, 'config', 'SLAM', 'current_map.yaml',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'keepout_mask',
+            default_value=PathJoinSubstitution([
+                workspace, 'config', 'SLAM', 'keepout_mask.yaml',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'params_file',
+            default_value=PathJoinSubstitution([
+                FindPackageShare('drive'), 'params', 'nav2_params.yaml',
+            ]),
+        ),
+        DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument('use_composition', default_value='True'),
+        DeclareLaunchArgument('start_navigation', default_value='True'),
+        DeclareLaunchArgument(
+            'start_parking_supervisor',
+            default_value='True',
+            description='Run the namespaced auto-parking action server',
+        ),
+        DeclareLaunchArgument(
+            'parking_spots_yaml',
+            default_value=PathJoinSubstitution([
+                FindPackageShare('drive'), 'params', 'parking_spots.yaml',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'parking_supervisor_start_delay',
+            default_value='15.0',
+            description=(
+                'Seconds to wait after this launch group starts before '
+                'starting parking_new, so it does not start while the '
+                'Nav2 composable-node burst is still loading'
+            ),
+        ),
+        OpaqueFunction(function=_launch_nav2),
+        TimerAction(
+            # Starting alongside the ~12 Nav2 composable nodes overloads the
+            # Pi enough that parking_new dies during rclpy/DDS init with no
+            # captured traceback. Let the composable-node burst finish first.
+            period=LaunchConfiguration('parking_supervisor_start_delay'),
+            condition=IfCondition(LaunchConfiguration('start_parking_supervisor')),
+            actions=[
+                Node(
+                    package='drive',
+                    executable='parking_new',
+                    name='parking_supervisor',
+                    namespace=vehicle_id,
+                    output='screen',
+                    parameters=[{
+                        'parking_spots_yaml': LaunchConfiguration(
+                            'parking_spots_yaml'
+                        ),
+                        'cmd_vel_topic': 'cmd_vel_safe_input',
+                    }],
+                ),
+            ],
+        ),
+    ])

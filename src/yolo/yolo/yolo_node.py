@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
 from cv_bridge import CvBridge
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 import rclpy
@@ -16,6 +18,14 @@ from std_msgs.msg import String
 
 
 class YoloNode(Node):
+    # BGR colors keyed by color keyword expected to appear in OBB class labels
+    # (e.g. 'container_red', 'blue_container'). Matched by substring, case-insensitive.
+    CONTAINER_COLOR_MAP = {
+        'black': (60, 60, 60),
+        'gray': (160, 160, 160),
+        'brown': (19, 69, 139),
+    }
+
     def __init__(self):
         super().__init__('yolo_node')
 
@@ -27,7 +37,22 @@ class YoloNode(Node):
         self.declare_parameter('confidence_threshold', 0.6)
         self.declare_parameter('device', '')
         self.declare_parameter('publish_annotated_image', True)
-        self.declare_parameter('class_names', ['red', 'blue'])
+        self.declare_parameter('show_heading_annotation', False)
+        self.declare_parameter('enable_obb', True)
+        self.declare_parameter('obb_weights_path', 'config/weights/best1.pt')
+        self.declare_parameter('obb_confidence_threshold', 0.6)
+        self.declare_parameter(
+            'class_names',
+            [
+                'trailer',
+                'car_yellow',
+                'car_blue',
+                'A-1',
+                'A-2',
+                'A-3',
+                'B-1',
+            ],
+        )
 
         self.input_topic = str(self.get_parameter('input_topic').value)
         self.input_is_compressed = bool(self.get_parameter('input_is_compressed').value)
@@ -37,7 +62,13 @@ class YoloNode(Node):
         self.confidence_threshold = float(self.get_parameter('confidence_threshold').value)
         self.device = str(self.get_parameter('device').value).strip()
         self.publish_annotated_image = bool(self.get_parameter('publish_annotated_image').value)
+        self.show_heading_annotation = bool(
+            self.get_parameter('show_heading_annotation').value
+        )
         self.expected_class_names = [str(name) for name in self.get_parameter('class_names').value]
+        self.enable_obb = bool(self.get_parameter('enable_obb').value)
+        self.obb_weights_path = self.resolve_weights_path(str(self.get_parameter('obb_weights_path').value))
+        self.obb_confidence_threshold = float(self.get_parameter('obb_confidence_threshold').value)
 
         if not self.weights_path.exists():
             raise FileNotFoundError(f'YOLO weights not found: {self.weights_path}')
@@ -48,6 +79,24 @@ class YoloNode(Node):
 
         self.get_logger().info(f'Expected segmentation classes: {", ".join(self.expected_class_names)}')
         self.get_logger().info(f'Model class map: {self.class_names}')
+
+        self.obb_model = None
+        self.obb_stream = None
+        self.obb_executor = None
+        if self.enable_obb:
+            if self.obb_weights_path.exists():
+                self.obb_model = YOLO(str(self.obb_weights_path))
+                self.get_logger().info(
+                    f'OBB model loaded: {self.obb_weights_path} (classes: {self.obb_model.names})'
+                )
+                if torch.cuda.is_available():
+                    self.obb_stream = torch.cuda.Stream()
+                    self.get_logger().info('OBB inference will run concurrently on a separate CUDA stream')
+                self.obb_executor = ThreadPoolExecutor(max_workers=1)
+            else:
+                self.get_logger().warn(
+                    f'OBB weights not found at {self.obb_weights_path}; OBB inference disabled'
+                )
 
         self.annotated_pub = None
         if self.publish_annotated_image:
@@ -75,6 +124,11 @@ class YoloNode(Node):
             f'({"compressed" if self.input_is_compressed else "raw"})'
         )
         self.get_logger().info(f'Publishing detections to: {self.detection_topic}')
+
+    def destroy_node(self):
+        if self.obb_executor is not None:
+            self.obb_executor.shutdown(wait=False)
+        super().destroy_node()
 
     def resolve_weights_path(self, configured_path: str) -> Path:
         path = Path(configured_path)
@@ -117,6 +171,10 @@ class YoloNode(Node):
         self.process_frame(frame_array, msg.header.frame_id, msg.header.stamp)
 
     def process_frame(self, frame_bgr, frame_id, stamp):
+        obb_future = None
+        if self.obb_model is not None:
+            obb_future = self.obb_executor.submit(self.infer_obb, frame_bgr)
+
         results = self.model.predict(
             source=frame_bgr,
             conf=self.confidence_threshold,
@@ -125,6 +183,8 @@ class YoloNode(Node):
         )
 
         if not results:
+            if obb_future is not None:
+                obb_future.result()
             return
 
         result = results[0]
@@ -154,10 +214,21 @@ class YoloNode(Node):
                     heading_deg = self.compute_heading_deg(polygon)
                     if heading_deg is not None:
                         detection['heading_deg'] = round(heading_deg, 2)
-                        self.draw_heading_label(annotated_frame, x1, y1, heading_deg)
+                        if self.show_heading_annotation:
+                            self.draw_heading_label(
+                                annotated_frame,
+                                x1,
+                                y1,
+                                heading_deg,
+                            )
 
                 if not self.expected_class_names or label in self.expected_class_names:
                     detections.append(detection)
+
+        obb_detections = []
+        if obb_future is not None:
+            obb = obb_future.result()
+            obb_detections = self.postprocess_obb(obb, annotated_frame)
 
         summary = {
             'frame_id': frame_id,
@@ -168,6 +239,8 @@ class YoloNode(Node):
             'detection_count': len(detections),
             'segmentation': masks is not None,
             'detections': detections,
+            'obb_detection_count': len(obb_detections),
+            'obb_detections': obb_detections,
         }
 
         detection_msg = String()
@@ -185,6 +258,84 @@ class YoloNode(Node):
             annotated_msg.step = int(annotated_frame.shape[1] * annotated_frame.shape[2])
             annotated_msg.data = annotated_frame.tobytes()
             self.annotated_pub.publish(annotated_msg)
+
+    def infer_obb(self, frame_bgr):
+        """Run OBB inference, optionally on its own CUDA stream so it overlaps
+        with the segmentation model's inference happening on the main thread."""
+        if self.obb_stream is not None:
+            with torch.cuda.stream(self.obb_stream):
+                results = self.obb_model.predict(
+                    source=frame_bgr,
+                    conf=self.obb_confidence_threshold,
+                    device=self.device or None,
+                    verbose=False,
+                )
+            self.obb_stream.synchronize()
+        else:
+            results = self.obb_model.predict(
+                source=frame_bgr,
+                conf=self.obb_confidence_threshold,
+                device=self.device or None,
+                verbose=False,
+            )
+
+        if not results:
+            return None
+
+        return results[0].obb
+
+    def postprocess_obb(self, obb, annotated_frame):
+        detections = []
+
+        if obb is None or obb.xyxyxyxy is None:
+            return detections
+
+        obb_class_names = self.obb_model.names
+
+        for index in range(len(obb)):
+            class_id = int(obb.cls[index].item())
+            confidence = float(obb.conf[index].item())
+            label = obb_class_names.get(class_id, str(class_id))
+            corners = obb.xyxyxyxy[index].tolist()
+            heading_deg = float(np.degrees(obb.xywhr[index][4].item()))
+
+            detections.append({
+                'class_id': class_id,
+                'label': label,
+                'confidence': round(confidence, 4),
+                'corners_xy': [[round(float(x), 2), round(float(y), 2)] for x, y in corners],
+                'heading_deg': round(heading_deg, 2),
+            })
+
+            self.draw_obb_box(annotated_frame, corners, label, confidence)
+
+        return detections
+
+    def resolve_container_color(self, label):
+        normalized = label.lower()
+        for keyword, color in self.CONTAINER_COLOR_MAP.items():
+            if keyword in normalized:
+                return color
+        return (0, 255, 255)
+
+    def draw_obb_box(self, image, corners, label, confidence):
+        points = np.asarray(corners, dtype=np.int32).reshape((-1, 1, 2))
+        color = self.resolve_container_color(label)
+        cv2.polylines(image, [points], True, color, 2)
+
+        text = f'{label} {confidence:.2f}'
+        origin_x = int(corners[0][0])
+        origin_y = max(18, int(corners[0][1]) - 8)
+        cv2.putText(
+            image,
+            text,
+            (origin_x, origin_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
 
     def compute_heading_deg(self, polygon):
         if polygon is None or len(polygon) < 3:

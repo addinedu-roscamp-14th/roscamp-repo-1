@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+
+import json
+import math
+
+from action_msgs.msg import GoalStatus, GoalStatusArray
+from geometry_msgs.msg import PoseWithCovarianceStamped
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from std_msgs.msg import String
+import yaml
+
+
+def quaternion_to_yaw(orientation):
+    return 2.0 * math.atan2(orientation.z, orientation.w)
+
+
+class NavigationEventPublisher(Node):
+    def __init__(self):
+        super().__init__('navigation_event_publisher')
+
+        self.declare_parameter('event_topic', '/drive/navigation_event')
+        self.declare_parameter('amcl_pose_topic', '/amcl_pose')
+        self.declare_parameter(
+            'navigate_to_pose_status_topic',
+            '/navigate_to_pose/_action/status',
+        )
+        self.declare_parameter(
+            'navigate_through_poses_status_topic',
+            '/navigate_through_poses/_action/status',
+        )
+        self.declare_parameter('frame_id', 'map')
+        self.declare_parameter('start_position_1_id', 'position_1')
+        self.declare_parameter('start_position_1_x', 1.635463773844374)
+        self.declare_parameter('start_position_1_y', 0.16880950610511666)
+        self.declare_parameter('start_position_tolerance_m', 0.25)
+        self.declare_parameter('area_config_file', '')
+        self.declare_parameter('area_tolerance_m', 0.25)
+
+        self.event_topic = str(self.get_parameter('event_topic').value)
+        self.amcl_pose_topic = str(self.get_parameter('amcl_pose_topic').value)
+        self.frame_id = str(self.get_parameter('frame_id').value)
+        self.position_1_id = str(self.get_parameter('start_position_1_id').value)
+        self.position_1_x = float(self.get_parameter('start_position_1_x').value)
+        self.position_1_y = float(self.get_parameter('start_position_1_y').value)
+        self.position_tolerance = float(
+            self.get_parameter('start_position_tolerance_m').value
+        )
+        self.area_tolerance = float(
+            self.get_parameter('area_tolerance_m').value
+        )
+        self.area_config_file = str(
+            self.get_parameter('area_config_file').value
+        )
+        self.areas = self.load_area_config(
+            self.area_config_file, self.area_tolerance
+        )
+
+        self.latest_pose = None
+        self.goal_states = {}
+        self.started_goal_ids = set()
+        self.finished_goal_ids = set()
+
+        self.event_pub = self.create_publisher(String, self.event_topic, 10)
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            self.amcl_pose_topic,
+            self.on_amcl_pose,
+            10,
+        )
+
+        status_topics = [
+            (
+                str(self.get_parameter('navigate_to_pose_status_topic').value),
+                'navigate_to_pose',
+            ),
+            (
+                str(self.get_parameter('navigate_through_poses_status_topic').value),
+                'navigate_through_poses',
+            ),
+        ]
+        for topic, action_name in status_topics:
+            self.create_subscription(
+                GoalStatusArray,
+                topic,
+                lambda msg, name=action_name: self.on_status_array(msg, name),
+                10,
+            )
+
+        self.get_logger().info(
+            f'Publishing navigation JSON events: {self.event_topic}; '
+            f'pose_topic={self.amcl_pose_topic}; '
+            f'{self.position_1_id}=({self.position_1_x:.3f}, '
+            f'{self.position_1_y:.3f}), '
+            f'tolerance={self.position_tolerance:.3f} m; '
+            f'area_config_file={self.area_config_file}, '
+            f'areas={self.areas}, '
+            f'area_tolerance={self.area_tolerance:.3f} m'
+        )
+
+    def on_amcl_pose(self, msg):
+        self.latest_pose = msg.pose.pose
+
+    def on_status_array(self, msg, action_name):
+        for status in msg.status_list:
+            goal_id = self.goal_id_to_string(status.goal_info.goal_id.uuid)
+            previous_status = self.goal_states.get(goal_id)
+            self.goal_states[goal_id] = status.status
+
+            if self.is_active_status(status.status):
+                if goal_id not in self.started_goal_ids:
+                    self.started_goal_ids.add(goal_id)
+                    self.publish_started(action_name, goal_id, status.status)
+                continue
+
+            if (
+                previous_status is not None
+                and self.is_terminal_status(status.status)
+                and goal_id not in self.finished_goal_ids
+            ):
+                self.finished_goal_ids.add(goal_id)
+                self.publish_finished(action_name, goal_id, status.status)
+
+    def publish_started(self, action_name, goal_id, nav2_status):
+        current_pose = self.current_pose_payload()
+        matched_start = self.match_start_position()
+        matched_area = self.match_area()
+
+        payload = {
+            'schema': 'poter.navigation_event.v1',
+            'event': 'navigation_started',
+            'goal_type': action_name,
+            'goal_id': goal_id,
+            'nav2_status': int(nav2_status),
+            'frame_id': self.frame_id,
+            'start_type': 'position_1' if matched_start else 'other',
+            'current_pose': current_pose,
+            'matched_start_position': matched_start,
+            'current_area': matched_area['id'] if matched_area else None,
+            'matched_area': matched_area,
+        }
+        if self.latest_pose is None:
+            payload['start_type'] = 'unknown'
+            payload['reason'] = f'No pose received from {self.amcl_pose_topic}'
+
+        self.publish_json(payload)
+
+    def publish_finished(self, action_name, goal_id, nav2_status):
+        matched_area = self.match_area()
+        payload = {
+            'schema': 'poter.navigation_event.v1',
+            'event': 'navigation_finished',
+            'goal_type': action_name,
+            'goal_id': goal_id,
+            'nav2_status': int(nav2_status),
+            'status': self.status_name(nav2_status),
+            'frame_id': self.frame_id,
+            'current_pose': self.current_pose_payload(),
+            'current_area': matched_area['id'] if matched_area else None,
+            'matched_area': matched_area,
+        }
+        self.publish_json(payload)
+
+    def publish_json(self, payload):
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.event_pub.publish(msg)
+        self.get_logger().info(msg.data)
+
+    def current_pose_payload(self):
+        if self.latest_pose is None:
+            return None
+
+        position = self.latest_pose.position
+        yaw = quaternion_to_yaw(self.latest_pose.orientation)
+        return {
+            'x': round(float(position.x), 6),
+            'y': round(float(position.y), 6),
+            'yaw': round(float(yaw), 6),
+        }
+
+    def match_start_position(self):
+        if self.latest_pose is None:
+            return None
+
+        position = self.latest_pose.position
+        distance = math.hypot(
+            float(position.x) - self.position_1_x,
+            float(position.y) - self.position_1_y,
+        )
+        if distance > self.position_tolerance:
+            return None
+
+        return {
+            'id': self.position_1_id,
+            'x': round(self.position_1_x, 6),
+            'y': round(self.position_1_y, 6),
+            'distance_m': round(distance, 6),
+            'tolerance_m': round(self.position_tolerance, 6),
+        }
+
+    def match_area(self):
+        if not self.areas or self.latest_pose is None:
+            return None
+
+        position = self.latest_pose.position
+        current_x = float(position.x)
+        current_y = float(position.y)
+
+        closest_match = None
+        for area in self.areas:
+            distance = math.hypot(
+                current_x - area['x'],
+                current_y - area['y'],
+            )
+            if distance > self.area_tolerance:
+                continue
+
+            match = {
+                'id': area['id'],
+                'x': round(area['x'], 6),
+                'y': round(area['y'], 6),
+                'distance_m': round(distance, 6),
+                'tolerance_m': round(self.area_tolerance, 6),
+            }
+            if (
+                closest_match is None
+                or match['distance_m'] < closest_match['distance_m']
+            ):
+                closest_match = match
+
+        return closest_match
+
+    def load_area_config(self, config_file, default_tolerance):
+        if not config_file:
+            self.get_logger().warning('No area_config_file set')
+            return []
+
+        try:
+            with open(config_file, 'r', encoding='utf-8') as file:
+                config = yaml.safe_load(file) or {}
+        except OSError as exc:
+            self.get_logger().error(
+                f'Failed to read area config file {config_file}: {exc}'
+            )
+            return []
+        except yaml.YAMLError as exc:
+            self.get_logger().error(
+                f'Failed to parse area config file {config_file}: {exc}'
+            )
+            return []
+
+        self.area_tolerance = float(
+            config.get('area_tolerance_m', default_tolerance)
+        )
+        return self.parse_area_config(config.get('areas', {}))
+
+    def parse_area_config(self, area_config):
+        areas = []
+        if not isinstance(area_config, dict):
+            self.get_logger().warning('Ignoring invalid areas config')
+            return areas
+
+        for area_id, pose in area_config.items():
+            if not isinstance(pose, dict):
+                self.get_logger().warning(
+                    f'Ignoring invalid area definition: {area_id}'
+                )
+                continue
+
+            try:
+                areas.append(
+                    {
+                        'id': str(area_id),
+                        'x': float(pose['x']),
+                        'y': float(pose['y']),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                self.get_logger().warning(
+                    f'Ignoring invalid area coordinates: {area_id}'
+                )
+
+        return areas
+
+    @staticmethod
+    def goal_id_to_string(uuid):
+        return ''.join(f'{value:02x}' for value in uuid)
+
+    @staticmethod
+    def is_active_status(status):
+        return status in (
+            GoalStatus.STATUS_ACCEPTED,
+            GoalStatus.STATUS_EXECUTING,
+        )
+
+    @staticmethod
+    def is_terminal_status(status):
+        return status in (
+            GoalStatus.STATUS_SUCCEEDED,
+            GoalStatus.STATUS_CANCELED,
+            GoalStatus.STATUS_ABORTED,
+        )
+
+    @staticmethod
+    def status_name(status):
+        names = {
+            GoalStatus.STATUS_UNKNOWN: 'unknown',
+            GoalStatus.STATUS_ACCEPTED: 'accepted',
+            GoalStatus.STATUS_EXECUTING: 'executing',
+            GoalStatus.STATUS_CANCELING: 'canceling',
+            GoalStatus.STATUS_SUCCEEDED: 'succeeded',
+            GoalStatus.STATUS_CANCELED: 'canceled',
+            GoalStatus.STATUS_ABORTED: 'aborted',
+        }
+        return names.get(status, 'unknown')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = NavigationEventPublisher()
+
+    try:
+        rclpy.spin(node)
+    except ExternalShutdownException:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

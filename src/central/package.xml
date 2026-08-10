@@ -7,13 +7,22 @@
   <maintainer email="jio@todo.todo">jio</maintainer>
   <license>TODO: License declaration</license>
 
+  <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>drive</exec_depend>
+  <exec_depend>map_msgs</exec_depend>
+  <exec_depend>porter_interfaces</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-fastapi</exec_depend>
+  <exec_depend>python3-uvicorn</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

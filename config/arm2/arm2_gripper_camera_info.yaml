@@ -1,18 +1,17 @@
 image_width: 640
 image_height: 480
-# Template copied from arm1. Recalibrate when arm2 uses a different camera.
-camera_name: arm2_gripper_camera
+camera_name: usb_2.0_camera:_usb_camera
 camera_matrix:
   rows: 3
   cols: 3
-  data: [967.1069, 0.0, 334.29417,
-         0.0, 966.72508, 237.71671,
+  data: [1083.54804, 0.0, 334.47021,
+         0.0, 1081.54347, 359.15374,
          0.0, 0.0, 1.0]
 distortion_model: plumb_bob
 distortion_coefficients:
   rows: 1
   cols: 5
-  data: [-0.450193, 0.319830, -0.002216, 0.000916, 0.0]
+  data: [-0.494370, 0.310652, -0.019240, -0.000626, 0.0]
 rectification_matrix:
   rows: 3
   cols: 3
@@ -22,6 +21,6 @@ rectification_matrix:
 projection_matrix:
   rows: 3
   cols: 4
-  data: [916.979, 0.0, 335.62418, 0.0,
-         0.0, 937.51367, 236.64581, 0.0,
+  data: [1036.28328, 0.0, 335.66365, 0.0,
+         0.0, 1050.15689, 361.12664, 0.0,
          0.0, 0.0, 1.0, 0.0]

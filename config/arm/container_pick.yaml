@@ -41,6 +41,23 @@
     minimum_lift_after_pick_m: 0.05
     lift_search_step_m: 0.02
 
+    # ID 0 is released with its top marker one container height above ID 1.
+    # Measure the physical container height and override this launch argument
+    # before executing a real stack.
+    stack_container_height_m: 0.035
+    # Try the highest approach first, then reduce it near the arm reach limit.
+    stack_approach_clearance_m: 0.08
+    stack_minimum_approach_clearance_m: 0.03
+    stack_approach_search_step_m: 0.01
+    stack_xy_offset_m: [0.0, 0.0]
+    # Follow ID 0 orientation during stack pickup. Yaw fallback execution is
+    # disabled for stacking, so the wrist does not cycle through candidates.
+    stack_source_orientation_mode: marker_yaw
+    # If one full descent cannot be planned, execute only collision-checked
+    # Cartesian segments and replan the remaining distance from the new state.
+    stack_segmented_descent_min_fraction: 0.65
+    stack_segmented_descent_max_segments: 5
+    stack_pose_goal_finish_max_distance_m: 0.075
     minimum_stable_samples: 5
     max_translation_std_m: 0.005
     max_rotation_spread_deg: 10.0
@@ -54,11 +71,11 @@
     # XY workspace is a bottom/right inverted L: a horizontal bar in
     # Y <= 0 plus a vertical bar in X >= 0. Bounds are in base_link metres.
     workspace_xy_shape: inverted_l
-    workspace_horizontal_min_xy_m: [-0.28, -0.28]
-    workspace_horizontal_max_xy_m: [0.28, 0.0]
-    workspace_vertical_min_xy_m: [0.0, -0.28]
-    workspace_vertical_max_xy_m: [0.28, 0.28]
-    max_joint_delta_deg: 60.0
+    workspace_horizontal_min_xy_m: [-0.30, -0.30]
+    workspace_horizontal_max_xy_m: [0.30, 0.0]
+    workspace_vertical_min_xy_m: [0.0, -0.30]
+    workspace_vertical_max_xy_m: [0.30, 0.30]
+    max_joint_delta_deg: 75.0
 
     serial_port: /dev/ttyUSB0
     baud_rate: 1000000
@@ -71,9 +88,9 @@
     moveit_group: arm_group
     moveit_ee_link: TCP
     moveit_position_tolerance_m: 0.005
-    moveit_orientation_tolerance_deg: 5.0
-    moveit_planning_time_sec: 10.0
-    moveit_planning_attempts: 20
+    moveit_orientation_tolerance_deg: 7.0
+    moveit_planning_time_sec: 15.0
+    moveit_planning_attempts: 30
     moveit_velocity_scale: 0.35
     moveit_acceleration_scale: 0.25
 
@@ -82,11 +99,11 @@
     # Use dense samples near the low-Z workspace boundary. A 5 mm step could
     # produce a large joint change near the grasp.
     cartesian_max_step_m: 0.001
-    # Prefer 97% completion. A path down to 90% is accepted only when the
-    # measured TCP-to-target residual is at most 5 mm.
-    cartesian_min_fraction: 0.97
-    cartesian_absolute_min_fraction: 0.90
-    cartesian_max_shortfall_m: 0.005
+    # Prefer 95% completion. A path down to 85% is accepted only when the
+    # measured TCP-to-target residual is at most 8 mm.
+    cartesian_min_fraction: 0.95
+    cartesian_absolute_min_fraction: 0.85
+    cartesian_max_shortfall_m: 0.008
     cartesian_max_speed_mps: 0.04
-    cartesian_max_joint_jump_deg: 15.0
-    moveit_state_settle_sec: 0.2
+    cartesian_max_joint_jump_deg: 20.0
+    moveit_state_settle_sec: 0.4

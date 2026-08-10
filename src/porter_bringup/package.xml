@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"?>
+<package format="3">
+  <name>porter_bringup</name>
+  <version>0.1.0</version>
+  <description>Split launch package for the Port-ER control and dashboard laptops.</description>
+  <maintainer email="jio@todo.todo">jio</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>v4l2_camera</exec_depend>
+  <exec_depend>image_proc</exec_depend>
+  <exec_depend>image_transport</exec_depend>
+  <exec_depend>yolo</exec_depend>
+  <exec_depend>dashboard</exec_depend>
+  <exec_depend>central</exec_depend>
+  <exec_depend>drive</exec_depend>
+  <exec_depend>pinky</exec_depend>
+  <exec_depend>porter_interfaces</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

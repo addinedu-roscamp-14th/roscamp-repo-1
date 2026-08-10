@@ -1,0 +1,23 @@
+parking_spots:
+  park_red:
+    approach:
+      x: 1.218242
+      y: 0.375254
+      yaw: -3.095542
+    parked:
+      x: 1.673782
+      y: 0.408066
+      yaw: -3.094020
+  # AGV2 calibrated parking sequence.
+  parking_yellow:
+    # Do not reuse park_red's generated pre-approach geometry.
+    auto_pre_approach_distance_m: 0.0
+    reverse_distance_m: 0.451511
+    approach:
+      x: 1.3654310509404668
+      y: 0.17624451234213756
+      yaw: -3.136509010914669
+    parked:
+      x: 1.635463773844374
+      y: 0.16880950610511666
+      yaw: -3.098529967767224

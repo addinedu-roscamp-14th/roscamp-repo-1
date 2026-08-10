@@ -2,6 +2,23 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
     <xacro:macro name="insert_robot" params="namespace is_sim:=false cam_tilt_deg screen_tilt_deg">
         <xacro:include filename="$(find pinky)/urdf/common/insert_inertia.urdf.xacro"/>
+        <!-- upload_robot.launch.py passes the namespace with a trailing slash. -->
+        <xacro:property name="vehicle_id" value="${namespace.strip('/') or 'unknown'}"/>
+        <xacro:property name="cargo_rgba" value="${
+            '0.12 0.42 0.92 1.0' if vehicle_id == 'agv1' else
+            ('1.00 0.78 0.05 1.0' if vehicle_id == 'agv2' else
+             '0.80 0.10 0.10 1.0')
+        }"/>
+
+        <!-- Declared at robot scope rather than inline in the visual below.
+             RViz resolves a link's material from its FIRST <visual>, and
+             base_link's first visual is the untextured mesh; a material
+             attached to the second visual is never found and the box renders
+             with the RVIZ/ShadedRed fallback. The vehicle id is part of the
+             name so two robot models in one RViz cannot collide on it. -->
+        <material name="cargo_box_${vehicle_id}">
+            <color rgba="${cargo_rgba}"/>
+        </material>
 
         <link name="base_footprint"/>
         <link name="base_link">
@@ -16,9 +33,7 @@
                 <geometry>
                     <box size="0.102 0.08 0.086"/>
                 </geometry>
-                <material name="base_link_extension_gray">
-                    <color rgba="0.55 0.55 0.55 1.0"/>
-                </material>
+                <material name="cargo_box_${vehicle_id}"/>
             </visual>
             <collision>
                 <origin xyz="0 0 0" rpy="0 0 ${pi}"/>

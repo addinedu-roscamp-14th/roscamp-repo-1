@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml', 'README.md']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        ('share/' + package_name + '/rviz', glob('rviz/*.rviz')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -38,8 +39,12 @@ setup(
             'arm2.arm2_charuco_board_generator:main',
             'arm2_container_pick_coordinator = '
             'arm2.arm2_container_pick_coordinator:main',
+            'arm2_grasp_offset_calibrator = '
+            'arm2.arm2_grasp_offset_calibrator:main',
             'arm2_jetcobot_trajectory_bridge = '
             'arm2.arm2_jetcobot_trajectory_bridge:main',
+            'arm2_auto_handeye_sampler = '
+            'arm2.arm2_auto_handeye_sampler:main',
         ],
     },
 )

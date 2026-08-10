@@ -1,0 +1,28 @@
+<?xml version='1.0'?>
+<launch>
+    <arg name="use_sim_time" default="false"/>
+    <arg name="event_topic" default="/drive/navigation_event"/>
+    <arg name="amcl_pose_topic" default="/amcl_pose"/>
+    <arg name="navigate_to_pose_status_topic" default="/navigate_to_pose/_action/status"/>
+    <arg name="navigate_through_poses_status_topic" default="/navigate_through_poses/_action/status"/>
+    <arg name="frame_id" default="map"/>
+    <arg name="start_position_1_id" default="position_1"/>
+    <arg name="start_position_1_x" default="1.635463773844374"/>
+    <arg name="start_position_1_y" default="0.16880950610511666"/>
+    <arg name="start_position_tolerance_m" default="0.25"/>
+    <arg name="area_config_file" default="$(find-pkg-share drive)/params/navigation_areas.yaml"/>
+
+    <node pkg="drive" exec="navigation_event_publisher" name="navigation_event_publisher" output="screen">
+        <param name="use_sim_time" value="$(var use_sim_time)"/>
+        <param name="event_topic" value="$(var event_topic)"/>
+        <param name="amcl_pose_topic" value="$(var amcl_pose_topic)"/>
+        <param name="navigate_to_pose_status_topic" value="$(var navigate_to_pose_status_topic)"/>
+        <param name="navigate_through_poses_status_topic" value="$(var navigate_through_poses_status_topic)"/>
+        <param name="frame_id" value="$(var frame_id)"/>
+        <param name="start_position_1_id" value="$(var start_position_1_id)"/>
+        <param name="start_position_1_x" value="$(var start_position_1_x)"/>
+        <param name="start_position_1_y" value="$(var start_position_1_y)"/>
+        <param name="start_position_tolerance_m" value="$(var start_position_tolerance_m)"/>
+        <param name="area_config_file" value="$(var area_config_file)"/>
+    </node>
+</launch>

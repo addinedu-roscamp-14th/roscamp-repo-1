@@ -2,7 +2,174 @@
 
 중앙 관제에서 카메라 픽셀 좌표를 SLAM `/map` 좌표로 변환하고, 차량/브릿지에 전달 가능한 형태로 발행하는 패키지입니다.
 
-현재 핵심 노드는 `rqt_click_to_target`와 `camera_to_map_bridge`입니다.
+현재 핵심 노드는 `rqt_click_to_target`, `camera_to_map_bridge`,
+`control_gateway`, `fleet_dispatcher`, `fleet_collision_supervisor`입니다.
+
+## 2대 차량 Fleet 제어
+
+`fleet_dispatcher`는 `agv1`, `agv2`의 Nav2 액션과 상태를 통합합니다.
+
+```text
+/central/dispatch_navigation
+porter_interfaces/action/DispatchNavigation
+
+/central/fleet/agv1/state
+/central/fleet/agv2/state
+porter_interfaces/msg/VehicleState
+
+/central/fleet/zones
+std_msgs/String
+
+/central/fleet/vehicle_markers
+visualization_msgs/MarkerArray
+```
+
+AUTO 명령은 준비된 유휴 차량 중 목표와 가까운 차량을 선택하며 동률이면
+`agv1`을 선택합니다. `vehicle_id`가 지정되면 다른 차량으로 대체하지 않습니다.
+기본 새 명령은 선택된 차량의 기존 Nav2 목표와 대기 명령을 취소하고 새 목표로
+교체합니다. 포괄적인 사용자 명령의 독립적인 차량 작업은 기본적으로 동시에
+전송합니다. 같은 차량의 연속 목표나 물리적 선행 조건이 있는 단계에만
+`predecessor_command_id`를 연결하며, 이전 단계가 실패하거나 취소되면 해당 후속
+단계를 실행하지 않습니다.
+명시적으로 현재 작업 뒤에 대기시킬 명령만 `queue_if_busy: true`를 사용합니다.
+B-1과 공용 A 구역은 각각 한 차량만 점유할 수 있습니다. 이미 점유 중이면 새
+차량은 FIFO 대기열에 들어간 뒤 최종 자세의 뒤쪽 대기점까지 먼저 이동합니다.
+dispatcher는 최신 AMCL 위치를 기본 `2Hz`로 감시합니다. 점유 차량이 A 또는
+B-1 목표 반경에 실제로 진입한 뒤 구역 밖으로 나가면, 다음 목적지 도착이나 LLM
+재호출을 기다리지 않고 잠금을 해제하여 대기열 첫 차량을 최종 위치로 보냅니다.
+AUTO 요청에서는 현재 점유 차량을 후보에서 제외합니다. 중앙 노드 재시작으로
+잠금 메모리가 비어 있어도 최종 구역 좌표 반경 `0.18m` 안의 최신 AMCL 차량을
+점유자로 복원합니다. 진입 반경은 `zone_occupancy_radius_m`, 경계에서 잠금이
+반복 전환되지 않도록 하는 추가 해제 여유는 `zone_release_hysteresis_m`(기본
+`0.05m`)으로 조정합니다.
+점유 차량의 통신이 끊기면 안전을 위해 `UNKNOWN`으로 잠긴 상태를 유지합니다.
+B-1 점유 차량이 B-1 이외의 목적지 명령을 받으면 최종 이동이나 구역 대기점 이동
+전에 Nav2 `Spin`으로 왼쪽 `90°` 제자리 회전합니다. 회전 액션이 성공해야 다음
+단계로 넘어가며, 회전이 끝나면 `DriveOnHeading`으로 차량 전방 `0.30m`를 직진한
+뒤 최종 목적지 경로를 시작합니다. 기본 각도는 `b1_exit_left_turn_deg`, 직진
+거리는 `b1_exit_forward_distance_m`, 직진 속도는
+`b1_exit_forward_speed_mps`(기본 `0.05m/s`)로 관리합니다. 각 동작 제한 시간은
+`b1_exit_behavior_timeout_sec`(기본 `20초`)입니다. 회전 또는 직진이 실패하면 최종
+목적지 경로를 시작하지 않습니다. `Spin` 성공 후에도 AMCL map 헤딩을 검사하며,
+`b1_exit_turn_tolerance_deg`(기본 `5도`)를 벗어나면 잔여 각도를 최대 두 번
+추가 보정합니다. B-1 잠금이 위치 오차로 먼저 해제되는 경우를 위해 B-1 목표
+`b1_exit_detection_radius_m`(기본 `0.35m`) 안의 차량에도 같은 이탈 시퀀스를
+적용합니다.
+중앙 노드를 재시작한 경우에도 `b1_zone_map_x`, `b1_zone_map_y`로 등록된 B-1
+기준점과 각 차량의 최신 AMCL 위치를 비교해 B-1 점유 차량을 복원합니다. 따라서
+메모리 잠금이 없어도 B-1 반경 안에 있는 명령 대상 차량에는 같은 이탈 시퀀스가
+적용됩니다. 현재 지도 기본값은 `(1.294, -0.087)`입니다.
+실시간 LLM이 같은 목적지를 새 command ID로 반복 보내더라도, 동일 차량의 진행 중
+목표와 최종 위치 `0.12m` 및 헤딩 `20도` 이내이면 기존 작업에 병합합니다. 따라서
+B-1 이탈 회전과 전진이 중간에 재시작되지 않으며, 실제로 다른 목적지만 현재 작업을
+선점합니다. 허용치는 `duplicate_goal_distance_m`와
+`duplicate_goal_yaw_tolerance_deg`로 조정합니다.
+
+## 자동 후진 주차
+
+각 차량은 공유 없이 자기 전용 주차 스팟만 사용합니다: `agv1`은
+`park_red`(구역 `PARK1`), `agv2`는 `parking_yellow`(구역 `PARK2`)입니다
+(`drive/params/parking_spots.yaml`). 서로 다른 자리라서 B-1/A처럼 FIFO 대기가
+필요 없고, 항상 자기 자리로만 갑니다. `parking_yellow`의 approach 좌표와 두
+yaw 값은 AGV2에서 측정한 전용 캘리브레이션 값입니다.
+
+`fleet_dispatcher`는 두 가지 경로로 주차를 트리거합니다.
+
+- **유휴 자동 주차**: 차량이 `auto_park_idle_sec`(기본 `20초`) 이상 READY 상태로
+  가만히 있으면(바쁘지도, 이미 자기 자리에 주차돼 있지도 않으면) 자동으로
+  자기 전용 스팟으로 후진 주차를 시작합니다. `auto_park_check_interval_sec`
+  (기본 `3초`)마다 재확인합니다. `auto_park_idle_sec:=0`으로 끌 수 있습니다.
+- **명시적 명령**: `/central/fleet/park_request`(`std_msgs/String`, `data`에
+  `agv1`/`agv2`/빈 문자열)를 publish하면 즉시 해당(또는 유휴 중 아무) 차량을
+  주차시킵니다. `control_gateway`의 `POST /api/v1/navigation/park`가 이 토픽으로
+  중계합니다.
+
+실제 후진 동작은 `drive` 패키지의 `parking_new` 노드(`/{vehicle_id}/park_in_spot`
+액션)가 수행하며, `multi_vehicle_nav.launch.py`에서 각 차량 네임스페이스로 자동
+실행됩니다(`start_parking_supervisor:=false`로 끌 수 있음).
+
+주차가 완료된 차량에 다른 목적지 명령이 들어오면 일반 Nav2 경로를 보내기 전에
+`DriveOnHeading`으로 현재 차량 전방을 따라 반드시 `0.20m` 직진합니다. 이 출차가
+성공한 뒤에만 주차 구역 잠금을 해제하고 목적지 경로를 시작합니다. 거리와 속도는
+각각 `park_exit_forward_distance_m`(기본 `0.20`)와
+`park_exit_forward_speed_mps`(기본 `0.05`)로 조정합니다. 중앙 노드를 재시작해도
+차량이 자기 주차 기준점 근처에 있으면 같은 출차 절차를 적용합니다.
+
+## YOLO 차량 충돌 감독
+
+`fleet_collision_supervisor`는 `/central/yolo/detections`의 `car_yellow`
+(`agv1`)와 `car_blue`/`car_bule`(`agv2`) 중심을 카메라-map Homography로
+변환합니다. 최근 검출 속도, `/<vehicle_id>/odom`, `/<vehicle_id>/plan`을 함께
+사용해 기본 3초 동안 두 차량의 위치를 예측합니다. 한 차량이 카메라에서 잠시
+가려지면 최신 AMCL 기반 `VehicleState.pose`를 대신 사용합니다. 예상 최소 거리가
+`0.22m` 이하이면 한 차량의 `/<vehicle_id>/safety_hold`를 잠급니다. 거리가 `0.30m`
+이상으로 0.8초간 유지되면 같은 Nav2 목표를 재개합니다.
+차량 설치본이 아직 `safety_hold` 서비스를 제공하지 않으면 기존
+`/<vehicle_id>/emergency_stop`을 자동 hold 채널로 사용하며, 위험 해제 시 같은
+서비스를 통해 정지를 해제합니다. 최종 구성에서는 차량의 `pinky` 패키지도
+업데이트하여 `safety_hold`를 사용하는 것이 권장됩니다.
+
+```bash
+ros2 topic echo /central/fleet/collision_status
+```
+
+감독 기능을 일시적으로 끄면서 자동 hold를 해제하려면 다음 서비스를 사용합니다.
+
+```bash
+ros2 service call /central/fleet/collision_supervisor/enabled \
+  std_srvs/srv/SetBool '{data: false}'
+```
+
+직접 차량 hold를 해제할 때는 감독 기능을 먼저 끈 뒤 실행합니다.
+
+```bash
+ros2 service call /agv1/safety_hold std_srvs/srv/SetBool '{data: false}'
+```
+
+임계값과 예측 시간은 `config/central/fleet_collision_supervisor.yaml`에서
+관리합니다. YOLO와 AMCL Fleet pose가 모두 없거나 오래된 차량이 있으면 새 자동
+hold를 걸지 않고 차량 LiDAR와 Nav2가 로컬 충돌 방지를 담당합니다. 이미 hold된
+상태에서 위치 입력이 끊기면 입력이 복구되거나 운영자가 명시적으로 해제할 때까지
+hold를 유지합니다. 상태 JSON의 `position_source`에서 차량별로 `vision`, `fleet`,
+`missing` 중 어느 위치를 사용 중인지 확인할 수 있습니다.
+
+`fleet_dispatcher`는 `/<vehicle_id>/odom`을 온라인 상태 확인용으로 구독하고,
+배차 거리 계산에는 `/<vehicle_id>/amcl_pose`를 사용합니다. 초기 위치 설정 전
+odom 위치를 임시 배차 좌표로 사용할 때만 `subscribe_odom_fallback:=true`로
+실행합니다.
+
+## `control_gateway`
+
+AI/LLM 서버가 계산한 탑다운 카메라 픽셀 목표를 HTTP JSON으로 받고, 기존
+`camera_to_map_bridge`가 사용하는 `/central/target_pixel`에 목표점과 방향점을
+순서대로 발행합니다. 직접 map 좌표를 생성하지 않으므로 기존 카메라-SLAM
+캘리브레이션을 그대로 거칩니다.
+
+입력 API:
+
+```text
+POST http://<관제노트북_IP>:8100/api/v1/navigation/pixel-goal
+```
+
+ROS 출력:
+
+```text
+/central/target_pixel
+geometry_msgs/PointStamped
+
+/central/control/status
+std_msgs/String
+```
+
+관제 상태 API:
+
+```text
+GET http://<관제노트북_IP>:8100/api/v1/status
+GET http://<관제노트북_IP>:8100/health
+```
+
+상태 API에는 `/battery/percent`, `/battery/voltage`, `/odom`,
+`/central/target_map_json`의 최신값과 데이터 나이가 포함됩니다.
 
 ## `rqt_click_to_target`
 
@@ -25,6 +192,27 @@ geometry_msgs/PointStamped
 ## `camera_to_map_bridge`
 
 캘리브레이션 결과 YAML을 읽어서 카메라 픽셀 좌표 `(u, v)`를 SLAM map 좌표 `(x, y)`로 변환합니다.
+
+시작할 때 캘리브레이션 YAML에 기록된 지도 크기, 해상도, 원점과 현재 map
+YAML/PGM을 비교합니다. `config/SLAM/current_map.yaml` 또는 PGM을 교체했다면 기존
+호모그래피를 재사용할 수 없으므로 현재 지도로 다시 캘리브레이션해야 합니다. 지도
+정보가 다르면 잘못된 Nav2 목표 발행을 막기 위해 노드가 시작되지 않습니다.
+
+`parking_b1` API 명령은 B-1 중심을 map 좌표로 변환한 뒤, 탑다운 카메라 영상의
+왼쪽 방향을 같은 호모그래피로 계산하여 기본 `0.15m`, 화면 아래쪽으로 기본
+`0.03m` 이동합니다. 목표와 헤딩점을 같이 이동하므로 B-1 정렬 방향은 유지됩니다.
+거리는 `b1_camera_left_offset_m`, `b1_camera_down_offset_m` 파라미터로 조정합니다.
+
+점유 구역 대기점은 최종 헤딩의 반대 방향으로 계산합니다.
+
+- `b1_waiting_distance_m`: B-1 대기 거리, 기본 `0.25m`
+- `a_zone_waiting_distance_m`: 공용 A 구역 대기 거리, 기본 `0.20m`
+- `a_zone_waiting_camera_down_offset_m`: A 대기점을 카메라 화면 아래 방향으로
+  추가 이동하는 거리, 기본 `0.05m`
+
+예를 들어 B-1 차량은 그대로 두고 다음 차량만 미리 대기시키려면 B-1 요청을
+먼저 보냅니다. 이후 점유 차량에 B-1이 아닌 목적지 명령을 보내면, 출차 성공
+시 잠금이 풀리고 대기 차량이 자동으로 B-1에 진입합니다.
 
 입력:
 
@@ -80,6 +268,94 @@ rqt click
 → /central/target_map_pose
 → /central/target_map_json
 ```
+
+### AI 좌표 자동 전송
+
+단일 목표 모드로 카메라-map 변환 노드와 Nav2 목표 브리지를 먼저 실행합니다.
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+ros2 run central camera_to_map_bridge
+```
+
+```bash
+ros2 launch drive target_map_pose_nav.launch.xml start_nav2:=false
+```
+
+별도 터미널에서 중앙제어 API를 실행합니다. 영상/SLAM API의 기본 포트는
+`8000`, 제어 API의 기본 포트는 `8100`입니다.
+
+```bash
+cd ~/poter_ws
+source install/setup.bash
+ros2 launch central control_gateway.launch.py
+```
+
+기본값은 관제 노트북 내부의 `127.0.0.1`에서만 접속할 수 있습니다. 외부 AI
+서버가 접속해야 할 때는 토큰을 설정하고 전체 네트워크 인터페이스에 엽니다.
+
+```bash
+export PORT_CONTROL_API_TOKEN='<충분히_긴_임의의_문자열>'
+ros2 launch central control_gateway.launch.py host:=0.0.0.0
+```
+
+AI 서버는 탑다운 영상의 목표 픽셀과 차량이 바라볼 방향 픽셀을 함께 보냅니다.
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/navigation/pixel-goal \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
+  -d '{
+    "command_id": "dispatch-001",
+    "vehicle_id": "",
+    "zone_id": "",
+    "target": {"x": 320, "y": 300},
+    "heading": {"x": 380, "y": 300}
+  }'
+```
+
+`vehicle_id`는 빈 문자열(AUTO), `agv1`, `agv2` 중 하나입니다. B-1 주차는
+`mode: "parking_b1"` 또는 `zone_id: "B-1"`을 사용합니다.
+
+비상정지:
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/emergency-stop \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
+  -d '{"vehicle_id":"fleet","enabled":true}'
+```
+
+`fleet` 대신 `agv1` 또는 `agv2`를 지정할 수 있습니다. 해제는
+`"enabled":false`로 요청합니다.
+
+B-1 `UNKNOWN` 잠금은 차량 위치를 확인한 운영자만 해제합니다.
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/zones/b1/clear \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}"
+```
+
+`command_id`는 재시도 시 같은 명령이 두 번 실행되는 것을 막는 선택값입니다.
+같은 ID를 다시 보내면 게이트웨이는 성공 응답을 반환하지만 ROS 목표는 재발행하지
+않습니다. 좌표는 `640x480` 영상 범위 안이어야 하고 목표와 방향점은 기본 10픽셀
+이상 떨어져야 합니다.
+
+상태 확인:
+
+```bash
+curl http://127.0.0.1:8100/api/v1/status
+ros2 topic echo /central/control/status
+ros2 topic echo /central/target_map_pose
+```
+
+`camera_to_map_bridge`가 실행되지 않아 `/central/target_pixel` 구독자가 없으면
+제어 API는 명령을 버리지 않고 HTTP `503`으로 거부합니다.
+외부 접속 모드에서는 `/api/v1/*` 요청에 동일한 `X-Control-Token` 헤더가
+없으면 HTTP `401`로 거부합니다. `/health`는 프로세스 확인용으로 공개됩니다.
 
 ---
 

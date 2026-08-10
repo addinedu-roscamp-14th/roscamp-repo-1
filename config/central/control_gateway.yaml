@@ -1,0 +1,17 @@
+central_control_gateway:
+  ros__parameters:
+    host: 127.0.0.1
+    port: 8100
+    api_token: ''
+    target_pixel_topic: /central/target_pixel
+    fleet_pixel_command_topic: /central/fleet/pixel_navigation_command
+    target_map_json_topic: /central/target_map_json
+    command_status_topic: /central/control/status
+    battery_percent_topic: /battery/percent
+    battery_voltage_topic: /battery/voltage
+    odom_topic: /odom
+    camera_frame_id: camera
+    image_width: 640
+    image_height: 480
+    minimum_heading_distance_px: 10.0
+    telemetry_stale_timeout_sec: 2.0

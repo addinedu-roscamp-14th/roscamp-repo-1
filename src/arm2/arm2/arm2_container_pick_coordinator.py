@@ -10,6 +10,7 @@ from geometry_msgs.msg import PoseStamped
 import numpy as np
 from pymycobot.mycobot280 import MyCobot280
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import (
@@ -45,7 +46,11 @@ JOINT_NAMES = [f'{index}_Joint' for index in range(1, 7)]
 
 
 class CartesianPlanningError(RuntimeError):
-    """A Cartesian request failed before any physical execution started."""
+    """A Cartesian request failed, optionally after safe partial segments."""
+
+    def __init__(self, message, executed_segments=0):
+        super().__init__(message)
+        self.executed_segments = executed_segments
 
 
 def normalize_quaternion(values):
@@ -119,9 +124,25 @@ def compose_fixed_base_pose(marker_translation, base_offset, base_rotation):
     return translation, normalize_quaternion(base_rotation)
 
 
+def apply_base_frame_correction(translation, correction):
+    """Apply an empirical correction without rotating it with the marker."""
+    return (
+        np.asarray(translation, dtype=np.float64)
+        + np.asarray(correction, dtype=np.float64)
+    )
+
+
 def wrap_degrees(angle):
     """Wrap an angle to [-180, 180)."""
     return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def wrap_symmetric_degrees(angle, symmetry_degrees):
+    """Wrap an angle using the rotational symmetry of the grasped object."""
+    period = float(symmetry_degrees)
+    if period <= 0.0 or period > 360.0:
+        raise ValueError('yaw symmetry must be in the range (0, 360]')
+    return (float(angle) + period / 2.0) % period - period / 2.0
 
 
 def compose_yaw_follow_pose(
@@ -130,20 +151,24 @@ def compose_yaw_follow_pose(
     fixed_rpy_degrees,
     marker_yaw_degrees,
     reference_marker_yaw_degrees,
+    rotate_offset=True,
+    yaw_symmetry_degrees=360.0,
 ):
     """Follow marker yaw while retaining the taught vertical roll/pitch."""
-    yaw_delta = wrap_degrees(
-        marker_yaw_degrees - reference_marker_yaw_degrees
+    yaw_delta = wrap_symmetric_degrees(
+        marker_yaw_degrees - reference_marker_yaw_degrees,
+        yaw_symmetry_degrees,
     )
     angle = math.radians(yaw_delta)
     cosine, sine = math.cos(angle), math.sin(angle)
     offset = np.asarray(reference_offset, dtype=np.float64)
-    rotated_offset = np.array([
-        cosine * offset[0] - sine * offset[1],
-        sine * offset[0] + cosine * offset[1],
-        offset[2],
-    ])
-    translation = np.asarray(marker_translation) + rotated_offset
+    if rotate_offset:
+        offset = np.array([
+            cosine * offset[0] - sine * offset[1],
+            sine * offset[0] + cosine * offset[1],
+            offset[2],
+        ])
+    translation = np.asarray(marker_translation) + offset
     roll, pitch, reference_grasp_yaw = fixed_rpy_degrees
     rotation = quaternion_from_rpy_degrees(
         roll,
@@ -153,16 +178,89 @@ def compose_yaw_follow_pose(
     return translation, rotation, yaw_delta
 
 
-def apply_vertical_pick_offsets(nominal_grasp, pregrasp_lift, extra_depth):
-    """Keep pregrasp fixed while applying extra depth only to final grasp."""
-    if pregrasp_lift < 0.0 or extra_depth < 0.0:
+def apply_vertical_pick_offsets(
+    nominal_grasp,
+    pregrasp_lift,
+    extra_depth,
+    stop_above=0.0,
+):
+    """Keep pregrasp fixed while adjusting only the final grasp height."""
+    if pregrasp_lift < 0.0 or extra_depth < 0.0 or stop_above < 0.0:
         raise ValueError('vertical pick offsets must be non-negative')
+    if stop_above > pregrasp_lift:
+        raise ValueError('grasp stop-above distance exceeds pregrasp lift')
     nominal = np.asarray(nominal_grasp, dtype=np.float64)
     grasp = nominal.copy()
-    grasp[2] -= extra_depth
+    grasp[2] += stop_above - extra_depth
     pregrasp = nominal.copy()
     pregrasp[2] += pregrasp_lift
     return grasp, pregrasp
+
+
+def calculate_stack_poses(
+    source_marker,
+    destination_marker,
+    grasp_translation,
+    container_height,
+    approach_clearance,
+    xy_offset,
+):
+    """Calculate TCP release and approach positions for marker-on-marker stacking."""
+    if container_height <= 0.0 or approach_clearance <= 0.0:
+        raise ValueError('stack height and approach clearance must be positive')
+    source = np.asarray(source_marker, dtype=np.float64)
+    destination = np.asarray(destination_marker, dtype=np.float64)
+    grasp = np.asarray(grasp_translation, dtype=np.float64)
+    offset = np.asarray(xy_offset, dtype=np.float64)
+    if source.shape != (3,) or destination.shape != (3,) or grasp.shape != (3,):
+        raise ValueError('stack pose inputs must be XYZ vectors')
+    if offset.shape != (2,):
+        raise ValueError('stack XY offset must contain two values')
+
+    marker_to_tcp = grasp - source
+    release = destination + marker_to_tcp
+    release[:2] += offset
+    release[2] += container_height
+    approach = release.copy()
+    approach[2] += approach_clearance
+    return release, approach
+
+
+def calculate_heading_aligned_stack_poses(
+    destination_marker,
+    grasp_offset,
+    grasp_rpy_degrees,
+    destination_yaw_degrees,
+    reference_marker_yaw_degrees,
+    container_height,
+    approach_clearance,
+    extra_depth,
+    xy_offset,
+    yaw_symmetry_degrees=360.0,
+):
+    """Place the held container with its heading aligned to the destination."""
+    if container_height <= 0.0 or approach_clearance <= 0.0:
+        raise ValueError('stack height and approach clearance must be positive')
+    if extra_depth < 0.0:
+        raise ValueError('extra grasp depth must be non-negative')
+    offset = np.asarray(xy_offset, dtype=np.float64)
+    if offset.shape != (2,):
+        raise ValueError('stack XY offset must contain two values')
+
+    release, rotation, yaw_delta = compose_yaw_follow_pose(
+        destination_marker,
+        grasp_offset,
+        grasp_rpy_degrees,
+        destination_yaw_degrees,
+        reference_marker_yaw_degrees,
+        yaw_symmetry_degrees=yaw_symmetry_degrees,
+    )
+    release = np.asarray(release, dtype=np.float64)
+    release[:2] += offset
+    release[2] += container_height - extra_depth
+    approach = release.copy()
+    approach[2] += approach_clearance
+    return release, approach, rotation, yaw_delta
 
 
 def lift_distance_candidates(requested, minimum, step):
@@ -197,6 +295,23 @@ def cartesian_path_acceptable(
     return shortfall <= max_shortfall
 
 
+def cartesian_segment_executable(
+    fraction,
+    requested_distance,
+    minimum_fraction,
+    minimum_progress,
+    segment_count,
+    maximum_segments,
+):
+    """Return whether a safe partial Cartesian result may be executed."""
+    if requested_distance is None or segment_count >= maximum_segments:
+        return False
+    return (
+        fraction >= minimum_fraction
+        and requested_distance * fraction >= minimum_progress
+    )
+
+
 def inverted_l_workspace_contains(
     xy,
     horizontal_min,
@@ -223,6 +338,9 @@ class ContainerPickCoordinator(Node):
         self._declare_parameters()
         self.base_frame = str(self.get_parameter('base_frame').value)
         self.marker_frame = str(self.get_parameter('marker_frame').value)
+        self.stack_target_frame = str(
+            self.get_parameter('stack_target_frame').value
+        )
         self.execute_motion = bool(self.get_parameter('execute_motion').value)
         self.motion_backend = str(
             self.get_parameter('motion_backend').value
@@ -239,11 +357,22 @@ class ContainerPickCoordinator(Node):
         self.grasp_orientation_mode = str(
             self.get_parameter('grasp_orientation_mode').value
         ).lower()
+        self.rotate_grasp_offset_with_marker_yaw = bool(
+            self.get_parameter(
+                'rotate_grasp_offset_with_marker_yaw'
+            ).value
+        )
         self.grasp_offset = self._vector_parameter('grasp_offset_xyz_m', 3)
+        self.base_correction = self._vector_parameter(
+            'base_correction_xyz_m', 3
+        )
         self.grasp_rpy = self._vector_parameter('grasp_offset_rpy_deg', 3)
         self.grasp_rotation = quaternion_from_rpy_degrees(*self.grasp_rpy)
         self.reference_marker_yaw = float(
             self.get_parameter('reference_marker_yaw_deg').value
+        )
+        self.container_yaw_symmetry = float(
+            self.get_parameter('container_yaw_symmetry_deg').value
         )
         self.max_yaw_spread = float(
             self.get_parameter('max_yaw_spread_deg').value
@@ -262,6 +391,9 @@ class ContainerPickCoordinator(Node):
         self.grasp_extra_depth = float(
             self.get_parameter('grasp_extra_depth_m').value
         )
+        self.grasp_stop_above = float(
+            self.get_parameter('grasp_stop_above_m').value
+        )
         self.refresh_marker_before_descent = bool(
             self.get_parameter('refresh_marker_before_descent').value
         )
@@ -278,6 +410,41 @@ class ContainerPickCoordinator(Node):
         )
         self.lift_search_step = float(
             self.get_parameter('lift_search_step_m').value
+        )
+        self.stack_container_height = float(
+            self.get_parameter('stack_container_height_m').value
+        )
+        self.stack_approach_clearance = float(
+            self.get_parameter('stack_approach_clearance_m').value
+        )
+        self.stack_minimum_approach_clearance = float(
+            self.get_parameter(
+                'stack_minimum_approach_clearance_m'
+            ).value
+        )
+        self.stack_approach_search_step = float(
+            self.get_parameter('stack_approach_search_step_m').value
+        )
+        self.stack_xy_offset = self._vector_parameter(
+            'stack_xy_offset_m', 2
+        )
+        self.stack_source_orientation_mode = str(
+            self.get_parameter('stack_source_orientation_mode').value
+        ).lower()
+        self.stack_segmented_descent_min_fraction = float(
+            self.get_parameter(
+                'stack_segmented_descent_min_fraction'
+            ).value
+        )
+        self.stack_segmented_descent_max_segments = int(
+            self.get_parameter(
+                'stack_segmented_descent_max_segments'
+            ).value
+        )
+        self.stack_pose_goal_finish_max_distance = float(
+            self.get_parameter(
+                'stack_pose_goal_finish_max_distance_m'
+            ).value
         )
         self.minimum_samples = int(
             self.get_parameter('minimum_stable_samples').value
@@ -419,15 +586,44 @@ class ContainerPickCoordinator(Node):
             self.minimum_lift_after_pick,
             self.lift_search_step,
         )
+        if self.stack_container_height <= 0.0:
+            raise ValueError('stack_container_height_m must be positive')
+        if self.stack_approach_clearance <= 0.0:
+            raise ValueError('stack_approach_clearance_m must be positive')
+        if self.stack_source_orientation_mode not in ('fixed', 'marker_yaw'):
+            raise ValueError(
+                'stack_source_orientation_mode must be fixed or marker_yaw'
+            )
+        if not 0.0 < self.stack_segmented_descent_min_fraction < 1.0:
+            raise ValueError(
+                'stack_segmented_descent_min_fraction must be within (0, 1)'
+            )
+        if self.stack_segmented_descent_max_segments < 1:
+            raise ValueError(
+                'stack_segmented_descent_max_segments must be positive'
+            )
+        if self.stack_pose_goal_finish_max_distance <= 0.0:
+            raise ValueError(
+                'stack_pose_goal_finish_max_distance_m must be positive'
+            )
+        lift_distance_candidates(
+            self.stack_approach_clearance,
+            self.stack_minimum_approach_clearance,
+            self.stack_approach_search_step,
+        )
 
         self.buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=5.0))
         self.listener = TransformListener(self.buffer, self)
         self.history = deque(maxlen=max(100, self.minimum_samples * 3))
+        self.stack_target_history = deque(
+            maxlen=max(100, self.minimum_samples * 3)
+        )
         self.history_lock = threading.Lock()
         self.last_transform_stamp = None
-        self.last_tracking_error = ''
-        self.last_tracking_error_time = 0.0
+        self.last_stack_target_stamp = None
+        self.tracking_errors = {}
         self.motion_lock = threading.Lock()
+        self.tracking_suspended = threading.Event()
         self.serial_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.motion_thread = None
@@ -441,12 +637,18 @@ class ContainerPickCoordinator(Node):
         self.current_moveit_goal = None
         self.moveit_goal_lock = threading.Lock()
         self.last_status_text = ''
+        self.add_on_set_parameters_callback(
+            self._on_tuning_parameters_changed
+        )
 
         self.status_publisher = self.create_publisher(
             String, '/arm2/container_pick/status', 10
         )
         self.marker_pose_publisher = self.create_publisher(
             PoseStamped, '/arm2/container_pick/marker_pose', 10
+        )
+        self.stack_target_pose_publisher = self.create_publisher(
+            PoseStamped, '/arm2/container_pick/stack_target_pose', 10
         )
         target_qos = QoSProfile(
             depth=1,
@@ -459,7 +661,15 @@ class ContainerPickCoordinator(Node):
         self.pregrasp_pose_publisher = self.create_publisher(
             PoseStamped, '/arm2/container_pick/pregrasp_pose', target_qos
         )
+        self.stack_release_pose_publisher = self.create_publisher(
+            PoseStamped, '/arm2/container_pick/stack_release_pose', target_qos
+        )
+        self.stack_approach_pose_publisher = self.create_publisher(
+            PoseStamped, '/arm2/container_pick/stack_approach_pose', target_qos
+        )
         self.create_service(Trigger, '/arm2/pick_container', self.start_pick)
+        self.create_service(Trigger, '/arm2/preview_stack', self.preview_stack)
+        self.create_service(Trigger, '/arm2/stack_container', self.start_stack)
         self.create_service(
             Trigger, '/arm2/preview_pregrasp', self.preview_pregrasp
         )
@@ -479,21 +689,142 @@ class ContainerPickCoordinator(Node):
         mode = 'EXECUTE' if self.execute_motion else 'DRY-RUN'
         self.publish_status(
             f'{mode}/{self.motion_backend}: tracking '
-            f'{self.base_frame} -> {self.marker_frame}'
+            f'{self.marker_frame} and {self.stack_target_frame} in '
+            f'{self.base_frame}'
         )
+        self.get_logger().info(
+            'Loaded grasp tuning: '
+            f'grasp_offset={self.grasp_offset.tolist()}, '
+            f'base_correction={self.base_correction.tolist()}, '
+            f'grasp_rpy={self.grasp_rpy.tolist()}, '
+            f'reference_yaw={self.reference_marker_yaw:.3f}deg, '
+            f'yaw_symmetry={self.container_yaw_symmetry:.1f}deg'
+        )
+
+    def _on_tuning_parameters_changed(self, parameters):
+        """Apply safe RQt tuning updates to the active target calculations."""
+        tuning_names = {
+            'allow_full_pick',
+            'offsets_configured',
+            'grasp_offset_xyz_m',
+            'base_correction_xyz_m',
+            'grasp_offset_rpy_deg',
+            'reference_marker_yaw_deg',
+            'container_yaw_symmetry_deg',
+            'rotate_grasp_offset_with_marker_yaw',
+        }
+        requested = {
+            parameter.name: parameter.value
+            for parameter in parameters
+            if parameter.name in tuning_names
+        }
+        if not requested:
+            return SetParametersResult(successful=True)
+        if self.motion_lock.locked():
+            return SetParametersResult(
+                successful=False,
+                reason='grasp tuning cannot change while robot motion is active',
+            )
+
+        try:
+            grasp_offset = self.grasp_offset
+            if 'grasp_offset_xyz_m' in requested:
+                grasp_offset = self._validated_tuning_vector(
+                    'grasp_offset_xyz_m',
+                    requested['grasp_offset_xyz_m'],
+                    limit=0.5,
+                )
+
+            base_correction = self.base_correction
+            if 'base_correction_xyz_m' in requested:
+                base_correction = self._validated_tuning_vector(
+                    'base_correction_xyz_m',
+                    requested['base_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            grasp_rpy = self.grasp_rpy
+            if 'grasp_offset_rpy_deg' in requested:
+                grasp_rpy = self._validated_tuning_vector(
+                    'grasp_offset_rpy_deg',
+                    requested['grasp_offset_rpy_deg'],
+                    limit=360.0,
+                )
+
+            reference_yaw = float(requested.get(
+                'reference_marker_yaw_deg',
+                self.reference_marker_yaw,
+            ))
+            yaw_symmetry = float(requested.get(
+                'container_yaw_symmetry_deg',
+                self.container_yaw_symmetry,
+            ))
+            if not math.isfinite(reference_yaw):
+                raise ValueError('reference_marker_yaw_deg must be finite')
+            if not 0.0 < yaw_symmetry <= 360.0:
+                raise ValueError(
+                    'container_yaw_symmetry_deg must be within (0, 360]'
+                )
+        except (TypeError, ValueError) as exc:
+            return SetParametersResult(successful=False, reason=str(exc))
+
+        self.grasp_offset = grasp_offset
+        self.base_correction = base_correction
+        self.grasp_rpy = grasp_rpy
+        self.grasp_rotation = quaternion_from_rpy_degrees(*grasp_rpy)
+        self.reference_marker_yaw = reference_yaw
+        self.container_yaw_symmetry = yaw_symmetry
+        if 'allow_full_pick' in requested:
+            self.allow_full_pick = bool(requested['allow_full_pick'])
+        if 'offsets_configured' in requested:
+            self.offsets_configured = bool(requested['offsets_configured'])
+        if 'rotate_grasp_offset_with_marker_yaw' in requested:
+            self.rotate_grasp_offset_with_marker_yaw = bool(
+                requested['rotate_grasp_offset_with_marker_yaw']
+            )
+        self.get_logger().info(
+            'Applied grasp tuning: '
+            f'allow_full_pick={self.allow_full_pick}, '
+            f'offsets_configured={self.offsets_configured}, '
+            f'grasp_offset={self.grasp_offset.tolist()}, '
+            f'base_correction={self.base_correction.tolist()}, '
+            f'grasp_rpy={self.grasp_rpy.tolist()}'
+        )
+        return SetParametersResult(successful=True)
+
+    @staticmethod
+    def _validated_tuning_vector(name, values, limit):
+        vector = np.asarray(values, dtype=np.float64)
+        if vector.shape != (3,):
+            raise ValueError(f'{name} must contain exactly 3 values')
+        if not np.all(np.isfinite(vector)):
+            raise ValueError(f'{name} must contain only finite values')
+        if np.any(np.abs(vector) > limit):
+            raise ValueError(
+                f'{name} magnitude must not exceed {limit:g}'
+            )
+        return vector
 
     def _declare_parameters(self):
         self.declare_parameter('base_frame', 'arm2/base_link')
         self.declare_parameter('marker_frame', 'arm2/container_marker')
+        self.declare_parameter(
+            'stack_target_frame', 'arm2/stack_target_marker'
+        )
         self.declare_parameter('execute_motion', False)
         self.declare_parameter('motion_backend', 'direct')
         self.declare_parameter('allow_full_pick', False)
         self.declare_parameter('offsets_configured', False)
         self.declare_parameter('use_marker_rotation_for_grasp', False)
         self.declare_parameter('grasp_orientation_mode', 'fixed')
+        self.declare_parameter(
+            'rotate_grasp_offset_with_marker_yaw', True
+        )
         self.declare_parameter('grasp_offset_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('base_correction_xyz_m', [0.0, 0.0, 0.0])
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
+        self.declare_parameter('container_yaw_symmetry_deg', 360.0)
         self.declare_parameter('max_yaw_spread_deg', 8.0)
         self.declare_parameter('max_container_yaw_delta_deg', 90.0)
         self.declare_parameter(
@@ -501,6 +832,7 @@ class ContainerPickCoordinator(Node):
         )
         self.declare_parameter('pregrasp_lift_m', 0.08)
         self.declare_parameter('grasp_extra_depth_m', 0.0)
+        self.declare_parameter('grasp_stop_above_m', 0.0)
         self.declare_parameter('refresh_marker_before_descent', True)
         self.declare_parameter(
             'pregrasp_test_keep_current_orientation', True
@@ -508,32 +840,47 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('lift_after_pick_m', 0.08)
         self.declare_parameter('minimum_lift_after_pick_m', 0.05)
         self.declare_parameter('lift_search_step_m', 0.02)
+        self.declare_parameter('stack_container_height_m', 0.035)
+        self.declare_parameter('stack_approach_clearance_m', 0.08)
+        self.declare_parameter(
+            'stack_minimum_approach_clearance_m', 0.03
+        )
+        self.declare_parameter('stack_approach_search_step_m', 0.01)
+        self.declare_parameter('stack_xy_offset_m', [0.0, 0.0])
+        self.declare_parameter('stack_source_orientation_mode', 'marker_yaw')
+        self.declare_parameter(
+            'stack_segmented_descent_min_fraction', 0.65
+        )
+        self.declare_parameter('stack_segmented_descent_max_segments', 5)
+        self.declare_parameter(
+            'stack_pose_goal_finish_max_distance_m', 0.075
+        )
         self.declare_parameter('minimum_stable_samples', 5)
         self.declare_parameter('max_translation_std_m', 0.005)
         self.declare_parameter('max_rotation_spread_deg', 5.0)
         self.declare_parameter('dry_run_max_rotation_spread_deg', 25.0)
         self.declare_parameter('max_marker_age_sec', 2.0)
-        self.declare_parameter('workspace_min_xyz_m', [-0.28, -0.28, 0.02])
-        self.declare_parameter('workspace_max_xyz_m', [0.28, 0.28, 0.30])
+        self.declare_parameter('workspace_min_xyz_m', [-0.30, -0.30, 0.005])
+        self.declare_parameter('workspace_max_xyz_m', [0.30, 0.30, 0.32])
         self.declare_parameter('workspace_xy_shape', 'box')
         self.declare_parameter(
-            'workspace_horizontal_min_xy_m', [-0.28, -0.28]
+            'workspace_horizontal_min_xy_m', [-0.30, -0.30]
         )
         self.declare_parameter(
-            'workspace_horizontal_max_xy_m', [0.28, 0.0]
+            'workspace_horizontal_max_xy_m', [0.30, 0.0]
         )
         self.declare_parameter(
-            'workspace_vertical_min_xy_m', [0.0, -0.28]
+            'workspace_vertical_min_xy_m', [0.0, -0.30]
         )
         self.declare_parameter(
-            'workspace_vertical_max_xy_m', [0.28, 0.28]
+            'workspace_vertical_max_xy_m', [0.30, 0.30]
         )
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
         self.declare_parameter('baud_rate', 1000000)
         self.declare_parameter('speed', 10)
         self.declare_parameter('motion_timeout_sec', 15.0)
         self.declare_parameter('stabilization_timeout_sec', 12.0)
-        self.declare_parameter('max_joint_delta_deg', 60.0)
+        self.declare_parameter('max_joint_delta_deg', 75.0)
         self.declare_parameter('gripper_open_value', 100)
         self.declare_parameter('gripper_closed_value', 20)
         self.declare_parameter('gripper_speed', 50)
@@ -548,18 +895,18 @@ class ContainerPickCoordinator(Node):
             '/arm2/compute_cartesian_path',
         )
         self.declare_parameter('moveit_position_tolerance_m', 0.005)
-        self.declare_parameter('moveit_orientation_tolerance_deg', 5.0)
-        self.declare_parameter('moveit_planning_time_sec', 5.0)
-        self.declare_parameter('moveit_planning_attempts', 10)
+        self.declare_parameter('moveit_orientation_tolerance_deg', 7.0)
+        self.declare_parameter('moveit_planning_time_sec', 15.0)
+        self.declare_parameter('moveit_planning_attempts', 30)
         self.declare_parameter('moveit_velocity_scale', 0.35)
         self.declare_parameter('moveit_acceleration_scale', 0.25)
         self.declare_parameter('cartesian_max_step_m', 0.005)
-        self.declare_parameter('cartesian_min_fraction', 0.97)
-        self.declare_parameter('cartesian_absolute_min_fraction', 0.90)
-        self.declare_parameter('cartesian_max_shortfall_m', 0.005)
+        self.declare_parameter('cartesian_min_fraction', 0.95)
+        self.declare_parameter('cartesian_absolute_min_fraction', 0.85)
+        self.declare_parameter('cartesian_max_shortfall_m', 0.008)
         self.declare_parameter('cartesian_max_speed_mps', 0.04)
-        self.declare_parameter('cartesian_max_joint_jump_deg', 10.0)
-        self.declare_parameter('moveit_state_settle_sec', 0.2)
+        self.declare_parameter('cartesian_max_joint_jump_deg', 20.0)
+        self.declare_parameter('moveit_state_settle_sec', 0.4)
 
     def _vector_parameter(self, name, length):
         values = np.asarray(self.get_parameter(name).value, dtype=np.float64)
@@ -619,32 +966,57 @@ class ContainerPickCoordinator(Node):
             self.status_publisher.publish(message)
 
     def update_tracking(self):
+        # The target is locked in base_frame before motion starts. The wrist
+        # camera may lose the marker while rotating, descending, or lifting.
+        if self.tracking_suspended.is_set() or (
+            self.motion_lock.locked()
+            and not self.refresh_marker_before_descent
+        ):
+            return
+
+        self._collect_marker_sample(
+            self.marker_frame,
+            self.history,
+            'last_transform_stamp',
+            self.marker_pose_publisher,
+            'source',
+        )
+        self._collect_marker_sample(
+            self.stack_target_frame,
+            self.stack_target_history,
+            'last_stack_target_stamp',
+            self.stack_target_pose_publisher,
+            'stack target',
+        )
+
+    def _collect_marker_sample(
+        self, frame, history, stamp_attribute, publisher, label
+    ):
         try:
             transform = self.buffer.lookup_transform(
-                self.base_frame, self.marker_frame, Time()
+                self.base_frame, frame, Time()
             )
         except TransformException as exc:
             error = str(exc)
+            previous_error, previous_time = self.tracking_errors.get(
+                frame, ('', 0.0)
+            )
             now = time.monotonic()
-            if (
-                error != self.last_tracking_error
-                or now - self.last_tracking_error_time >= 5.0
-            ):
+            if error != previous_error or now - previous_time >= 5.0:
                 self.get_logger().warning(
-                    'Cannot collect marker sample: '
-                    f'{self.base_frame} -> {self.marker_frame}: {error}'
+                    f'Cannot collect {label} marker sample: '
+                    f'{self.base_frame} -> {frame}: {error}'
                 )
-                self.last_tracking_error = error
-                self.last_tracking_error_time = now
+                self.tracking_errors[frame] = (error, now)
             return
 
         stamp = (
             transform.header.stamp.sec * 1_000_000_000
             + transform.header.stamp.nanosec
         )
-        if stamp == self.last_transform_stamp:
+        if stamp == getattr(self, stamp_attribute):
             return
-        self.last_transform_stamp = stamp
+        setattr(self, stamp_attribute, stamp)
         translation = np.array([
             transform.transform.translation.x,
             transform.transform.translation.y,
@@ -657,14 +1029,21 @@ class ContainerPickCoordinator(Node):
             transform.transform.rotation.w,
         ])
         with self.history_lock:
-            self.history.append((stamp, translation, rotation))
-        self.marker_pose_publisher.publish(
+            history.append((stamp, translation, rotation))
+        publisher.publish(
             self.make_pose(translation, rotation, transform.header.stamp)
         )
 
-    def stable_marker_pose(self, max_rotation_spread=None, yaw_only=False):
+    def stable_marker_pose(
+        self,
+        max_rotation_spread=None,
+        yaw_only=False,
+        history=None,
+        position_only=False,
+    ):
+        selected_history = self.history if history is None else history
         with self.history_lock:
-            samples = list(self.history)[-self.minimum_samples:]
+            samples = list(selected_history)[-self.minimum_samples:]
         if len(samples) < self.minimum_samples:
             return None, f'need {self.minimum_samples - len(samples)} more samples'
 
@@ -681,6 +1060,9 @@ class ContainerPickCoordinator(Node):
                 'marker translation is unstable: std_mm='
                 f'{np.round(translation_std * 1000.0, 2).tolist()}'
             )
+
+        if position_only:
+            return (translation, samples[-1][2]), 'stable'
 
         if yaw_only:
             yaws = np.array([
@@ -723,9 +1105,12 @@ class ContainerPickCoordinator(Node):
         return (translation, rotation), 'stable'
 
     def calculate_targets(
-        self, validate_workspace=True, max_rotation_spread=None
+        self,
+        validate_workspace=True,
+        max_rotation_spread=None,
+        orientation_mode=None,
     ):
-        mode = self.grasp_orientation_mode
+        mode = orientation_mode or self.grasp_orientation_mode
         if self.use_marker_rotation and mode == 'fixed':
             mode = 'marker_full'
         rotation_limit = max_rotation_spread
@@ -754,6 +1139,8 @@ class ContainerPickCoordinator(Node):
                     self.grasp_rpy,
                     marker_yaw,
                     self.reference_marker_yaw,
+                    self.rotate_grasp_offset_with_marker_yaw,
+                    self.container_yaw_symmetry,
                 )
             )
             if abs(yaw_delta) > self.max_yaw_delta:
@@ -766,10 +1153,15 @@ class ContainerPickCoordinator(Node):
                 self.grasp_offset,
                 self.grasp_rotation,
             )
+        grasp_translation = apply_base_frame_correction(
+            grasp_translation,
+            self.base_correction,
+        )
         grasp_translation, pregrasp_translation = apply_vertical_pick_offsets(
             grasp_translation,
             self.pregrasp_lift,
             self.grasp_extra_depth,
+            self.grasp_stop_above,
         )
         if validate_workspace:
             if not self.in_workspace(grasp_translation):
@@ -807,6 +1199,98 @@ class ContainerPickCoordinator(Node):
                 last_report_reason = reason
                 last_report_time = now
         return None, f'marker did not stabilize: {reason}'
+
+    def calculate_stack_targets(self, validate_workspace=True):
+        """Build source pick and destination release targets from two markers."""
+        source_targets, reason = self.calculate_targets(
+            validate_workspace=validate_workspace,
+            orientation_mode=self.stack_source_orientation_mode,
+        )
+        if source_targets is None:
+            return None, f'source marker: {reason}'
+
+        destination_pose, reason = self.stable_marker_pose(
+            history=self.stack_target_history,
+            yaw_only=True,
+        )
+        if destination_pose is None:
+            return None, f'stack target marker: {reason}'
+
+        destination_yaw = quaternion_to_rpy_degrees(destination_pose[1])[2]
+        (
+            release_translation,
+            approach_translation,
+            release_rotation,
+            destination_yaw_delta,
+        ) = calculate_heading_aligned_stack_poses(
+            destination_pose[0],
+            self.grasp_offset,
+            self.grasp_rpy,
+            destination_yaw,
+            self.reference_marker_yaw,
+            self.stack_container_height,
+            self.stack_approach_clearance,
+            self.grasp_extra_depth,
+            self.stack_xy_offset,
+            self.container_yaw_symmetry,
+        )
+        release_translation = apply_base_frame_correction(
+            release_translation,
+            self.base_correction,
+        )
+        approach_translation = apply_base_frame_correction(
+            approach_translation,
+            self.base_correction,
+        )
+        if abs(destination_yaw_delta) > self.max_yaw_delta:
+            return None, (
+                'stack target yaw delta '
+                f'{destination_yaw_delta:.2f}deg exceeds limit'
+            )
+        if validate_workspace:
+            if not self.in_workspace(release_translation):
+                return None, (
+                    f'stack release target outside workspace: '
+                    f'{release_translation}'
+                )
+            if not self.in_workspace(approach_translation):
+                return None, (
+                    f'stack approach target outside workspace: '
+                    f'{approach_translation}'
+                )
+
+        stamp = self.get_clock().now().to_msg()
+        release = self.make_pose(
+            release_translation, release_rotation, stamp
+        )
+        approach = self.make_pose(
+            approach_translation, release_rotation, stamp
+        )
+        self.stack_release_pose_publisher.publish(release)
+        self.stack_approach_pose_publisher.publish(approach)
+        return (source_targets, release, approach), 'stack targets valid'
+
+    def wait_for_new_stable_stack_targets(self):
+        """Wait until source and destination markers are fresh and stable."""
+        with self.history_lock:
+            self.history.clear()
+            self.stack_target_history.clear()
+        deadline = time.monotonic() + self.stabilization_timeout
+        reason = 'no new marker samples'
+        last_report_time = 0.0
+        last_report_reason = ''
+        while time.monotonic() < deadline:
+            if self.stop_event.wait(0.2):
+                return None, 'stack stopped'
+            targets, reason = self.calculate_stack_targets()
+            if targets is not None:
+                return targets, reason
+            now = time.monotonic()
+            if reason != last_report_reason or now - last_report_time >= 1.0:
+                self.publish_status(f'STACK: waiting for markers: {reason}')
+                last_report_reason = reason
+                last_report_time = now
+        return None, f'markers did not stabilize: {reason}'
 
     def in_workspace(self, translation):
         if not (
@@ -886,6 +1370,75 @@ class ContainerPickCoordinator(Node):
             return
         self.publish_status('PICK: fresh marker target locked')
         self.execute_pick(targets)
+
+    def preview_stack(self, _request, response):
+        targets, reason = self.calculate_stack_targets(
+            validate_workspace=False
+        )
+        if targets is None:
+            response.success = False
+            response.message = reason
+            return response
+        source_targets, release, approach = targets
+        source_grasp_yaw = quaternion_to_rpy_degrees([
+            source_targets[0].pose.orientation.x,
+            source_targets[0].pose.orientation.y,
+            source_targets[0].pose.orientation.z,
+            source_targets[0].pose.orientation.w,
+        ])[2]
+        release_xyz = np.round([
+            release.pose.position.x,
+            release.pose.position.y,
+            release.pose.position.z,
+        ], 4).tolist()
+        approach_xyz = np.round([
+            approach.pose.position.x,
+            approach.pose.position.y,
+            approach.pose.position.z,
+        ], 4).tolist()
+        response.success = True
+        response.message = (
+            'PREVIEW ONLY: no motion; '
+            f'release_m={release_xyz}, approach_m={approach_xyz}, '
+            f'source_grasp_yaw_deg={source_grasp_yaw:.2f}, '
+            f'container_height_m={self.stack_container_height:.4f}'
+        )
+        return response
+
+    def start_stack(self, _request, response):
+        if not self.execute_motion:
+            response.success = False
+            response.message = 'Stack requires execute_motion:=true'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.success = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_stack_after_stabilization,
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = (
+            'Stack accepted; waiting for fresh ID 0 and ID 1 markers'
+        )
+        return response
+
+    def execute_stack_after_stabilization(self):
+        """Lock both marker poses before starting any physical movement."""
+        self.publish_status('STACK: waiting for fresh stable markers')
+        targets, reason = self.wait_for_new_stable_stack_targets()
+        if targets is None:
+            self.publish_status(f'STACK FAILED: {reason}')
+            return
+        self.publish_status('STACK: source and destination targets locked')
+        self.execute_stack(targets)
 
     def start_pregrasp_test(self, _request, response):
         if not self.execute_motion:
@@ -991,43 +1544,8 @@ class ContainerPickCoordinator(Node):
         if not self.motion_lock.acquire(blocking=False):
             return
         try:
-            grasp, pregrasp = initial_targets
-            self.publish_status('PICK: opening gripper')
-            self.command_gripper(open_gripper=True)
-            self.publish_status(
-                'PICK: moving to pregrasp'
-            )
-            self.move_to_pose(
-                pregrasp,
-                keep_current_orientation=(
-                    self.pregrasp_test_keep_orientation
-                ),
-            )
-            if self.pregrasp_test_keep_orientation:
-                self.publish_status('PICK: aligning at pregrasp')
-                self.move_to_pose(pregrasp)
-            if self.refresh_marker_before_descent:
-                refreshed, reason = self.wait_for_new_stable_targets()
-                if refreshed is None:
-                    raise RuntimeError(
-                        f'failed to refresh marker pose: {reason}'
-                    )
-                grasp, pregrasp = refreshed
-            else:
-                self.publish_status(
-                    'PICK: marker refresh skipped; using locked base target'
-                )
-            self.publish_status('PICK: descending to grasp pose')
-            try:
-                self.move_cartesian_to_pose(grasp)
-            except CartesianPlanningError as initial_error:
-                grasp = self.move_with_yaw_fallbacks(
-                    grasp, pregrasp, initial_error
-                )
-            self.publish_status('PICK: closing gripper')
-            self.command_gripper(open_gripper=False)
-            self.publish_status('PICK: finding vertical lift path')
-            self.move_adaptive_cartesian_lift(grasp)
+            self.publish_pick_target('PICK', initial_targets[0])
+            self._perform_pick(initial_targets)
             self.publish_status('PICK: completed')
         except Exception as exc:
             self.stop_event.set()
@@ -1035,6 +1553,164 @@ class ContainerPickCoordinator(Node):
             self.publish_status(f'PICK FAILED: {exc}')
         finally:
             self.motion_lock.release()
+
+    def _perform_pick(
+        self,
+        initial_targets,
+        allow_yaw_fallback=True,
+        allow_segmented_descent=False,
+    ):
+        grasp, pregrasp = initial_targets
+        self.publish_status('PICK: opening gripper')
+        self.command_gripper(open_gripper=True)
+        self.publish_status('PICK: moving to pregrasp')
+        self.move_to_pose(
+            pregrasp,
+            keep_current_orientation=self.pregrasp_test_keep_orientation,
+        )
+        if self.pregrasp_test_keep_orientation:
+            self.publish_status('PICK: aligning at pregrasp')
+            self.move_to_pose(pregrasp)
+        if self.refresh_marker_before_descent:
+            refreshed, reason = self.wait_for_new_stable_targets()
+            if refreshed is None:
+                raise RuntimeError(
+                    f'failed to refresh marker pose: {reason}'
+                )
+            grasp, pregrasp = refreshed
+        else:
+            self.publish_status(
+                'PICK: marker refresh skipped; using locked base target'
+            )
+        self.publish_status('PICK: descending to grasp pose')
+        try:
+            self.move_cartesian_to_pose(
+                grasp, allow_segmented=allow_segmented_descent
+            )
+        except CartesianPlanningError as initial_error:
+            remaining_distance = self._cartesian_request_distance(grasp)
+            can_finish_with_pose_goal = (
+                allow_segmented_descent
+                and initial_error.executed_segments > 0
+                and remaining_distance is not None
+                and remaining_distance
+                <= self.stack_pose_goal_finish_max_distance
+            )
+            if can_finish_with_pose_goal:
+                self.publish_status(
+                    'PICK: finishing locked grasp pose without marker: '
+                    f'remaining={remaining_distance * 1000.0:.1f}mm'
+                )
+                self.move_to_pose(grasp)
+            elif not allow_yaw_fallback:
+                raise
+            else:
+                grasp = self.move_with_yaw_fallbacks(
+                    grasp, pregrasp, initial_error
+                )
+        self.publish_status('PICK: closing gripper')
+        self.command_gripper(open_gripper=False)
+        self.publish_status('PICK: finding vertical lift path')
+        self.move_adaptive_cartesian_lift(grasp)
+        return grasp
+
+    def publish_pick_target(self, label, grasp):
+        yaw = quaternion_to_rpy_degrees([
+            grasp.pose.orientation.x,
+            grasp.pose.orientation.y,
+            grasp.pose.orientation.z,
+            grasp.pose.orientation.w,
+        ])[2]
+        self.publish_status(
+            f'{label}: ID 0 grasp target '
+            f'x={grasp.pose.position.x:.4f}, '
+            f'y={grasp.pose.position.y:.4f}, '
+            f'z={grasp.pose.position.z:.4f}, yaw={yaw:.2f}deg'
+        )
+
+    def execute_stack(self, targets):
+        if not self.motion_lock.acquire(blocking=False):
+            return
+        self.tracking_suspended.set()
+        try:
+            source_targets, release, approach = targets
+            self.publish_status(
+                'STACK: using locked initial ID 0 and ID 1 poses'
+            )
+            source_targets = copy.deepcopy(source_targets)
+            self.publish_pick_target('STACK', source_targets[0])
+            self._perform_pick(
+                source_targets,
+                allow_yaw_fallback=False,
+                allow_segmented_descent=True,
+            )
+            destination_yaw = quaternion_to_rpy_degrees([
+                release.pose.orientation.x,
+                release.pose.orientation.y,
+                release.pose.orientation.z,
+                release.pose.orientation.w,
+            ])[2]
+            self.publish_status(
+                'STACK: moving above ID 1 and aligning heading: '
+                f'tcp_yaw={destination_yaw:.2f}deg'
+            )
+            approach = self.move_to_reachable_stack_approach(
+                release, approach.pose.orientation
+            )
+            self.publish_status('STACK: descending vertically to release')
+            self.move_cartesian_to_pose(release)
+            self.publish_status('STACK: opening gripper')
+            self.command_gripper(open_gripper=True)
+            self.publish_status('STACK: retreating vertically')
+            self.move_cartesian_to_pose(approach)
+            self.publish_status('STACK: completed ID 0 onto ID 1')
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(f'STACK FAILED: {exc}')
+        finally:
+            self.tracking_suspended.clear()
+            self.motion_lock.release()
+
+    def move_to_reachable_stack_approach(self, release, orientation):
+        """Use the highest reachable clearance above the stack target."""
+        failures = []
+        for clearance in lift_distance_candidates(
+            self.stack_approach_clearance,
+            self.stack_minimum_approach_clearance,
+            self.stack_approach_search_step,
+        ):
+            approach = copy.deepcopy(release)
+            approach.pose.position.z += clearance
+            approach.pose.orientation = copy.deepcopy(orientation)
+            translation = np.array([
+                approach.pose.position.x,
+                approach.pose.position.y,
+                approach.pose.position.z,
+            ])
+            if not self.in_workspace(translation):
+                failures.append(f'{clearance:.3f}m: outside workspace')
+                continue
+            self.publish_status(
+                'STACK: trying approach clearance '
+                f'{clearance * 100.0:.1f} cm'
+            )
+            try:
+                self.move_to_pose(approach)
+                self.stack_approach_pose_publisher.publish(approach)
+                self.publish_status(
+                    'STACK: selected approach clearance '
+                    f'{clearance * 100.0:.1f} cm'
+                )
+                return approach
+            except RuntimeError as exc:
+                if 'code=99999' not in str(exc):
+                    raise
+                failures.append(f'{clearance:.3f}m: {exc}')
+        raise RuntimeError(
+            'No reachable stack approach; move ID 1 closer to the robot: '
+            + '; '.join(failures)
+        )
 
     def move_with_yaw_fallbacks(self, grasp, pregrasp, initial_error):
         """Retry descent with progressively reduced marker-yaw following."""
@@ -1198,9 +1874,7 @@ class ContainerPickCoordinator(Node):
 
     def _execute_moveit_pose_goal(self, target):
         if not self.move_group_client.wait_for_server(timeout_sec=5.0):
-            raise RuntimeError(
-                f'MoveIt {self.move_group_action} server is unavailable'
-            )
+            raise RuntimeError('MoveIt /arm2/move_action server is unavailable')
 
         target = copy.deepcopy(target)
         # The target is already expressed in base_frame. Plan against the
@@ -1330,7 +2004,9 @@ class ContainerPickCoordinator(Node):
         constraints.orientation_constraints = [orientation]
         return constraints
 
-    def move_cartesian_to_pose(self, target):
+    def move_cartesian_to_pose(
+        self, target, allow_segmented=False, segment_count=0
+    ):
         """Execute a collision-checked straight TCP path to one waypoint."""
         if self.motion_backend != 'moveit':
             self.move_to_pose(target)
@@ -1348,8 +2024,7 @@ class ContainerPickCoordinator(Node):
             )
         if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
             raise CartesianPlanningError(
-                'MoveIt Cartesian service is unavailable: '
-                f'{self.compute_cartesian_path_service}'
+                'MoveIt /arm2/compute_cartesian_path service is unavailable'
             )
 
         requested_distance = self._cartesian_request_distance(target)
@@ -1383,13 +2058,54 @@ class ContainerPickCoordinator(Node):
                 'Cartesian planning failed: '
                 f'code={response.error_code.val}, message={detail}'
             )
-        if not cartesian_path_acceptable(
+        acceptable = cartesian_path_acceptable(
             response.fraction,
             requested_distance,
             self.cartesian_min_fraction,
             self.cartesian_absolute_min_fraction,
             self.cartesian_max_shortfall,
-        ):
+        )
+        if not acceptable:
+            can_execute_segment = (
+                allow_segmented
+                and bool(response.solution.joint_trajectory.points)
+                and cartesian_segment_executable(
+                    response.fraction,
+                    requested_distance,
+                    self.stack_segmented_descent_min_fraction,
+                    0.005,
+                    segment_count,
+                    self.stack_segmented_descent_max_segments,
+                )
+            )
+            if can_execute_segment:
+                progress_mm = (
+                    requested_distance * response.fraction * 1000.0
+                )
+                remaining_mm = (
+                    requested_distance * (1.0 - response.fraction) * 1000.0
+                )
+                self.publish_status(
+                    'PICK: executing safe segmented descent '
+                    f'{segment_count + 1}/'
+                    f'{self.stack_segmented_descent_max_segments}: '
+                    f'fraction={response.fraction:.3f}, '
+                    f'progress={progress_mm:.1f}mm, '
+                    f'remaining={remaining_mm:.1f}mm'
+                )
+                self._execute_cartesian_trajectory(response.solution)
+                try:
+                    self.move_cartesian_to_pose(
+                        target,
+                        allow_segmented=True,
+                        segment_count=segment_count + 1,
+                    )
+                except CartesianPlanningError as exc:
+                    exc.executed_segments = max(
+                        exc.executed_segments, segment_count + 1
+                    )
+                    raise
+                return
             diagnostics = self._diagnose_cartesian_limits(request)
             distance_detail = ''
             if requested_distance is not None:
@@ -1404,7 +2120,8 @@ class ContainerPickCoordinator(Node):
                 'Cartesian path rejected: '
                 f'fraction={response.fraction:.3f} is below '
                 f'{self.cartesian_min_fraction:.3f}{distance_detail}; '
-                f'{diagnostics}'
+                f'{diagnostics}',
+                executed_segments=segment_count,
             )
         if response.fraction < self.cartesian_min_fraction:
             shortfall_mm = (
@@ -1420,15 +2137,17 @@ class ContainerPickCoordinator(Node):
                 'Cartesian path contains no trajectory points'
             )
 
+        self._execute_cartesian_trajectory(response.solution)
+
+    def _execute_cartesian_trajectory(self, trajectory):
         if not self.execute_trajectory_client.wait_for_server(
             timeout_sec=5.0
         ):
             raise RuntimeError(
-                'MoveIt trajectory action is unavailable: '
-                f'{self.execute_trajectory_action}'
+                'MoveIt /arm2/execute_trajectory action is unavailable'
             )
         goal = ExecuteTrajectory.Goal()
-        goal.trajectory = response.solution
+        goal.trajectory = trajectory
         goal_future = self.execute_trajectory_client.send_goal_async(goal)
         self._wait_future(goal_future, 5.0)
         goal_handle = goal_future.result()

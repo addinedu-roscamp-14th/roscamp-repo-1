@@ -1,4 +1,14 @@
 image: keepout_mask.pgm
+# B-1 center=(1.294, -0.087) m. Its access pocket follows the physical
+# bookshelf and pillar boundaries instead of using a circular cutout. The
+# +X-facing final approach corridor is clear through PGM x=170 for y=69..78,
+# keeping the vehicle center and footprint away from the inflated mask edge.
+# Remaining boundary: (181,58)->(181,67)->(170,68)->(170,78)->(158,79)
+# ->(158,96)->(148,96).
+# Keep a 0.22 m radius rotation pocket around the shared A-zone center
+# (0.168, -0.038) m.
+# A-zone access corridor: centerline (0.168, -0.038) -> (0.520, 0.100) m,
+# with a 0.11 m half-width to clear the vehicle footprint and tracking margin.
 mode: trinary
 resolution: 0.010
 origin: [-0.198, -0.517, 0]
