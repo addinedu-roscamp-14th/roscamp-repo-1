@@ -3,14 +3,29 @@
 import math
 
 from arm2.arm2_jetcobot_trajectory_bridge import (
+    JetCobotTrajectoryBridge,
+    adaptive_joint_command_degrees,
+    clamp_measured_joints_for_planning,
+    cumulative_joint_travel_degrees,
     duration_seconds,
     interpolate_positions,
-    JetCobotTrajectoryBridge,
     joint_errors_degrees,
+    validate_home_angles,
 )
 from builtin_interfaces.msg import Duration
 import pytest
 from trajectory_msgs.msg import JointTrajectoryPoint
+
+
+def test_small_measured_limit_overshoot_is_clamped_for_moveit_only():
+    measured = [0.0, 0.0, -150.29, 0.0, 0.0, 0.0]
+    assert clamp_measured_joints_for_planning(measured, 0.5)[2] == -150.0
+    assert measured[2] == -150.29
+
+
+def test_large_measured_limit_overshoot_remains_visible_to_moveit():
+    measured = [0.0, 0.0, -151.0, 0.0, 0.0, 0.0]
+    assert clamp_measured_joints_for_planning(measured, 0.5)[2] == -151.0
 
 
 def make_point(seconds, positions):
@@ -58,3 +73,59 @@ def test_joint_errors_report_target_minus_actual():
     assert joint_errors_degrees(
         [10.0, -20.0, 30.0], [12.5, -21.0, 30.0]
     ) == [2.5, -1.0, 0.0]
+
+
+def test_adaptive_correction_changes_only_selected_joint():
+    command = adaptive_joint_command_degrees(
+        target=[0.0, 0.0, 0.0, -60.0, 0.0, 0.0],
+        actual=[1.0, 1.0, 1.0, -61.2, 1.0, 1.0],
+        current_command=[0.0, 0.0, 0.0, -60.0, 0.0, 0.0],
+        joint_indices=[3],
+        gain=1.0,
+        max_total_correction=3.0,
+    )
+    assert command == [0.0, 0.0, 0.0, -58.8, 0.0, 0.0]
+
+
+def test_adaptive_correction_is_bounded_from_original_target():
+    command = adaptive_joint_command_degrees(
+        target=[0.0] * 6,
+        actual=[0.0, 0.0, 0.0, -10.0, 0.0, 0.0],
+        current_command=[0.0] * 6,
+        joint_indices=[3],
+        gain=1.0,
+        max_total_correction=3.0,
+    )
+    assert command[3] == 3.0
+
+
+def test_validate_home_angles_accepts_measured_pose():
+    measured = [-90.61, 8.96, -36.29, -52.29, 2.02, -48.25]
+    assert validate_home_angles(measured) == measured
+
+
+def test_validate_home_angles_rejects_wrong_length_and_limit():
+    with pytest.raises(ValueError, match='six values'):
+        validate_home_angles([0.0] * 5)
+    with pytest.raises(ValueError, match='home J5'):
+        validate_home_angles([0.0, 0.0, 0.0, 0.0, 161.0, 0.0])
+
+
+def test_j6_is_limited_to_plus_or_minus_150_degrees():
+    positions = [0.0] * 6
+    positions[5] = math.radians(150.0)
+    JetCobotTrajectoryBridge._validate_joint_limits(positions)
+
+    positions[5] = math.radians(150.1)
+    with pytest.raises(RuntimeError, match='J6 target'):
+        JetCobotTrajectoryBridge._validate_joint_limits(positions)
+
+
+def test_cumulative_j6_travel_counts_direction_changes():
+    points = [
+        make_point(1, [0.0] * 5 + [math.radians(20.0)]),
+        make_point(2, [0.0] * 5 + [math.radians(-10.0)]),
+    ]
+    assert cumulative_joint_travel_degrees(0.0, points, 5) == pytest.approx(
+        50.0
+    )

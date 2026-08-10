@@ -31,14 +31,25 @@
           "/agv[12]/joint_states",
           "/agv[12]/robot_description",
           "/agv[12]/battery/percent",
-          "/agv[12]/battery/voltage"
+          "/agv[12]/battery/voltage",
+          "/arm2/transfer_events",
+          "/arm2/container_pick/status",
+          "/arm2/joint_states"
         ],
         "service_servers": [],
         "service_clients": [
           "/agv[12]/safety_hold",
           "/agv[12]/emergency_stop",
           "/agv[12]/local_costmap/local_costmap/get_parameters",
-          "/agv[12]/local_costmap/local_costmap/set_parameters"
+          "/agv[12]/local_costmap/local_costmap/set_parameters",
+          "/arm2/scan_destinations",
+          "/arm2/transfer_to_a[123]_[12]",
+          "/arm2/load_id[0-8]_to_trailer",
+          "/arm2/transfer_by_id",
+          "/arm2/go_initial_pose",
+          "/arm2/go_a[123]_pose",
+          "/arm2/stop_pick",
+          "/arm2/reset_stack_level"
         ],
         "action_servers": [],
         "action_clients": [

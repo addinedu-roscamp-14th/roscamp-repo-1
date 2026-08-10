@@ -232,6 +232,8 @@ class YoloNode(Node):
 
         summary = {
             'frame_id': frame_id,
+            'image_width': int(annotated_frame.shape[1]),
+            'image_height': int(annotated_frame.shape[0]),
             'stamp': {
                 'sec': stamp.sec,
                 'nanosec': stamp.nanosec,

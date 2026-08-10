@@ -5,6 +5,59 @@
 현재 핵심 노드는 `rqt_click_to_target`, `camera_to_map_bridge`,
 `control_gateway`, `fleet_dispatcher`, `fleet_collision_supervisor`입니다.
 
+## 로봇팔 중앙 연동
+
+중앙은 `/central/arms/dispatch` 액션으로 ARM 명령을 FIFO 처리합니다. 현재 ARM2만
+설정되어 있고 ARM1은 서비스 계약을 받기 전까지 `UNCONFIGURED`로 표시됩니다.
+ARM2는 직접 서비스 응답을 작업 완료로 간주하지 않습니다. 반드시
+`/arm2/transfer_events`에서 같은 `operation_id`의 최종 `COMPLETED` 또는 `FAILED`
+이벤트를 받은 뒤 중앙 결과를 확정합니다.
+
+허용 작업은 다음으로 제한됩니다.
+
+- `scan_destinations`
+- `transfer_to_slot`: 차량에서 창고로 이동
+- `load_to_trailer`: 창고에서 차량으로 이동
+- `transfer_by_id`: 창고 내부 이동
+- `go_pose`, `reset_stack_level`, `stop`
+
+차량 출발 승인은 `transfer_to_slot` 또는 `load_to_trailer`가 최종 성공하고 요청의
+`final_for_vehicle`가 참일 때만 `/central/autonomy/vehicle_release`에 발행됩니다.
+`transfer_by_id` 성공은 차량 출발 조건이 아닙니다.
+
+HTTP API 예시:
+
+```bash
+curl -X POST http://127.0.0.1:8100/api/v1/arms/commands \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Token: ${PORT_CONTROL_API_TOKEN}" \
+  -d '{
+    "command_id":"arm2-load-001",
+    "mission_id":"mission-001",
+    "arm_id":"arm2",
+    "operation":"load_to_trailer",
+    "source_id":3,
+    "vehicle_id":"agv1",
+    "final_for_vehicle":true
+  }'
+```
+
+작업 상태 확인:
+
+```bash
+ros2 topic echo /central/arms/arm2/state
+ros2 topic echo /central/arms/results
+ros2 topic echo /central/autonomy/vehicle_release
+```
+
+## 입항 자동 감지
+
+`port_event_detector`는 대시보드에서 지정한 탑다운 카메라 ROI 안의 YOLO OBB를
+검사합니다. 신뢰도 `0.65` 이상, ROI 겹침 `30%` 이상이 최근 5프레임 중 3프레임에
+있으면 입항으로 판정합니다. 10초 동안 사라지면 출항으로 판정합니다. 입항 시
+`autonomy_orchestrator`가 ARM2 목적지 스캔을 요청하고, ARM1 계약과 화물 정책이
+준비될 때까지 `WAITING_FOR_CARGO_POLICY`로 대기합니다.
+
 ## 2대 차량 Fleet 제어
 
 `fleet_dispatcher`는 `agv1`, `agv2`의 Nav2 액션과 상태를 통합합니다.

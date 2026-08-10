@@ -24,7 +24,7 @@ def resolve_camera_info_url(context):
 def generate_launch_description():
     """Create the gripper camera and marker tracking graph."""
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
+        DeclareLaunchArgument('video_device', default_value='/dev/arm_camera'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
@@ -35,7 +35,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
         DeclareLaunchArgument('secondary_marker_id', default_value='-1'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
             'marker_frame_id', default_value='arm2/container_marker'
@@ -90,6 +90,27 @@ def generate_launch_description():
             'secondary_marker_frame_id': LaunchConfiguration(
                 'secondary_marker_frame_id'
             ),
+            'additional_marker_ids': [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            ],
+            'additional_marker_frame_ids': [
+                'arm2/container_marker_1',
+                'arm2/container_marker_2',
+                'arm2/container_marker_3',
+                'arm2/container_marker_4',
+                'arm2/container_marker_5',
+                'arm2/container_marker_6',
+                'arm2/container_marker_7',
+                'arm2/container_marker_8',
+                'arm2/trailer_marker_9',
+                'arm2/trailer_marker_10',
+                'arm2/destination_marker_11',
+                'arm2/destination_marker_12',
+                'arm2/destination_marker_13',
+                'arm2/destination_marker_14',
+                'arm2/destination_marker_15',
+                'arm2/destination_marker_16',
+            ],
             'use_node_time_for_pose': ParameterValue(
                 LaunchConfiguration('use_node_time_for_pose'),
                 value_type=bool,

@@ -376,3 +376,40 @@ def test_visible_zone_transfer_repairs_unknown_response():
         'destination_detection_index': 1,
         'vehicle_id': '',
     }
+
+
+def test_same_arm_operations_are_always_sequential():
+    result = {
+        'execution_mode': 'parallel',
+        'actions': [
+            {
+                'type': 'arm_scan_destinations',
+                'arm_id': 'arm2',
+            },
+            {
+                'type': 'arm_transfer_to_slot',
+                'arm_id': 'arm2',
+                'destination_slot': 'A-1-1',
+            },
+        ],
+    }
+
+    assert resolve_execution_mode('arm2로 스캔하고 A-1-1에 적재해', result) == (
+        'sequential'
+    )
+
+
+def test_unknown_arm_command_is_not_repaired_as_vehicle_navigation():
+    unknown = {
+        'actions': [
+            {'type': 'unknown', 'reason': '로봇팔 작업을 해석하지 못함'},
+        ]
+    }
+
+    result = normalize_navigation_result(
+        'arm2로 컨테이너를 A-2-1에 적재해',
+        unknown,
+        DETECTIONS,
+    )
+
+    assert result == unknown

@@ -1,35 +1,5 @@
 # Port-ER Workspace
 
-스마트 항만 관제를 위한 ROS2 워크스페이스입니다. 각 패키지는 역할별로 분리되어 있으며, 자세한 실행 방법은 각 패키지의 `README.md`에 정리합니다.
-
-별도 설명이 없는 명령은 모두 `poter_ws/` 워크스페이스 루트에서 실행하며, 프로젝트
-파일 경로는 워크스페이스 기준 상대경로를 사용합니다.
-
-## Quick Start: 카메라부터 차량 주행까지
-
-차량과 노트북은 같은 네트워크와 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. 아래 노트북
-명령은 각각 새 터미널에서 실행하며, 모든 터미널에서 먼저 다음 환경을 불러옵니다.
-
-### 0. 시각 동기화 (차량 실행 전 필수)
-
-AGV는 RTC가 없고 로봇 LAN에 인터넷이 없어서, 부팅할 때 마지막 종료 시각을 복원한 채
-멈춰 있습니다. 두 차량의 시계가 어긋나면 `map`을 공통 부모로 쓰는 하나의 TF 버퍼 안에서
-tf2가 "최신"을 앞선 차량 기준으로 잡고, 뒤처진 차량은 `extrapolation into the past`로
-탈락합니다. RViz에서 RobotModel이 빨갛게 깜빡이다 사라지는 증상이 이것입니다.
-
-중앙 노트북에서 최초 1회만:
-
-```bash
-sudo ./scripts/setup_ntp_server.sh    # chrony를 로봇 LAN 시간 서버로 설치
-```
-
-차량을 켤 때마다, **차량 스택을 실행하기 전에**:
-
-```bash
-./scripts/check_fleet_clocks.sh       # 편차 확인 (exit 0이면 진행 가능)
-./scripts/sync_vehicle_clocks.sh      # FAIL이면 실행 후 다시 확인
-```
-
 ### 1. 중앙 관제 노트북
 
 ``` bash 
@@ -42,7 +12,7 @@ export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 sudo ip link set lo multicast on
 ros2 daemon stop
-
+  
 zenoh-bridge-ros2dds \
   -c config/network/zenoh_central.json5
 ```

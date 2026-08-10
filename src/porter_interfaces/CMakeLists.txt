@@ -7,8 +7,11 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/ArmState.msg"
   "msg/PixelNavigationCommand.msg"
+  "msg/PortEvent.msg"
   "msg/VehicleState.msg"
+  "action/DispatchArmCommand.action"
   "action/DispatchNavigation.action"
   DEPENDENCIES geometry_msgs std_msgs
 )

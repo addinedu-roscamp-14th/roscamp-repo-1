@@ -1,0 +1,18 @@
+port_event_detector:
+  ros__parameters:
+    detection_topic: /central/yolo/detections
+    event_topic: /central/autonomy/port_events
+    roi_config_topic: /central/autonomy/arrival_roi_config
+    # Normalized top-down image ROI: x_min, y_min, x_max, y_max.
+    roi_normalized: [0.0, 0.0, 0.35, 0.35]
+    vessel_label_keywords:
+      [container, black, gray, brown, vessel, ship]
+    minimum_confidence: 0.65
+    minimum_roi_overlap: 0.30
+    history_size: 5
+    required_hits: 3
+    departure_absence_sec: 10.0
+
+autonomy_orchestrator:
+  ros__parameters:
+    auto_scan_arm2_on_arrival: true
