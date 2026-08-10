@@ -51,6 +51,7 @@ from cargo_dispatch_tool import (
     load_cargo_registry,
     load_cargo_details,
     save_cargo_registry,
+    save_cargo_details,
     load_named_locations,
     location_coord_text,
 )
@@ -530,21 +531,33 @@ class CommandPopup(ctk.CTkToplevel):
                 self._log(f"[액션 무시] 목적지 '{destination}'이 등록된 위치 목록에 없습니다: {action}")
                 return False
 
+            target_aruco_id = action.get("target_aruco_id", "")
+            target_floor = action.get("target_floor", 1)
+
             if item not in self.cargo_registry:
                 # 미등록 화물 → 목적지에 자동 등록하고 바로 배치 완료 처리
                 self._log(f"[자동 등록] 화물 '{item}'이 등록부에 없어 '{destination}'에 신규 등록합니다.")
                 self.cargo_registry[item] = destination
+                
+                # 추가 정보로 빈 세부정보 생성 후 층수/기반 설정
+                detail = self.cargo_details.get(item, {})
+                detail["기반ArUco"] = target_aruco_id
+                detail["층수"] = str(target_floor)
+                self.cargo_details[item] = detail
+                
                 save_cargo_registry(self.cargo_registry)
+                save_cargo_details(self.cargo_details)
+                
                 if self.on_cargo_updated:
                     self.on_cargo_updated()
                 self.result_label.configure(
-                    text=f"[신규 등록 완료] 화물 '{item}' → '{destination}'에 등록되었습니다.",
+                    text=f"[신규 등록 완료] 화물 '{item}' → '{destination}' (Base: {target_aruco_id}, {target_floor}층)",
                     text_color="#28C76F",
                 )
                 return True
 
-            self._log(f"[LLM 해석] '{command}' -> 화물={item}, 목적지={destination}")
-            self._execute_cargo_single(item, destination)
+            self._log(f"[LLM 해석] '{command}' -> 화물={item}, 목적지={destination}, Base={target_aruco_id}, Floor={target_floor}")
+            self._execute_cargo_single(item, destination, target_aruco_id, target_floor)
             return True
 
         if action_type == "cargo_bulk_by_location":
@@ -572,6 +585,39 @@ class CommandPopup(ctk.CTkToplevel):
                 return False
             self._log(f"[LLM 해석] '{command}' -> 화물종류='{cargo_type}' 전체를 '{destination}'로 이동")
             self._execute_cargo_bulk_by_type(cargo_type, destination)
+            return True
+
+        if action_type == "query_location":
+            item = action.get("item", "").strip()
+            if not item:
+                self.result_label.configure(text="[조회 실패] 위치를 확인할 대상이 명확하지 않습니다.", text_color="#EA5455")
+                return True
+                
+            self._log(f"[LLM 해석] '{command}' -> '{item}' 위치 조회")
+            
+            # 1) 차량 검색
+            if "차" in item or "agv" in item.lower():
+                for idx, pos in enumerate(self.vehicle_positions):
+                    if str(idx+1) in item or ("yellow" in item.lower() and idx == 0) or ("blue" in item.lower() and idx == 1):
+                        self.result_label.configure(text=f"[위치 조회] 차량 {idx+1}은(는) 현재 '{pos}'에 대기 중입니다.", text_color="#00CFE8")
+                        return True
+                self.result_label.configure(text=f"[위치 조회] 전체 {len(self.vehicle_positions)}대의 차량이 맵 상에 있습니다. 레이더 뷰를 확인하세요.", text_color="#00CFE8")
+                return True
+                
+            # 2) 화물 검색
+            found = False
+            for cargo, loc in self.cargo_registry.items():
+                if item in cargo or cargo in item:
+                    detail = self.cargo_details.get(cargo, {})
+                    floor = detail.get("층수", "1")
+                    base = detail.get("기반ArUco", "")
+                    base_str = f", 기반: {base}" if base else ""
+                    self.result_label.configure(text=f"[위치 조회] '{cargo}' 화물은 '{loc}' ({floor}층{base_str})에 있습니다.", text_color="#00CFE8")
+                    found = True
+                    break
+                    
+            if not found:
+                self.result_label.configure(text=f"[위치 조회] 시스템에 '{item}' 객체가 등록되어 있지 않거나 찾을 수 없습니다.", text_color="#EA5455")
             return True
 
         if action_type == "travel":
@@ -606,50 +652,6 @@ class CommandPopup(ctk.CTkToplevel):
                     ),
                 )
             except (VisualNavigationError, CentralControlApiError) as exc:
-                self._log(f'[VLM 객체 접근 실패] {exc}')
-                self.result_label.configure(
-                    text=f'[VLM 객체 접근 실패] {exc}',
-                    text_color='#EA5455',
-                )
-                return True
-
-            command_id = response.get('command_id', 'unknown')
-            self._log(
-                '[VLM 객체 접근 좌표 계산] '
-                f'index={selected["detection_index"]}, '
-                f'label={selected["label"]}, '
-                f'mode={"parking" if selected["label"] == "B-1" else "approach"}, '
-                f'side={action.get("approach_side")}, '
-                f'target={target}, heading={heading}, '
-                f'command_id={command_id}'
-            )
-            self.result_label.configure(
-                text=(
-                    '[VLM 객체 접근 명령 전송 완료]\n'
-                    f'객체={selected["label"]}, '
-                    f'방식={"주차" if selected["label"] == "B-1" else action.get("approach_side")}\n'
-                    f'목표={target}, 방향={heading}'
-                ),
-                text_color='#28C76F',
-            )
-            return True
-
-        if action_type == "pixel_navigation":
-            target = action.get("target")
-            heading = action.get("heading")
-            try:
-                validate_pixel_navigation(
-                    target,
-                    heading,
-                    image_width,
-                    image_height,
-                    detection_summary,
-                )
-                response = CentralControlClient().send_pixel_goal(
-                    target,
-                    heading,
-                )
-            except (VisualNavigationError, CentralControlApiError) as exc:
                 self._log(f"[VLM 좌표 전송 실패] {exc}")
                 self.result_label.configure(
                     text=f"[VLM 좌표 전송 실패] {exc}",
@@ -670,6 +672,126 @@ class CommandPopup(ctk.CTkToplevel):
                     f"명령 ID={command_id}"
                 ),
                 text_color="#28C76F",
+            )
+            return True
+
+        if action_type == "bringup":
+            color_str = str(action.get("color", "")).lower().strip()
+            
+            if "blue" in color_str or "파란" in color_str or "파랑" in color_str:
+                domain_id = 12
+                ip_address = "192.168.0.102"
+                robot_name = "Blue"
+            elif "yellow" in color_str or "노란" in color_str or "노랑" in color_str or "옐로우" in color_str:
+                domain_id = 13
+                ip_address = "192.168.0.96"
+                robot_name = "Yellow"
+            else:
+                self._log(f"[액션 무시] 지원하지 않는 색상이거나 색상을 인식하지 못했습니다: {color_str}")
+                return False
+                
+            self._log(f"[LLM 해석] '{command}' -> {robot_name} 로봇 시동 (Bringup)")
+            
+            import subprocess
+            import threading
+            import time
+            
+            session_name = f"pinky_bringup_{robot_name.lower()}"
+            cmd_str = f"export ROS_DOMAIN_ID={domain_id}; ros2 launch pinky bringup_robot.launch.xml"
+            title = f"Pinky Bringup (Domain: {domain_id})"
+            
+            subprocess.run(["/usr/bin/tmux", "kill-session", "-t", session_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # 터미널 창을 띄우지 않고 백그라운드(숨김) 모드로 tmux 세션 시작
+            subprocess.run(["/usr/bin/tmux", "new-session", "-d", "-s", session_name, f"ssh -tt pinky@{ip_address}"])
+            
+            def auto_type():
+                # 1. Bringup 실행
+                time.sleep(5.0)
+                subprocess.run(["/usr/bin/tmux", "send-keys", "-t", session_name, "1", "Enter"])
+                time.sleep(5.0)
+                subprocess.run(["/usr/bin/tmux", "send-keys", "-t", session_name, cmd_str, "Enter"])
+                
+                # 자동으로 불(LED)도 켬 (Yellow, Blue 공통)
+                # 2. LED Server 및 Service Call 실행 (단일 터미널)
+                time.sleep(5.0)  # Bringup이 어느정도 올라오길 잠시 대기
+                led_session = f"pinky_led_{robot_name.lower()}"
+                subprocess.run(["/usr/bin/tmux", "kill-session", "-t", led_session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # 터미널 창을 띄우지 않고 백그라운드(숨김) 모드로 tmux 세션 시작
+                subprocess.run(["/usr/bin/tmux", "new-session", "-d", "-s", led_session, f"ssh -tt pinky@{ip_address}"])
+                time.sleep(5.0)
+                subprocess.run(["/usr/bin/tmux", "send-keys", "-t", led_session, "1", "Enter"])
+                time.sleep(5.0)
+                
+                # LED 서버를 백그라운드(&)로 실행
+                led_run_cmd = f"export ROS_DOMAIN_ID={domain_id}; ros2 run pinky led_server &"
+                subprocess.run(["/usr/bin/tmux", "send-keys", "-t", led_session, led_run_cmd, "Enter"])
+                
+                # 5초 지연시간 후 같은 터미널에 서비스 호출 명령어 입력
+                time.sleep(5.0)
+                if robot_name == "Yellow":
+                    r, g, b = 255, 255, 0
+                else:
+                    r, g, b = 0, 0, 255
+                    
+                led_srv_cmd = f"export ROS_DOMAIN_ID={domain_id}; ros2 service call /set_led pinky/srv/SetLed \"{{command: 'fill', r: {r}, g: {g}, b: {b}}}\""
+                subprocess.run(["/usr/bin/tmux", "send-keys", "-t", led_session, led_srv_cmd, "Enter"])
+                    
+            threading.Thread(target=auto_type, daemon=True).start()
+            
+            self.result_label.configure(
+                text=f"[{robot_name} 로봇 시동]\n{ip_address}(도메인 {domain_id})으로 자동 연결하여 Bringup을 실행합니다.",
+                text_color="#28C76F",
+            )
+            return True
+
+        if action_type == "shutdown":
+            color_str = str(action.get("color", "")).lower().strip()
+            
+            if "blue" in color_str or "파란" in color_str or "파랑" in color_str:
+                robot_name = "Blue"
+                ip_address = "192.168.0.102"
+            elif "yellow" in color_str or "노란" in color_str or "노랑" in color_str or "옐로우" in color_str:
+                robot_name = "Yellow"
+                ip_address = "192.168.0.96"
+            else:
+                self._log(f"[액션 무시] 지원하지 않는 색상이거나 색상을 인식하지 못했습니다: {color_str}")
+                return False
+                
+            self._log(f"[LLM 해석] '{command}' -> {robot_name} 로봇 시동 끄기 (Shutdown)")
+            
+            import os
+            import subprocess
+            import threading
+            import time
+            
+            def auto_shutdown():
+                domain_id = 12 if robot_name == "Blue" else 13
+                led_session = f"pinky_led_{robot_name.lower()}"
+                
+                # 1. 이미 열려 있는 기존 LED 터미널에 조명 끄기(r:0, g:0, b:0) 서비스 명령 즉시 전송
+                # (새로 SSH 연결할 필요 없이, 백그라운드(&)로 실행 중인 터미널의 프롬프트를 재활용)
+                off_cmd = f"export ROS_DOMAIN_ID={domain_id}; ros2 service call /set_led pinky/srv/SetLed \"{{command: 'fill', r: 0, g: 0, b: 0}}\""
+                subprocess.run(["/usr/bin/tmux", "send-keys", "-t", led_session, off_cmd, "Enter"])
+                
+                # 서비스가 처리되고 조명이 물리적으로 꺼질 때까지 충분히 대기
+                time.sleep(5.0)
+                
+                # 2. 모든 세션 및 프로세스 완전 종료
+                try:
+                    subprocess.run(["/usr/bin/tmux", "kill-session", "-t", f"pinky_bringup_{robot_name.lower()}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["/usr/bin/tmux", "kill-session", "-t", f"pinky_teleop_{robot_name.lower()}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["/usr/bin/tmux", "kill-session", "-t", led_session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # pkill은 IP를 통해 해당 로봇으로 가는 SSH 세션만 닫습니다.
+                    os.system(f"pkill -9 -f 'ssh -tt pinky@{ip_address}'")
+                except Exception as e:
+                    print(f"[종료 실패] 프로세스 강제 종료 중 오류: {e}")
+                    
+            threading.Thread(target=auto_shutdown, daemon=True).start()
+                
+            self.result_label.configure(
+                text=f"[{robot_name} 로봇 시동 종료]\nLED를 끄고 모든 원격 연결을 종료하는 중입니다...",
+                text_color="#EA5455",
             )
             return True
 
@@ -694,7 +816,7 @@ class CommandPopup(ctk.CTkToplevel):
             return
 
         self._log(f"[명령 해석] '{command}' -> 화물={item}, 목적지={destination}")
-        self._execute_cargo_single(item, destination)
+        self._execute_cargo_single(item, destination, "", 1)
 
     def _assign_next_vehicle(self) -> Tuple[int, str]:
         """다음 작업을 맡을 차량 번호와, 그 차량이 지금 있는 위치(출발점)를 정합니다.
@@ -705,15 +827,131 @@ class CommandPopup(ctk.CTkToplevel):
         self.next_vehicle_index = (self.next_vehicle_index + 1) % len(self.vehicle_positions)
         return vehicle_idx, start_location
 
-    def _execute_cargo_single(self, item: str, destination: str) -> None:
-        """화물 하나를 목적지까지 이동시키고, 즉시 화물 등록부를 갱신/저장합니다."""
+    def _calculate_target_info(self, location: str) -> tuple[int, str]:
+        # 바닥(1층) 고유 ArUco 매핑
+        base_aruco_map = {
+            "A-1-1": "11",
+            "A-1-2": "12",
+            "A-2-1": "13",
+            "A-2-2": "14",
+            "A-3-1": "15",
+            "A-3-2": "16"
+        }
+        
+        existing_at_loc = [
+            d for n, d in self.cargo_details.items()
+            if self.cargo_registry.get(n) == location
+        ]
+        if not existing_at_loc:
+            # 해당 구역에 화물이 없으면 1층 배정 및 바닥 고유 ArUco 반환
+            return 1, base_aruco_map.get(location, "")
+        # 최상단 화물을 찾아, 그 화물의 '컨테이너ID'를 새 화물의 '기반ArUco'로 상속
+        top_cargo = max(existing_at_loc, key=lambda d: int(d.get("층수", "1")))
+        max_floor = int(top_cargo.get("층수", "1"))
+        inherited_aruco = top_cargo.get("컨테이너ID", "")
+        
+        return max_floor + 1, inherited_aruco
+
+    def _execute_cargo_single(self, item: str, destination: str, target_aruco_id: str = "", target_floor: int = 1) -> None:
+        """화물 하나를 목적지까지 이동시키고, 즉시 화물 등록부를 갱신/저장합니다. (언스택/리스택 포함)"""
+        current_loc = self.cargo_registry.get(item)
+        if not current_loc:
+            self.result_label.configure(text=f"'{item}'의 현재 위치를 알 수 없습니다.", text_color="#EA5455")
+            return
+            
+        current_floor = int(self.cargo_details.get(item, {}).get("층수", "1"))
+        
+        # 1. 대상 화물 위에 쌓인 화물들 찾기
+        cargos_on_top = []
+        for other_item, other_loc in self.cargo_registry.items():
+            if other_loc == current_loc and other_item != item:
+                other_floor = int(self.cargo_details.get(other_item, {}).get("층수", "1"))
+                if other_floor > current_floor:
+                    cargos_on_top.append((other_item, other_floor))
+        
+        if cargos_on_top:
+            self._log(f"[Unstacking 감지] '{item}' 위에 {len(cargos_on_top)}개의 화물이 있어 임시 이동을 시작합니다.")
+            # 층수가 높은 것부터 순서대로 (맨 위부터)
+            cargos_on_top.sort(key=lambda x: x[1], reverse=True)
+            
+            # 임시 구역 찾기 (하역장/크레인/대기장소가 아닌 일반 적재구역 중, 최대 3층을 넘지 않는 곳)
+            valid_locs = [loc for loc in self.locations.keys() if not any(kw in loc for kw in ["하역장", "회차", "크레인", "대기"])]
+            
+            # 각 위치별 현재 쌓여있는 층수(화물 개수) 파악
+            loc_counts = {loc: 0 for loc in valid_locs}
+            for l in self.cargo_registry.values():
+                if l in loc_counts:
+                    loc_counts[l] += 1
+                    
+            needed_space = len(cargos_on_top)
+            # 현재 위치(current_loc)와 최종 목적지(destination)는 제외하고, 짐을 옮겨도 총 3층 이하인 곳을 후보로 선정
+            candidate_locs = [loc for loc in valid_locs if loc_counts[loc] + needed_space <= 3 and loc not in (current_loc, destination)]
+            
+            # 만약 모두 꽉 차서 3층을 넘기게 된다면 최후의 수단으로 대기장소 사용
+            temp_location = candidate_locs[0] if candidate_locs else "대기장소 1"
+            self._log(f"[임시 구역 선정] '{temp_location}'으로 상단 화물들을 이동시킵니다.")
+            
+            # 2. 위에 있는 화물들을 임시 구역으로 이동
+            moved_cargos = []
+            for top_item, top_floor in cargos_on_top:
+                temp_floor, temp_aruco = self._calculate_target_info(temp_location)
+                self._log(f"-> {top_item}({top_floor}층) 화물을 임시구역 {temp_location}({temp_floor}층)으로 이동")
+                self._execute_single_step(top_item, temp_location, temp_aruco, temp_floor, is_temp_move=True)
+                moved_cargos.append((top_item, top_floor))
+                
+            # 3. 목표 화물 본래 목적지로 이동
+            actual_target_floor, actual_target_aruco = target_floor, target_aruco_id
+            if target_floor == 1 and not target_aruco_id:
+                actual_target_floor, actual_target_aruco = self._calculate_target_info(destination)
+                
+            self._log(f"-> 목표 화물 '{item}'을(를) 최종 목적지 '{destination}'({actual_target_floor}층)으로 이동")
+            self._execute_single_step(item, destination, actual_target_aruco, actual_target_floor, is_temp_move=False)
+            
+            # 4. 임시 구역에 뒀던 상단 화물들을 다시 원래 구역으로 원상복구
+            self._log(f"[Restacking] 임시 구역에 둔 화물들을 다시 '{current_loc}'으로 복귀시킵니다.")
+            # 다시 돌아올 때는 가장 아래(원래 층수가 낮았던 것)부터
+            moved_cargos.sort(key=lambda x: x[1])
+            
+            for top_item, original_floor in moved_cargos:
+                new_floor, new_aruco = self._calculate_target_info(current_loc)
+                self._log(f"<- {top_item} 화물을 '{current_loc}'의 {new_floor}층으로 복귀")
+                self._execute_single_step(top_item, current_loc, new_aruco, new_floor, is_temp_move=True)
+                
+            self.result_label.configure(
+                text=f"[순차 이동 완료] 상단 화물 대피 및 '{item}' 이동 후 원상복구 완료",
+                text_color="#28C76F",
+            )
+            
+        else:
+            # 위에 아무것도 없으면 그냥 바로 이동
+            actual_target_floor, actual_target_aruco = target_floor, target_aruco_id
+            if target_floor == 1 and not target_aruco_id:
+                actual_target_floor, actual_target_aruco = self._calculate_target_info(destination)
+            self._execute_single_step(item, destination, actual_target_aruco, actual_target_floor, is_temp_move=False)
+
+    def _generate_auto_note(self, destination: str, target_floor: int, target_aruco_id: str) -> str:
+        if target_floor == 1:
+            return f"{destination} 바닥"
+        
+        # 2층 이상인 경우 Base ArUco(컨테이너ID)를 가진 화물 이름을 찾아 표시
+        if target_aruco_id:
+            for name, d in self.cargo_details.items():
+                if d.get("컨테이너ID") == target_aruco_id and self.cargo_registry.get(name) == destination:
+                    return f"{name} 위 적재"
+        return f"{destination} {target_floor}층 적재"
+
+    def _execute_single_step(self, item: str, destination: str, target_aruco_id: str = "", target_floor: int = 1, is_temp_move: bool = False) -> None:
+        """실제로 화물 하나를 지정된 목적지와 층수로 옮기는 단일 작업입니다."""
         vehicle_idx, start_location = self._assign_next_vehicle()
         try:
             route = build_route(item, destination, self.cargo_registry,
                                 standby_location=start_location, waypoint_rules=self.rules)
         except ValueError as exc:
-            self.result_label.configure(text=str(exc), text_color="#EA5455")
-            self.next_vehicle_index = vehicle_idx  # 롤백: 차량 안 씀
+            if not is_temp_move:
+                self.result_label.configure(text=str(exc), text_color="#EA5455")
+            else:
+                self._log(f"[오류] 경로 생성 실패: {exc}")
+            self.next_vehicle_index = vehicle_idx  # 롤백
             return
 
         is_crane_only = any(step.action == "크레인 전용 이동" for step in route)
@@ -721,17 +959,44 @@ class CommandPopup(ctk.CTkToplevel):
             self.next_vehicle_index = vehicle_idx  # 배차 취소
             self._run_route_log(item, route)
             self.cargo_registry[item] = route[-1].location
+            
+            detail = self.cargo_details.get(item, {})
+            detail["기반ArUco"] = target_aruco_id
+            detail["층수"] = str(target_floor)
+            detail["비고"] = self._generate_auto_note(route[-1].location, target_floor, target_aruco_id)
+            self.cargo_details[item] = detail
+            
             save_cargo_registry(self.cargo_registry)
+            save_cargo_details(self.cargo_details)
             if self.on_cargo_updated:
                 self.on_cargo_updated()
             
             route_text = " → ".join(
                 f"{location_coord_text(step.location, self.locations)}[{step.action}]" for step in route
             )
-            self.result_label.configure(
-                text=f"[크레인 이동 완료] 화물 '{item}' → '{route[-1].location}'\n경로: {route_text}",
-                text_color="#28C76F",
-            )
+            if not is_temp_move:
+                self.result_label.configure(
+                    text=f"[크레인 이동 완료] 화물 '{item}' → '{route[-1].location}'\n경로: {route_text}",
+                    text_color="#28C76F",
+                )
+            
+            # 중앙 서버(ROS)로 JSON 명령 전송 (크레인)
+            try:
+                from central_control_client import CentralControlClient, CentralControlApiError
+                client = CentralControlClient()
+                resp = client.send_cargo_dispatch(
+                    item=item,
+                    destination=route[-1].location,
+                    target_floor=target_floor,
+                    target_aruco_id=target_aruco_id,
+                    is_temp_move=is_temp_move,
+                    vehicle_idx=vehicle_idx,
+                    is_crane_only=True
+                )
+                self._log(f"[API 전송 성공] 크레인 명령 ID: {resp.get('command_id', 'unknown')}")
+            except Exception as e:
+                self._log(f"[API 전송 실패] 중앙 제어 서버 미연결 상태입니다. (DB만 갱신됨): {e}")
+                
             return
 
         self._log(f"[차량 {vehicle_idx + 1}] '{start_location}'에서 출발해 배차됨")
@@ -744,13 +1009,37 @@ class CommandPopup(ctk.CTkToplevel):
                 break
 
         self.cargo_registry[item] = route[-1].location
+        
+        detail = self.cargo_details.get(item, {})
+        detail["기반ArUco"] = target_aruco_id
+        detail["층수"] = str(target_floor)
+        detail["비고"] = self._generate_auto_note(route[-1].location, target_floor, target_aruco_id)
+        self.cargo_details[item] = detail
+        
         self.vehicle_positions[vehicle_idx] = agv_final_loc
         save_cargo_registry(self.cargo_registry)
+        save_cargo_details(self.cargo_details)
         save_vehicle_state(self.vehicle_positions, self.next_vehicle_index)
         record_vehicle_job(vehicle_idx, f"'{item}' → '{route[-1].location}' 이동 완료")
-        self._log(f"[적용 완료] cargo_locations.json에 '{item}': '{route[-1].location}' 로 저장됨")
+        self._log(f"[적용 완료] DB에 '{item}' -> '{route[-1].location}' (Base: {target_aruco_id}, {target_floor}층) 로 저장됨")
 
-        # 이 배차(단건)가 끝났으니, 방금 쓴 차량을 대기장소로 복귀시킴
+        # 중앙 서버(ROS)로 JSON 명령 전송 (AGV 이동 포함)
+        try:
+            from central_control_client import CentralControlClient, CentralControlApiError
+            client = CentralControlClient()
+            resp = client.send_cargo_dispatch(
+                item=item,
+                destination=route[-1].location,
+                target_floor=target_floor,
+                target_aruco_id=target_aruco_id,
+                is_temp_move=is_temp_move,
+                vehicle_idx=vehicle_idx,
+                is_crane_only=False
+            )
+            self._log(f"[API 전송 성공] 차량 이동 명령 ID: {resp.get('command_id', 'unknown')}")
+        except Exception as e:
+            self._log(f"[API 전송 실패] 중앙 제어 서버 미연결 상태입니다. (DB만 갱신됨): {e}")
+
         self._return_used_vehicles_to_standby([vehicle_idx])
 
         if self.on_cargo_updated:
@@ -759,10 +1048,11 @@ class CommandPopup(ctk.CTkToplevel):
         route_text = " → ".join(
             f"{location_coord_text(step.location, self.locations)}[{step.action}]" for step in route
         )
-        self.result_label.configure(
-            text=f"[화물 이동 완료] 화물 '{item}' → '{route[-1].location}'\n경로: {route_text}",
-            text_color="#28C76F",
-        )
+        if not is_temp_move:
+            self.result_label.configure(
+                text=f"[화물 이동 완료] 화물 '{item}' → '{route[-1].location}'\n경로: {route_text}",
+                text_color="#28C76F",
+            )
 
     def _move_items_to(self, items: List[str], destination: str, label: str) -> List[str]:
         """items에 있는 화물명들을 전부 destination으로 이동시키고, 실제로 이동에
@@ -972,11 +1262,23 @@ class CommandPopup(ctk.CTkToplevel):
         self.log_box.configure(state="disabled")
 
 
-def open_command_popup(master, on_cargo_updated=None, initial_text=None) -> CommandPopup:
+def open_command_popup(master, on_cargo_updated=None, initial_text=None):
     """각 화면의 "명령" 버튼에서 호출하는 진입점. 매번 새 팝업을 띄웁니다.
     on_cargo_updated를 넘기면, 화물 위치가 실제로 바뀔 때마다 그 함수가 호출됩니다.
     initial_text를 넘기면, 팝업이 열릴 때 명령 입력창에 그 문구가 미리 채워집니다
     (예: 화물 목록에서 특정 화물의 "🗣️" 버튼을 눌렀을 때 "화물A를 " 를 미리 채워주는 식)."""
+    # 권한 체크 (master가 AGVControlCenter 내부에 있을 때만 작동)
+    try:
+        app = master.winfo_toplevel()
+        if hasattr(app, "current_user_id") and app.current_user_id:
+            role = app.USERS.get(app.current_user_id, {}).get("role", "")
+            if role != "최고 관리자 (Admin)":
+                from tkinter import messagebox
+                messagebox.showerror("접근 거부", "자율주행 및 로봇 제어 명령 권한이 없습니다.\n(최고 관리자 전용 기능)", parent=master)
+                return None
+    except Exception:
+        pass
+        
     return CommandPopup(master, on_cargo_updated=on_cargo_updated, initial_text=initial_text)
 
 

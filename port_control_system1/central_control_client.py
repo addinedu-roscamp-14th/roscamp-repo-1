@@ -76,6 +76,56 @@ class CentralControlClient:
             )
         return body
 
+    def send_cargo_dispatch(
+        self,
+        item: str,
+        destination: str,
+        target_floor: int = 1,
+        target_aruco_id: str = "",
+        command_id: str = None,
+        is_temp_move: bool = False,
+        vehicle_idx: int = None,
+        is_crane_only: bool = False,
+    ):
+        """Send a cargo dispatch command to the central ROS gateway."""
+        command_id = command_id or f'cargo-{uuid.uuid4()}'
+        headers = {'Content-Type': 'application/json'}
+        if self.token:
+            headers['X-Control-Token'] = self.token
+
+        try:
+            response = requests.post(
+                f'{self.base_url}/api/v1/navigation/cargo-move',
+                headers=headers,
+                json={
+                    'command_id': command_id,
+                    'item': item,
+                    'destination': destination,
+                    'target_floor': target_floor,
+                    'target_aruco_id': target_aruco_id,
+                    'is_temp_move': is_temp_move,
+                    'vehicle_idx': vehicle_idx,
+                    'is_crane_only': is_crane_only,
+                },
+                timeout=self.timeout_sec,
+            )
+        except requests.RequestException as exc:
+            raise CentralControlApiError(
+                f'중앙제어 API에 화물 이동 명령을 전송할 수 없습니다: {exc}'
+            ) from exc
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = {'detail': response.text.strip() or 'empty response'}
+        if not response.ok:
+            raise CentralControlApiError(
+                '중앙제어 API가 화물 이동 명령을 거부했습니다 '
+                f'(HTTP {response.status_code}): '
+                f'{body.get("detail", body)}'
+            )
+        return body
+
     @staticmethod
     def _pixel_payload(value, field_name):
         if not isinstance(value, dict):

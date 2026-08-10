@@ -64,8 +64,31 @@ ctk.set_default_color_theme("blue")
 
 
 class AGVControlCenter(ctk.CTk):
+    USERS = {
+        "admin": {
+            "name": "Operator OP-084",
+            "role": "최고 관리자 (Admin)",
+            "permissions": "전체 시스템 제어, 긴급 정지, 설정 변경",
+            "password": "1"
+        },
+        "manager": {
+            "name": "Manager MG-042",
+            "role": "현장 관리자 (Manager)",
+            "permissions": "시스템 모니터링, 단순 화물 조회, 화물 추가 및 삭제",
+            "password": "1"
+        },
+        "viewer": {
+            "name": "Viewer VI-001",
+            "role": "일반 작업자 (Operator)",
+            "permissions": "시스템 모니터링, 단순 화물 조회",
+            "password": "1"
+        }
+    }
+    
     def __init__(self):
         super().__init__()
+        
+        self.current_user_id = None
 
         self.title("스마트 항만 통합 관제 시스템")
         self.geometry("1400x900")
@@ -107,11 +130,17 @@ class AGVControlCenter(ctk.CTk):
             text_color="#f0ad4e",
         )
         self.ros_status_label.pack(side="left", padx=8)
-        ctk.CTkLabel(user_info, text="Operator OP-084", font=ctk.CTkFont(family="Inter", size=13, weight="normal"), text_color="#c4c4c5").pack(side="left", padx=16)
-        avatar = ctk.CTkFrame(user_info, width=32, height=32, corner_radius=16, fg_color="#39393a", border_width=1, border_color="#39393a")
-        avatar.pack(side="left")
+        self.user_name_label = ctk.CTkLabel(user_info, text="", font=ctk.CTkFont(family="Inter", size=13, weight="normal"), text_color="#c4c4c5", cursor="hand2")
+        self.user_name_label.pack(side="left", padx=16)
+        
+        self.avatar = ctk.CTkFrame(user_info, width=32, height=32, corner_radius=16, fg_color="#39393a", border_width=1, border_color="#39393a", cursor="hand2")
+        self.avatar.pack(side="left")
+        
+        # 아바타나 이름 클릭 시 프로필 팝업 띄우기
+        self.user_name_label.bind("<Button-1>", lambda e: self.show_user_profile())
+        self.avatar.bind("<Button-1>", lambda e: self.show_user_profile())
 
-        # 실제 콘텐츠가 들어갈 영역
+        # 실제 콘텐츠가 들어갈 영역 (복구)
         self.content_frame = ctk.CTkFrame(self.main_area, fg_color="transparent")
         self.content_frame.grid(row=1, column=0, sticky="nsew")
         self.content_frame.grid_columnconfigure(0, weight=1)
@@ -120,6 +149,78 @@ class AGVControlCenter(ctk.CTk):
         self.current_view = None
         self.show_view("dashboard")
         self.after(500, self._update_ros_status)
+        
+        # 메인 UI를 가리는 꽉 찬 로그인 스크린 생성
+        self.login_frame = ctk.CTkFrame(self, fg_color="#131314", corner_radius=0)
+        self.show_login_screen()
+
+    def show_login_screen(self):
+        """기존 화면을 덮고 로그인 화면을 띄웁니다."""
+        self.current_user_id = None
+        self.login_frame.place(x=0, y=0, relwidth=1, relheight=1)
+        
+        for widget in self.login_frame.winfo_children():
+            widget.destroy()
+            
+        center_box = ctk.CTkFrame(self.login_frame, fg_color="#1b1b1c", corner_radius=15, width=400, height=450)
+        center_box.place(relx=0.5, rely=0.5, anchor="center")
+        center_box.pack_propagate(False)
+        
+        ctk.CTkLabel(center_box, text="PORT CONTROL", font=ctk.CTkFont(family="Inter", size=28, weight="bold"), text_color="#e6e6e6").pack(pady=(40, 10))
+        ctk.CTkLabel(center_box, text="Smart Port Integrated Management", font=ctk.CTkFont(family="Inter", size=14), text_color="#8e8e93").pack(pady=(0, 40))
+        
+        # 계정 선택
+        names = [u["name"] for u in self.USERS.values()]
+        self.login_user_var = ctk.StringVar(value=names[0])
+        user_menu = ctk.CTkOptionMenu(center_box, variable=self.login_user_var, 
+                                      values=names,
+                                      font=ctk.CTkFont(size=14), height=40)
+        user_menu.pack(fill="x", padx=40, pady=(0, 20))
+        
+        # 비밀번호 입력
+        self.login_pw_entry = ctk.CTkEntry(center_box, placeholder_text="비밀번호", show="*", font=ctk.CTkFont(size=14), height=40)
+        self.login_pw_entry.pack(fill="x", padx=40, pady=(0, 10))
+        
+        self.login_error_label = ctk.CTkLabel(center_box, text="", text_color="#ff453a", font=ctk.CTkFont(size=12))
+        self.login_error_label.pack(pady=(0, 20))
+        
+        ctk.CTkButton(center_box, text="로그인", font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold"),
+                      height=45, fg_color="#2e86c1", hover_color="#3498db", command=self.handle_login).pack(fill="x", padx=40)
+                      
+    def handle_login(self):
+        selected_name = self.login_user_var.get()
+        pw = self.login_pw_entry.get()
+        
+        uid = None
+        for k, v in self.USERS.items():
+            if v["name"] == selected_name:
+                uid = k
+                break
+        
+        if uid and self.USERS[uid]["password"] == pw:
+            self.current_user_id = uid
+            self.user_name_label.configure(text=self.USERS[uid]["name"])
+            self.login_pw_entry.delete(0, "end") # 다음 로그인을 위해 비밀번호 초기화
+            self.login_error_label.configure(text="")
+            self.login_frame.place_forget()
+        else:
+            self.login_error_label.configure(text="비밀번호가 일치하지 않습니다.")
+
+    def show_user_profile(self):
+        from user_profile_popup import UserProfilePopup
+        if hasattr(self, "profile_popup") and self.profile_popup.winfo_exists():
+            self.profile_popup.focus()
+            return
+            
+        uid = self.current_user_id
+        if not uid: return
+        
+        user_info = self.USERS[uid]
+        self.profile_popup = UserProfilePopup(self, 
+            current_user=user_info["name"],
+            role=user_info["role"],
+            permissions=user_info["permissions"]
+        )
 
     def setup_sidebar(self) -> None:
         self.sidebar = ctk.CTkFrame(self, width=280, fg_color="#1b1b1c", corner_radius=0)
@@ -192,6 +293,11 @@ class AGVControlCenter(ctk.CTk):
 
     def activate_emergency_stop(self) -> None:
         """Latch a local ROS cmd_vel stop and show the operator alert."""
+        from tkinter import messagebox
+        if self.current_user_id and self.USERS.get(self.current_user_id, {}).get("role") != "최고 관리자 (Admin)":
+            messagebox.showerror("접근 거부", "비상 정지 발동 권한이 없습니다.\n(최고 관리자 전용 기능)")
+            return
+            
         if self.ros_bridge.emergency_stop():
             self.show_emergency_popup(
                 "EMERGENCY_STOP",
@@ -229,6 +335,10 @@ class AGVControlCenter(ctk.CTk):
         elif view_key == "stream":
             self.current_view = StreamView(self.content_frame)
         elif view_key == "settings":
+            from tkinter import messagebox
+            if self.current_user_id and self.USERS.get(self.current_user_id, {}).get("role") != "최고 관리자 (Admin)":
+                messagebox.showerror("접근 거부", "시스템 설정 탭에 접근할 권한이 없습니다.\n(최고 관리자 전용 메뉴)")
+                return
             self.current_view = SettingsView(self.content_frame)
         else:
             raise ValueError(f"알 수 없는 화면: {view_key}")
