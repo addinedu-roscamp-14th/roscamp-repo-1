@@ -1,0 +1,21 @@
+uint8 UNCONFIGURED=0
+uint8 OFFLINE=1
+uint8 READY=2
+uint8 BUSY=3
+uint8 STOPPED=4
+uint8 WAITING_OPERATOR=5
+uint8 ERROR=6
+
+std_msgs/Header header
+string arm_id
+uint8 state
+string state_text
+bool ready
+string current_command_id
+string current_mission_id
+string current_operation
+string operation_id
+string phase
+float32 progress
+string last_error
+float32 telemetry_age_sec

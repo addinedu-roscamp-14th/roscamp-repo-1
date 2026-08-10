@@ -163,6 +163,84 @@ class CentralControlClient:
         response.raise_for_status()
         return response.json()
 
+    def send_arm_command(
+        self,
+        operation,
+        arm_id='arm2',
+        command_id=None,
+        mission_id='',
+        destination_slot='',
+        source_id=-1,
+        destination_id=-1,
+        vehicle_id='',
+        final_for_vehicle=False,
+    ):
+        """Queue one central robot-arm command."""
+        return self._request_json(
+            'POST',
+            '/api/v1/arms/commands',
+            {
+                'command_id': command_id or f'arm-{uuid.uuid4()}',
+                'mission_id': mission_id,
+                'arm_id': arm_id,
+                'operation': operation,
+                'destination_slot': destination_slot,
+                'source_id': int(source_id),
+                'destination_id': int(destination_id),
+                'vehicle_id': vehicle_id,
+                'final_for_vehicle': bool(final_for_vehicle),
+            },
+        )
+
+    def stop_arm(self, arm_id='arm2'):
+        """Request an immediate stop through the central ARM dispatcher."""
+        return self._request_json(
+            'POST', f'/api/v1/arms/{arm_id}/stop', {}
+        )
+
+    def update_arrival_roi(self, roi_normalized):
+        """Set the normalized top-down ROI used for vessel arrival events."""
+        if len(roi_normalized) != 4:
+            raise CentralControlApiError('입항 ROI는 네 좌표가 필요합니다')
+        x_min, y_min, x_max, y_max = map(float, roi_normalized)
+        return self._request_json(
+            'PUT',
+            '/api/v1/autonomy/arrival-roi',
+            {
+                'x_min': x_min,
+                'y_min': y_min,
+                'x_max': x_max,
+                'y_max': y_max,
+            },
+        )
+
+    def _request_json(self, method, path, payload):
+        headers = {'Content-Type': 'application/json'}
+        if self.token:
+            headers['X-Control-Token'] = self.token
+        try:
+            response = requests.request(
+                method,
+                f'{self.base_url}{path}',
+                headers=headers,
+                json=payload,
+                timeout=self.timeout_sec,
+            )
+        except requests.RequestException as exc:
+            raise CentralControlApiError(
+                f'중앙제어 API에 연결할 수 없습니다: {exc}'
+            ) from exc
+        try:
+            body = response.json()
+        except ValueError:
+            body = {'detail': response.text.strip() or 'empty response'}
+        if not response.ok:
+            raise CentralControlApiError(
+                f'중앙제어 API 거부 (HTTP {response.status_code}): '
+                f'{body.get("detail", body)}'
+            )
+        return body
+
     @staticmethod
     def _pixel_payload(value, field_name):
         if not isinstance(value, dict):

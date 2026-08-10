@@ -1,0 +1,20 @@
+string command_id
+string mission_id
+string arm_id
+string operation
+string destination_slot
+int32 source_id
+int32 destination_id
+string vehicle_id
+bool final_for_vehicle
+---
+bool success
+uint16 error_code
+string message
+string operation_id
+bool vehicle_release_allowed
+---
+string arm_id
+string phase
+float32 progress
+string message

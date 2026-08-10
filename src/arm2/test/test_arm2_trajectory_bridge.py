@@ -3,12 +3,12 @@
 import math
 
 from arm2.arm2_jetcobot_trajectory_bridge import (
+    JetCobotTrajectoryBridge,
     adaptive_joint_command_degrees,
     clamp_measured_joints_for_planning,
     cumulative_joint_travel_degrees,
     duration_seconds,
     interpolate_positions,
-    JetCobotTrajectoryBridge,
     joint_errors_degrees,
     validate_home_angles,
 )

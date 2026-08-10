@@ -31,12 +31,15 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'arm_dispatcher = central.arm_dispatcher:main',
+            'autonomy_orchestrator = central.autonomy_orchestrator:main',
             'camera_to_map_bridge = central.camera_to_map_bridge:main',
             'control_gateway = central.control_gateway:main',
             'fleet_collision_supervisor = '
             'central.fleet_collision_supervisor:main',
             'fleet_dispatcher = central.fleet_dispatcher:main',
             'map_relay = central.map_relay:main',
+            'port_event_detector = central.port_event_detector:main',
             'rqt_click_to_target = central.rqt_click_to_target:main',
         ],
     },

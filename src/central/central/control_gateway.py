@@ -15,14 +15,17 @@ import uuid
 from geometry_msgs.msg import PointStamped
 
 from nav_msgs.msg import Odometry
-from porter_interfaces.msg import PixelNavigationCommand, VehicleState
+from porter_interfaces.action import DispatchArmCommand
+from porter_interfaces.msg import ArmState, PixelNavigationCommand, VehicleState
 
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.executors import (
     ExternalShutdownException,
     SingleThreadedExecutor,
 )
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from std_msgs.msg import Float32, String
 from std_srvs.srv import SetBool, Trigger
@@ -97,6 +100,9 @@ class CentralControlGateway(Node):
         self.declare_parameter('image_height', 480)
         self.declare_parameter('minimum_heading_distance_px', 10.0)
         self.declare_parameter('telemetry_stale_timeout_sec', 2.0)
+        self.declare_parameter(
+            'arrival_roi_normalized', [0.0, 0.0, 0.35, 0.35]
+        )
 
         self.host = str(self.get_parameter('host').value)
         self.port = int(self.get_parameter('port').value)
@@ -139,6 +145,11 @@ class CentralControlGateway(Node):
             'last_map_target': None,
             'last_command': None,
             'vehicles': {},
+            'arms': {},
+            'last_arm_result': None,
+            'arrival_roi': list(
+                self.get_parameter('arrival_roi_normalized').value
+            ),
             'b1_zone': 'B-1:UNKNOWN',
         }
         self._received_at = {
@@ -162,6 +173,14 @@ class CentralControlGateway(Node):
             String,
             self.command_status_topic,
             10,
+        )
+        config_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.arrival_roi_publisher = self.create_publisher(
+            String, '/central/autonomy/arrival_roi_config', config_qos
         )
         self.park_request_publisher = self.create_publisher(
             String,
@@ -205,6 +224,27 @@ class CentralControlGateway(Node):
             self._on_zone_state,
             10,
         )
+        for arm_id in ('arm1', 'arm2'):
+            self.create_subscription(
+                ArmState,
+                f'/central/arms/{arm_id}/state',
+                self._on_arm_state,
+                10,
+            )
+        self.create_subscription(
+            String,
+            '/central/arms/results',
+            self._on_arm_result,
+            10,
+        )
+        self._arm_dispatch_client = ActionClient(
+            self,
+            DispatchArmCommand,
+            '/central/arms/dispatch',
+        )
+        self._arm_stop_client = self.create_client(
+            Trigger, '/central/arms/arm2/stop'
+        )
         self._fleet_emergency_client = self.create_client(
             SetBool, '/central/fleet/emergency_stop'
         )
@@ -226,6 +266,9 @@ class CentralControlGateway(Node):
 
         self.get_logger().info(
             f'Central control API: http://{self.host}:{self.port}'
+        )
+        self.publish_arrival_roi(
+            list(self.get_parameter('arrival_roi_normalized').value)
         )
         self.get_logger().info(
             f'AI pixel goals -> {self.target_pixel_topic} '
@@ -310,6 +353,145 @@ class CentralControlGateway(Node):
     def _on_zone_state(self, message):
         with self._lock:
             self._telemetry['b1_zone'] = message.data
+
+    def _on_arm_state(self, message):
+        value = {
+            'arm_id': message.arm_id,
+            'state': int(message.state),
+            'state_text': message.state_text,
+            'ready': bool(message.ready),
+            'current_command_id': message.current_command_id,
+            'current_mission_id': message.current_mission_id,
+            'current_operation': message.current_operation,
+            'operation_id': message.operation_id,
+            'phase': message.phase,
+            'progress': float(message.progress),
+            'last_error': message.last_error,
+            'telemetry_age_sec': float(message.telemetry_age_sec),
+        }
+        with self._lock:
+            self._telemetry['arms'][message.arm_id] = value
+
+    def _on_arm_result(self, message):
+        try:
+            result = json.loads(message.data)
+        except json.JSONDecodeError:
+            result = {'raw': message.data}
+        with self._lock:
+            self._telemetry['last_arm_result'] = result
+
+    def publish_arrival_roi(self, values):
+        if len(values) != 4:
+            raise CommandValidationError('ROI requires four normalized values')
+        x_min, y_min, x_max, y_max = (float(value) for value in values)
+        if not (
+            0.0 <= x_min < x_max <= 1.0
+            and 0.0 <= y_min < y_max <= 1.0
+        ):
+            raise CommandValidationError(
+                'ROI must satisfy 0<=x_min<x_max<=1 and '
+                '0<=y_min<y_max<=1'
+            )
+        roi = [x_min, y_min, x_max, y_max]
+        message = String()
+        message.data = json.dumps({
+            'x_min': x_min,
+            'y_min': y_min,
+            'x_max': x_max,
+            'y_max': y_max,
+        })
+        self.arrival_roi_publisher.publish(message)
+        with self._lock:
+            self._telemetry['arrival_roi'] = roi
+        return {'accepted': True, 'roi_normalized': roi}
+
+    def dispatch_arm_command(self, payload, timeout_sec=3.0):
+        """Queue an ARM action and return after the action server accepts it."""
+        command_id = str(payload.get('command_id') or uuid.uuid4())
+        arm_id = str(payload.get('arm_id') or 'arm2').lower()
+        operation = str(payload.get('operation') or '').lower()
+        if arm_id not in {'arm1', 'arm2'}:
+            raise CommandValidationError('arm_id must be arm1 or arm2')
+        if not operation:
+            raise CommandValidationError('operation is required')
+        with self._dispatch_lock:
+            if command_id in self._recent_command_ids:
+                return {
+                    'accepted': True,
+                    'duplicate': True,
+                    'command_id': command_id,
+                }
+            if not self._arm_dispatch_client.wait_for_server(
+                timeout_sec=0.5
+            ):
+                raise RuntimeError('central ARM dispatcher is unavailable')
+            goal = DispatchArmCommand.Goal()
+            goal.command_id = command_id
+            goal.mission_id = str(payload.get('mission_id') or '')
+            goal.arm_id = arm_id
+            goal.operation = operation
+            goal.destination_slot = str(payload.get('destination_slot') or '')
+            goal.source_id = int(payload.get('source_id', -1))
+            goal.destination_id = int(payload.get('destination_id', -1))
+            goal.vehicle_id = str(payload.get('vehicle_id') or '')
+            goal.final_for_vehicle = bool(
+                payload.get('final_for_vehicle', False)
+            )
+            future = self._arm_dispatch_client.send_goal_async(goal)
+            deadline = time.monotonic() + timeout_sec
+            while not future.done() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not future.done():
+                raise RuntimeError('ARM dispatcher goal acceptance timed out')
+            goal_handle = future.result()
+            if goal_handle is None or not goal_handle.accepted:
+                raise RuntimeError('ARM dispatcher rejected the command')
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(
+                lambda done, cid=command_id: self._log_arm_result(cid, done)
+            )
+            self._recent_command_ids.append(command_id)
+        return {
+            'accepted': True,
+            'duplicate': False,
+            'command_id': command_id,
+            'mission_id': goal.mission_id,
+            'arm_id': arm_id,
+            'operation': operation,
+            'queued': True,
+        }
+
+    def _log_arm_result(self, command_id, future):
+        try:
+            wrapped = future.result()
+            result = wrapped.result
+            level = self.get_logger().info if result.success else self.get_logger().error
+            level(
+                f'ARM command {command_id} completed: '
+                f'success={result.success}, message={result.message}'
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f'ARM command {command_id} result failed: {exc}'
+            )
+
+    def stop_arm(self, arm_id, timeout_sec=3.0):
+        if str(arm_id).lower() != 'arm2':
+            raise CommandValidationError(
+                'ARM1 stop is unavailable until ARM1 is configured'
+            )
+        if not self._arm_stop_client.wait_for_service(timeout_sec=0.5):
+            raise RuntimeError('central ARM2 stop service is unavailable')
+        future = self._arm_stop_client.call_async(Trigger.Request())
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise RuntimeError('ARM2 stop timed out')
+        response = future.result()
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {'accepted': True, 'arm_id': 'arm2', 'message': response.message}
 
     def dispatch_pixel_goal(self, payload):
         """Validate and publish a target/heading pixel pair exactly once."""
@@ -614,6 +796,46 @@ def create_app(
                 status_code=503,
                 detail=str(exc),
             ) from exc
+
+    @app.post('/api/v1/arms/commands')
+    async def arm_command(
+        payload: dict,
+        x_control_token: str | None = header_factory(default=None),
+    ):
+        authorize(x_control_token)
+        try:
+            return node.dispatch_arm_command(payload)
+        except CommandValidationError as exc:
+            raise http_exception_class(status_code=422, detail=str(exc)) from exc
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise http_exception_class(status_code=503, detail=str(exc)) from exc
+
+    @app.post('/api/v1/arms/{arm_id}/stop')
+    async def arm_stop(
+        arm_id: str,
+        x_control_token: str | None = header_factory(default=None),
+    ):
+        authorize(x_control_token)
+        try:
+            return node.stop_arm(arm_id)
+        except CommandValidationError as exc:
+            raise http_exception_class(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise http_exception_class(status_code=503, detail=str(exc)) from exc
+
+    @app.put('/api/v1/autonomy/arrival-roi')
+    async def update_arrival_roi(
+        payload: dict,
+        x_control_token: str | None = header_factory(default=None),
+    ):
+        authorize(x_control_token)
+        try:
+            return node.publish_arrival_roi([
+                payload['x_min'], payload['y_min'],
+                payload['x_max'], payload['y_max'],
+            ])
+        except (KeyError, TypeError, ValueError, CommandValidationError) as exc:
+            raise http_exception_class(status_code=422, detail=str(exc)) from exc
 
     @app.post('/api/v1/emergency-stop')
     async def emergency_stop(

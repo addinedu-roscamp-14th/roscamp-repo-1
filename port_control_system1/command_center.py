@@ -26,6 +26,7 @@ command_center.py
 
 import re
 import time
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 import customtkinter as ctk
@@ -518,7 +519,10 @@ class CommandPopup(ctk.CTkToplevel):
             return False
 
         any_handled = False
-        plan_context = {'predecessor_command_id': ''}
+        plan_context = {
+            'predecessor_command_id': '',
+            'mission_id': f'llm-{uuid.uuid4().hex[:12]}',
+        }
         execution_mode = resolve_execution_mode(command, result)
         exchange_plan = is_reciprocal_zone_exchange(
             actions,
@@ -555,7 +559,10 @@ class CommandPopup(ctk.CTkToplevel):
                     image_width,
                     image_height,
                     (
-                        {'predecessor_command_id': ''}
+                        {
+                            'predecessor_command_id': '',
+                            'mission_id': plan_context['mission_id'],
+                        }
                         if parallel_plan
                         else plan_context
                     ),
@@ -642,6 +649,15 @@ class CommandPopup(ctk.CTkToplevel):
             self._log(f"[LLM 해석] '{command}' -> 위치 이동: {' → '.join(stops)}")
             self._execute_travel(stops)
             return True
+
+        if action_type in {
+            'arm_scan_destinations',
+            'arm_transfer_to_slot',
+            'arm_load_to_trailer',
+            'arm_transfer_by_id',
+            'arm_stop',
+        }:
+            return self._execute_arm_action(action, plan_context)
 
         if action_type == "visual_transfer":
             return self._execute_visual_transfer(
@@ -804,6 +820,101 @@ class CommandPopup(ctk.CTkToplevel):
 
         # type == "unknown" 이거나 예상 밖의 값이면 처리 못 한 것으로 간주
         return False
+
+    def _execute_arm_action(self, action, plan_context):
+        """Validate one whitelisted ARM tool call and queue it centrally."""
+        action_type = str(action.get('type') or '')
+        arm_id = str(action.get('arm_id') or 'arm2').strip().lower()
+        if arm_id != 'arm2':
+            self._log('[ARM 명령 거부] ARM1 서비스 계약은 아직 설정되지 않았습니다.')
+            return True
+        if action_type == 'arm_stop':
+            try:
+                response = CentralControlClient().stop_arm('arm2')
+            except CentralControlApiError as exc:
+                self._log(f'[ARM2 정지 실패] {exc}')
+                self.result_label.configure(
+                    text=f'[ARM2 정지 실패] {exc}', text_color='#EA5455'
+                )
+                return True
+            self._log(f'[ARM2 정지 요청] {response.get("message", "accepted")}')
+            self.result_label.configure(
+                text='[ARM2 정지 요청 전송 완료]', text_color='#28C76F'
+            )
+            return True
+
+        operation_by_type = {
+            'arm_scan_destinations': 'scan_destinations',
+            'arm_transfer_to_slot': 'transfer_to_slot',
+            'arm_load_to_trailer': 'load_to_trailer',
+            'arm_transfer_by_id': 'transfer_by_id',
+        }
+        operation = operation_by_type[action_type]
+        destination_slot = str(action.get('destination_slot') or '').upper()
+        source_id = action.get('source_id', -1)
+        destination_id = action.get('destination_id', -1)
+        vehicle_id = self._extract_vehicle_id(action)
+        valid_slots = {
+            'A-1-1', 'A-1-2', 'A-2-1',
+            'A-2-2', 'A-3-1', 'A-3-2',
+        }
+        try:
+            source_id = int(source_id)
+            destination_id = int(destination_id)
+        except (TypeError, ValueError):
+            self._log(f'[ARM 명령 거부] ID가 정수가 아닙니다: {action}')
+            return True
+        if operation == 'transfer_to_slot' and destination_slot not in valid_slots:
+            self._log(f'[ARM 명령 거부] 잘못된 목적 슬롯: {destination_slot}')
+            return True
+        if operation == 'load_to_trailer' and not 0 <= source_id <= 8:
+            self._log(f'[ARM 명령 거부] source_id는 0..8이어야 합니다: {source_id}')
+            return True
+        if operation == 'transfer_by_id' and (
+            not 0 <= source_id <= 8
+            or destination_id not in set(range(9)) | set(range(11, 17))
+            or source_id == destination_id
+        ):
+            self._log(
+                '[ARM 명령 거부] 창고 내부 source_id/destination_id가 '
+                f'유효하지 않습니다: {source_id}->{destination_id}'
+            )
+            return True
+        vehicle_operation = operation in {'transfer_to_slot', 'load_to_trailer'}
+        final_for_vehicle = bool(action.get('final_for_vehicle', False))
+        if vehicle_operation and final_for_vehicle and not vehicle_id:
+            self._log('[ARM 명령 거부] 차량 출발 승인에는 vehicle_id가 필요합니다.')
+            return True
+        try:
+            response = CentralControlClient().send_arm_command(
+                operation=operation,
+                arm_id='arm2',
+                mission_id=plan_context['mission_id'],
+                destination_slot=destination_slot,
+                source_id=source_id,
+                destination_id=destination_id,
+                vehicle_id=vehicle_id,
+                final_for_vehicle=(final_for_vehicle if vehicle_operation else False),
+            )
+        except CentralControlApiError as exc:
+            self._log(f'[ARM2 명령 전송 실패] {exc}')
+            self.result_label.configure(
+                text=f'[ARM2 명령 전송 실패] {exc}', text_color='#EA5455'
+            )
+            return True
+        self._log(
+            '[ARM2 명령 큐 등록] '
+            f'operation={operation}, mission={response.get("mission_id")}, '
+            f'command={response.get("command_id")}'
+        )
+        self.result_label.configure(
+            text=(
+                '[ARM2 작업 명령 전송 완료]\n'
+                f'작업={operation}, 임무={response.get("mission_id")}'
+            ),
+            text_color='#28C76F',
+        )
+        return True
 
     def _execute_visual_transfer(
         self,

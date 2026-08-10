@@ -1,0 +1,32 @@
+{
+  "id": "r015",
+  "mode": "client",
+  "scouting": {
+    "multicast": {"enabled": false},
+    "gossip": {"enabled": false}
+  },
+  "plugins": {
+    "ros2dds": {
+      "nodename": "zenoh_bridge_arm1",
+      "domain": 15,
+      "ros_automatic_discovery_range": "LOCALHOST",
+      "allow": {
+        "publishers": [],
+        "subscribers": [],
+        "service_servers": [],
+        "service_clients": [],
+        "action_servers": [],
+        "action_clients": []
+      },
+      "queries_timeout": {
+        "default": 5.0,
+        "services": 5.0,
+        "actions": {
+          "send_goal": 5.0,
+          "cancel_goal": 5.0,
+          "get_result": 1800.0
+        }
+      }
+    }
+  }
+}

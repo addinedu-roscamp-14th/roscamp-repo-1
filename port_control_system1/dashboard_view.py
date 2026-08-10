@@ -20,6 +20,7 @@ import requests
 from PIL import Image
 
 from cctv_monitor_view import CCTVMonitorView
+from central_control_client import CentralControlClient
 from ros_control_bridge import AMR_DISPLAY_NAMES, RosControlBridge
 
 # Tailwind Color Palette
@@ -125,6 +126,22 @@ class DashboardView(ctk.CTkFrame):
             text_color=TEXT_SECONDARY, font=self.font_subtitle,
         )
         self.live_feed_label.pack(expand=True, fill="both", padx=5, pady=5)
+        self._arrival_roi = [0.0, 0.0, 0.35, 0.35]
+        self._roi_editing = False
+        self._roi_drag_start = None
+        self._roi_drag_current = None
+        self._central_client = CentralControlClient()
+        self.roi_button = ctk.CTkButton(
+            self.map_frame,
+            text="입항 ROI",
+            width=92,
+            height=30,
+            command=self._toggle_roi_editor,
+        )
+        self.roi_button.place(relx=1.0, x=-14, y=14, anchor="ne")
+        self.live_feed_label.bind("<ButtonPress-1>", self._roi_press)
+        self.live_feed_label.bind("<B1-Motion>", self._roi_motion)
+        self.live_feed_label.bind("<ButtonRelease-1>", self._roi_release)
 
         self._ui_alive = True
         self.update_live_feed()  # 주기적으로 CCTVMonitorView.SHARED_FRAME을 읽어와 표시
@@ -351,6 +368,70 @@ class DashboardView(ctk.CTkFrame):
         from command_center import open_command_popup
         open_command_popup(self)
 
+    def _toggle_roi_editor(self):
+        self._roi_editing = not self._roi_editing
+        self._roi_drag_start = None
+        self._roi_drag_current = None
+        self.roi_button.configure(
+            text="드래그 중" if self._roi_editing else "입항 ROI",
+            fg_color=ACCENT_ORANGE if self._roi_editing else ACCENT_BLUE,
+        )
+
+    def _event_normalized(self, event):
+        width = max(1, self.live_feed_label.winfo_width())
+        height = max(1, self.live_feed_label.winfo_height())
+        return (
+            min(1.0, max(0.0, event.x / width)),
+            min(1.0, max(0.0, event.y / height)),
+        )
+
+    def _roi_press(self, event):
+        if not self._roi_editing:
+            return
+        self._roi_drag_start = self._event_normalized(event)
+        self._roi_drag_current = self._roi_drag_start
+
+    def _roi_motion(self, event):
+        if self._roi_editing and self._roi_drag_start is not None:
+            self._roi_drag_current = self._event_normalized(event)
+
+    def _roi_release(self, event):
+        if not self._roi_editing or self._roi_drag_start is None:
+            return
+        end = self._event_normalized(event)
+        start_x, start_y = self._roi_drag_start
+        end_x, end_y = end
+        roi = [
+            min(start_x, end_x), min(start_y, end_y),
+            max(start_x, end_x), max(start_y, end_y),
+        ]
+        self._roi_drag_start = None
+        self._roi_drag_current = None
+        if roi[2] - roi[0] < 0.02 or roi[3] - roi[1] < 0.02:
+            return
+        self._arrival_roi = roi
+        self._roi_editing = False
+        self.roi_button.configure(text="저장 중", fg_color=ACCENT_ORANGE)
+        threading.Thread(
+            target=self._save_arrival_roi,
+            args=(roi,),
+            daemon=True,
+        ).start()
+
+    def _save_arrival_roi(self, roi):
+        try:
+            self._central_client.update_arrival_roi(roi)
+            text, color = "ROI 저장됨", ACCENT_GREEN
+        except Exception:
+            text, color = "ROI 실패", ALERT_RED
+        self.after(0, lambda: self.roi_button.configure(text=text, fg_color=color))
+        self.after(
+            1800,
+            lambda: self.roi_button.configure(
+                text="입항 ROI", fg_color=ACCENT_BLUE
+            ),
+        )
+
     # ------------------------------------------------------------------
     # 실시간 영상 갱신 (CCTVMonitorView와 프레임 공유)
     # ------------------------------------------------------------------
@@ -367,6 +448,19 @@ class DashboardView(ctk.CTkFrame):
         if frame is not None:
             try:
                 color_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_height, frame_width = color_frame.shape[:2]
+                roi = self._arrival_roi
+                if self._roi_drag_start and self._roi_drag_current:
+                    sx, sy = self._roi_drag_start
+                    ex, ey = self._roi_drag_current
+                    roi = [min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey)]
+                cv2.rectangle(
+                    color_frame,
+                    (int(roi[0] * frame_width), int(roi[1] * frame_height)),
+                    (int(roi[2] * frame_width), int(roi[3] * frame_height)),
+                    (97, 222, 138),
+                    2,
+                )
                 pil_img = Image.fromarray(color_frame)
 
                 w = max(self.map_frame.winfo_width() - 10, 100)

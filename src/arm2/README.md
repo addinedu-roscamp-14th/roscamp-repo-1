@@ -261,6 +261,15 @@ ros2 topic echo /arm2/transfer_events
 ```
 
 다른 컴퓨터에 UDP로 전달하려면 기존 launch 명령에 다음 인자를 추가합니다.
+UDP로 전송되는 이벤트는 컴퓨터 2에서 바로 읽을 수 있도록 항목명과 상태값이
+한국어로 변환됩니다. `명령어` 값은 항상 `arm2`로 시작합니다. 예를 들어 목적지
+스캔은 `"명령어":"arm2 목적지 스캔"`으로 전달됩니다. UDP JSON은 `로봇`,
+`명령어`, `메시지`, `상태` 순서이며 `상태`는 항상 마지막입니다. ROS 2 내부
+토픽은 기존 영문 필드 형식을 유지합니다. UDP 이벤트는 중간 단계별로 전송하지
+않고 `컨테이너를 적재 구역에`, `컨테이너를 컨테이너에`, `컨테이너를
+트레일러에` 중 하나의 전체 시퀀스가 끝났을 때 작업 ID당 한 줄만 전송합니다.
+목적지 스캔, 위치 이동, 집기, 놓기 및 복귀 이벤트는 UDP로 보내지 않습니다.
+`상태` 값은 반드시 `성공`과 `실패` 둘 중 하나입니다.
 
 ```bash
 event_udp_enabled:=true \
@@ -280,7 +289,12 @@ sock.bind(('0.0.0.0', 15002))
 while True:
     payload, sender = sock.recvfrom(65535)
     event = json.loads(payload.decode('utf-8'))
-    print(sender, event)
+    print(
+        event['로봇'],
+        event['명령어'],
+        event['메시지'],
+        event['상태'],
+    )
 ```
 
 UDP 전송을 켜지 않아도 ROS 2 JSON 토픽은 항상 발행됩니다. UDP는 로컬망의

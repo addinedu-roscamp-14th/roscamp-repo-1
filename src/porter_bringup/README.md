@@ -1,8 +1,77 @@
 # porter_bringup
 
-## 2대 Pinky 실행 순서
+## 분리 도메인 + Zenoh 권장 구성
 
-두 차량과 중앙 노트북은 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. 각 차량에는
+현재 권장 도메인은 중앙 `12`, AGV1 `13`, AGV2 `14`, ARM1 `15`, ARM2 `16`입니다.
+각 장비는 로컬 DDS만 사용하고 Zenoh가 필요한 토픽, 서비스, 액션만 중앙으로
+전달합니다. 이 구성에서는 `ROS_DISCOVERY_SERVER`를 사용하지 않습니다.
+
+중앙 노트북:
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+unset ROS_DISCOVERY_SERVER
+export ROS_DOMAIN_ID=12
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+zenoh-bridge-ros2dds -c config/network/zenoh_central.json5
+```
+
+다른 터미널:
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+unset ROS_DISCOVERY_SERVER
+export ROS_DOMAIN_ID=12
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+ros2 launch porter_bringup fleet_central_laptop.launch.py \
+  start_discovery_server:=false \
+  control_host:=0.0.0.0
+```
+
+ARM2 노트북은 먼저 `REAL`에 기록된 ARM2 launch를 실행한 뒤 별도 터미널에서
+다음 브리지를 실행합니다. `<중앙_IP>`는 중앙 노트북의 로봇망 IP입니다.
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+unset ROS_DISCOVERY_SERVER
+export ROS_DOMAIN_ID=16
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+zenoh-bridge-ros2dds \
+  -c config/network/zenoh_arm2.json5 \
+  -e tcp/<중앙_IP>:7447
+```
+
+ARM1은 도메인 15와 `config/network/zenoh_arm1.json5`를 사용하지만, 현재 파일은
+서비스 계약을 받기 전의 빈 화이트리스트입니다. ARM1 명령은 중앙에서 거부됩니다.
+
+```bash
+unset ROS_DISCOVERY_SERVER
+export ROS_DOMAIN_ID=15
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+zenoh-bridge-ros2dds \
+  -c config/network/zenoh_arm1.json5 \
+  -e tcp/<중앙_IP>:7447
+```
+
+## 레거시 단일 도메인: 2대 Pinky 실행 순서
+
+이 절은 Zenoh를 사용하지 않는 레거시 구성입니다. 이 방식에서만 두 차량과 중앙
+노트북이 같은 `ROS_DOMAIN_ID`를 사용합니다. 각 차량에는
 동일한 `config/SLAM/current_map.yaml`이 있어야 합니다.
 
 각 차량에서 하드웨어 bringup, AMCL과 Nav2를 실행합니다. 중앙 노트북은

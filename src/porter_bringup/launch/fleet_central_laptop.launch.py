@@ -50,6 +50,16 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('start_dashboard_api', default_value='true'),
         DeclareLaunchArgument(
+            'start_arm_dispatcher',
+            default_value='true',
+            description='Start the central ARM1/ARM2 command dispatcher',
+        ),
+        DeclareLaunchArgument(
+            'start_port_autonomy',
+            default_value='true',
+            description='Enable vessel ROI events and autonomous ARM2 scan',
+        ),
+        DeclareLaunchArgument(
             'dashboard_enable_scan',
             default_value='false',
             description='Stream AGV1 LaserScan to the central dashboard',
@@ -130,7 +140,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'start_discovery_server',
-            default_value='true',
+            default_value='false',
+            description='Use false for the domain-separated Zenoh topology',
         ),
         DeclareLaunchArgument(
             'api_token',
@@ -239,6 +250,57 @@ def generate_launch_description():
                 ),
                 'zone_release_hysteresis_m': 0.05,
             }],
+        ),
+        Node(
+            package='central',
+            executable='arm_dispatcher',
+            name='arm_dispatcher',
+            output='screen',
+            condition=IfCondition(
+                LaunchConfiguration('start_arm_dispatcher')
+            ),
+            parameters=[
+                PathJoinSubstitution([
+                    workspace,
+                    'config',
+                    'central',
+                    'arm_dispatcher.yaml',
+                ]),
+            ],
+        ),
+        Node(
+            package='central',
+            executable='port_event_detector',
+            name='port_event_detector',
+            output='screen',
+            condition=IfCondition(
+                LaunchConfiguration('start_port_autonomy')
+            ),
+            parameters=[
+                PathJoinSubstitution([
+                    workspace,
+                    'config',
+                    'central',
+                    'port_autonomy.yaml',
+                ]),
+            ],
+        ),
+        Node(
+            package='central',
+            executable='autonomy_orchestrator',
+            name='autonomy_orchestrator',
+            output='screen',
+            condition=IfCondition(
+                LaunchConfiguration('start_port_autonomy')
+            ),
+            parameters=[
+                PathJoinSubstitution([
+                    workspace,
+                    'config',
+                    'central',
+                    'port_autonomy.yaml',
+                ]),
+            ],
         ),
         Node(
             package='central',

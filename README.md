@@ -1,57 +1,39 @@
 # Port-ER Workspace
 
-스마트 항만 관제를 위한 ROS2 워크스페이스입니다. 각 패키지는 역할별로 분리되어 있으며, 자세한 실행 방법은 각 패키지의 `README.md`에 정리합니다.
+## 분리 도메인 + Zenoh 실행 순서
 
-별도 설명이 없는 명령은 모두 `poter_ws/` 워크스페이스 루트에서 실행하며, 프로젝트
-파일 경로는 워크스페이스 기준 상대경로를 사용합니다.
-
-## Quick Start: 카메라부터 차량 주행까지
-
-차량과 노트북은 같은 네트워크와 같은 `ROS_DOMAIN_ID`를 사용해야 합니다. 아래 노트북
-명령은 각각 새 터미널에서 실행하며, 모든 터미널에서 먼저 다음 환경을 불러옵니다.
-
-### 0. 시각 동기화 (차량 실행 전 필수)
-
-AGV는 RTC가 없고 로봇 LAN에 인터넷이 없어서, 부팅할 때 마지막 종료 시각을 복원한 채
-멈춰 있습니다. 두 차량의 시계가 어긋나면 `map`을 공통 부모로 쓰는 하나의 TF 버퍼 안에서
-tf2가 "최신"을 앞선 차량 기준으로 잡고, 뒤처진 차량은 `extrapolation into the past`로
-탈락합니다. RViz에서 RobotModel이 빨갛게 깜빡이다 사라지는 증상이 이것입니다.
-
-중앙 노트북에서 최초 1회만:
-
-```bash
-sudo ./scripts/setup_ntp_server.sh    # chrony를 로봇 LAN 시간 서버로 설치
-```
-
-차량을 켤 때마다, **차량 스택을 실행하기 전에**:
-
-```bash
-./scripts/check_fleet_clocks.sh       # 편차 확인 (exit 0이면 진행 가능)
-./scripts/sync_vehicle_clocks.sh      # FAIL이면 실행 후 다시 확인
-```
+장비별 ROS Domain은 중앙 `12`, AGV1 `13`, AGV2 `14`, ARM1 `15`,
+ARM2 `16`을 사용합니다. 중앙 노트북의 로봇망 IP는 아래 예시에서
+`192.168.5.6`입니다. 실제 IP가 다르면 각 Zenoh endpoint와 `central_ip`를 함께
+변경합니다. 각 코드 블록은 별도 터미널에서 실행합니다.
 
 ### 1. 중앙 관제 노트북
 
-``` bash 
+터미널 1 - Zenoh router/bridge:
+
+```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
+export ROS_DOMAIN_ID=12
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 sudo ip link set lo multicast on
 ros2 daemon stop
 
-zenoh-bridge-ros2dds \
-  -c config/network/zenoh_central.json5
+zenoh-bridge-ros2dds -c config/network/zenoh_central.json5
 ```
+
+터미널 2 - 카메라, YOLO, Fleet, ARM dispatcher와 중앙 API:
 
 ```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
+export ROS_DOMAIN_ID=12
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export PORT_CONTROL_API_TOKEN='porter1234'
@@ -59,16 +41,18 @@ export PORT_CONTROL_API_TOKEN='porter1234'
 ros2 launch porter_bringup fleet_central_laptop.launch.py \
   control_host:=0.0.0.0 \
   start_discovery_server:=false
-
 ```
 
 ### 2. AGV1
 
-``` bash
+터미널 1 - Zenoh bridge:
+
+```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
+export ROS_DOMAIN_ID=13
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
@@ -80,27 +64,32 @@ zenoh-bridge-ros2dds \
   -e tcp/192.168.5.6:7447
 ```
 
+터미널 2 - 차량 하드웨어, AMCL과 Nav2:
+
 ```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
+export ROS_DOMAIN_ID=13
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 ros2 launch porter_bringup agv_vehicle.launch.py \
   vehicle_id:=agv1 \
-  discovery_server:= \
   start_nav2:=true
 ```
 
 ### 3. AGV2
+
+터미널 1 - Zenoh bridge:
 
 ```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
+export ROS_DOMAIN_ID=14
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
@@ -112,46 +101,131 @@ zenoh-bridge-ros2dds \
   -e tcp/192.168.5.6:7447
 ```
 
+터미널 2 - 차량 하드웨어, AMCL과 Nav2:
+
 ```bash
 cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
+export ROS_DOMAIN_ID=14
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 ros2 launch porter_bringup agv_vehicle.launch.py \
   vehicle_id:=agv2 \
-  discovery_server:= \
   start_nav2:=true
 ```
 
-### 중앙제어 노트북 
+### 4. ARM2 노트북
+
+터미널 1 - 로봇팔, 그리퍼 카메라와 작업 서비스:
 
 ```bash
-cd ~/poter_ws 
+cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
+
+export ROS_DOMAIN_ID=16
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+ros2 launch arm2 arm2_container_pick_moveit.launch.py \
+  camera_info_url:=config/arm2/arm2_gripper_camera_info.yaml \
+  video_device:=/dev/arm_camera \
+  calibration_name:=arm2_jetcobot_eye_in_hand_charuco_5x5_v4 \
+  params_file:=config/arm2/arm2_container_pick.yaml \
+  use_node_time_for_pose:=true \
+  marker_id:=0 \
+  stack_marker_id:=11 \
+  marker_size_m:=0.020 \
+  serial_port:=/dev/jetcobot \
+  trajectory_speed:=50 \
+  goal_correction_speed:=35 \
+  goal_tolerance_deg:=3.5 \
+  goal_timeout_sec:=15.0 \
+  use_rviz:=true
+```
+
+터미널 2 - 중앙 관제 연결용 Zenoh bridge:
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+export ROS_DOMAIN_ID=16
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+sudo ip link set lo multicast on
+ros2 daemon stop
+
+zenoh-bridge-ros2dds \
+  -c config/network/zenoh_arm2.json5 \
+  -e tcp/192.168.5.6:7447
+```
+
+ARM2 연결 확인:
+
+```bash
+ros2 service list | grep '^/arm2/'
+ros2 topic echo /arm2/transfer_events
+```
+
+Zenoh 연결 후 서비스 호출은 중앙 `arm_dispatcher`가 담당합니다. 입항 자동화 모드에서는
+ARM2 노트북에서 `/arm2/scan_destinations`를 별도로 호출하지 않아도 됩니다. 중앙
+노트북에서는 다음 명령으로 ARM2 서비스와 최종 작업 이벤트가 전달되는지 확인합니다.
+
+```bash
+export ROS_DOMAIN_ID=12
+ros2 service list | grep '^/arm2/'
+ros2 topic echo /arm2/transfer_events
+ros2 topic echo /central/arms/arm2/state
+```
+
+ARM1은 Domain `15`를 사용하지만 서비스와 이벤트 계약이 확정되기 전까지 중앙
+명령이 비활성화되어 있습니다.
+
+### 5. 대시보드 노트북
+
+`OLLAMA_HOST`는 실제 Ollama 서버 주소로 변경합니다. 현재 사용하는 모델이
+`qwen3-vl:8b`가 아니면 `LOCAL_LLM_MODEL`도 변경합니다.
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+export ROS_DOMAIN_ID=12
 export PORT_CONTROL_API_TOKEN='porter1234'
+export OLLAMA_HOST='http://192.168.5.5:11434'
+export LOCAL_LLM_MODEL='qwen3-vl:8b'
 
 ros2 launch porter_bringup dashboard_laptop.launch.py \
   central_ip:=192.168.5.6 \
-  ollama_host:=http://agent.sds.codes \
-  llm_model:=gemma4:31b
+  ollama_host:=${OLLAMA_HOST} \
+  llm_model:=${LOCAL_LLM_MODEL}
 ```
-### 잠금해제 
+
+### 6. 잠금 해제
 
 ``` bash
 cd ~/poter_ws 
 ./scripts/clear_all_holds.sh --cancel-goals
 ```
 
-### 0. 최초 빌드
+## 개별 노드 실행 참고
+
+아래 절은 디버깅과 수동 실행을 위한 참고 명령입니다. 다중 장비 통합 실행에는
+위의 분리 Domain + Zenoh 실행 순서를 사용합니다.
+
+### 최초 빌드
 
 노트북:
 
 ```bash
-colcon build
+colcon build --symlink-install
 source install/setup.bash
 ```
 

@@ -3,7 +3,7 @@
 <package format="3">
   <name>porter_interfaces</name>
   <version>0.1.0</version>
-  <description>Fleet command and status interfaces for Port-ER AGVs.</description>
+  <description>Fleet, robot-arm, and port event interfaces for Port-ER.</description>
   <maintainer email="jio@todo.todo">jio</maintainer>
   <license>Apache-2.0</license>
 

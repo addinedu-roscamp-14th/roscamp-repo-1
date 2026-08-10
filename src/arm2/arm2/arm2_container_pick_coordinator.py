@@ -10,10 +10,10 @@ import threading
 import time
 import uuid
 
-from arm2_interfaces.srv import TransferById
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped
+from arm2_interfaces.srv import TransferById
 import numpy as np
 from pymycobot.mycobot280 import MyCobot280
 from rcl_interfaces.msg import SetParametersResult

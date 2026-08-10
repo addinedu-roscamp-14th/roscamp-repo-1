@@ -81,7 +81,7 @@ agv1과 agv2 action을 각각 만들고, 두 action이 독립적이면 execution
 "빠져나오면", "도착한 뒤" 같은 순서 표현이 있으면 반드시 서로 다른 action으로
 나누고, 조건을 만족하는 순서대로 배열하세요.
 
-각 action은 아래 9가지 형식 중 하나입니다:
+각 action은 아래 14가지 형식 중 하나입니다:
 
 1) 등록부의 화물 위치만 관리하는 행정 명령:
 {{"type": "cargo_single", "item": "<화물명>", "destination": "<등록된 위치명>"}}
@@ -168,7 +168,35 @@ heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 �
 쓰세요. 차량을 색상/번호로 지칭했으면 vehicle_id를 채우고, 안 했으면 빈
 문자열로 두어 유휴 차량이 자동으로 선택되게 하세요.
 
-9) 위 어느 것에도 해당하지 않는 경우:
+9) ARM2가 차량의 컨테이너 목적지를 스캔하는 경우:
+{{"type": "arm_scan_destinations", "arm_id": "arm2"}}
+
+10) ARM2가 차량의 컨테이너를 창고 슬롯으로 옮기는 경우:
+{{"type": "arm_transfer_to_slot", "arm_id": "arm2",
+  "destination_slot": "<A-1-1|A-1-2|A-2-1|A-2-2|A-3-1|A-3-2>",
+  "vehicle_id": "<agv1|agv2>", "final_for_vehicle": <true|false>}}
+
+11) ARM2가 창고 ID의 컨테이너를 차량 트레일러에 싣는 경우:
+{{"type": "arm_load_to_trailer", "arm_id": "arm2",
+  "source_id": <0..8>, "vehicle_id": "<agv1|agv2>",
+  "final_for_vehicle": <true|false>}}
+
+12) ARM2가 창고 안에서 컨테이너를 ID 사이로 옮기는 경우:
+{{"type": "arm_transfer_by_id", "arm_id": "arm2",
+  "source_id": <0..8>, "destination_id": <0..8 또는 11..16>}}
+
+13) ARM2 작업을 즉시 정지하는 경우:
+{{"type": "arm_stop", "arm_id": "arm2"}}
+
+ARM 작업은 위 다섯 형식만 사용할 수 있습니다. ROS 서비스 이름이나 임의 operation을
+만들지 마세요. ARM1은 아직 중앙 서비스 계약이 없으므로 ARM1 작업 요청은 unknown으로
+반환하세요. 같은 ARM2에 여러 작업을 지시하면 반드시 명시된 순서대로 actions에 넣고
+execution_mode는 sequential로 설정하세요. 차량과 연결된 마지막 하역/상차 작업에만
+final_for_vehicle=true를 지정하세요. 이 값이 true인 작업이 최종 성공한 뒤에만 해당
+차량이 출발할 수 있습니다. 창고 내부 이동 arm_transfer_by_id에는 차량 출발 승인을
+연결하지 마세요.
+
+14) 위 어느 것에도 해당하지 않는 경우:
 {{"type": "unknown", "reason": "<간단한 이유>"}}
 
 주의:
@@ -319,6 +347,17 @@ _VEHICLE_NAVIGATION_TYPES = {
     'visual_navigation', 'pixel_navigation', 'visual_transfer',
     'park_command',
 }
+_ARM_ACTION_TYPES = {
+    'arm_scan_destinations',
+    'arm_transfer_to_slot',
+    'arm_load_to_trailer',
+    'arm_transfer_by_id',
+    'arm_stop',
+}
+_ARM_COMMAND_TERMS = (
+    'arm1', 'arm2', '로봇팔', '매니퓰레이터', '그리퍼',
+    'robot arm', 'manipulator',
+)
 
 
 def resolve_execution_mode(command: str, result: Dict) -> str:
@@ -343,6 +382,18 @@ def resolve_execution_mode(command: str, result: Dict) -> str:
         in {'agv1', 'agv2'}
     ]
     if len(explicit_vehicle_ids) != len(set(explicit_vehicle_ids)):
+        return 'sequential'
+
+    arm_actions = [
+        action for action in actions
+        if isinstance(action, dict)
+        and action.get('type') in _ARM_ACTION_TYPES
+    ]
+    arm_ids = [
+        str(action.get('arm_id') or 'arm2').strip().lower()
+        for action in arm_actions
+    ]
+    if len(arm_ids) != len(set(arm_ids)):
         return 'sequential'
 
     declared = str(result.get('execution_mode') or '').strip().lower()
@@ -396,6 +447,17 @@ def normalize_navigation_result(
     actions = result.get('actions')
     if not isinstance(actions, list):
         return result
+
+    lowered_command = str(command).lower()
+    mentions_arm = any(term in lowered_command for term in _ARM_COMMAND_TERMS)
+    has_arm_action = any(
+        isinstance(action, dict)
+        and action.get('type') in _ARM_ACTION_TYPES
+        for action in actions
+    )
+    if mentions_arm and not has_arm_action:
+        # Never reinterpret a failed ARM tool selection as an AGV movement.
+        return _finalize_navigation_result(command, result, actions)
 
     detections = [
         item for item in (yolo_detections or [])
@@ -780,7 +842,7 @@ def parse_command_with_llm(
     """
     자연어 명령을 로컬 Ollama 모델로 해석해서 구조화된 dict로 반환합니다.
     반환 형식은 항상 {"actions": [action, ...]} 이며, 각 action은
-    _SYSTEM_PROMPT_TEMPLATE에 정의된 9가지 type 중 하나입니다.
+    _SYSTEM_PROMPT_TEMPLATE에 정의된 14가지 type 중 하나입니다.
     (한 문장에 지시가 여러 개 섞여 있으면 actions에 여러 개가 들어옵니다)
 
     실패(패키지 미설치, Ollama 서버 미실행, 모델 미설치, JSON 파싱 실패 등) 시
