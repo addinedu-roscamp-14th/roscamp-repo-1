@@ -143,6 +143,27 @@ def test_all_vehicle_request_expands_one_navigation_action():
     ]
 
 
+def test_idle_fleet_park_request_expands_to_both_vehicles():
+    """"유휴 차량들" addresses the fleet, so both vehicles must be parked.
+
+    Only one park_command used to be emitted, and an empty vehicle_id makes
+    the dispatcher pick a single vehicle - so the second AGV never parked.
+    """
+    result = normalize_navigation_result(
+        '유휴차량들은 주차해줘',
+        {'actions': [{'type': 'park_command', 'vehicle_id': ''}]},
+        DETECTIONS,
+    )
+
+    assert result['execution_mode'] == 'parallel'
+    assert [action['vehicle_id'] for action in result['actions']] == [
+        'agv1', 'agv2'
+    ]
+    assert all(
+        action['type'] == 'park_command' for action in result['actions']
+    )
+
+
 def test_broad_harbor_command_recovers_unknown_as_b1_navigation():
     result = normalize_navigation_result(
         '노란 차 상차하러 보내줘',
@@ -156,13 +177,14 @@ def test_broad_harbor_command_recovers_unknown_as_b1_navigation():
                 'type': 'visual_navigation',
                 'detection_index': 0,
                 'approach_side': 'bottom',
-                'vehicle_id': 'agv1',
+                'vehicle_id': 'agv2',
             }
         ]
     }
 
 
 def test_park_command_infers_vehicle_id_from_color():
+    """Yellow is AMR 2 (agv2) and blue is AMR 1 (agv1)."""
     result = normalize_navigation_result(
         '노란 차 주차해줘',
         {'actions': [{'type': 'park_command', 'vehicle_id': ''}]},
@@ -170,6 +192,18 @@ def test_park_command_infers_vehicle_id_from_color():
     )
 
     assert result == {
+        'actions': [
+            {'type': 'park_command', 'vehicle_id': 'agv2'},
+        ]
+    }
+
+    blue = normalize_navigation_result(
+        '파란 차 주차해줘',
+        {'actions': [{'type': 'park_command', 'vehicle_id': ''}]},
+        DETECTIONS,
+    )
+
+    assert blue == {
         'actions': [
             {'type': 'park_command', 'vehicle_id': 'agv1'},
         ]
@@ -219,7 +253,7 @@ def test_visual_action_missing_fields_is_repaired_from_command():
     action = result['actions'][0]
     assert action['detection_index'] == 0
     assert action['approach_side'] == 'bottom'
-    assert action['vehicle_id'] == 'agv2'
+    assert action['vehicle_id'] == 'agv1'
 
 
 def test_single_registered_harbor_travel_prefers_visible_b1():

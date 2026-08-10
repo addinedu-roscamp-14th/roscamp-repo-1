@@ -7,16 +7,48 @@ emergency_view.py의 구성(장비 선택 드롭다운 -> 크레인/AGV 각각 �
 제어 화면 레이아웃과 색상을 통일했습니다.
 """
 
+import shutil
+
 import customtkinter as ctk
 
-from ros_control_bridge import RosControlBridge
+from ros_control_bridge import AMR_DISPLAY_NAMES, RosControlBridge
+
+
+def _tmux_path():
+    """Locate tmux, or return None when it is not installed.
+
+    The SSH terminal helpers below are only a fallback for when the ROS
+    bridge is unavailable, so tmux is optional. Hardcoding /usr/bin/tmux
+    crashed the whole emergency screen on machines without it.
+    """
+    return shutil.which("tmux")
+
+AMR_1_LABEL = AMR_DISPLAY_NAMES["agv1"]
+AMR_2_LABEL = AMR_DISPLAY_NAMES["agv2"]
 
 DEVICE_OPTIONS = [
     "JetCobot #01 (크레인)",
     "JetCobot #02 (크레인)",
-    "Pinky_Pro AGV (Red)",
-    "Pinky_Pro AGV (Blue)",
+    AMR_1_LABEL,
+    AMR_2_LABEL,
 ]
+
+# Operator-facing name -> real vehicle wiring. AMR 1 carries the blue cargo
+# box and AMR 2 the yellow one, matching the cargo_box colours in
+# pinky.urdf.xacro. Only the displayed name changed: the ROS namespace is
+# still agv1/agv2, so topics, services and actions keep their current names.
+AMR_DEVICES = {
+    AMR_1_LABEL: {
+        "vehicle_id": "agv1",
+        "host": "192.168.5.2",
+        "domain_id": 13,
+    },
+    AMR_2_LABEL: {
+        "vehicle_id": "agv2",
+        "host": "192.168.5.3",
+        "domain_id": 14,
+    },
+}
 
 # Tailwind Colors
 BG_MAIN = "#242424"
@@ -82,6 +114,15 @@ class EmergencyControlView(ctk.CTkFrame):
         bottom_row.pack(fill="x", side="bottom", pady=15, padx=20)
         ctk.CTkButton(bottom_row, text="🗣️ 명령", font=self.font_subtitle, fg_color="#92ccff", text_color="#003351",
                       hover_color="#cce5ff", height=40, width=100, command=self.open_command_popup).pack(side="right", padx=10)
+
+    def _selected_amr(self) -> dict:
+        """Resolve the selected AMR to its vehicle id, host and ROS domain.
+
+        Returns an empty dict when a crane is selected. Matching on the label
+        rather than a colour substring keeps the display name free to change
+        without silently re-targeting a different robot.
+        """
+        return AMR_DEVICES.get(self.device_selector.get(), {})
 
     def open_control_panel(self) -> None:
         selected = self.device_selector.get()
@@ -251,7 +292,7 @@ class EmergencyControlView(ctk.CTkFrame):
         # Drive Control
         drive_frame = ctk.CTkFrame(right_panel, fg_color=BG_FRAME, corner_radius=8, border_width=1, border_color=BORDER_COLOR)
         drive_frame.pack(fill="x", pady=(0, 16))
-        ctk.CTkLabel(drive_frame, text="AGV Drive Control", font=self.font_subtitle, text_color=TEXT_MAIN).pack(anchor="w", padx=16, pady=12)
+        ctk.CTkLabel(drive_frame, text="AMR Drive Control", font=self.font_subtitle, text_color=TEXT_MAIN).pack(anchor="w", padx=16, pady=12)
         ctk.CTkFrame(drive_frame, height=1, fg_color=BORDER_LIGHT).pack(fill="x", padx=16)
         
         pad = ctk.CTkFrame(drive_frame, fg_color="transparent")
@@ -302,70 +343,114 @@ class EmergencyControlView(ctk.CTkFrame):
     def _disconnect_pinky(self) -> None:
         import os
         import subprocess
+        tmux = _tmux_path()
         try:
-            subprocess.run(["/usr/bin/tmux", "kill-session", "-t", "pinky_teleop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["/usr/bin/tmux", "kill-session", "-t", "pinky_bringup"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            os.system("pkill -9 -f 'ssh -tt pinky@192.168.0.102'")
-            os.system("pkill -9 -f 'ssh -tt pinky@192.168.0.96'")
+            if tmux:
+                for session in ("pinky_teleop", "pinky_bringup"):
+                    subprocess.run([tmux, "kill-session", "-t", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for device in AMR_DEVICES.values():
+                os.system(f"pkill -9 -f 'ssh -tt pinky@{device['host']}'")
             os.system("pkill -9 -f 'pinky_teleop'")
             os.system("pkill -9 -f 'pinky_bringup'")
         except Exception:
             pass
 
-    def _run_automated_ssh(self, session_name: str, command: str, title: str, ip_address: str) -> None:
+    def _run_automated_ssh(self, session_name: str, command: str, title: str, ip_address: str) -> bool:
+        """Open a terminal, SSH into the AMR and run one command.
+
+        Returns False when tmux is missing instead of raising: this is only
+        the fallback path, and a missing optional tool must not crash the
+        emergency screen.
+        """
         import subprocess
         import threading
         import time
-        
+
+        tmux = _tmux_path()
+        if not tmux:
+            return False
+
         # 기존 동일 세션 종료
-        subprocess.run(["/usr/bin/tmux", "kill-session", "-t", session_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+        subprocess.run([tmux, "kill-session", "-t", session_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         # 새 터미널에서 SSH 접속 시작
         subprocess.Popen([
-            "gnome-terminal", 
-            "--title", title, 
-            "--", 
-            "bash", "-c", 
-            f"echo -e '\\e[1;32m[{title}]\\e[0m 자동 연결을 진행합니다...'; /usr/bin/tmux new-session -s {session_name} 'ssh -tt pinky@{ip_address}'"
+            "gnome-terminal",
+            "--title", title,
+            "--",
+            "bash", "-c",
+            f"echo -e '\\e[1;32m[{title}]\\e[0m 자동 연결을 진행합니다...'; {tmux} new-session -s {session_name} 'ssh -tt pinky@{ip_address}'"
         ])
         
         def auto_type():
             time.sleep(2.0) # SSH 암호 프롬프트 대기
             # 비밀번호 '1' 자동 입력
-            subprocess.run(["/usr/bin/tmux", "send-keys", "-t", session_name, "1", "Enter"])
+            subprocess.run([tmux, "send-keys", "-t", session_name, "1", "Enter"])
             time.sleep(1.0) # 로그인 대기
-            
+
             if command:
-                subprocess.run(["/usr/bin/tmux", "send-keys", "-t", session_name, command, "Enter"])
-                
+                subprocess.run([tmux, "send-keys", "-t", session_name, command, "Enter"])
+
         threading.Thread(target=auto_type, daemon=True).start()
+        return True
 
     def _start_pinky_engine(self, auto: bool = False) -> None:
         from tkinter import messagebox
-        selected = self.device_selector.get()
-        domain_id = 12 if "Blue" in selected else 13
-        ip_address = "192.168.0.102" if "Blue" in selected else "192.168.0.96"
-        self._run_automated_ssh(
+        device = self._selected_amr()
+        if not device:
+            messagebox.showerror("시동 실패", "AMR을 먼저 선택하세요.")
+            return
+        domain_id = device["domain_id"]
+        ip_address = device["host"]
+        if not self._run_automated_ssh(
             session_name="pinky_bringup",
             command=f"export ROS_DOMAIN_ID={domain_id}; ros2 launch pinky bringup_robot.launch.xml",
-            title=f"Pinky Bringup (Domain: {domain_id})",
+            title=f"AMR Bringup (Domain: {domain_id})",
             ip_address=ip_address
-        )
+        ):
+            messagebox.showerror(
+                "시동 실패",
+                "이 기능은 tmux가 필요한데 설치되어 있지 않습니다.\n"
+                "'sudo apt install tmux' 후 다시 시도하거나, 차량에서 직접\n"
+                f"ROS_DOMAIN_ID={domain_id} 으로 bringup을 실행하세요.",
+            )
+            return
         if not auto:
             messagebox.showinfo("시동 (Engine ON)", f"{ip_address}(도메인 {domain_id})으로 자동 SSH 접속 후 Bringup 명령을 실행합니다.\n잠시 기다려주세요.")
 
     def _connect_pinky_control(self) -> None:
         from tkinter import messagebox
-        selected = self.device_selector.get()
-        domain_id = 12 if "Blue" in selected else 13
-        ip_address = "192.168.0.102" if "Blue" in selected else "192.168.0.96"
-        self._run_automated_ssh(
+        device = self._selected_amr()
+        if not device:
+            messagebox.showerror("제어 연결 실패", "AMR을 먼저 선택하세요.")
+            return
+
+        # Preferred path: publish straight to /<vehicle_id>/cmd_vel_manual over
+        # the zenoh bridge. The SSH/teleop terminal below stays as a fallback
+        # for when the bridge is down.
+        if self.ros_bridge.snapshot().ready:
+            messagebox.showinfo(
+                "제어 연결",
+                f"{device['vehicle_id']} 수동 제어가 연결되었습니다.\n"
+                "방향 버튼으로 바로 조작하세요.",
+            )
+            return
+
+        domain_id = device["domain_id"]
+        ip_address = device["host"]
+        if self._run_automated_ssh(
             session_name="pinky_teleop",
             command=f"export ROS_DOMAIN_ID={domain_id}; ros2 run teleop_twist_keyboard teleop_twist_keyboard",
-            title=f"Pinky Teleop (Domain: {domain_id})",
+            title=f"AMR Teleop (Domain: {domain_id})",
             ip_address=ip_address
-        )
-        messagebox.showinfo("제어 연결", f"{ip_address}(도메인 {domain_id})으로 자동 SSH 접속 후 Teleop 제어 노드를 실행합니다.\n터미널에 명령어가 입력된 후 방향키 제어를 사용할 수 있습니다.")
+        ):
+            messagebox.showinfo("제어 연결", f"ROS 브리지가 준비되지 않아 {ip_address}(도메인 {domain_id})으로 SSH Teleop을 실행합니다.")
+        else:
+            messagebox.showerror(
+                "제어 연결 실패",
+                "ROS 브리지가 준비되지 않았고, 대체 경로인 tmux도 없습니다.\n"
+                "중앙 관제 스택과 zenoh 브릿지가 실행 중인지 확인하세요.",
+            )
 
     def _send_teleop_cmd(self, char: str) -> None:
         velocity_commands = {
@@ -379,30 +464,41 @@ class EmergencyControlView(ctk.CTkFrame):
             ',': (-0.12, 0.0),
             '.': (-0.10, 0.8),
         }
-        if char in velocity_commands and self.ros_bridge.snapshot().ready:
+        device = self._selected_amr()
+        if char in velocity_commands and device and self.ros_bridge.snapshot().ready:
             linear, angular = velocity_commands[char]
-            selected = self.device_selector.get()
-            vehicle_id = "agv1" if "Red" in selected else "agv2"
-            self.ros_bridge.send_velocity(
-                linear, angular, vehicle_id=vehicle_id
-            )
-            return
+            # Publishes /<vehicle_id>/cmd_vel_manual, which the vehicle's
+            # cmd_vel_safety_gate feeds into /<vehicle_id>/cmd_vel. The topic
+            # must be listed in the zenoh allow-lists or it never leaves the
+            # laptop - see config/network/zenoh_*.json5.
+            if self.ros_bridge.send_velocity(
+                linear, angular, vehicle_id=device["vehicle_id"]
+            ):
+                return
 
         import subprocess
+        tmux = _tmux_path()
+        if not tmux:
+            print(
+                "Manual drive unavailable: ROS bridge not ready and tmux is "
+                "not installed."
+            )
+            return
         try:
-            subprocess.Popen(["/usr/bin/tmux", "send-keys", "-t", "pinky_teleop", char], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen([tmux, "send-keys", "-t", "pinky_teleop", char], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"Failed to send command: {e}")
 
     def _activate_emergency_stop(self) -> None:
         from tkinter import messagebox
 
-        selected = self.device_selector.get()
-        vehicle_id = "agv1" if "Red" in selected else "agv2"
-        if self.ros_bridge.emergency_stop(vehicle_id):
+        # This button is the fleet-wide stop, so it must latch every vehicle.
+        # It used to derive a single vehicle_id from the dropdown, which left
+        # the unselected AMR running.
+        if self.ros_bridge.emergency_stop("fleet"):
             messagebox.showwarning(
                 "비상 정지",
-                "현재 ROS 도메인의 /cmd_vel 정지 신호를 100Hz로 유지합니다.",
+                "전체 AMR의 정지 신호를 100Hz로 유지합니다.",
             )
         else:
             messagebox.showerror(
@@ -413,17 +509,53 @@ class EmergencyControlView(ctk.CTkFrame):
     def _release_emergency_stop(self) -> None:
         from tkinter import messagebox
 
-        selected = self.device_selector.get()
-        vehicle_id = "agv1" if "Red" in selected else "agv2"
-        if self.ros_bridge.release_emergency_stop(vehicle_id):
-            messagebox.showinfo(
-                "비상 정지 해제",
-                "정지 유지 신호를 해제했습니다. 이동 전에 주변 안전을 확인하세요.",
-            )
-        else:
+        # A vehicle stays stopped while ANY latch is set, and they live in
+        # different nodes. Release all of them, like
+        # scripts/clear_all_holds.sh --cancel-goals.
+        if not self.ros_bridge.snapshot().ready:
             messagebox.showerror(
                 "해제 실패",
                 "ROS 브리지가 연결되지 않았습니다.",
+            )
+            return
+
+        import threading
+
+        def worker():
+            results = self.ros_bridge.clear_all_holds(cancel_goals=True)
+            self.after(0, lambda: self._show_hold_release_result(results))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_hold_release_result(self, results) -> None:
+        from tkinter import messagebox
+
+        if results is None:
+            messagebox.showerror(
+                "해제 실패",
+                "ROS 브리지가 준비되지 않아 잠금을 해제하지 못했습니다.",
+            )
+            return
+
+        failed = [
+            f"  · {label}: {detail or '실패'}"
+            for label, ok, detail in results
+            if not ok
+        ]
+        cleared = len(results) - len(failed)
+        if failed:
+            messagebox.showwarning(
+                "일부 해제 실패",
+                f"{cleared}/{len(results)}개 잠금을 해제했습니다.\n\n"
+                "실패 항목:\n" + "\n".join(failed) + "\n\n"
+                "해당 노드가 실행 중인지 확인하세요.",
+            )
+        else:
+            messagebox.showinfo(
+                "비상 정지 해제",
+                f"모든 잠금 {cleared}개를 해제했습니다.\n"
+                "(충돌 정지 · 비상정지 · 구역 잠금 · 진행 중 주행 목표)\n\n"
+                "이동 전에 주변 안전을 확인하세요.",
             )
 
     def _call_crane_service(

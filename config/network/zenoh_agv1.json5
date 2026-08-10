@@ -14,6 +14,8 @@
         "publishers": [
           "/tf",
           "/tf_static",
+          "/agv1/map",
+          "/agv1/keepout_filter_mask",
           "/agv1/amcl_pose",
           "/agv1/odom",
           "/agv1/scan",
@@ -25,11 +27,14 @@
         ],
         "subscribers": [
           "/agv1/initialpose",
-          "/agv1/goal_pose"
+          "/agv1/goal_pose",
+          "/agv1/cmd_vel_manual"
         ],
         "service_servers": [
           "/agv1/safety_hold",
-          "/agv1/emergency_stop"
+          "/agv1/emergency_stop",
+          "/agv1/local_costmap/local_costmap/get_parameters",
+          "/agv1/local_costmap/local_costmap/set_parameters"
         ],
         "service_clients": [],
         "action_servers": [

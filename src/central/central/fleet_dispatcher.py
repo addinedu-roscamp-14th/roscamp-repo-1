@@ -13,7 +13,7 @@ import time
 
 from action_msgs.msg import GoalStatus
 from drive.action import ParkInSpot
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import (
     DriveOnHeading,
     NavigateThroughPoses,
@@ -23,6 +23,8 @@ from nav2_msgs.action import (
 from nav_msgs.msg import Odometry
 from porter_interfaces.action import DispatchNavigation
 from porter_interfaces.msg import VehicleState
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
 import rclpy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -62,6 +64,12 @@ class VehicleRuntime:
     b1_exit_turn_completed: bool = False
     b1_exit_forward_completed: bool = False
     park_exit_forward_completed: bool = False
+    # Local-costmap inflation is relaxed while the vehicle crawls out of its
+    # parking pocket, where the measured wall clearance is below the footprint
+    # inscribed radius. Holds the value to put back, so the relaxation can
+    # never outlive the manoeuvre.
+    park_exit_inflation_restore_m: float | None = None
+    park_exit_origin_xy: tuple[float, float] | None = None
 
 
 STALL_MOVING = 'moving'
@@ -154,6 +162,20 @@ class FleetDispatcher(Node):
         self.declare_parameter('park_exit_forward_speed_mps', 0.05)
         self.declare_parameter('park_exit_behavior_timeout_sec', 20.0)
         self.declare_parameter('park_exit_detection_radius_m', 0.25)
+        # The parking pockets are tighter than the footprint's inscribed
+        # radius (0.069 m): measured wall clearance is 0.023 m for agv1 and
+        # 0.054 m for agv2, so every cell the vehicle occupies is already
+        # INSCRIBED_INFLATED_OBSTACLE and DriveOnHeading aborts with
+        # COLLISION_AHEAD. Shrink the rolling costmap's inflation until the
+        # vehicle is clear of the pocket, then put it straight back.
+        self.declare_parameter('park_exit_inflation_radius_m', 0.01)
+        self.declare_parameter('park_exit_inflation_clear_distance_m', 0.70)
+        # Nav2's DriveOnHeading cannot leave a pocket this tight even with the
+        # inflation relaxed, so the exit is an open-loop timed move like the
+        # entry (parking_new.reverse_to_parked). Set false to go back to
+        # DriveOnHeading once the spots have real clearance.
+        self.declare_parameter('park_exit_open_loop', True)
+        self.declare_parameter('park_exit_open_loop_rate_hz', 20.0)
         self.declare_parameter('duplicate_goal_distance_m', 0.12)
         self.declare_parameter('duplicate_goal_yaw_tolerance_deg', 20.0)
         self.declare_parameter('sequence_dependency_timeout_sec', 300.0)
@@ -310,6 +332,30 @@ class FleetDispatcher(Node):
         )
         if self.park_exit_detection_radius_m <= 0.0:
             raise ValueError('park_exit_detection_radius_m must be positive')
+        self.park_exit_inflation_radius_m = float(
+            self.get_parameter('park_exit_inflation_radius_m').value
+        )
+        if self.park_exit_inflation_radius_m <= 0.0:
+            raise ValueError(
+                'park_exit_inflation_radius_m must be positive'
+            )
+        self.park_exit_inflation_clear_distance_m = float(
+            self.get_parameter('park_exit_inflation_clear_distance_m').value
+        )
+        if self.park_exit_inflation_clear_distance_m <= 0.0:
+            raise ValueError(
+                'park_exit_inflation_clear_distance_m must be positive'
+            )
+        self.park_exit_open_loop = bool(
+            self.get_parameter('park_exit_open_loop').value
+        )
+        self.park_exit_open_loop_rate_hz = float(
+            self.get_parameter('park_exit_open_loop_rate_hz').value
+        )
+        if self.park_exit_open_loop_rate_hz <= 0.0:
+            raise ValueError(
+                'park_exit_open_loop_rate_hz must be positive'
+            )
         self.auto_park_idle_sec = float(
             self.get_parameter('auto_park_idle_sec').value
         )
@@ -402,7 +448,30 @@ class FleetDispatcher(Node):
         self.park_clients = {}
         self.gate_clients = {}
         self.state_publishers = {}
+        self.local_costmap_set_param_clients = {}
+        self.local_costmap_get_param_clients = {}
+        self.park_exit_cmd_publishers = {}
         for vehicle_id in vehicle_ids:
+            # cmd_vel_safety_gate feeds this into the vehicle's cmd_vel, so the
+            # emergency and collision latches still gate the exit crawl.
+            self.park_exit_cmd_publishers[vehicle_id] = self.create_publisher(
+                Twist, f'/{vehicle_id}/cmd_vel_manual', 10
+            )
+            costmap_node = f'/{vehicle_id}/local_costmap/local_costmap'
+            self.local_costmap_set_param_clients[vehicle_id] = (
+                self.create_client(
+                    SetParameters,
+                    f'{costmap_node}/set_parameters',
+                    callback_group=self.callback_group,
+                )
+            )
+            self.local_costmap_get_param_clients[vehicle_id] = (
+                self.create_client(
+                    GetParameters,
+                    f'{costmap_node}/get_parameters',
+                    callback_group=self.callback_group,
+                )
+            )
             self.nav_pose_clients[vehicle_id] = ActionClient(
                 self,
                 NavigateToPose,
@@ -501,6 +570,11 @@ class FleetDispatcher(Node):
         )
         rate = float(self.get_parameter('state_publish_rate_hz').value)
         self.create_timer(1.0 / rate, self._publish_states)
+        self.create_timer(
+            0.5,
+            self._check_park_exit_inflation,
+            callback_group=self.callback_group,
+        )
 
         self._idle_since = {vehicle_id: None for vehicle_id in vehicle_ids}
         self.create_subscription(
@@ -1296,15 +1370,30 @@ class FleetDispatcher(Node):
                     f'{self.park_exit_forward_distance_m:.2f}m before following '
                     'the destination path'
                 )
-                exit_success, exit_message = await self._drive_straight(
-                    goal_handle,
-                    vehicle_id,
-                    command_id,
-                    self.park_exit_forward_distance_m,
-                    self.park_exit_forward_speed_mps,
-                    self.park_exit_behavior_timeout_sec,
-                    'parking exit forward motion',
-                )
+                # The destination path starts inside the same tight pocket, so
+                # the relaxation has to outlast the straight leg. The finally
+                # block below and the periodic clearance check both put it back.
+                await self._relax_park_exit_inflation(vehicle_id, runtime)
+                if self.park_exit_open_loop:
+                    exit_success, exit_message = (
+                        await self._drive_straight_open_loop(
+                            goal_handle,
+                            vehicle_id,
+                            self.park_exit_forward_distance_m,
+                            self.park_exit_forward_speed_mps,
+                            'parking exit forward motion',
+                        )
+                    )
+                else:
+                    exit_success, exit_message = await self._drive_straight(
+                        goal_handle,
+                        vehicle_id,
+                        command_id,
+                        self.park_exit_forward_distance_m,
+                        self.park_exit_forward_speed_mps,
+                        self.park_exit_behavior_timeout_sec,
+                        'parking exit forward motion',
+                    )
                 if not exit_success:
                     if goal_handle.is_cancel_requested:
                         goal_handle.canceled()
@@ -1555,6 +1644,10 @@ class FleetDispatcher(Node):
             result.message = f'navigation exception: {exc}'
             return result
         finally:
+            # Backstop for the periodic clearance check: whatever ended this
+            # command - success, abort, cancel or exception - the vehicle must
+            # not be left driving with a shrunken obstacle buffer.
+            await self._restore_park_exit_inflation(vehicle_id, runtime)
             if queued_zone_id:
                 self._discard_zone_request(command_id, queued_zone_id)
             with self._vehicle_condition:
@@ -1864,6 +1957,142 @@ class FleetDispatcher(Node):
             'B-1 exit forward motion',
         )
 
+    async def _drive_straight_open_loop(
+        self,
+        goal_handle,
+        vehicle_id,
+        distance_m,
+        speed_mps,
+        phase,
+    ):
+        """Crawl straight out of the parking pocket without Nav2's checks.
+
+        The pocket is tighter than the footprint's inscribed radius, so
+        DriveOnHeading always reports COLLISION_AHEAD there and the vehicle can
+        never leave. Parking in is already an open-loop timed move
+        (parking_new.reverse_to_parked), so the exit mirrors it.
+
+        This bypasses costmap collision checking. The velocity still goes
+        through cmd_vel_safety_gate, so the emergency-stop and collision-hold
+        latches keep working.
+        """
+        publisher = self.park_exit_cmd_publishers[vehicle_id]
+        duration_sec = float(distance_m) / max(float(speed_mps), 1e-6)
+        command = Twist()
+        command.linear.x = float(speed_mps)
+
+        self.get_logger().info(
+            f'{vehicle_id} {phase}: open-loop {distance_m:.2f}m at '
+            f'{speed_mps:.3f} m/s ({duration_sec:.1f}s), costmap checks '
+            'bypassed'
+        )
+        period = 1.0 / self.park_exit_open_loop_rate_hz
+        deadline = time.monotonic() + duration_sec
+        try:
+            while time.monotonic() < deadline:
+                if goal_handle.is_cancel_requested:
+                    return False, f'{phase} canceled'
+                with self._lock:
+                    if self.vehicles[vehicle_id].emergency:
+                        return False, f'{phase} stopped by emergency latch'
+                publisher.publish(command)
+                await self._sleep_async(period)
+        finally:
+            # The gate also times out on its own, but do not rely on that.
+            publisher.publish(Twist())
+        return True, ''
+
+    async def _relax_park_exit_inflation(self, vehicle_id, runtime):
+        """Shrink the rolling costmap inflation for the parking-pocket exit.
+
+        Reads the live value first and refuses to relax when it cannot be read
+        back, so the vehicle never drives with the obstacle buffer removed and
+        no recorded value to restore.
+        """
+        if runtime.park_exit_inflation_restore_m is not None:
+            return True
+
+        get_client = self.local_costmap_get_param_clients[vehicle_id]
+        set_client = self.local_costmap_set_param_clients[vehicle_id]
+        if not get_client.service_is_ready() or not set_client.service_is_ready():
+            self.get_logger().warning(
+                f'{vehicle_id} local costmap parameter services unavailable; '
+                'leaving inflation untouched for the parking exit'
+            )
+            return False
+
+        request = GetParameters.Request()
+        request.names = ['inflation_layer.inflation_radius']
+        response = await get_client.call_async(request)
+        if not response.values or response.values[0].type != (
+            ParameterType.PARAMETER_DOUBLE
+        ):
+            self.get_logger().warning(
+                f'{vehicle_id} could not read inflation_radius; leaving it '
+                'untouched for the parking exit'
+            )
+            return False
+        current = float(response.values[0].double_value)
+
+        if not await self._write_local_inflation(
+            vehicle_id, self.park_exit_inflation_radius_m
+        ):
+            return False
+
+        with self._lock:
+            runtime.park_exit_inflation_restore_m = current
+            position = runtime.pose.pose.position
+            runtime.park_exit_origin_xy = (
+                float(position.x), float(position.y)
+            )
+        self.get_logger().warning(
+            f'{vehicle_id} parking exit: local costmap inflation '
+            f'{current:.3f} -> {self.park_exit_inflation_radius_m:.3f} m '
+            'until it clears the pocket'
+        )
+        return True
+
+    async def _restore_park_exit_inflation(self, vehicle_id, runtime):
+        """Put the rolling costmap inflation back after the pocket exit."""
+        with self._lock:
+            restore_m = runtime.park_exit_inflation_restore_m
+        if restore_m is None:
+            return
+        if await self._write_local_inflation(vehicle_id, restore_m):
+            self.get_logger().info(
+                f'{vehicle_id} parking exit complete: local costmap '
+                f'inflation restored to {restore_m:.3f} m'
+            )
+        else:
+            self.get_logger().error(
+                f'{vehicle_id} FAILED to restore local costmap inflation to '
+                f'{restore_m:.3f} m; obstacle clearance stays reduced until '
+                'the costmap is reconfigured'
+            )
+        with self._lock:
+            runtime.park_exit_inflation_restore_m = None
+            runtime.park_exit_origin_xy = None
+
+    async def _write_local_inflation(self, vehicle_id, radius_m):
+        client = self.local_costmap_set_param_clients[vehicle_id]
+        if not client.service_is_ready():
+            return False
+        parameter = Parameter()
+        parameter.name = 'inflation_layer.inflation_radius'
+        parameter.value = ParameterValue()
+        parameter.value.type = ParameterType.PARAMETER_DOUBLE
+        parameter.value.double_value = float(radius_m)
+        request = SetParameters.Request()
+        request.parameters = [parameter]
+        try:
+            response = await client.call_async(request)
+        except Exception as exc:  # noqa: BLE001 - ROS future exception
+            self.get_logger().error(
+                f'{vehicle_id} inflation_radius set failed: {exc}'
+            )
+            return False
+        return bool(response.results and response.results[0].successful)
+
     async def _drive_straight(
         self,
         goal_handle,
@@ -1968,6 +2197,37 @@ class FleetDispatcher(Node):
             park_zone_id,
             radius_m=self.park_exit_detection_radius_m,
         )
+
+    def _check_park_exit_inflation(self):
+        """Restore inflation as soon as a vehicle is clear of its pocket.
+
+        The command's finally block is the last resort; this returns the
+        obstacle buffer for the rest of a long trip instead of holding it
+        reduced all the way to the destination.
+        """
+        to_restore = []
+        with self._lock:
+            for vehicle_id, runtime in self.vehicles.items():
+                origin = runtime.park_exit_origin_xy
+                if (
+                    origin is None
+                    or runtime.park_exit_inflation_restore_m is None
+                ):
+                    continue
+                travelled = math.hypot(
+                    runtime.pose.pose.position.x - origin[0],
+                    runtime.pose.pose.position.y - origin[1],
+                )
+                if travelled >= self.park_exit_inflation_clear_distance_m:
+                    to_restore.append((vehicle_id, runtime, travelled))
+        for vehicle_id, runtime, travelled in to_restore:
+            self.get_logger().info(
+                f'{vehicle_id} moved {travelled:.2f}m from its parking spot; '
+                'restoring local costmap inflation'
+            )
+            self.executor.create_task(
+                self._restore_park_exit_inflation(vehicle_id, runtime)
+            )
 
     def _vehicle_is_at_zone(self, runtime, zone_id, radius_m=None):
         """Reject a false exit turn when a reserved vehicle is still en route."""

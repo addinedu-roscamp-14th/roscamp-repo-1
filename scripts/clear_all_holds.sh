@@ -58,11 +58,9 @@ done
 echo "== fleet emergency =="
 call /central/fleet/emergency_stop std_srvs/srv/SetBool "{data: false}"
 
-echo "== zone locks =="
-for service in $ZONE_SERVICES; do
-    call "/central/fleet/$service" std_srvs/srv/Trigger "{}"
-done
-
+# Goals must be cancelled before the zone locks: the dispatcher refuses to
+# clear a lock while its owning vehicle is still executing a command, so
+# clearing first fails with "owner is still executing a command".
 if [ "$CANCEL_GOALS" = true ]; then
     echo "== in-flight navigation goals =="
     # An all-zero goal_id with a zero stamp cancels every goal on the server.
@@ -76,7 +74,14 @@ if [ "$CANCEL_GOALS" = true ]; then
                 && echo OK || echo "UNAVAILABLE"
         done
     done
+    # Let the dispatcher observe the cancellations and drop `busy`.
+    sleep 1.5
 fi
+
+echo "== zone locks =="
+for service in $ZONE_SERVICES; do
+    call "/central/fleet/$service" std_srvs/srv/Trigger "{}"
+done
 
 echo
 echo "Verify:  ros2 topic echo /central/fleet/collision_status --once"

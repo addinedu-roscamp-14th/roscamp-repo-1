@@ -15,6 +15,54 @@ from dataclasses import dataclass, replace
 from typing import Iterable, Optional, Sequence, Tuple
 
 
+# Operator-facing vehicle names, keyed by ROS namespace. AMR 1 carries the
+# blue cargo box and AMR 2 the yellow one, matching pinky.urdf.xacro. Only the
+# displayed name is AMR: topics and services still use agv1/agv2.
+AMR_DISPLAY_NAMES = {
+    "agv1": "AMR 1 (파랑)",
+    "agv2": "AMR 2 (노랑)",
+}
+
+# Latch-clearing surface, kept in step with scripts/clear_all_holds.sh.
+COLLISION_SUPERVISOR_SERVICE = "/central/fleet/collision_supervisor/enabled"
+FLEET_EMERGENCY_SERVICE = "/central/fleet/emergency_stop"
+# Derived from fleet_dispatcher's exclusive_zone_ids ['B-1','A','PARK1','PARK2'].
+ZONE_CLEAR_SERVICES = (
+    "clear_b1_lock",
+    "clear_a_lock",
+    "clear_park1_lock",
+    "clear_park2_lock",
+)
+CANCELLABLE_ACTIONS = (
+    "navigate_to_pose",
+    "navigate_through_poses",
+    "park_in_spot",
+)
+
+
+@dataclass(frozen=True)
+class FleetVehicleState:
+    """One vehicle's telemetry as published on /central/fleet/<id>/state.
+
+    emergency_stopped is only the operator/gateway latch. The collision
+    supervisor stops a vehicle through a separate safety_hold service that
+    never reaches VehicleState, so that reason arrives via RosSnapshot's
+    collision_* fields instead.
+    """
+
+    vehicle_id: str = ""
+    state_text: str = ""
+    battery_percent: float = 0.0
+    emergency_stopped: bool = False
+    x: float = 0.0
+    y: float = 0.0
+    battery_voltage: float = 0.0
+    nav2_ready: bool = False
+    locked_zone: str = ""
+    telemetry_age_sec: float = 0.0
+    current_command_id: str = ""
+
+
 @dataclass(frozen=True)
 class RosSnapshot:
     ready: bool = False
@@ -29,6 +77,11 @@ class RosSnapshot:
     last_command: Optional[str] = None
     fleet_states: tuple = ()
     b1_zone: str = "B-1:UNKNOWN"
+    # Mirrors /central/fleet/collision_status from fleet_collision_supervisor.
+    collision_state: str = ""
+    collision_held_vehicle: str = ""
+    collision_distance_m: Optional[float] = None
+    collision_transport: str = ""
 
 
 class RosControlBridge:
@@ -106,8 +159,9 @@ class RosControlBridge:
             from rclpy.executors import SingleThreadedExecutor
             from rclpy.node import Node
             from rclpy.signals import SignalHandlerOptions
+            from action_msgs.srv import CancelGoal
             from std_msgs.msg import Float32, String
-            from std_srvs.srv import Trigger
+            from std_srvs.srv import SetBool, Trigger
             from porter_interfaces.msg import VehicleState
         except Exception as exc:
             self._update_snapshot(
@@ -129,6 +183,8 @@ class RosControlBridge:
                     "Twist": Twist,
                     "Path": Path,
                     "Trigger": Trigger,
+                    "SetBool": SetBool,
+                    "CancelGoal": CancelGoal,
                 }
                 owner._publishers = {
                     "cmd_vel": self.create_publisher(
@@ -161,6 +217,30 @@ class RosControlBridge:
                         Trigger, "/arm2/stack_container"
                     ),
                 }
+                # Every latch that can keep a vehicle from moving lives in a
+                # different node, so releasing one is not enough. Mirrors
+                # scripts/clear_all_holds.sh.
+                owner._clients[COLLISION_SUPERVISOR_SERVICE] = (
+                    self.create_client(SetBool, COLLISION_SUPERVISOR_SERVICE)
+                )
+                owner._clients[FLEET_EMERGENCY_SERVICE] = self.create_client(
+                    SetBool, FLEET_EMERGENCY_SERVICE
+                )
+                for vehicle_id in AMR_DISPLAY_NAMES:
+                    for service in ("safety_hold", "emergency_stop"):
+                        name = f"/{vehicle_id}/{service}"
+                        owner._clients[name] = self.create_client(
+                            SetBool, name
+                        )
+                    for action in CANCELLABLE_ACTIONS:
+                        name = f"/{vehicle_id}/{action}/_action/cancel_goal"
+                        owner._clients[name] = self.create_client(
+                            CancelGoal, name
+                        )
+                for service in ZONE_CLEAR_SERVICES:
+                    name = f"/central/fleet/{service}"
+                    owner._clients[name] = self.create_client(Trigger, name)
+
                 for vehicle_id in ("agv1", "agv2"):
                     self.create_subscription(
                         VehicleState,
@@ -172,6 +252,12 @@ class RosControlBridge:
                     String,
                     "/central/fleet/zones",
                     lambda msg: owner._update_snapshot(b1_zone=msg.data),
+                    10,
+                )
+                self.create_subscription(
+                    String,
+                    "/central/fleet/collision_status",
+                    owner._on_collision_status,
                     10,
                 )
                 self.create_subscription(
@@ -260,13 +346,18 @@ class RosControlBridge:
         self._emergency_active = (
             self._fleet_emergency or bool(self._emergency_vehicles)
         )
-        self._fleet_states[message.vehicle_id] = (
-            message.vehicle_id,
-            message.state_text,
-            float(message.battery_percent),
-            bool(message.emergency_stopped),
-            float(message.pose.pose.position.x),
-            float(message.pose.pose.position.y),
+        self._fleet_states[message.vehicle_id] = FleetVehicleState(
+            vehicle_id=message.vehicle_id,
+            state_text=message.state_text,
+            battery_percent=float(message.battery_percent),
+            emergency_stopped=bool(message.emergency_stopped),
+            x=float(message.pose.pose.position.x),
+            y=float(message.pose.pose.position.y),
+            battery_voltage=float(message.battery_voltage),
+            nav2_ready=bool(message.nav2_ready),
+            locked_zone=str(message.locked_zone),
+            telemetry_age_sec=float(message.telemetry_age_sec),
+            current_command_id=str(message.current_command_id),
         )
         self._update_snapshot(
             fleet_states=tuple(
@@ -274,6 +365,26 @@ class RosControlBridge:
                 for key in sorted(self._fleet_states)
             ),
             emergency_active=self._emergency_active,
+        )
+
+    def _on_collision_status(self, message) -> None:
+        """Track which vehicle the collision supervisor is currently holding."""
+        import json
+
+        try:
+            status = json.loads(message.data)
+        except (ValueError, AttributeError):
+            return
+        if not isinstance(status, dict):
+            return
+        distance = status.get("minimum_distance_m")
+        self._update_snapshot(
+            collision_state=str(status.get("state") or ""),
+            collision_held_vehicle=str(status.get("held_vehicle") or ""),
+            collision_distance_m=(
+                float(distance) if isinstance(distance, (int, float)) else None
+            ),
+            collision_transport=str(status.get("hold_transport") or ""),
         )
 
     def _new_twist(self, linear_x: float = 0.0, angular_z: float = 0.0):
@@ -446,6 +557,168 @@ class RosControlBridge:
             command = f"target_waypoints(count={len(poses)})"
         self._update_snapshot(last_command=command)
         return True
+
+    def _call_service_sync(self, service_name, request, timeout_sec=5.0):
+        """Call one service and wait for it, returning (ok, detail).
+
+        The node already spins on its own executor thread, so this polls the
+        future instead of spinning it again from here.
+        """
+        client = self._clients.get(service_name)
+        if client is None:
+            return False, "클라이언트 없음"
+        if not client.service_is_ready():
+            return False, "서비스 없음"
+        future = client.call_async(request)
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not future.done():
+            return False, "응답 시간 초과"
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001 - ROS future exception
+            return False, str(exc)
+        # CancelGoal has no success field; an accepted cancel returns code 0.
+        success = getattr(response, "success", None)
+        if success is None:
+            code = getattr(response, "return_code", 0)
+            return code == 0, f"return_code={code}"
+        return bool(success), str(getattr(response, "message", ""))
+
+    def _await_services(self, service_names, timeout_sec=4.0):
+        """Wait once for every client to discover its service.
+
+        Services reached through the zenoh bridge can take a second or two to
+        show up. Waiting per call would multiply that by the number of calls,
+        so poll them all together and bound the total wait instead.
+        """
+        deadline = time.monotonic() + timeout_sec
+        pending = list(service_names)
+        while pending and time.monotonic() < deadline:
+            pending = [
+                name for name in pending
+                if not (
+                    self._clients.get(name) is not None
+                    and self._clients[name].service_is_ready()
+                )
+            ]
+            if pending:
+                time.sleep(0.05)
+        return pending
+
+    def clear_all_holds(self, cancel_goals: bool = True):
+        """Release every latch that can keep an AMR stopped.
+
+        Same sequence as scripts/clear_all_holds.sh: the collision supervisor
+        is toggled off and back on so it drops whatever it holds without
+        leaving collisions unguarded. Returns a list of (label, ok, detail).
+        """
+        if not self.snapshot().ready:
+            return None
+
+        set_bool = self._message_types.get("SetBool")
+        trigger = self._message_types.get("Trigger")
+        cancel = self._message_types.get("CancelGoal")
+        if set_bool is None or trigger is None or cancel is None:
+            return None
+
+        def set_bool_request(value):
+            request = set_bool.Request()
+            request.data = value
+            return request
+
+        # Give every client one shared chance to finish discovery first.
+        all_services = [COLLISION_SUPERVISOR_SERVICE, FLEET_EMERGENCY_SERVICE]
+        for vehicle_id in AMR_DISPLAY_NAMES:
+            all_services += [
+                f"/{vehicle_id}/safety_hold",
+                f"/{vehicle_id}/emergency_stop",
+            ]
+            if cancel_goals:
+                all_services += [
+                    f"/{vehicle_id}/{action}/_action/cancel_goal"
+                    for action in CANCELLABLE_ACTIONS
+                ]
+        all_services += [
+            f"/central/fleet/{service}" for service in ZONE_CLEAR_SERVICES
+        ]
+        self._await_services(all_services)
+
+        results = []
+
+        # 1) Collision supervisor: disabling releases its automatic hold.
+        results.append((
+            "충돌 감시기 해제",
+            *self._call_service_sync(
+                COLLISION_SUPERVISOR_SERVICE, set_bool_request(False)
+            ),
+        ))
+        time.sleep(1.0)
+        results.append((
+            "충돌 감시기 재가동",
+            *self._call_service_sync(
+                COLLISION_SUPERVISOR_SERVICE, set_bool_request(True)
+            ),
+        ))
+
+        # 2) Per-vehicle latches inside cmd_vel_safety_gate.
+        for vehicle_id, display_name in AMR_DISPLAY_NAMES.items():
+            for service, label in (
+                ("safety_hold", "충돌 정지"),
+                ("emergency_stop", "비상정지"),
+            ):
+                results.append((
+                    f"{display_name} {label}",
+                    *self._call_service_sync(
+                        f"/{vehicle_id}/{service}", set_bool_request(False)
+                    ),
+                ))
+
+        # 3) Fleet-wide emergency latch in the dispatcher.
+        results.append((
+            "전체 비상정지",
+            *self._call_service_sync(
+                FLEET_EMERGENCY_SERVICE, set_bool_request(False)
+            ),
+        ))
+
+        # 4) In-flight goals: bt_navigator rejects new ones while one runs.
+        #    This must precede the zone locks - _clear_zone_lock refuses while
+        #    the owning vehicle is still busy, so clearing first always failed
+        #    with "owner is still executing a command".
+        if cancel_goals:
+            for vehicle_id, display_name in AMR_DISPLAY_NAMES.items():
+                for action in CANCELLABLE_ACTIONS:
+                    # A default request is all-zero, which cancels every goal.
+                    results.append((
+                        f"{display_name} {action} 취소",
+                        *self._call_service_sync(
+                            f"/{vehicle_id}/{action}/_action/cancel_goal",
+                            cancel.Request(),
+                        ),
+                    ))
+            # Let the dispatcher observe the cancelled goals and drop `busy`.
+            time.sleep(1.5)
+
+        # 5) Zone locks, or the dispatcher refuses to dispatch into them.
+        for service in ZONE_CLEAR_SERVICES:
+            results.append((
+                f"구역 잠금 {service}",
+                *self._call_service_sync(
+                    f"/central/fleet/{service}", trigger.Request()
+                ),
+            ))
+
+        self._fleet_emergency = False
+        self._emergency_vehicles.clear()
+        self._emergency_active = False
+        self._manual_stop_deadline = 0.0
+        self._update_snapshot(
+            emergency_active=False,
+            last_command="CLEAR_ALL_HOLDS",
+        )
+        return results
 
     def call_trigger(self, service_name: str) -> bool:
         client = self._clients.get(service_name)
