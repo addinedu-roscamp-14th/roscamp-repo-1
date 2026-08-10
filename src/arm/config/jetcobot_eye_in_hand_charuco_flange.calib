@@ -1,8 +1,8 @@
 parameters:
-  name: jetcobot_eye_in_hand
+  name: jetcobot_eye_in_hand_charuco_flange
   calibration_type: eye_in_hand
   robot_base_frame: arm/base_link
-  robot_effector_frame: arm/TCP
+  robot_effector_frame: arm/6_Link
   tracking_base_frame: arm/gripper_camera_optical_frame
   tracking_marker_frame: arm/handeye_target
   freehand_robot_movement: true
@@ -10,11 +10,11 @@ parameters:
   move_group: manipulator
 transform:
   translation:
-    x: 0.0006761234152592471
-    y: -0.0356222201978537
-    z: -0.0395251188060033
+    x: 0.04652167357046161
+    y: -0.008317074592648202
+    z: 0.04745132911968335
   rotation:
-    x: -0.010630253278160874
-    y: -0.02094190389400441
-    z: 0.05757575022071566
-    w: 0.9980648613006361
+    x: -0.4831559314594924
+    y: 0.5198978779009056
+    z: -0.4834300619241592
+    w: 0.5124079602012924

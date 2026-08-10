@@ -2,6 +2,8 @@
 
 JetCobot 6축 로봇팔의 MoveIt2 planning group, KDL IK, 관절 제한, SRDF와 controller
 연결 설정을 제공합니다. 로봇 모델은 `jetcobot_description`의 기존 URDF를 사용합니다.
+MoveIt 위치 한계도 `pymycobot.robot_info`의 `MyCobot280` 범위와 동일하게
+유지하여 계획된 관절값이 하드웨어 검증에서 거부되지 않도록 합니다.
 
 ## 실기기 planning 실행
 
