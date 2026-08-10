@@ -1,8 +1,11 @@
 """Execute FollowJointTrajectory goals on a JetCobot through pymycobot."""
 
+from datetime import datetime, timezone
+import json
 import math
 import threading
 import time
+import uuid
 
 from control_msgs.action import FollowJointTrajectory
 from pymycobot.mycobot280 import MyCobot280
@@ -11,7 +14,9 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 
@@ -371,6 +376,14 @@ class JetCobotTrajectoryBridge(Node):
         callback_group = ReentrantCallbackGroup()
         self.joint_state_publisher = self.create_publisher(
             JointState, self.joint_states_topic, 10
+        )
+        event_qos = QoSProfile(
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.transfer_event_publisher = self.create_publisher(
+            String, '/arm2/transfer_events', event_qos
         )
         self.action_server = ActionServer(
             self,
@@ -874,17 +887,36 @@ class JetCobotTrajectoryBridge(Node):
 
     def return_home(self, _request, response):
         """Move the physical arm to the configured joint-space home."""
+        operation_id = self._publish_motion_event(
+            destination='INITIAL', phase='MOVING', state='STARTED'
+        )
         try:
             self._move_home()
             response.success = True
             response.message = f'home reached: {self.home_angles}'
+            self._publish_motion_event(
+                destination='INITIAL',
+                phase='COMPLETED',
+                state='COMPLETED',
+                operation_id=operation_id,
+            )
         except Exception as exc:
             response.success = False
             response.message = f'home move failed: {exc}'
+            self._publish_motion_event(
+                destination='INITIAL',
+                phase='FAILED',
+                state='FAILED',
+                operation_id=operation_id,
+                error=str(exc),
+            )
         return response
 
     def go_a1_pose(self, _request, response):
         """Move the physical arm to the configured A-1 joint pose."""
+        operation_id = self._publish_motion_event(
+            destination='A-1', phase='MOVING', state='STARTED'
+        )
         try:
             self._run_exclusive_targets(
                 (self.a1_angles,),
@@ -894,13 +926,24 @@ class JetCobotTrajectoryBridge(Node):
             )
             response.success = True
             response.message = f'A-1 pose reached: {self.a1_angles}'
+            self._publish_motion_event(
+                destination='A-1', phase='COMPLETED',
+                state='COMPLETED', operation_id=operation_id,
+            )
         except Exception as exc:
             response.success = False
             response.message = f'A-1 pose move failed: {exc}'
+            self._publish_motion_event(
+                destination='A-1', phase='FAILED', state='FAILED',
+                operation_id=operation_id, error=str(exc),
+            )
         return response
 
     def go_a2_pose(self, _request, response):
         """Move the physical arm to the configured A-2 joint pose."""
+        operation_id = self._publish_motion_event(
+            destination='A-2', phase='MOVING', state='STARTED'
+        )
         try:
             self._run_exclusive_targets(
                 (self.a2_angles,),
@@ -910,13 +953,24 @@ class JetCobotTrajectoryBridge(Node):
             )
             response.success = True
             response.message = f'A-2 pose reached: {self.a2_angles}'
+            self._publish_motion_event(
+                destination='A-2', phase='COMPLETED',
+                state='COMPLETED', operation_id=operation_id,
+            )
         except Exception as exc:
             response.success = False
             response.message = f'A-2 pose move failed: {exc}'
+            self._publish_motion_event(
+                destination='A-2', phase='FAILED', state='FAILED',
+                operation_id=operation_id, error=str(exc),
+            )
         return response
 
     def go_a3_pose(self, _request, response):
         """Move the physical arm to the configured A-3 joint pose."""
+        operation_id = self._publish_motion_event(
+            destination='A-3', phase='MOVING', state='STARTED'
+        )
         try:
             self._run_exclusive_targets(
                 (self.a3_angles,),
@@ -926,10 +980,59 @@ class JetCobotTrajectoryBridge(Node):
             )
             response.success = True
             response.message = f'A-3 pose reached: {self.a3_angles}'
+            self._publish_motion_event(
+                destination='A-3', phase='COMPLETED',
+                state='COMPLETED', operation_id=operation_id,
+            )
         except Exception as exc:
             response.success = False
             response.message = f'A-3 pose move failed: {exc}'
+            self._publish_motion_event(
+                destination='A-3', phase='FAILED', state='FAILED',
+                operation_id=operation_id, error=str(exc),
+            )
         return response
+
+    def _publish_motion_event(
+        self, destination, phase, state, operation_id=None, error=None
+    ):
+        """Publish one manual/route position movement event."""
+        if operation_id is None:
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+            operation_id = (
+                f'move-{destination.lower()}-{timestamp}-'
+                f'{uuid.uuid4().hex[:6]}'
+            )
+        completed = state == 'COMPLETED'
+        payload = {
+            'schema_version': '1.0',
+            'timestamp': datetime.now(timezone.utc).isoformat(
+                timespec='milliseconds'
+            ).replace('+00:00', 'Z'),
+            'robot': 'arm2',
+            'operation_id': operation_id,
+            'operation': 'position_move',
+            'source': {'zone': None, 'container_id': None},
+            'destination': {'zone': destination, 'container_id': None},
+            'recognized_ids': {'source': None, 'destination': None},
+            'phase': phase,
+            'state': state,
+            'progress': 100 if completed else (0 if error is None else None),
+            'message': (
+                f'{destination} 위치 이동 완료'
+                if completed else (
+                    f'{destination} 위치 이동 실패'
+                    if error is not None else f'{destination} 위치 이동 시작'
+                )
+            ),
+            'error': error,
+        }
+        message = String()
+        message.data = json.dumps(
+            payload, ensure_ascii=False, separators=(',', ':')
+        )
+        self.transfer_event_publisher.publish(message)
+        return operation_id
 
     def sweep_joint1(self, _request, response):
         """Sweep J1 for a bounded duration, then return the robot home."""

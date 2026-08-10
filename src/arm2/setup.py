@@ -47,6 +47,7 @@ setup(
             'arm2.arm2_auto_handeye_sampler:main',
             'arm2_camera_repeatability_monitor = '
             'arm2.arm2_camera_repeatability_monitor:main',
+            'arm2_json_udp_bridge = arm2.arm2_json_udp_bridge:main',
         ],
     },
 )

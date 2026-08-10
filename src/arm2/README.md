@@ -242,6 +242,51 @@ ros2 service call /arm2/stack_container std_srvs/srv/Trigger '{}'
 ros2 topic echo /arm2/container_pick/status
 ```
 
+### JSON 이송 진행 이벤트와 원격 전송
+
+`/arm2/transfer_events`에는 `std_msgs/msg/String` JSON 이벤트가 발행됩니다.
+저장 목적지 이송뿐 아니라 목적지 스캔, ID 0-8 트레일러 적재, ID 간 이송,
+초기/A-1/A-2/A-3 위치 이동, 긴급 정지 및 적재 층수 초기화가 포함됩니다.
+요청 접수, 검색, 위치 확정, 집기 시작/완료, 목적지 이동, 내려놓기, 복귀,
+완료 및 실패 단계가 동일한 `operation_id`로 연결됩니다. `operation` 값은
+`transfer`, `destination_scan`, `trailer_load`, `id_transfer`, `position_move`,
+`emergency_stop`, `stack_level_reset` 중 하나입니다.
+컨테이너 작업은 카메라로 확정한 ID를 `recognized_ids.source`와
+`recognized_ids.destination`에 넣습니다. 메시지도 `ID 1을 집었습니다`,
+`ID 1을 ID 2에 놓았습니다`, `작업이 성공했습니다/실패했습니다`처럼 실제
+출발 및 목적지 ID를 포함합니다.
+
+```bash
+ros2 topic echo /arm2/transfer_events
+```
+
+다른 컴퓨터에 UDP로 전달하려면 기존 launch 명령에 다음 인자를 추가합니다.
+
+```bash
+event_udp_enabled:=true \
+event_udp_host:=192.168.0.50 \
+event_udp_port:=15002
+```
+
+수신 컴퓨터에서는 방화벽의 UDP 15002 포트를 허용한 뒤 다음 예제로 확인할 수
+있습니다.
+
+```python
+import json
+import socket
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(('0.0.0.0', 15002))
+while True:
+    payload, sender = sock.recvfrom(65535)
+    event = json.loads(payload.decode('utf-8'))
+    print(sender, event)
+```
+
+UDP 전송을 켜지 않아도 ROS 2 JSON 토픽은 항상 발행됩니다. UDP는 로컬망의
+간단한 상태 전달용이며, 전달 보장이 필요한 네트워크에서는 이 토픽을 MQTT나
+데이터베이스 브리지에 연결하는 것이 좋습니다.
+
 ### 베이스 좌표계 고정 보정
 
 `config/arm2/arm2_container_pick.yaml`에서 파지점 보정은 두 종류로 나뉩니다.
@@ -249,6 +294,7 @@ ros2 topic echo /arm2/container_pick/status
 ```yaml
 grasp_offset_xyz_m: [0.006879, -0.002075, -0.036814]
 pick_correction_xyz_m: [0.0, -0.007925, 0.0]
+saved_destination_pick_correction_xyz_m: [0.01, 0.0, 0.0]
 id_transfer_pick_correction_xyz_m: [-0.02, -0.01, -0.02]
 place_correction_xyz_m: [0.0, 0.0, 0.0]
 saved_destination_correction_xyz_m: [-0.02, -0.01, -0.005]
@@ -264,6 +310,9 @@ trailer_a3_pick_correction_xyz_m: [0.02, -0.03, 0.0]
 - `pick_correction_xyz_m`: `marker_yaw`/`marker_full` 집기 목표에 마커 축
   기준으로 더하며 마커 yaw와 함께 회전합니다. X는 빨간 축, Y는 초록 축입니다.
   `fixed` 모드에서만 `arm2/base_link` 축 기준으로 적용됩니다.
+- `saved_destination_pick_correction_xyz_m`: `/arm2/transfer_to_a1_1`부터
+  `/arm2/transfer_to_a3_2`까지의 집기에만 공통 집기 보정에 추가됩니다.
+  `[0.01, 0.0, 0.0]`은 마커의 빨간 축(`+X`) 방향 10 mm입니다.
 - `id_transfer_pick_correction_xyz_m`: `/arm2/transfer_by_id`의 집기에만
   적용됩니다. 현재 값은 초록 축 반대 10 mm이며 기존 X/Z 집기 보정을
   유지합니다.

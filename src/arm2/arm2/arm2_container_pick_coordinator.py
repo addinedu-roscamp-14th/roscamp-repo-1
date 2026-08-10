@@ -2,11 +2,13 @@
 
 from collections import deque
 import copy
+from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
 import threading
 import time
+import uuid
 
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
@@ -510,6 +512,9 @@ class ContainerPickCoordinator(Node):
         self.grasp_offset = self._vector_parameter('grasp_offset_xyz_m', 3)
         self.pick_correction = self._vector_parameter(
             'pick_correction_xyz_m', 3
+        )
+        self.saved_destination_pick_correction = self._vector_parameter(
+            'saved_destination_pick_correction_xyz_m', 3
         )
         self.id_transfer_pick_correction = self._vector_parameter(
             'id_transfer_pick_correction_xyz_m', 3
@@ -1118,12 +1123,22 @@ class ContainerPickCoordinator(Node):
         self.ik_seed_fallback_index = 0
         self.ik_seed_fallback_solutions = set()
         self.last_status_text = ''
+        self.transfer_event_lock = threading.Lock()
+        self.transfer_event_sequence = 0
         self.add_on_set_parameters_callback(
             self._on_tuning_parameters_changed
         )
 
         self.status_publisher = self.create_publisher(
             String, '/arm2/container_pick/status', 10
+        )
+        event_qos = QoSProfile(
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.transfer_event_publisher = self.create_publisher(
+            String, '/arm2/transfer_events', event_qos
         )
         self.marker_pose_publisher = self.create_publisher(
             PoseStamped, '/arm2/container_pick/marker_pose', 10
@@ -1226,6 +1241,8 @@ class ContainerPickCoordinator(Node):
             'Loaded grasp tuning: '
             f'grasp_offset={self.grasp_offset.tolist()}, '
             f'pick_correction={self.pick_correction.tolist()}, '
+            'saved_destination_pick_correction='
+            f'{self.saved_destination_pick_correction.tolist()}, '
             'id_transfer_pick_correction='
             f'{self.id_transfer_pick_correction.tolist()}, '
             f'place_correction={self.place_correction.tolist()}, '
@@ -1245,6 +1262,7 @@ class ContainerPickCoordinator(Node):
             'offsets_configured',
             'grasp_offset_xyz_m',
             'pick_correction_xyz_m',
+            'saved_destination_pick_correction_xyz_m',
             'id_transfer_pick_correction_xyz_m',
             'place_correction_xyz_m',
             'saved_destination_correction_xyz_m',
@@ -1283,6 +1301,18 @@ class ContainerPickCoordinator(Node):
                     'pick_correction_xyz_m',
                     requested['pick_correction_xyz_m'],
                     limit=0.2,
+                )
+
+            saved_destination_pick_correction = (
+                self.saved_destination_pick_correction
+            )
+            if 'saved_destination_pick_correction_xyz_m' in requested:
+                saved_destination_pick_correction = (
+                    self._validated_tuning_vector(
+                        'saved_destination_pick_correction_xyz_m',
+                        requested['saved_destination_pick_correction_xyz_m'],
+                        limit=0.2,
+                    )
                 )
 
             id_transfer_pick_correction = self.id_transfer_pick_correction
@@ -1352,6 +1382,9 @@ class ContainerPickCoordinator(Node):
 
         self.grasp_offset = grasp_offset
         self.pick_correction = pick_correction
+        self.saved_destination_pick_correction = (
+            saved_destination_pick_correction
+        )
         self.id_transfer_pick_correction = id_transfer_pick_correction
         self.place_correction = place_correction
         self.saved_destination_correction = saved_destination_correction
@@ -1375,6 +1408,8 @@ class ContainerPickCoordinator(Node):
             f'offsets_configured={self.offsets_configured}, '
             f'grasp_offset={self.grasp_offset.tolist()}, '
             f'pick_correction={self.pick_correction.tolist()}, '
+            'saved_destination_pick_correction='
+            f'{self.saved_destination_pick_correction.tolist()}, '
             'id_transfer_pick_correction='
             f'{self.id_transfer_pick_correction.tolist()}, '
             f'place_correction={self.place_correction.tolist()}, '
@@ -1416,6 +1451,9 @@ class ContainerPickCoordinator(Node):
         )
         self.declare_parameter('grasp_offset_xyz_m', [0.0, 0.0, 0.0])
         self.declare_parameter('pick_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter(
+            'saved_destination_pick_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
         self.declare_parameter(
             'id_transfer_pick_correction_xyz_m', [0.0, 0.0, 0.0]
         )
@@ -1662,6 +1700,65 @@ class ContainerPickCoordinator(Node):
         message.data = text
         self.status_publisher.publish(message)
         self.get_logger().info(text)
+
+    @staticmethod
+    def _new_operation_id(label):
+        """Create a compact identifier shared by one operation's events."""
+        safe_label = str(label).lower().replace('_', '-')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+        return f'{safe_label}-{timestamp}-{uuid.uuid4().hex[:6]}'
+
+    def publish_transfer_event(
+        self,
+        operation_id,
+        phase,
+        state,
+        message,
+        destination_zone=None,
+        source_zone=None,
+        source_id=None,
+        destination_id=None,
+        progress=None,
+        error=None,
+        operation='transfer',
+    ):
+        """Publish one machine-readable transfer lifecycle event as JSON."""
+        with self.transfer_event_lock:
+            self.transfer_event_sequence += 1
+            sequence = self.transfer_event_sequence
+        payload = {
+            'schema_version': '1.0',
+            'timestamp': datetime.now(timezone.utc).isoformat(
+                timespec='milliseconds'
+            ).replace('+00:00', 'Z'),
+            'sequence': sequence,
+            'robot': 'arm2',
+            'operation_id': operation_id,
+            'operation': operation,
+            'source': {
+                'zone': source_zone,
+                'container_id': source_id,
+            },
+            'destination': {
+                'zone': destination_zone,
+                'container_id': destination_id,
+            },
+            'recognized_ids': {
+                'source': source_id,
+                'destination': destination_id,
+            },
+            'phase': phase,
+            'state': state,
+            'progress': progress,
+            'message': message,
+            'error': error,
+        }
+        ros_message = String()
+        ros_message.data = json.dumps(
+            payload, ensure_ascii=False, separators=(',', ':')
+        )
+        self.transfer_event_publisher.publish(ros_message)
+        self.get_logger().info(f'TRANSFER EVENT: {ros_message.data}')
 
     def _republish_status(self):
         if self.last_status_text:
@@ -2493,8 +2590,18 @@ class ContainerPickCoordinator(Node):
             return response
         self.stop_event.clear()
         self.destination_scan_active.set()
+        operation_id = self._new_operation_id('destination-scan')
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='destination_scan',
+            phase='ACCEPTED',
+            state='STARTED',
+            progress=0,
+            message='목적지 및 트레일러 위치 스캔 요청 접수',
+        )
         self.motion_thread = threading.Thread(
             target=self.execute_destination_scan,
+            args=(operation_id,),
             daemon=True,
         )
         self.motion_thread.start()
@@ -2504,8 +2611,16 @@ class ContainerPickCoordinator(Node):
         )
         return response
 
-    def execute_destination_scan(self):
+    def execute_destination_scan(self, operation_id):
         try:
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='destination_scan',
+                phase='SCANNING',
+                state='RUNNING',
+                progress=10,
+                message='HOME-A1-A2-A3 목적지 스캔 중',
+            )
             destination_marker_ids = tuple(range(11, 17))
             trailer_marker_ids = tuple(self.trailer_frames)
             scan_marker_ids = destination_marker_ids + trailer_marker_ids
@@ -2533,6 +2648,14 @@ class ContainerPickCoordinator(Node):
             )
             if locked is None:
                 self.publish_status(f'DESTINATION SCAN FAILED: {reason}')
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='destination_scan',
+                    phase='FAILED',
+                    state='FAILED',
+                    message='목적지 스캔 실패',
+                    error=reason,
+                )
                 return
             # All required destinations are now locked in base_frame.  Freeze
             # marker collection for the entire home return so IDs 11-16 seen
@@ -2557,6 +2680,14 @@ class ContainerPickCoordinator(Node):
                 f'DESTINATION SCAN FAILED during pose route: {exc}'
             )
             self._recover_home_after_failure('DESTINATION SCAN')
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='destination_scan',
+                phase='FAILED',
+                state='FAILED',
+                message='목적지 스캔 실패',
+                error=str(exc),
+            )
             return
         finally:
             self.tracking_suspended.clear()
@@ -2570,6 +2701,14 @@ class ContainerPickCoordinator(Node):
                 f'{"saved" if marker_id in self.saved_marker_poses else "not seen"}'
                 for marker_id in self.trailer_frames
             )
+        )
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='destination_scan',
+            phase='COMPLETED',
+            state='COMPLETED',
+            progress=100,
+            message='목적지 ID 11-16 및 트레일러 위치 스캔 완료',
         )
 
     def _scan_destination_route(self, specs, required_count):
@@ -2707,9 +2846,22 @@ class ContainerPickCoordinator(Node):
             response.message = 'A robot motion is already running'
             return response
         self.stop_event.clear()
+        operation_id = self._new_operation_id(
+            f'trailer-load-id{source_marker_id}'
+        )
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='trailer_load',
+            phase='ACCEPTED',
+            state='STARTED',
+            source_id=source_marker_id,
+            destination_zone='TRAILER',
+            progress=0,
+            message=f'ID {source_marker_id} 트레일러 적재 요청 접수',
+        )
         self.motion_thread = threading.Thread(
             target=self.execute_loading_transfer,
-            args=(source_marker_id,),
+            args=(source_marker_id, operation_id),
             daemon=True,
         )
         self.motion_thread.start()
@@ -2775,9 +2927,23 @@ class ContainerPickCoordinator(Node):
             )
             return response
         self.stop_event.clear()
+        operation_id = self._new_operation_id(
+            f'id-transfer-{source_id}-to-{destination_id}'
+        )
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='id_transfer',
+            phase='ACCEPTED',
+            state='STARTED',
+            source_id=source_id,
+            destination_zone=destination_zone,
+            destination_id=destination_id,
+            progress=0,
+            message=f'ID {source_id}에서 ID {destination_id} 이송 요청 접수',
+        )
         self.motion_thread = threading.Thread(
             target=self.execute_id_to_id_transfer,
-            args=(source_id, destination_id),
+            args=(source_id, destination_id, operation_id),
             daemon=True,
         )
         self.motion_thread.start()
@@ -2792,7 +2958,9 @@ class ContainerPickCoordinator(Node):
         )
         return response
 
-    def execute_id_to_id_transfer(self, source_id, destination_id):
+    def execute_id_to_id_transfer(
+        self, source_id, destination_id, operation_id
+    ):
         """Scan a source and transfer to a container or saved stack marker."""
         destination_zone = next(
             (
@@ -2821,6 +2989,17 @@ class ContainerPickCoordinator(Node):
             ))
         if destination_zone is not None:
             self.destination_scan_active.set()
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='id_transfer',
+            phase='SCANNING',
+            state='RUNNING',
+            source_id=source_id,
+            destination_zone=destination_zone,
+            destination_id=destination_id,
+            progress=10,
+            message=f'ID {source_id}와 ID {destination_id} 위치 스캔 중',
+        )
         try:
             scan_result, reason = self._scan_id_transfer_route(specs)
         finally:
@@ -2830,8 +3009,34 @@ class ContainerPickCoordinator(Node):
             self.publish_status(
                 f'ID {source_id} -> ID {destination_id} FAILED: {reason}'
             )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='id_transfer',
+                phase='FAILED',
+                state='FAILED',
+                source_id=source_id,
+                destination_zone=destination_zone,
+                destination_id=destination_id,
+                message='ID 간 이송 스캔 실패',
+                error=reason,
+            )
             return
         locked, source_scan_zone, destination_scan_zone = scan_result
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='id_transfer',
+            phase='SOURCE_LOCKED',
+            state='COMPLETED',
+            source_zone=source_scan_zone,
+            source_id=source_id,
+            destination_zone=destination_scan_zone or destination_zone,
+            destination_id=destination_id,
+            progress=20,
+            message=(
+                f'카메라가 출발 ID {source_id}와 목적지 ID '
+                f'{destination_id}를 인식했습니다'
+            ),
+        )
         self.tracking_suspended.set()
         source_pose = copy.deepcopy(locked[0])
         destination_pose = copy.deepcopy(locked[1])
@@ -2894,10 +3099,25 @@ class ContainerPickCoordinator(Node):
                 align_source_before_pick=True,
                 source_scan_zone=source_scan_zone,
                 source_bearing_xy=source_pose[0][:2],
+                operation_id=operation_id,
+                event_operation='id_transfer',
+                destination_marker_id=destination_id,
             )
         except Exception as exc:
             self.publish_status(
                 f'ID {source_id} -> ID {destination_id} FAILED: {exc}'
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='id_transfer',
+                phase='FAILED',
+                state='FAILED',
+                source_zone=source_scan_zone,
+                source_id=source_id,
+                destination_zone=destination_scan_zone or destination_zone,
+                destination_id=destination_id,
+                message='ID 간 이송 실패',
+                error=str(exc),
             )
             self._recover_home_after_failure(
                 f'ID {source_id} -> ID {destination_id}'
@@ -3023,8 +3243,18 @@ class ContainerPickCoordinator(Node):
             + ', '.join(missing)
         )
 
-    def execute_loading_transfer(self, source_marker_id):
+    def execute_loading_transfer(self, source_marker_id, operation_id):
         """Scan a selected source and trailer, then execute the transfer."""
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='trailer_load',
+            phase='SCANNING',
+            state='RUNNING',
+            source_id=source_marker_id,
+            destination_zone='TRAILER',
+            progress=10,
+            message=f'ID {source_marker_id}와 트레일러 위치 스캔 중',
+        )
         specs = [(
             f'container ID {source_marker_id}',
             self.source_frames[source_marker_id],
@@ -3043,6 +3273,16 @@ class ContainerPickCoordinator(Node):
             self.publish_status(
                 f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
             )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='trailer_load',
+                phase='FAILED',
+                state='FAILED',
+                source_id=source_marker_id,
+                destination_zone='TRAILER',
+                message='트레일러 적재 스캔 실패',
+                error=reason,
+            )
             return
         locked, source_scan_zone = scan_result
         # Freeze both accepted base-frame poses for the complete operation.
@@ -3055,6 +3295,21 @@ class ContainerPickCoordinator(Node):
         )
         trailer_pose = copy.deepcopy(locked[selected_offset])
         trailer_marker_id = tuple(self.trailer_frames)[selected_offset - 1]
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='trailer_load',
+            phase='SOURCE_LOCKED',
+            state='COMPLETED',
+            source_zone=source_scan_zone,
+            source_id=source_marker_id,
+            destination_zone='TRAILER',
+            destination_id=trailer_marker_id,
+            progress=20,
+            message=(
+                f'카메라가 출발 ID {source_marker_id}와 트레일러 ID '
+                f'{trailer_marker_id}를 인식했습니다'
+            ),
+        )
         try:
             source_pick_correction = self.pick_correction
             if source_scan_zone == 'A-3':
@@ -3078,6 +3333,18 @@ class ContainerPickCoordinator(Node):
                 self._recover_home_after_failure(
                     f'TRAILER LOAD ID {source_marker_id}'
                 )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='trailer_load',
+                    phase='FAILED',
+                    state='FAILED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone='TRAILER',
+                    destination_id=trailer_marker_id,
+                    message='트레일러 집기 목표 계산 실패',
+                    error=reason,
+                )
                 return
             with self.stack_level_lock:
                 placed_count = self.saved_destination_stack_counts['TRAILER']
@@ -3088,6 +3355,18 @@ class ContainerPickCoordinator(Node):
                 )
                 self._recover_home_after_failure(
                     f'TRAILER LOAD ID {source_marker_id}'
+                )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='trailer_load',
+                    phase='FAILED',
+                    state='FAILED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone='TRAILER',
+                    destination_id=trailer_marker_id,
+                    message='트레일러 최대 적재 층수 도달',
+                    error='maximum stack level reached',
                 )
                 return
             targets, reason = self.calculate_stack_targets_from_locked_poses(
@@ -3103,6 +3382,18 @@ class ContainerPickCoordinator(Node):
                 self._recover_home_after_failure(
                     f'TRAILER LOAD ID {source_marker_id}'
                 )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='trailer_load',
+                    phase='FAILED',
+                    state='FAILED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone='TRAILER',
+                    destination_id=trailer_marker_id,
+                    message='트레일러 놓기 목표 계산 실패',
+                    error=reason,
+                )
                 return
             self.publish_status(
                 f'TRAILER LOAD: ID {source_marker_id} and trailer ID '
@@ -3116,6 +3407,29 @@ class ContainerPickCoordinator(Node):
                 count_stack=False,
                 saved_stack_name='TRAILER',
                 source_marker_id=source_marker_id,
+                source_scan_zone=source_scan_zone,
+                operation_id=operation_id,
+                event_operation='trailer_load',
+                destination_marker_id=trailer_marker_id,
+            )
+        except Exception as exc:
+            self.publish_status(
+                f'TRAILER LOAD ID {source_marker_id} FAILED: {exc}'
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='trailer_load',
+                phase='FAILED',
+                state='FAILED',
+                source_zone=source_scan_zone,
+                source_id=source_marker_id,
+                destination_zone='TRAILER',
+                destination_id=trailer_marker_id,
+                message='트레일러 적재 실패',
+                error=str(exc),
+            )
+            self._recover_home_after_failure(
+                f'TRAILER LOAD ID {source_marker_id}'
             )
         finally:
             self.tracking_suspended.clear()
@@ -3237,9 +3551,24 @@ class ContainerPickCoordinator(Node):
             response.message = 'A robot motion is already running'
             return response
         self.stop_event.clear()
+        operation_id = self._new_operation_id(
+            f'transfer-{destination_name}'
+        )
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            phase='ACCEPTED',
+            state='STARTED',
+            destination_zone=destination_name,
+            destination_id=self.destination_ids[destination_name],
+            progress=0,
+            message=(
+                f'{destination_name}(ID '
+                f'{self.destination_ids[destination_name]}) 이송 요청 접수'
+            ),
+        )
         self.motion_thread = threading.Thread(
             target=self.execute_saved_destination_transfer,
-            args=(destination_name,),
+            args=(destination_name, operation_id),
             daemon=True,
         )
         self.motion_thread.start()
@@ -3249,8 +3578,20 @@ class ContainerPickCoordinator(Node):
         )
         return response
 
-    def execute_saved_destination_transfer(self, destination_name):
+    def execute_saved_destination_transfer(
+        self, destination_name, operation_id
+    ):
+        destination_marker_id = self.destination_ids[destination_name]
         try:
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                phase='SCANNING',
+                state='RUNNING',
+                destination_zone=destination_name,
+                destination_id=destination_marker_id,
+                progress=10,
+                message='출발 컨테이너 검색 중',
+            )
             specs = tuple(
                 (
                     f'container ID {marker_id}',
@@ -3269,20 +3610,58 @@ class ContainerPickCoordinator(Node):
                 self.publish_status(
                     f'{destination_name} TRANSFER FAILED: {reason}'
                 )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    phase='FAILED',
+                    state='FAILED',
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=10,
+                    message='출발 컨테이너 검색 실패',
+                    error=reason,
+                )
                 return
             source_marker_id, source_pose = next(
                 (marker_id, pose)
                 for marker_id, pose in zip(self.source_frames, locked)
                 if pose is not None
             )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                phase='SOURCE_LOCKED',
+                state='COMPLETED',
+                source_id=source_marker_id,
+                destination_zone=destination_name,
+                destination_id=destination_marker_id,
+                progress=20,
+                message=(
+                    f'카메라가 출발 컨테이너 ID {source_marker_id}를 '
+                    '인식했습니다'
+                ),
+            )
             source_targets, reason = self.calculate_targets_from_marker_pose(
                 source_pose,
                 orientation_mode=self.stack_source_orientation_mode,
+                pick_correction=(
+                    self.pick_correction
+                    + self.saved_destination_pick_correction
+                ),
             )
             if source_targets is None:
                 self.publish_status(
                     f'{destination_name} TRANSFER FAILED: '
                     f'container ID {source_marker_id} target: {reason}'
+                )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    phase='FAILED',
+                    state='FAILED',
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=20,
+                    message='집기 목표 계산 실패',
+                    error=reason,
                 )
                 self._recover_home_after_failure(destination_name)
                 return
@@ -3301,6 +3680,17 @@ class ContainerPickCoordinator(Node):
                 self.publish_status(
                     f'{destination_name} TRANSFER FAILED: {reason}'
                 )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    phase='FAILED',
+                    state='FAILED',
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=20,
+                    message='목적지 목표 계산 실패',
+                    error=reason,
+                )
                 self._recover_home_after_failure(destination_name)
                 return
             self.execute_scanned_transfer(
@@ -3309,12 +3699,23 @@ class ContainerPickCoordinator(Node):
                 count_stack=False,
                 saved_stack_name=destination_name,
                 source_marker_id=source_marker_id,
+                operation_id=operation_id,
+                destination_marker_id=destination_marker_id,
             )
         except Exception as exc:
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(
                 f'{destination_name} TRANSFER FAILED: {exc}'
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                phase='FAILED',
+                state='FAILED',
+                destination_zone=destination_name,
+                destination_id=destination_marker_id,
+                message=f'{destination_name} 이송 실패',
+                error=str(exc),
             )
             self._recover_home_after_failure(destination_name)
 
@@ -3550,6 +3951,14 @@ class ContainerPickCoordinator(Node):
                 self.saved_destination_stack_counts[name] = 0
         self.publish_status(
             'STACK: all layer counters reset; next layer is 1'
+        )
+        self.publish_transfer_event(
+            operation_id=self._new_operation_id('stack-reset'),
+            operation='stack_level_reset',
+            phase='COMPLETED',
+            state='COMPLETED',
+            progress=100,
+            message='전체 적재 층수 초기화 완료',
         )
         response.success = True
         response.message = (
@@ -3844,6 +4253,14 @@ class ContainerPickCoordinator(Node):
         return response
 
     def stop_pick(self, _request, response):
+        operation_id = self._new_operation_id('emergency-stop')
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='emergency_stop',
+            phase='STOP_REQUESTED',
+            state='STARTED',
+            message='긴급 정지 요청 수신',
+        )
         self.stop_event.set()
         if self.motion_backend == 'moveit':
             self._stop_moveit_motion()
@@ -3852,10 +4269,26 @@ class ContainerPickCoordinator(Node):
                 with self.serial_lock:
                     self.robot.stop()
             except Exception as exc:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='emergency_stop',
+                    phase='FAILED',
+                    state='FAILED',
+                    message='긴급 정지 명령 실패',
+                    error=str(exc),
+                )
                 response.success = False
                 response.message = f'Stop command failed: {exc}'
                 return response
         self.publish_status('STOP requested')
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='emergency_stop',
+            phase='STOPPED',
+            state='COMPLETED',
+            progress=100,
+            message='로봇팔 정지 명령 전달 완료',
+        )
         response.success = True
         response.message = 'Stop command sent'
         return response
@@ -4577,10 +5010,22 @@ class ContainerPickCoordinator(Node):
         align_source_before_pick=False,
         source_scan_zone=None,
         source_bearing_xy=None,
+        operation_id=None,
+        event_operation='transfer',
+        destination_marker_id=None,
     ):
         """Move a scan-locked container to one locked destination."""
         if not self.motion_lock.acquire(blocking=False):
             return
+        source_label = f'ID {source_marker_id}'
+        if destination_marker_id is None:
+            destination_label = str(destination_name)
+        elif str(destination_name).startswith('ID '):
+            destination_label = f'ID {destination_marker_id}'
+        else:
+            destination_label = (
+                f'{destination_name}(ID {destination_marker_id})'
+            )
         try:
             self.j2_fallback_used = False
             self.j3_fallback_used = False
@@ -4588,6 +5033,19 @@ class ContainerPickCoordinator(Node):
             self.ik_seed_fallback_solutions = set()
             source_targets, release, approach = targets
             self.publish_status('TRANSFER: moving to saved container pose')
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='MOVING_TO_SOURCE',
+                    state='RUNNING',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=25,
+                    message=f'{source_label} 집기 위치로 이동 중',
+                )
             self.publish_pick_target(
                 'TRANSFER', source_targets[0], marker_id=source_marker_id
             )
@@ -4596,6 +5054,19 @@ class ContainerPickCoordinator(Node):
                     source_targets[0],
                     source_scan_zone,
                     source_bearing_xy=source_bearing_xy,
+                )
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='PICKING',
+                    state='STARTED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=35,
+                    message=f'{source_label} 컨테이너 집기 시작',
                 )
             picked_grasp = self._perform_pick(
                 copy.deepcopy(source_targets),
@@ -4606,6 +5077,22 @@ class ContainerPickCoordinator(Node):
                 marker_id=source_marker_id,
                 search_higher_pregrasp=align_source_before_pick,
             )
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='PICK_COMPLETE',
+                    state='COMPLETED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=50,
+                    message=(
+                        f'카메라가 인식한 {source_label} 컨테이너를 '
+                        '집었습니다'
+                    ),
+                )
             self.raise_to_common_clearance_before_j1(release)
             self.move_joint1_toward_destination(
                 picked_grasp,
@@ -4626,6 +5113,23 @@ class ContainerPickCoordinator(Node):
                 f'TRANSFER: container picked; moving to {destination_name}: '
                 f'tcp_yaw={destination_yaw:.2f}deg'
             )
+            if operation_id is not None:
+                route = source_scan_zone or f'ID {source_marker_id} 위치'
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='MOVING_TO_DESTINATION',
+                    state='RUNNING',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=65,
+                    message=(
+                        f'{source_label} 컨테이너를 {route}에서 '
+                        f'{destination_label}로 이동 중'
+                    ),
+                )
             approach = self.move_to_reachable_stack_release(
                 release,
                 approach.pose.orientation,
@@ -4648,7 +5152,39 @@ class ContainerPickCoordinator(Node):
             self.publish_status(
                 f'TRANSFER: releasing container at {destination_name}'
             )
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='PLACING',
+                    state='STARTED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=80,
+                    message=(
+                        f'{source_label} 컨테이너를 '
+                        f'{destination_label}에 놓기 시작'
+                    ),
+                )
             self.command_gripper(open_gripper=True)
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='PLACE_COMPLETE',
+                    state='COMPLETED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=90,
+                    message=(
+                        f'{source_label} 컨테이너를 '
+                        f'{destination_label}에 놓았습니다'
+                    ),
+                )
             self.publish_status(
                 f'TRANSFER: retreating from {destination_name}'
             )
@@ -4675,14 +5211,61 @@ class ContainerPickCoordinator(Node):
                     f'{completed_layer}/{self.max_stack_levels} placed'
                 )
             self.publish_status('TRANSFER: returning to final home')
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='RETURNING_HOME',
+                    state='RUNNING',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=95,
+                    message='초기 위치로 복귀 중',
+                )
             self.command_return_home()
             self.publish_status(
                 f'TRANSFER: container to {destination_name} completed'
             )
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='COMPLETED',
+                    state='COMPLETED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=100,
+                    message=(
+                        f'{source_label} 컨테이너를 '
+                        f'{destination_label}에 놓는 작업이 '
+                        '성공했습니다'
+                    ),
+                )
         except Exception as exc:
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'TRANSFER FAILED: {exc}')
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='FAILED',
+                    state='FAILED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    message=(
+                        f'{source_label} 컨테이너를 '
+                        f'{destination_label}에 놓는 작업이 '
+                        '실패했습니다'
+                    ),
+                    error=str(exc),
+                )
             self._recover_home_after_failure('TRANSFER')
         finally:
             self.tracking_suspended.clear()

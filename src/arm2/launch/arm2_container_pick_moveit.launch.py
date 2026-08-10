@@ -10,6 +10,7 @@ from launch.actions import (
     OpaqueFunction,
     SetLaunchConfiguration,
 )
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -62,6 +63,9 @@ def generate_launch_description():
         DeclareLaunchArgument('goal_tolerance_deg', default_value='2.5'),
         DeclareLaunchArgument('goal_timeout_sec', default_value='15.0'),
         DeclareLaunchArgument('use_rviz', default_value='true'),
+        DeclareLaunchArgument('event_udp_enabled', default_value='false'),
+        DeclareLaunchArgument('event_udp_host', default_value='127.0.0.1'),
+        DeclareLaunchArgument('event_udp_port', default_value='15002'),
     ]
 
     moveit = IncludeLaunchDescription(
@@ -149,6 +153,20 @@ def generate_launch_description():
             },
         ],
     )
+    event_udp_bridge = Node(
+        package='arm2',
+        executable='arm2_json_udp_bridge',
+        name='arm2_json_udp_bridge',
+        namespace='arm2',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('event_udp_enabled')),
+        parameters=[{
+            'remote_host': LaunchConfiguration('event_udp_host'),
+            'remote_port': ParameterValue(
+                LaunchConfiguration('event_udp_port'), value_type=int
+            ),
+        }],
+    )
 
     return LaunchDescription(arguments + [
         OpaqueFunction(function=resolve_params_file),
@@ -157,4 +175,5 @@ def generate_launch_description():
         camera,
         handeye,
         coordinator,
+        event_udp_bridge,
     ])
