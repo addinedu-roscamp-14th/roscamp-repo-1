@@ -56,9 +56,9 @@ _SYSTEM_PROMPT_TEMPLATE = """당신은 항만 자율주행 로봇 시스템의 �
 등록된 화물종류: {cargo_types}
 현재 탑다운 영상 크기: {image_width}x{image_height}
 
-우리 AGV 차량은 YOLO 검출 JSON에서 label로 구분됩니다: car_yellow=agv1(노란색
-차량), car_blue=agv2(파란색 차량). 이 둘은 화물이나 장애물이 아니라 우리가 직접
-제어하는 차량 자신입니다.
+우리 AGV 차량은 YOLO 검출 JSON에서 label로 구분됩니다: car_blue=agv1(파란색
+차량, AMR1), car_yellow=agv2(노란색 차량, AMR2). 이 둘은 화물이나 장애물이 아니라
+우리가 직접 제어하는 차량 자신입니다.
 
 사용자 문장을 분석해서 반드시 아래 형식으로만 응답하세요. 설명, 인사, 코드블록(```) 등
 JSON 이외의 텍스트는 절대 포함하지 마세요.
@@ -77,6 +77,11 @@ C는 D로") 각각을 별도 action으로 배열에 전부 넣으세요. 서로 
 agv1과 agv2 action을 각각 만들고, 두 action이 독립적이면 execution_mode를
 "parallel"로 설정하세요. "유휴 차량들"처럼 조건이 붙어도 어느 차량이 실제로
 유휴인지는 시스템이 판단하므로, 당신은 두 차량 action을 모두 만드세요.
+반대로 사용자가 차량 하나를 특정하면("AMR2한테만", "agv1만", "노란 차만",
+"2호차 단독") 그 차량 action을 정확히 하나만 만드세요. 지목되지 않은 차량의
+action을 절대 추가하지 마세요. 복수 지칭이 없는데 두 차량 action을 만드는 것은
+오류입니다. 지목된 차량이 지금 바쁜지 여부는 판단하지 말고, 그대로 그 차량을
+vehicle_id에 넣으세요.
 하나의 action에는 한 차량의 한 이동만 넣으세요. "먼저", "그 다음", "이후",
 "빠져나오면", "도착한 뒤" 같은 순서 표현이 있으면 반드시 서로 다른 action으로
 나누고, 조건을 만족하는 순서대로 배열하세요.
@@ -408,7 +413,14 @@ def _finalize_navigation_result(command: str, result: Dict, actions) -> Dict:
     finalized['actions'] = actions
 
     lowered = str(command).lower()
-    requests_all = any(term in lowered for term in _ALL_VEHICLE_TERMS)
+    # "차들"/"차량들" match as substrings, so a single-vehicle phrase like
+    # "노란 차들을 항구로" would otherwise fan out to both vehicles and throw
+    # the colour away. Naming exactly one vehicle always wins over the
+    # plural wording.
+    requests_all = (
+        any(term in lowered for term in _ALL_VEHICLE_TERMS)
+        and len(_mentioned_vehicle_ids(command)) != 1
+    )
     if requests_all and len(actions) == 1 and isinstance(actions[0], dict):
         action = actions[0]
         if action.get('type') in _VEHICLE_NAVIGATION_TYPES:
@@ -811,6 +823,21 @@ def _visual_action_from_detection(
             image_height,
         ),
         'vehicle_id': _infer_vehicle_id(command, vehicle_id),
+    }
+
+
+def _mentioned_vehicle_ids(command):
+    """Return every vehicle the command names outright.
+
+    An empty set means the request never says which vehicle; two entries mean
+    it addressed both by name. Only a single entry marks a request that one
+    specific vehicle must serve alone.
+    """
+    text = str(command or '').strip().lower()
+    return {
+        vehicle_id
+        for vehicle_id, aliases in _VEHICLE_TERMS
+        if any(alias in text for alias in aliases)
     }
 
 

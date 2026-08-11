@@ -25,6 +25,27 @@ ARM2는 직접 서비스 응답을 작업 완료로 간주하지 않습니다. �
 `final_for_vehicle`가 참일 때만 `/central/autonomy/vehicle_release`에 발행됩니다.
 `transfer_by_id` 성공은 차량 출발 조건이 아닙니다.
 
+### 출발 게이트
+
+같은 조건(`final_for_vehicle` + 차량 지정 + 위 두 이송 작업)을 만족하는 명령이
+큐에 들어가는 순간부터 종료될 때까지, `arm_dispatcher`는 해당 차량을 붙잡고
+있다고 `/central/arms/vehicle_holds`에 2Hz로 알립니다. `fleet_dispatcher`는 이
+스냅샷을 구독해서, 붙잡힌 차량의 주행 명령을 바퀴가 돌기 직전 단계에서
+대기시킵니다(피드백 상태 `WAITING_FOR_ARM`). 팔 작업이 끝나면 대기가 풀리고
+주행이 이어집니다.
+
+- 스냅샷은 **주기 발행**이며 매번 집합 전체를 교체합니다. 메시지를 놓쳐도 다음
+  스냅샷에서 스스로 복구되고, latch로 인해 낡은 hold가 재생되는 일도 없습니다.
+- 작업이 **실패해도** hold는 풀립니다. 차가 갇히는 쪽이 더 위험하기 때문이며,
+  실패 사실은 작업 결과로 별도 통보됩니다.
+- 대기는 `cargo_hold_timeout_sec`(기본 300초)에서 끊기고 명령은 abort 됩니다.
+- 대시보드의 수동 목표(`/agvX/goal_pose`)는 `fleet_dispatcher`를 거치지 않으므로
+  이 게이트의 적용을 받지 않습니다. 운용자 비상 수단으로 열어둔 경로입니다.
+
+```bash
+ros2 topic echo /central/arms/vehicle_holds
+```
+
 HTTP API 예시:
 
 ```bash

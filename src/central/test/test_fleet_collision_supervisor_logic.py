@@ -427,3 +427,68 @@ def test_a_predictive_horizon_stops_vehicles_that_are_still_far_apart():
     """
     assert _judged_separation(3.0, 0.9) < 0.22
     assert _judged_separation(0.0, 0.9) > 0.22
+
+
+def make_park_supervisor(radius_m=0.30):
+    supervisor = object.__new__(FleetCollisionSupervisor)
+    # Mirrors the 'parked' poses in src/drive/params/parking_spots.yaml.
+    supervisor.park_positions = {
+        'agv1': np.array([1.673782, 0.408066]),
+        'agv2': np.array([1.635464, 0.168810]),
+    }
+    supervisor.park_exempt_radius = radius_m
+    return supervisor
+
+
+def test_parked_spots_are_closer_than_the_hold_threshold():
+    supervisor = make_park_supervisor()
+    gap = float(
+        np.linalg.norm(
+            supervisor.park_positions['agv1']
+            - supervisor.park_positions['agv2']
+        )
+    )
+
+    # 0.24 m: below release_separation_m (0.30), so once a hold latches in
+    # the pockets the normal release can never fire. This is the whole
+    # reason the exemption exists.
+    assert gap < 0.30
+    assert round(gap, 2) == 0.24
+
+
+def test_both_vehicles_in_their_spots_are_exempt():
+    supervisor = make_park_supervisor()
+
+    assert supervisor._both_vehicles_in_park_spots({
+        'agv1': np.array([1.673782, 0.408066]),
+        'agv2': np.array([1.635464, 0.168810]),
+    })
+
+
+def test_guard_returns_once_one_vehicle_leaves_its_pocket():
+    supervisor = make_park_supervisor()
+
+    # agv1 has pulled 0.5 m out; it is ordinary traffic again.
+    assert not supervisor._both_vehicles_in_park_spots({
+        'agv1': np.array([1.173782, 0.408066]),
+        'agv2': np.array([1.635464, 0.168810]),
+    })
+
+
+def test_missing_position_never_grants_an_exemption():
+    supervisor = make_park_supervisor()
+
+    assert not supervisor._both_vehicles_in_park_spots({
+        'agv1': None,
+        'agv2': np.array([1.635464, 0.168810]),
+    })
+
+
+def test_unconfigured_spots_leave_the_guard_untouched():
+    supervisor = make_park_supervisor()
+    supervisor.park_positions = {}
+
+    assert not supervisor._both_vehicles_in_park_spots({
+        'agv1': np.array([1.673782, 0.408066]),
+        'agv2': np.array([1.635464, 0.168810]),
+    })

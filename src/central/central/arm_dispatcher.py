@@ -11,7 +11,7 @@ import time
 
 from arm2_interfaces.srv import TransferById
 from porter_interfaces.action import DispatchArmCommand
-from porter_interfaces.msg import ArmState
+from porter_interfaces.msg import ArmState, VehicleState
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -62,10 +62,34 @@ class ArmDispatcher(Node):
         self.declare_parameter('service_retry_count', 3)
         self.declare_parameter('operation_timeout_sec', 600.0)
         self.declare_parameter('scan_timeout_sec', 240.0)
+        # A transfer only makes sense once the trailer is actually parked in
+        # front of the arm. Without this the arm reached for a vehicle that
+        # was still driving. Empty zone disables the wait.
+        self.declare_parameter('vehicle_arrival_zone', 'A')
+        self.declare_parameter('vehicle_arrival_timeout_sec', 300.0)
+        self.declare_parameter('vehicle_state_max_age_sec', 5.0)
 
         self.callback_group = ReentrantCallbackGroup()
         self.condition = threading.Condition()
         self.queue = deque()
+        # token -> vehicle_id for every queued or running command that has
+        # promised to gate a vehicle's departure. Derived from live queue
+        # state rather than edge events so a dropped message self-heals.
+        self.vehicle_commitments = {}
+        self.vehicle_arrival_zone = str(
+            self.get_parameter('vehicle_arrival_zone').value or ''
+        ).strip('/')
+        self.vehicle_arrival_timeout_sec = float(
+            self.get_parameter('vehicle_arrival_timeout_sec').value
+        )
+        if self.vehicle_arrival_timeout_sec <= 0.0:
+            raise ValueError('vehicle_arrival_timeout_sec must be positive')
+        self.vehicle_state_max_age_sec = float(
+            self.get_parameter('vehicle_state_max_age_sec').value
+        )
+        if self.vehicle_state_max_age_sec <= 0.0:
+            raise ValueError('vehicle_state_max_age_sec must be positive')
+        self.vehicle_states = {}
         self.events = deque(maxlen=500)
         self.latest_sequence = 0
         self.latest_event_at = None
@@ -92,6 +116,22 @@ class ArmDispatcher(Node):
         self.result_publisher = self.create_publisher(
             String, '/central/arms/results', event_qos
         )
+        # Volatile on purpose: a periodic snapshot must never be replayed to
+        # a late joiner, or a restarted fleet dispatcher would hold a vehicle
+        # against a command that finished long ago.
+        self.vehicle_hold_publisher = self.create_publisher(
+            String, '/central/arms/vehicle_holds', 10
+        )
+        for vehicle_id in ('agv1', 'agv2'):
+            self.create_subscription(
+                VehicleState,
+                f'/central/fleet/{vehicle_id}/state',
+                lambda message, vid=vehicle_id: self._on_vehicle_state(
+                    vid, message
+                ),
+                10,
+                callback_group=self.callback_group,
+            )
         self.arm1_state_publisher = self.create_publisher(
             ArmState, '/central/arms/arm1/state', 10
         )
@@ -194,6 +234,7 @@ class ArmDispatcher(Node):
             self.condition.notify_all()
 
     def _publish_states(self):
+        self._publish_vehicle_holds()
         now = self.get_clock().now().to_msg()
         arm1 = ArmState()
         arm1.header.stamp = now
@@ -362,6 +403,82 @@ class ArmDispatcher(Node):
                 self.condition.wait(timeout=min(0.25, deadline - time.monotonic()))
         return None, operation_id, f'{operation} timed out after {timeout:.1f}s'
 
+    def _on_vehicle_state(self, vehicle_id, message):
+        with self.condition:
+            self.vehicle_states[vehicle_id] = (message, time.monotonic())
+            self.condition.notify_all()
+
+    def _vehicle_has_arrived(self, vehicle_id):
+        """Return true once the vehicle is parked in the arm's work zone."""
+        with self.condition:
+            entry = self.vehicle_states.get(vehicle_id)
+            if entry is None:
+                return False
+            message, received_at = entry
+        if time.monotonic() - received_at > self.vehicle_state_max_age_sec:
+            # Stale telemetry says nothing about where the vehicle is now.
+            return False
+        if message.state != VehicleState.READY:
+            return False
+        return (
+            str(message.locked_zone).strip('/') == self.vehicle_arrival_zone
+        )
+
+    def _wait_for_vehicle_arrival(self, goal_handle, goal, generation):
+        """Hold the command until its vehicle is parked in the work zone."""
+        vehicle_id = str(goal.vehicle_id)
+        if not self.vehicle_arrival_zone or not vehicle_id:
+            return True, ''
+        deadline = time.monotonic() + self.vehicle_arrival_timeout_sec
+        announced = False
+        while not self._vehicle_has_arrived(vehicle_id):
+            if goal_handle.is_cancel_requested:
+                return False, f'canceled while waiting for {vehicle_id}'
+            with self.condition:
+                stopped = generation != self.stop_generation
+            if stopped:
+                return False, 'stopped by operator while waiting'
+            if time.monotonic() >= deadline:
+                return False, (
+                    f'{vehicle_id} did not reach '
+                    f'{self.vehicle_arrival_zone} within '
+                    f'{self.vehicle_arrival_timeout_sec:.0f}s'
+                )
+            if not announced:
+                announced = True
+                self.get_logger().info(
+                    f'Waiting for {vehicle_id} to reach '
+                    f'{self.vehicle_arrival_zone} before starting '
+                    f'{goal.operation}'
+                )
+            with self.condition:
+                self.condition.wait(timeout=0.2)
+        return True, ''
+
+    @staticmethod
+    def _gates_vehicle(goal, operation):
+        """Return true when this command must gate the vehicle's departure.
+
+        The same predicate decides both the hold taken while the command is
+        pending and the release reported when it finishes, so the two can
+        never disagree.
+        """
+        return bool(
+            goal.final_for_vehicle
+            and str(goal.vehicle_id)
+            and operation in {'transfer_to_slot', 'load_to_trailer'}
+        )
+
+    def _publish_vehicle_holds(self):
+        """Broadcast which vehicles are still owed a cargo operation."""
+        with self.condition:
+            held = sorted(set(self.vehicle_commitments.values()))
+        message = String()
+        message.data = json.dumps(
+            {'held_vehicles': held}, ensure_ascii=False
+        )
+        self.vehicle_hold_publisher.publish(message)
+
     def _publish_result(self, goal, success, operation_id, message, release):
         payload = {
             'command_id': str(goal.command_id),
@@ -444,6 +561,29 @@ class ArmDispatcher(Node):
             baseline_sequence = self.latest_sequence
 
         try:
+            if self._gates_vehicle(goal, operation):
+                # Order matters: wait for the vehicle first, claim it second.
+                # Claiming before the wait would hold the vehicle in place
+                # while the arm waited for that same vehicle to arrive.
+                with self.condition:
+                    self.arm2_state_text = 'WAITING_FOR_VEHICLE'
+                arrived, arrival_message = self._wait_for_vehicle_arrival(
+                    goal_handle, goal, command_generation
+                )
+                if not arrived:
+                    return self._finish_error(
+                        goal_handle,
+                        goal,
+                        (
+                            self.ERROR_CANCELED
+                            if goal_handle.is_cancel_requested
+                            else self.ERROR_TIMEOUT
+                        ),
+                        arrival_message,
+                    )
+                with self.condition:
+                    self.vehicle_commitments[id(token)] = str(goal.vehicle_id)
+                    self.arm2_state_text = 'DISPATCHING'
             client, request, accepted_field = self._service_for_goal(
                 goal, operation
             )
@@ -529,11 +669,7 @@ class ArmDispatcher(Node):
                 success = True
                 terminal_message = service_message
 
-            release = bool(
-                goal.final_for_vehicle
-                and str(goal.vehicle_id)
-                and operation in {'transfer_to_slot', 'load_to_trailer'}
-            )
+            release = self._gates_vehicle(goal, operation)
             result = DispatchArmCommand.Result()
             result.success = True
             result.error_code = 0
@@ -556,6 +692,10 @@ class ArmDispatcher(Node):
                     self.queue.popleft()
                 elif token in self.queue:
                     self.queue.remove(token)
+                # Released on failure as well as success: a stuck vehicle is
+                # worse than an early release, and the operation result
+                # already tells the operator the transfer did not finish.
+                self.vehicle_commitments.pop(id(token), None)
                 self.condition.notify_all()
 
     def _stop_arm2(self, _request, response):

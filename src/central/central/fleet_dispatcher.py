@@ -118,12 +118,15 @@ class FleetDispatcher(Node):
         self.declare_parameter('telemetry_timeout_sec', 3.0)
         self.declare_parameter('state_publish_rate_hz', 2.0)
         # A goal Nav2 accepted can still leave the vehicle standing still.
-        # Watch odometry and re-send the goal rather than waiting out the
-        # action's full timeout with nothing happening.
+        # Watch odometry and fail safely instead of waiting out the action's
+        # full timeout. Automatic re-send is opt-in: some Nav2 Jazzy versions
+        # abort bt_navigator if a replacement arrives while cancellation is
+        # still being finalized, especially through a remote action bridge.
         self.declare_parameter('motion_threshold_mps', 0.015)
         self.declare_parameter('motion_yaw_threshold_rps', 0.05)
-        self.declare_parameter('motion_stall_timeout_sec', 8.0)
-        self.declare_parameter('max_motion_resends', 2)
+        self.declare_parameter('motion_stall_timeout_sec', 20.0)
+        self.declare_parameter('max_motion_resends', 0)
+        self.declare_parameter('cancel_settle_timeout_sec', 10.0)
         self.declare_parameter('max_park_retries', 2)
         self.declare_parameter('park_retry_backoff_sec', 2.0)
         self.declare_parameter(
@@ -136,6 +139,12 @@ class FleetDispatcher(Node):
         self.declare_parameter('b1_exit_forward_speed_mps', 0.05)
         self.declare_parameter('b1_exit_behavior_timeout_sec', 20.0)
         self.declare_parameter('b1_exit_detection_radius_m', 0.35)
+        # Spin overshoots the commanded angle, so feeding the measured error
+        # straight back oscillated (+21, -11, +9 deg) and ran out of
+        # corrections without ever landing inside the tolerance. Every failure
+        # aborted the command before the mandatory forward move could run.
+        # Turn once and advance; set true to restore closed-loop correction.
+        self.declare_parameter('b1_exit_turn_verify', False)
         self.declare_parameter('b1_exit_turn_tolerance_deg', 5.0)
         self.declare_parameter('b1_exit_turn_max_corrections', 2)
         self.declare_parameter('b1_exit_pose_update_timeout_sec', 3.0)
@@ -179,6 +188,7 @@ class FleetDispatcher(Node):
         self.declare_parameter('duplicate_goal_distance_m', 0.12)
         self.declare_parameter('duplicate_goal_yaw_tolerance_deg', 20.0)
         self.declare_parameter('sequence_dependency_timeout_sec', 300.0)
+        self.declare_parameter('cargo_hold_timeout_sec', 300.0)
         self.declare_parameter('subscribe_odom_fallback', False)
 
         vehicle_ids = [
@@ -210,6 +220,11 @@ class FleetDispatcher(Node):
         )
         if self.max_motion_resends < 0:
             raise ValueError('max_motion_resends must be non-negative')
+        self.cancel_settle_timeout_sec = float(
+            self.get_parameter('cancel_settle_timeout_sec').value
+        )
+        if self.cancel_settle_timeout_sec < 0.0:
+            raise ValueError('cancel_settle_timeout_sec must be non-negative')
         self.max_park_retries = int(
             self.get_parameter('max_park_retries').value
         )
@@ -263,6 +278,9 @@ class FleetDispatcher(Node):
         )
         if self.b1_exit_detection_radius_m <= 0.0:
             raise ValueError('b1_exit_detection_radius_m must be positive')
+        self.b1_exit_turn_verify = bool(
+            self.get_parameter('b1_exit_turn_verify').value
+        )
         self.b1_exit_turn_tolerance_rad = math.radians(float(
             self.get_parameter('b1_exit_turn_tolerance_deg').value
         ))
@@ -394,11 +412,20 @@ class FleetDispatcher(Node):
             raise ValueError(
                 'sequence_dependency_timeout_sec must be positive'
             )
+        self.cargo_hold_timeout_sec = float(
+            self.get_parameter('cargo_hold_timeout_sec').value
+        )
+        if self.cargo_hold_timeout_sec <= 0.0:
+            raise ValueError('cargo_hold_timeout_sec must be positive')
         self.subscribe_odom_fallback = bool(
             self.get_parameter('subscribe_odom_fallback').value
         )
         self.callback_group = ReentrantCallbackGroup()
         self._lock = threading.RLock()
+        # Vehicles the arm dispatcher still owes a cargo operation. Refreshed
+        # wholesale by every snapshot, so it cannot drift out of sync.
+        self._cargo_held_vehicles = set()
+        self._cargo_condition = threading.Condition()
         self._vehicle_condition = threading.Condition(self._lock)
         self._vehicle_queue = {
             vehicle_id: [] for vehicle_id in vehicle_ids
@@ -529,6 +556,13 @@ class FleetDispatcher(Node):
             String,
             '/central/fleet/collision_status',
             self._on_collision_status,
+            10,
+            callback_group=self.callback_group,
+        )
+        self.create_subscription(
+            String,
+            '/central/arms/vehicle_holds',
+            self._on_vehicle_holds,
             10,
             callback_group=self.callback_group,
         )
@@ -691,7 +725,7 @@ class FleetDispatcher(Node):
             self._collision_held_vehicle = held
 
     def _vehicle_is_deliberately_stopped(self, vehicle_id):
-        """Is this vehicle standing still because something stopped it?"""
+        """Return whether an external safety mechanism stopped the vehicle."""
         with self._lock:
             return (
                 self.vehicles[vehicle_id].emergency
@@ -994,6 +1028,58 @@ class FleetDispatcher(Node):
             if not self._command_outcomes[predecessor_command_id]:
                 return False, 'predecessor_failed'
             return True, ''
+
+    def _on_vehicle_holds(self, message):
+        """Replace the cargo-hold set from one arm dispatcher snapshot."""
+        try:
+            payload = json.loads(message.data)
+            held = {
+                str(vehicle_id).strip('/')
+                for vehicle_id in payload.get('held_vehicles', [])
+                if str(vehicle_id).strip('/')
+            }
+        except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+            self.get_logger().warning(f'Invalid vehicle hold snapshot: {exc}')
+            return
+        with self._cargo_condition:
+            if held == self._cargo_held_vehicles:
+                return
+            released = self._cargo_held_vehicles - held
+            self._cargo_held_vehicles = held
+            self._cargo_condition.notify_all()
+        for vehicle_id in sorted(released):
+            self.get_logger().info(
+                f'{vehicle_id} released by the arm dispatcher'
+            )
+
+    def _wait_for_cargo_release(self, goal_handle, vehicle_id):
+        """Block a departure until the arm finishes its cargo work.
+
+        The arm dispatcher owns the vehicle while a transfer that declared
+        final_for_vehicle is queued or running. Driving away underneath the
+        arm would tear the load off the trailer, so the move waits here
+        rather than being rejected: the vehicle proceeds on its own once the
+        transfer reaches a terminal state, successful or not.
+        """
+        vehicle_id = str(vehicle_id or '').strip('/')
+        if not vehicle_id:
+            return True, ''
+        deadline = time.monotonic() + self.cargo_hold_timeout_sec
+        announced = False
+        with self._cargo_condition:
+            while vehicle_id in self._cargo_held_vehicles:
+                if goal_handle.is_cancel_requested:
+                    return False, 'canceled'
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False, 'timeout'
+                if not announced:
+                    announced = True
+                    self.get_logger().info(
+                        f'{vehicle_id} is holding for an arm cargo operation'
+                    )
+                self._cargo_condition.wait(timeout=min(0.1, remaining))
+        return True, ''
 
     def _record_command_outcome(self, command_id, succeeded):
         with self._command_condition:
@@ -1562,6 +1648,35 @@ class FleetDispatcher(Node):
                 result.error_code = self.ERROR_CANCELED
                 result.message = 'superseded by a newer vehicle command'
                 return result
+            # Last gate before the wheels turn: the zone is ours, but the
+            # arm may still be over this vehicle's trailer.
+            self._publish_dispatch_feedback(
+                goal_handle,
+                vehicle_id,
+                'WAITING_FOR_ARM',
+                0,
+            )
+            cargo_ok, cargo_state = self._wait_for_cargo_release(
+                goal_handle,
+                vehicle_id,
+            )
+            if not cargo_ok:
+                if cargo_state == 'canceled':
+                    goal_handle.canceled()
+                    result.error_code = self.ERROR_CANCELED
+                    result.message = (
+                        'canceled while waiting for the arm to release '
+                        f'{vehicle_id}'
+                    )
+                else:
+                    goal_handle.abort()
+                    result.error_code = self.ERROR_NAV_FAILED
+                    result.message = (
+                        'timed out waiting for the arm to release '
+                        f'{vehicle_id}'
+                    )
+                self._record_command_outcome(command_id, False)
+                return result
             self._publish_dispatch_feedback(
                 goal_handle,
                 vehicle_id,
@@ -1742,6 +1857,28 @@ class FleetDispatcher(Node):
         relative_yaw_rad,
     ):
         """Rotate, verify map-frame yaw, and correct before translation."""
+        if not self.b1_exit_turn_verify:
+            success, message = await self._spin_in_place(
+                goal_handle,
+                vehicle_id,
+                command_id,
+                relative_yaw_rad,
+            )
+            if (
+                goal_handle.is_cancel_requested
+                or self._command_preempted(command_id)
+            ):
+                return False, message or 'canceled during B-1 exit rotation'
+            if not success:
+                # Report and carry on: the forward move is what actually
+                # clears the loading zone, and skipping it strands the
+                # vehicle in B-1 holding the lock.
+                self.get_logger().warning(
+                    f'{vehicle_id} B-1 exit rotation reported "{message}"; '
+                    'advancing anyway because turn verification is off'
+                )
+            return True, ''
+
         with self._lock:
             runtime = self.vehicles[vehicle_id]
             start_pose_time = runtime.pose_received_at
@@ -1873,7 +2010,32 @@ class FleetDispatcher(Node):
                 # Wait for the cancellation to land. bt_navigator muxes its
                 # navigators and rejects a new goal while one is still
                 # running, so re-sending too early is refused outright.
-                await nav_handle.cancel_goal_async()
+                # cancel_goal_async only delivers the request; the goal is
+                # not gone until its result arrives. Re-sending in between
+                # races bt_navigator's teardown, and its action server then
+                # dies on an uncaught "Failed to accept new goal".
+                cancel_response = await nav_handle.cancel_goal_async()
+                if not cancel_response.goals_canceling:
+                    return None, nav_handle, (
+                        'Nav2 did not accept cancellation; goal was not re-sent'
+                    )
+                settle_deadline = (
+                    time.monotonic() + self.cancel_settle_timeout_sec
+                )
+                while (
+                    not result_future.done()
+                    and time.monotonic() < settle_deadline
+                ):
+                    await self._sleep_async(0.05)
+                if not result_future.done():
+                    self.get_logger().error(
+                        f'{vehicle_id} cancellation did not settle within '
+                        f'{self.cancel_settle_timeout_sec:.1f}s; refusing to '
+                        're-send because it could abort bt_navigator'
+                    )
+                    return None, nav_handle, (
+                        'Nav2 cancellation did not finish; goal was not re-sent'
+                    )
                 new_handle = await resend()
                 if new_handle is None or not new_handle.accepted:
                     return None, nav_handle, 'Nav2 rejected the re-sent goal'

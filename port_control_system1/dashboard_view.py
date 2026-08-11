@@ -118,27 +118,45 @@ class DashboardView(ctk.CTkFrame):
         # ==========================================
         self.map_frame = ctk.CTkFrame(self, fg_color="black", border_width=1, border_color=BORDER_COLOR, corner_radius=12)
         self.map_frame.grid(row=0, column=0, padx=(15, 10), pady=(15, 10), sticky="nsew")
-        self.map_frame.pack_propagate(False)
+        self.map_frame.grid_columnconfigure(0, weight=1)
+        self.map_frame.grid_rowconfigure(1, weight=1)
+
+        roi_toolbar = ctk.CTkFrame(
+            self.map_frame,
+            fg_color=BG_PANEL,
+            corner_radius=0,
+            height=44,
+        )
+        roi_toolbar.grid(row=0, column=0, sticky="ew")
+        roi_toolbar.grid_propagate(False)
+        ctk.CTkLabel(
+            roi_toolbar,
+            text="입항 감지 영역",
+            text_color=TEXT_PRIMARY,
+            font=self.font_body_bold,
+        ).pack(side="left", padx=14)
 
         self.live_feed_label = ctk.CTkLabel(
             self.map_frame,
             text="[📷 실시간 영상 연동 대기 중]\n'설정 > 스트림 설정'에서 카메라 URL을 확인해주세요.",
             text_color=TEXT_SECONDARY, font=self.font_subtitle,
         )
-        self.live_feed_label.pack(expand=True, fill="both", padx=5, pady=5)
+        self.live_feed_label.grid(
+            row=1, column=0, padx=5, pady=5, sticky="nsew"
+        )
         self._arrival_roi = [0.0, 0.0, 0.35, 0.35]
         self._roi_editing = False
         self._roi_drag_start = None
         self._roi_drag_current = None
         self._central_client = CentralControlClient()
         self.roi_button = ctk.CTkButton(
-            self.map_frame,
-            text="입항 ROI",
-            width=92,
+            roi_toolbar,
+            text="선박 ROI 설정",
+            width=120,
             height=30,
             command=self._toggle_roi_editor,
         )
-        self.roi_button.place(relx=1.0, x=-14, y=14, anchor="ne")
+        self.roi_button.pack(side="right", padx=10, pady=7)
         self.live_feed_label.bind("<ButtonPress-1>", self._roi_press)
         self.live_feed_label.bind("<B1-Motion>", self._roi_motion)
         self.live_feed_label.bind("<ButtonRelease-1>", self._roi_release)
@@ -373,7 +391,7 @@ class DashboardView(ctk.CTkFrame):
         self._roi_drag_start = None
         self._roi_drag_current = None
         self.roi_button.configure(
-            text="드래그 중" if self._roi_editing else "입항 ROI",
+            text="ROI 선택 중" if self._roi_editing else "선박 ROI 설정",
             fg_color=ACCENT_ORANGE if self._roi_editing else ACCENT_BLUE,
         )
 
@@ -428,7 +446,7 @@ class DashboardView(ctk.CTkFrame):
         self.after(
             1800,
             lambda: self.roi_button.configure(
-                text="입항 ROI", fg_color=ACCENT_BLUE
+                text="선박 ROI 설정", fg_color=ACCENT_BLUE
             ),
         )
 
