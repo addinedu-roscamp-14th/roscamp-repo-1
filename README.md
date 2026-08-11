@@ -117,7 +117,54 @@ ros2 launch porter_bringup agv_vehicle.launch.py \
   start_nav2:=true
 ```
 
-### 4. ARM2 노트북
+### 4. ARM1 노트북
+
+터미널 1 - 중앙 관제 연결용 Zenoh bridge:
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+export ROS_DOMAIN_ID=15
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+sudo ip link set lo multicast on
+ros2 daemon stop
+
+zenoh-bridge-ros2dds \
+  -c config/network/zenoh_arm1.json5 \
+  -e tcp/192.168.5.6:7447
+```
+
+터미널 2 - ARM1 Pick/Place 노드(실제 작업 ID는 launch 인자로 지정):
+
+```bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+export ROS_DOMAIN_ID=15
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+ros2 launch arm_pick_place container_pick_place.launch.py \
+  serial_port:=/dev/ttyUSB0 \
+  video_device:=/dev/video2 \
+  marker_size_m:=0.020
+```
+
+ARM1 로컬 계약 확인:
+
+```bash
+ros2 service list | grep '^/arm/pick_place/'
+ros2 topic echo /arm/pick_place/work_state \
+  --qos-durability transient_local \
+  --qos-reliability reliable
+```
+
+### 5. ARM2 노트북
 
 터미널 1 - 로봇팔, 그리퍼 카메라와 작업 서비스:
 
@@ -173,24 +220,33 @@ ros2 service list | grep '^/arm2/'
 ros2 topic echo /arm2/transfer_events
 ```
 
-Zenoh 연결 후 서비스 호출은 중앙 `arm_dispatcher`가 담당합니다. 입항 자동화 모드에서는
-ARM2 노트북에서 `/arm2/scan_destinations`를 별도로 호출하지 않아도 됩니다. 중앙
-노트북에서는 다음 명령으로 ARM2 서비스와 최종 작업 이벤트가 전달되는지 확인합니다.
-
-```bash
-export ROS_DOMAIN_ID=12
-ros2 service list | grep '^/arm2/'
-ros2 topic echo /arm2/transfer_events
-ros2 topic echo /central/arms/arm2/state
-```
-
-ARM1은 Domain `15`를 사용하지만 서비스와 이벤트 계약이 확정되기 전까지 중앙
-명령이 비활성화되어 있습니다.
-
-### 5. 대시보드 노트북
+### 6. 대시보드 노트북
 
 `OLLAMA_HOST`는 실제 Ollama 서버 주소로 변경합니다. 현재 사용하는 모델이
 `qwen3-vl:8b`가 아니면 `LOCAL_LLM_MODEL`도 변경합니다.
+
+``` bash
+cd ~/poter_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+export ROS_DOMAIN_ID=12
+export PORT_CONTROL_API_TOKEN='porter1234'
+
+export OLLAMA_HOST='http://agent.sds.codes'
+export LOCAL_LLM_MODEL='gemma4:31b'
+
+export PORT_INVENTORY_DB_HOST='192.168.5.9'
+export PORT_INVENTORY_DB_PORT='5432'
+export PORT_INVENTORY_DB_NAME='port_db'
+export PORT_INVENTORY_DB_USER='postgres'
+export PORT_INVENTORY_DB_PASSWORD='1234'
+
+ros2 launch porter_bringup dashboard_laptop.launch.py \
+  central_ip:=192.168.5.6 \
+  ollama_host:="${OLLAMA_HOST}" \
+  llm_model:="${LOCAL_LLM_MODEL}"
+```
 
 ```bash
 cd ~/poter_ws
@@ -199,8 +255,8 @@ source install/setup.bash
 
 export ROS_DOMAIN_ID=12
 export PORT_CONTROL_API_TOKEN='porter1234'
-export OLLAMA_HOST='http://192.168.5.5:11434'
-export LOCAL_LLM_MODEL='qwen3-vl:8b'
+export OLLAMA_HOST='http://agent.sds.codes'
+export LOCAL_LLM_MODEL='gemma4:31b'
 
 ros2 launch porter_bringup dashboard_laptop.launch.py \
   central_ip:=192.168.5.6 \
@@ -208,7 +264,7 @@ ros2 launch porter_bringup dashboard_laptop.launch.py \
   llm_model:=${LOCAL_LLM_MODEL}
 ```
 
-### 6. 잠금 해제
+### 7. 잠금 해제
 
 ``` bash
 cd ~/poter_ws 

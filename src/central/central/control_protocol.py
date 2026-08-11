@@ -72,6 +72,7 @@ class ParkRequest:
 
     command_id: str | None
     requested_vehicle_id: str
+    predecessor_command_id: str
 
 
 def validate_park_request(payload: Any) -> ParkRequest:
@@ -102,9 +103,27 @@ def validate_park_request(payload: Any) -> ParkRequest:
             'vehicle_id must be empty, agv1, or agv2'
         )
 
+    predecessor_command_id = payload.get('predecessor_command_id', '')
+    if predecessor_command_id is None:
+        predecessor_command_id = ''
+    if not isinstance(predecessor_command_id, str):
+        raise CommandValidationError(
+            'predecessor_command_id must be a string'
+        )
+    predecessor_command_id = predecessor_command_id.strip()
+    if len(predecessor_command_id) > 128:
+        raise CommandValidationError(
+            'predecessor_command_id must not exceed 128 characters'
+        )
+    if command_id and predecessor_command_id == command_id:
+        raise CommandValidationError(
+            'predecessor_command_id must differ from command_id'
+        )
+
     return ParkRequest(
         command_id=command_id,
         requested_vehicle_id=requested_vehicle_id,
+        predecessor_command_id=predecessor_command_id,
     )
 
 

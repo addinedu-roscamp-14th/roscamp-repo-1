@@ -14,6 +14,7 @@ import time
 from nav_msgs.msg import Odometry, Path as NavPath
 import numpy as np
 from porter_interfaces.msg import VehicleState
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -190,6 +191,18 @@ class FleetCollisionSupervisor(Node):
         self.declare_parameter('prediction_step_sec', 0.1)
         self.declare_parameter('minimum_separation_m', 0.22)
         self.declare_parameter('release_separation_m', 0.30)
+        # Parked spots sit closer together than minimum_separation_m, so a
+        # vehicle starting its exit trips the guard and then cannot clear
+        # release_separation_m without moving -- which the hold forbids.
+        # While both vehicles are still in their own spots the proximity is
+        # by design, so the guard steps aside and the local costmap keeps
+        # doing the avoidance. Empty coordinates leave the guard untouched.
+        self.declare_parameter('park_exempt_radius_m', 0.30)
+        xy_descriptor = ParameterDescriptor(
+            type=ParameterType.PARAMETER_DOUBLE_ARRAY
+        )
+        self.declare_parameter('agv1_park_xy', [], xy_descriptor)
+        self.declare_parameter('agv2_park_xy', [], xy_descriptor)
         self.declare_parameter('release_stable_sec', 0.8)
         self.declare_parameter('minimum_hold_sec', 0.5)
         self.declare_parameter('max_hold_sec', 10.0)
@@ -232,6 +245,23 @@ class FleetCollisionSupervisor(Node):
         self.release_separation = float(
             self.get_parameter('release_separation_m').value
         )
+        self.park_exempt_radius = float(
+            self.get_parameter('park_exempt_radius_m').value
+        )
+        self.park_positions = {}
+        for vehicle_id in VEHICLE_IDS:
+            values = list(
+                self.get_parameter(f'{vehicle_id}_park_xy').value or []
+            )
+            if not values:
+                continue
+            if len(values) != 2:
+                raise ValueError(
+                    f'{vehicle_id}_park_xy must be [x, y]'
+                )
+            self.park_positions[vehicle_id] = np.array(
+                [float(values[0]), float(values[1])]
+            )
         self.release_stable_sec = float(
             self.get_parameter('release_stable_sec').value
         )
@@ -690,11 +720,23 @@ class FleetCollisionSupervisor(Node):
                 vehicle_id: self._vehicle_is_moving(vehicle_id)
                 for vehicle_id in VEHICLE_IDS
             }
-            risk = minimum_distance <= self.minimum_separation and any(
-                moving.values()
+            parked_pair = self._both_vehicles_in_park_spots(positions)
+            risk = (
+                minimum_distance <= self.minimum_separation
+                and any(moving.values())
+                and not parked_pair
             )
 
-            if self.held_vehicle:
+            if self.held_vehicle and parked_pair:
+                # release_separation_m is wider than the gap between the two
+                # spots, so the normal release below can never fire in here;
+                # without this the exit stalls until max_hold_sec expires.
+                self.get_logger().info(
+                    f'Releasing {self.held_vehicle}: both vehicles are still '
+                    'in their parking spots, where close spacing is expected'
+                )
+                self._request_hold(self.held_vehicle, False)
+            elif self.held_vehicle:
                 held_duration = now - float(self._hold_started_at or now)
                 safe = minimum_distance >= self.release_separation
                 if safe:
@@ -736,6 +778,28 @@ class FleetCollisionSupervisor(Node):
             times,
             held=vehicle_id == self.held_vehicle,
         )
+
+    def _both_vehicles_in_park_spots(self, positions):
+        """Return true while every vehicle still sits in its own spot.
+
+        Only the pair counts. A vehicle that has already pulled out onto the
+        floor is a normal traffic participant again, so the guard resumes the
+        moment either one leaves its pocket.
+        """
+        if len(self.park_positions) != len(VEHICLE_IDS):
+            return False
+        for vehicle_id in VEHICLE_IDS:
+            position = positions.get(vehicle_id)
+            if position is None:
+                return False
+            distance = float(
+                np.linalg.norm(
+                    np.asarray(position) - self.park_positions[vehicle_id]
+                )
+            )
+            if distance > self.park_exempt_radius:
+                return False
+        return True
 
     def _vehicle_is_moving(self, vehicle_id):
         track = self.tracks[vehicle_id]

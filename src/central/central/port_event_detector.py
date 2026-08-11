@@ -17,6 +17,9 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 
+DEFAULT_ARRIVAL_ROI = [0.78, 0.55, 0.99, 0.98]
+
+
 class PortEventDetector(Node):
     def __init__(self):
         super().__init__('port_event_detector')
@@ -27,7 +30,7 @@ class PortEventDetector(Node):
         self.declare_parameter(
             'roi_config_topic', '/central/autonomy/arrival_roi_config'
         )
-        self.declare_parameter('roi_normalized', [0.0, 0.0, 0.35, 0.35])
+        self.declare_parameter('roi_normalized', DEFAULT_ARRIVAL_ROI)
         self.declare_parameter(
             'vessel_label_keywords',
             ['container', 'black', 'gray', 'brown', 'vessel', 'ship'],

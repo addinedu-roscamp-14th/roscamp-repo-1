@@ -14,6 +14,16 @@ fleet_collision_supervisor:
     prediction_step_sec: 0.1
     minimum_separation_m: 0.22
     release_separation_m: 0.30
+    # The two parked spots are 0.24 m apart, closer than
+    # minimum_separation_m, so starting an exit trips the guard and the hold
+    # then blocks the very motion that would restore release_separation_m.
+    # The guard stands down while both vehicles are still in their pockets;
+    # the local costmap keeps handling avoidance there.
+    # Coordinates mirror the 'parked' poses in
+    # src/drive/params/parking_spots.yaml -- update both together.
+    park_exempt_radius_m: 0.30
+    agv1_park_xy: [1.673782, 0.408066]
+    agv2_park_xy: [1.635464, 0.168810]
     release_stable_sec: 0.8
     minimum_hold_sec: 0.5
     # Release a hold even when tracking degrades. Holding a vehicle stops it,

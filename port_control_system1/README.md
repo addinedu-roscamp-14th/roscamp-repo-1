@@ -10,12 +10,15 @@ CustomTkinter 기반 중앙관제 대시보드입니다. 기존 파일 기반 �
 | ROS → UI | `/battery/percent` (`std_msgs/Float32`) | 차량 1 배터리 표시 |
 | ROS → UI | `/battery/voltage` (`std_msgs/Float32`) | 차량 전압 수신 |
 | ROS → UI | `/odom` (`nav_msgs/Odometry`) | 차량 1 odom 위치·방향 표시 |
-| ROS → UI | `/arm/container_pick/status` | 1번 로봇팔 상태 수신 |
+| ROS → UI | `/arm/pick_place/status` | 1번 로봇팔 상태 로그 수신 |
+| ROS → UI | `/arm/pick_place/work_state` | ARM1 고정 작업 상태 수신 |
 | ROS → UI | `/arm2/container_pick/status` | 2번 로봇팔 상태 수신 |
+| ROS → UI | `/central/arms/arm1/state` | ARM1 연결·작업·오류 상태 표시 |
+| ROS → UI | `/central/arms/arm2/state` | ARM2 연결·작업·진행률 표시 |
 | UI → ROS | `/central/target_map_waypoints` (`nav_msgs/Path`) | 위치·경유지 주행 명령 |
 | UI → ROS | `/central/target_map_pose` (`geometry_msgs/PoseStamped`) | 단일 목표용 인터페이스 |
 | UI → ROS | `/cmd_vel` (`geometry_msgs/Twist`) | 수동 운전과 비상 정지 |
-| UI → ROS | `/arm/pick_container`, `/arm/stack_container` | 1번 로봇팔 파지·적재 |
+| UI → 중앙 | `/api/v1/arms/commands` (`arm1/pick_place`) | ARM1 Pick/Place 시작 |
 | UI → ROS | `/arm2/pick_container`, `/arm2/stack_container` | 2번 로봇팔 파지·적재 |
 
 비상 정지가 활성화되면 `/cmd_vel`에 정지 명령을 100Hz로 계속 발행합니다.
@@ -66,6 +69,11 @@ cd ~/poter_ws/port_control_system1
 
 상단에 `ROS 연결됨`이 표시되는지 확인합니다. 통합 관제 화면의 차량 탭에서
 배터리와 odom 값이 갱신되어야 합니다.
+
+대시보드의 `로봇팔 (ARM)` 카드에는 ARM1·ARM2의 연결 상태, 현재 작업, 작업 단계,
+진행률, 명령·미션 ID와 최근 오류가 표시됩니다. 중앙 ARM dispatcher의 구조화된
+상태를 우선 사용하고, 아직 중앙 상태가 없으면 기존 `/arm*/container_pick/status`
+문자열을 임시 상태로 표시합니다.
 
 비상상황 대처 화면에서 `JetCobot #01`은 `/arm`, `JetCobot #02`는 `/arm2`
 서비스를 사용합니다. 각 로봇팔의 MoveIt 파지 launch가 먼저 실행되어 해당 서비스가
@@ -219,6 +227,72 @@ export PORT_CONTROL_REALTIME_LLM_ENABLED=true
 export PORT_CONTROL_REALTIME_LLM_INTERVAL_SEC=2.0
 export PORT_CONTROL_REALTIME_LLM_HEARTBEAT_SEC=5.0
 export PORT_CONTROL_REALTIME_LLM_INITIAL_DELAY_SEC=5.0
+```
+
+## PostgreSQL DB 기반 컨테이너 이동 판단
+
+명령 창의 **DB 기반 계획** 버튼은 PostgreSQL `port_db.cargos`를 직접 읽고,
+목표를 완료하기 위한 컨테이너 이동 순서를 JSON으로 만듭니다.
+이 버튼은 기존 **실행** 버튼과 분리되어 있으며 DB 쓰기, ROS 서비스 호출,
+중앙제어 API 전송을 수행하지 않습니다. 생성된 목표는 실시간 에이전트의
+`inventory` 모드에도 등록되어 `snapshot_id`가 바뀌거나 heartbeat가 도래하면 같은
+읽기 전용 판단을 다시 수행합니다.
+
+대시보드 우측 하단의 **자율 관제모드 시작/중지** 버튼으로 지속 판단 루프를 직접
+켜고 끌 수 있습니다. 시작했지만 아직 목표가 등록되지 않았으면 버튼에 `목표 대기`,
+LLM이 판단 중이면 `판단 중`, 원격 조회나 판단이 실패하면 `오류`가 표시됩니다.
+사이드바의 기존 `LLM 실시간 관제` 스위치도 같은 상태로 자동 동기화됩니다.
+
+```bash
+pip install psycopg2-binary
+
+# 현재 기본값과 동일하므로 접속 정보가 바뀔 때만 설정합니다.
+export PORT_INVENTORY_DB_HOST=10.11.4.249
+export PORT_INVENTORY_DB_PORT=5432
+export PORT_INVENTORY_DB_NAME=port_db
+export PORT_INVENTORY_DB_USER=postgres
+export PORT_INVENTORY_DB_PASSWORD=1234
+export PORT_INVENTORY_DB_TIMEOUT_SEC=3
+```
+
+같은 DB를 터미널에서 확인하는 명령은 다음과 같습니다.
+
+```bash
+psql -h 10.11.4.249 -U postgres -d port_db
+```
+
+클라이언트는 `name, location, container_id, cargo_type, note, base_aruco_id, floor`만
+읽기 전용 트랜잭션으로 조회합니다. 조회 결과 내용으로 `sql-...` 스냅샷 ID를 만들기
+때문에 실제 재고가 바뀐 경우에만 지속 관제가 즉시 재판단합니다. 연결·인증·스키마
+오류가 발생하면 이전 데이터를 재사용하지 않고 `status=error`, `moves=[]`로
+종료합니다. 정상 계획도 LLM 응답을 그대로 사용하지 않고 컨테이너 ID, 현재 출발
+위치, 적층 순서와 목적지 기반 관계를 메모리에서 순서대로 검증합니다.
+
+판단 결과는 화면 로그와 실시간 에이전트 상태에 다음 형태로만 노출됩니다.
+
+```json
+{
+  "schema_version": "1.0",
+  "plan_id": "plan-...",
+  "snapshot_id": "sql-...",
+  "objective": "C0를 B-1로 옮겨",
+  "status": "ready",
+  "moves": [
+    {
+      "sequence": 1,
+      "container_id": "0",
+      "container_name": "컨테이너_C0",
+      "source_location": "A-1-1",
+      "source_floor": 1,
+      "destination_location": "B-1",
+      "destination_floor": 1,
+      "destination_base_aruco_id": "",
+      "reason": "운영 목표의 출고 위치로 이동"
+    }
+  ],
+  "summary": "C0 출고 계획",
+  "error": ""
+}
 ```
 
 ## 영상 설정

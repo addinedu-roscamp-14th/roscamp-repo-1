@@ -11,11 +11,16 @@ import pytest
 
 def test_valid_park_request_is_normalized():
     request = validate_park_request(
-        {'command_id': 'park-1', 'vehicle_id': '/agv1/'}
+        {
+            'command_id': 'park-1',
+            'vehicle_id': '/agv1/',
+            'predecessor_command_id': 'arm-1',
+        }
     )
 
     assert request.command_id == 'park-1'
     assert request.requested_vehicle_id == 'agv1'
+    assert request.predecessor_command_id == 'arm-1'
 
 
 def test_park_request_defaults_to_auto_vehicle_selection():
@@ -23,6 +28,7 @@ def test_park_request_defaults_to_auto_vehicle_selection():
 
     assert request.command_id is None
     assert request.requested_vehicle_id == ''
+    assert request.predecessor_command_id == ''
 
 
 def test_park_request_rejects_unknown_vehicle():

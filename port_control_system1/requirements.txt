@@ -22,5 +22,8 @@ ollama
 # 대시보드의 기상청(KMA)/해양조사원(KHOA) API 호출용 (dashboard_view.py)
 requests
 
+# PostgreSQL port_db의 cargos 테이블 읽기 전용 조회
+psycopg2-binary
+
 # ROS 2 모듈(rclpy, geometry_msgs, nav_msgs, std_msgs, std_srvs)은 pip가 아니라
 # ROS Jazzy 설치와 source /opt/ros/jazzy/setup.bash를 통해 사용합니다.

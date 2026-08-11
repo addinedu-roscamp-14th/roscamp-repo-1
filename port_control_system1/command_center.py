@@ -24,7 +24,9 @@ command_center.py
 그대로 가져다 씁니다.
 """
 
+import json
 import re
+import threading
 import time
 import uuid
 from typing import Dict, List, Optional, Tuple
@@ -60,6 +62,8 @@ from llm_command_parser import (
     parse_command_with_llm,
     resolve_execution_mode,
 )
+from inventory_decision_planner import InventoryDecisionPlanner
+from inventory_client import InventoryClient, InventoryClientError
 from ros_control_bridge import RosControlBridge
 from realtime_llm_agent import RealtimeLLMAgent
 from visual_navigation import (
@@ -358,7 +362,16 @@ class CommandPopup(ctk.CTkToplevel):
         cmd_entry.bind("<Return>", lambda e: self.run_command())
         cmd_entry.focus_set()
         cmd_entry.icursor("end")  # 미리 채운 문구 뒤에 바로 이어 쓸 수 있게 커서를 맨 끝으로
-        ctk.CTkButton(cmd_row, text="실행", width=90, command=self.run_command).grid(row=0, column=1)
+        self.plan_button = ctk.CTkButton(
+            cmd_row,
+            text="DB 기반 계획",
+            width=110,
+            command=self.generate_inventory_plan,
+        )
+        self.plan_button.grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(
+            cmd_row, text="실행", width=90, command=self.run_command
+        ).grid(row=0, column=2)
 
         self.result_label = ctk.CTkLabel(self, text="", font=self.font_body, text_color="#3B82F6",
                                          wraplength=680, justify="left")
@@ -374,6 +387,64 @@ class CommandPopup(ctk.CTkToplevel):
         self.log_box = ctk.CTkTextbox(log_frame, font=("Consolas", 12))
         self.log_box.grid(row=1, column=0, sticky="nsew", padx=15, pady=(0, 12))
         self.log_box.configure(state="disabled")
+
+    # ------------------------------------------------------------------
+    def generate_inventory_plan(self) -> None:
+        """Generate and display a read-only plan from the remote inventory."""
+        objective = self.command_var.get().strip()
+        if not objective:
+            return
+        self.plan_button.configure(state='disabled', text='판단 중...')
+        self.result_label.configure(
+            text='PostgreSQL 재고를 조회해 이동 계획을 생성하고 있습니다.',
+            text_color='#3B82F6',
+        )
+        known_locations = list(self.locations.keys())
+
+        def _plan():
+            result = InventoryDecisionPlanner().plan(
+                objective,
+                known_locations,
+            )
+            try:
+                self.after(
+                    0,
+                    lambda: self._finish_inventory_plan(objective, result),
+                )
+            except Exception:
+                # The popup may have been closed while the remote LLM ran.
+                return
+
+        threading.Thread(
+            target=_plan,
+            name='port-inventory-plan',
+            daemon=True,
+        ).start()
+
+    def _finish_inventory_plan(self, objective, result) -> None:
+        """Present a plan without entering any existing execution path."""
+        if not self.winfo_exists():
+            return
+        self.plan_button.configure(state='normal', text='DB 기반 계획')
+        rendered = json.dumps(result, ensure_ascii=False, indent=2)
+        self._log(f'[DB 기반 판단 JSON]\n{rendered}')
+        status = result.get('status')
+        if status == 'error':
+            self.result_label.configure(
+                text=f'[계획 생성 실패] {result.get("error") or "알 수 없는 오류"}',
+                text_color='#EA5455',
+            )
+            return
+        move_count = len(result.get('moves') or [])
+        summary = result.get('summary') or '추가 이동이 필요하지 않습니다.'
+        self.result_label.configure(
+            text=f'[DB 기반 계획: {move_count}건] {summary}',
+            text_color='#28C76F',
+        )
+        RealtimeLLMAgent.get_instance().set_inventory_objective(
+            objective,
+            initial_plan=result,
+        )
 
     # ------------------------------------------------------------------
     def run_command(self) -> None:
@@ -409,6 +480,19 @@ class CommandPopup(ctk.CTkToplevel):
         known_cargo_types = sorted({
             detail.get("화물종류", "") for detail in self.cargo_details.values() if detail.get("화물종류")
         })
+        inventory_snapshot = None
+        try:
+            inventory_snapshot = InventoryClient().fetch_snapshot().to_dict()
+            self._log(
+                '[실행용 DB 스냅샷] '
+                f'{inventory_snapshot["snapshot_id"]}, '
+                f'화물={len(inventory_snapshot["cargos"])}건'
+            )
+        except InventoryClientError as exc:
+            # Pure vehicle navigation can still run without inventory.  If the
+            # LLM creates an ARM loading action, the parser's deterministic
+            # inventory validator below fails closed instead of guessing an ID.
+            self._log(f'[실행용 DB 조회 실패] {exc}')
         try:
             llm_result = parse_command_with_llm(
                 command,
@@ -419,6 +503,7 @@ class CommandPopup(ctk.CTkToplevel):
                 image_width=image_width,
                 image_height=image_height,
                 yolo_detections=compact_detection_list,
+                inventory_snapshot=inventory_snapshot,
             )
         except LLMParseError as exc:
             self._log(f"[LLM 사용 불가 - 규칙 기반으로 대체] {exc}")
@@ -436,6 +521,18 @@ class CommandPopup(ctk.CTkToplevel):
                 RealtimeLLMAgent.get_instance().set_objective(
                     command,
                     llm_result.get('actions'),
+                )
+                return
+            if llm_result.get('suppress_rule_fallback'):
+                reason = str(
+                    (llm_result.get('actions') or [{}])[0].get(
+                        'reason', 'ARM 안전 계획 검증 실패'
+                    )
+                )
+                self._log(f'[LLM 계획 실행 차단] {reason}')
+                self.result_label.configure(
+                    text=f'[안전 검증 실패] {reason}',
+                    text_color='#EA5455',
                 )
                 return
             self._log("[LLM 결과를 적용할 수 없어 규칙 기반으로 재시도]")
@@ -550,7 +647,7 @@ class CommandPopup(ctk.CTkToplevel):
                 self._log(
                     f'[VLM 계획 단계 {step_index}/{len(actions)}] {action}'
                 )
-            if (
+            step_handled = (
                 isinstance(action, dict)
                 and self._handle_single_action(
                     command,
@@ -567,8 +664,21 @@ class CommandPopup(ctk.CTkToplevel):
                         else plan_context
                     ),
                 )
-            ):
+            )
+            if step_handled:
                 any_handled = True
+            if not parallel_plan and plan_context.pop('step_failed', False):
+                self._log(
+                    f'[VLM 순차 계획 중단] {step_index}번 단계가 '
+                    '실패해 후속 명령을 전송하지 않습니다.'
+                )
+                break
+            if not parallel_plan and not step_handled:
+                self._log(
+                    f'[VLM 순차 계획 중단] {step_index}번 단계를 '
+                    '처리할 수 없어 후속 명령을 취소합니다.'
+                )
+                break
         return any_handled
 
     def _handle_single_action(
@@ -655,6 +765,7 @@ class CommandPopup(ctk.CTkToplevel):
             'arm_transfer_to_slot',
             'arm_load_to_trailer',
             'arm_transfer_by_id',
+            'arm1_pick_place',
             'arm_stop',
         }:
             return self._execute_arm_action(action, plan_context)
@@ -674,6 +785,7 @@ class CommandPopup(ctk.CTkToplevel):
                 self._log(
                     '[VLM 객체 접근 거부] 최신 YOLO 검출 JSON이 없습니다.'
                 )
+                plan_context['step_failed'] = True
                 return True
             vehicle_id = self._extract_vehicle_id(action)
             try:
@@ -708,6 +820,7 @@ class CommandPopup(ctk.CTkToplevel):
                     text=f'[VLM 객체 접근 실패] {exc}',
                     text_color='#EA5455',
                 )
+                plan_context['step_failed'] = True
                 return True
 
             mode_text = {
@@ -768,6 +881,7 @@ class CommandPopup(ctk.CTkToplevel):
                     text=f"[VLM 좌표 전송 실패] {exc}",
                     text_color="#EA5455",
                 )
+                plan_context['step_failed'] = True
                 return True
 
             command_id = response.get("command_id", "unknown")
@@ -792,9 +906,13 @@ class CommandPopup(ctk.CTkToplevel):
 
         if action_type == "park_command":
             vehicle_id = self._extract_vehicle_id(action)
+            predecessor_command_id = plan_context.get(
+                'predecessor_command_id', ''
+            )
             try:
                 response = CentralControlClient().send_park(
-                    vehicle_id=vehicle_id
+                    vehicle_id=vehicle_id,
+                    predecessor_command_id=predecessor_command_id,
                 )
             except CentralControlApiError as exc:
                 self._log(f"[자동 주차 실패] {exc}")
@@ -802,18 +920,36 @@ class CommandPopup(ctk.CTkToplevel):
                     text=f"[자동 주차 실패] {exc}",
                     text_color="#EA5455",
                 )
+                plan_context['step_failed'] = True
                 return True
 
             command_id = response.get("command_id", "unknown")
-            self._log(
-                f"[자동 주차 명령 전송] vehicle={vehicle_id or 'AUTO'}, "
-                f"command_id={command_id}"
-            )
+            if command_id != 'unknown':
+                plan_context['predecessor_command_id'] = command_id
+            if predecessor_command_id:
+                self._log(
+                    '[자동 주차 예약] '
+                    f'vehicle={vehicle_id or "AUTO"}, '
+                    f'predecessor={predecessor_command_id}, '
+                    f'command_id={command_id} '
+                    '(선행 작업 성공 후 실행)'
+                )
+                result_text = (
+                    '[자동 주차 예약 완료]\n'
+                    f'차량={vehicle_id or "자동배차"}\n'
+                    'ARM/선행 작업 성공 후 주차합니다.'
+                )
+            else:
+                self._log(
+                    f"[자동 주차 명령 전송] vehicle={vehicle_id or 'AUTO'}, "
+                    f"command_id={command_id}"
+                )
+                result_text = (
+                    '[자동 주차 명령 전송 완료]\n'
+                    f'차량={vehicle_id or "자동배차"}'
+                )
             self.result_label.configure(
-                text=(
-                    "[자동 주차 명령 전송 완료]\n"
-                    f"차량={vehicle_id or '자동배차'}"
-                ),
+                text=result_text,
                 text_color="#28C76F",
             )
             return True
@@ -825,21 +961,38 @@ class CommandPopup(ctk.CTkToplevel):
         """Validate one whitelisted ARM tool call and queue it centrally."""
         action_type = str(action.get('type') or '')
         arm_id = str(action.get('arm_id') or 'arm2').strip().lower()
-        if arm_id != 'arm2':
-            self._log('[ARM 명령 거부] ARM1 서비스 계약은 아직 설정되지 않았습니다.')
+        if arm_id not in {'arm1', 'arm2'}:
+            self._log(f'[ARM 명령 거부] 알 수 없는 로봇팔: {arm_id}')
+            plan_context['step_failed'] = True
+            return True
+        if action_type == 'arm1_pick_place' and arm_id != 'arm1':
+            self._log('[ARM 명령 거부] arm1_pick_place는 ARM1 전용입니다.')
+            plan_context['step_failed'] = True
+            return True
+        if action_type != 'arm1_pick_place' and action_type != 'arm_stop' and arm_id != 'arm2':
+            self._log(
+                f'[ARM 명령 거부] {action_type}은 ARM2 전용 작업입니다.'
+            )
+            plan_context['step_failed'] = True
             return True
         if action_type == 'arm_stop':
             try:
-                response = CentralControlClient().stop_arm('arm2')
+                response = CentralControlClient().stop_arm(arm_id)
             except CentralControlApiError as exc:
-                self._log(f'[ARM2 정지 실패] {exc}')
+                self._log(f'[{arm_id.upper()} 정지 실패] {exc}')
                 self.result_label.configure(
-                    text=f'[ARM2 정지 실패] {exc}', text_color='#EA5455'
+                    text=f'[{arm_id.upper()} 정지 실패] {exc}',
+                    text_color='#EA5455',
                 )
+                plan_context['step_failed'] = True
                 return True
-            self._log(f'[ARM2 정지 요청] {response.get("message", "accepted")}')
+            self._log(
+                f'[{arm_id.upper()} 정지 요청] '
+                f'{response.get("message", "accepted")}'
+            )
             self.result_label.configure(
-                text='[ARM2 정지 요청 전송 완료]', text_color='#28C76F'
+                text=f'[{arm_id.upper()} 정지 요청 전송 완료]',
+                text_color='#28C76F',
             )
             return True
 
@@ -848,6 +1001,7 @@ class CommandPopup(ctk.CTkToplevel):
             'arm_transfer_to_slot': 'transfer_to_slot',
             'arm_load_to_trailer': 'load_to_trailer',
             'arm_transfer_by_id': 'transfer_by_id',
+            'arm1_pick_place': 'pick_place',
         }
         operation = operation_by_type[action_type]
         destination_slot = str(action.get('destination_slot') or '').upper()
@@ -863,12 +1017,26 @@ class CommandPopup(ctk.CTkToplevel):
             destination_id = int(destination_id)
         except (TypeError, ValueError):
             self._log(f'[ARM 명령 거부] ID가 정수가 아닙니다: {action}')
+            plan_context['step_failed'] = True
             return True
         if operation == 'transfer_to_slot' and destination_slot not in valid_slots:
             self._log(f'[ARM 명령 거부] 잘못된 목적 슬롯: {destination_slot}')
+            plan_context['step_failed'] = True
             return True
         if operation == 'load_to_trailer' and not 0 <= source_id <= 8:
             self._log(f'[ARM 명령 거부] source_id는 0..8이어야 합니다: {source_id}')
+            plan_context['step_failed'] = True
+            return True
+        if operation == 'pick_place' and (
+            not 0 <= source_id <= 49
+            or not 0 <= destination_id <= 49
+            or source_id == destination_id
+        ):
+            self._log(
+                '[ARM1 명령 거부] source_id/destination_id는 서로 다른 '
+                f'0..49 값이어야 합니다: {source_id}->{destination_id}'
+            )
+            plan_context['step_failed'] = True
             return True
         if operation == 'transfer_by_id' and (
             not 0 <= source_id <= 8
@@ -879,16 +1047,20 @@ class CommandPopup(ctk.CTkToplevel):
                 '[ARM 명령 거부] 창고 내부 source_id/destination_id가 '
                 f'유효하지 않습니다: {source_id}->{destination_id}'
             )
+            plan_context['step_failed'] = True
             return True
-        vehicle_operation = operation in {'transfer_to_slot', 'load_to_trailer'}
+        vehicle_operation = operation in {
+            'transfer_to_slot', 'load_to_trailer', 'pick_place'
+        }
         final_for_vehicle = bool(action.get('final_for_vehicle', False))
         if vehicle_operation and final_for_vehicle and not vehicle_id:
             self._log('[ARM 명령 거부] 차량 출발 승인에는 vehicle_id가 필요합니다.')
+            plan_context['step_failed'] = True
             return True
         try:
             response = CentralControlClient().send_arm_command(
                 operation=operation,
-                arm_id='arm2',
+                arm_id=arm_id,
                 mission_id=plan_context['mission_id'],
                 destination_slot=destination_slot,
                 source_id=source_id,
@@ -897,19 +1069,27 @@ class CommandPopup(ctk.CTkToplevel):
                 final_for_vehicle=(final_for_vehicle if vehicle_operation else False),
             )
         except CentralControlApiError as exc:
-            self._log(f'[ARM2 명령 전송 실패] {exc}')
+            self._log(f'[{arm_id.upper()} 명령 전송 실패] {exc}')
             self.result_label.configure(
-                text=f'[ARM2 명령 전송 실패] {exc}', text_color='#EA5455'
+                text=f'[{arm_id.upper()} 명령 전송 실패] {exc}',
+                text_color='#EA5455',
             )
+            plan_context['step_failed'] = True
             return True
         self._log(
-            '[ARM2 명령 큐 등록] '
+            f'[{arm_id.upper()} 명령 큐 등록] '
             f'operation={operation}, mission={response.get("mission_id")}, '
             f'command={response.get("command_id")}'
         )
+        command_id = str(response.get('command_id') or '').strip()
+        if command_id:
+            # A following vehicle step must wait for the ARM result, not just
+            # for the last navigation step. The fleet dispatcher records ARM
+            # outcomes on the same predecessor timeline.
+            plan_context['predecessor_command_id'] = command_id
         self.result_label.configure(
             text=(
-                '[ARM2 작업 명령 전송 완료]\n'
+                f'[{arm_id.upper()} 작업 명령 전송 완료]\n'
                 f'작업={operation}, 임무={response.get("mission_id")}'
             ),
             text_color='#28C76F',

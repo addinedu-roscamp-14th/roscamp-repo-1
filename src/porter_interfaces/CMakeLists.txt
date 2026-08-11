@@ -11,6 +11,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PixelNavigationCommand.msg"
   "msg/PortEvent.msg"
   "msg/VehicleState.msg"
+  "srv/ExecutePickPlace.srv"
   "action/DispatchArmCommand.action"
   "action/DispatchNavigation.action"
   DEPENDENCIES geometry_msgs std_msgs

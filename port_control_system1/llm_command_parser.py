@@ -56,9 +56,23 @@ _SYSTEM_PROMPT_TEMPLATE = """당신은 항만 자율주행 로봇 시스템의 �
 등록된 화물종류: {cargo_types}
 현재 탑다운 영상 크기: {image_width}x{image_height}
 
-우리 AGV 차량은 YOLO 검출 JSON에서 label로 구분됩니다: car_yellow=agv1(노란색
-차량), car_blue=agv2(파란색 차량). 이 둘은 화물이나 장애물이 아니라 우리가 직접
-제어하는 차량 자신입니다.
+현재 PostgreSQL 재고 스냅샷(JSON):
+{inventory_snapshot}
+
+재고 스냅샷의 container_id는 ARM2가 실제로 찾아야 하는 컨테이너 ArUco ID이며,
+location은 창고 슬롯, floor는 같은 location 안의 적층 층수입니다. 사용자가 특정
+창고 슬롯의 컨테이너를 차량에 실으라고 했지만 컨테이너 번호를 생략했다면, 그
+location에서 floor가 가장 큰 최상단 컨테이너를 골라 arm_load_to_trailer의
+source_id로 사용하세요. 아래층 컨테이너를 위 컨테이너보다 먼저 집지 마세요.
+재고 스냅샷이 unavailable이면 source_id를 추측하지 말고 unknown을 반환하세요.
+
+우리 AGV 차량은 YOLO 검출 JSON에서 label로 구분됩니다: car_blue=agv1(파란색
+차량, AMR1), car_yellow=agv2(노란색 차량, AMR2). 이 둘은 화물이나 장애물이 아니라
+우리가 직접 제어하는 차량 자신입니다.
+AMR1/AMR2는 차량 이름이고 ARM1/ARM2는 로봇팔 이름이므로 서로 혼동하지
+마세요. 현재 상·하차 로봇팔은 ARM2만 사용하며, ARM2는 AMR1(agv1)과
+AMR2(agv2) 둘 다의 트레일러에 상차·하역할 수 있습니다. 사용자가 AMR1을
+지정했다면 ARM 액션의 arm_id는 "arm2", vehicle_id는 "agv1"로 만드세요.
 
 사용자 문장을 분석해서 반드시 아래 형식으로만 응답하세요. 설명, 인사, 코드블록(```) 등
 JSON 이외의 텍스트는 절대 포함하지 마세요.
@@ -77,11 +91,16 @@ C는 D로") 각각을 별도 action으로 배열에 전부 넣으세요. 서로 
 agv1과 agv2 action을 각각 만들고, 두 action이 독립적이면 execution_mode를
 "parallel"로 설정하세요. "유휴 차량들"처럼 조건이 붙어도 어느 차량이 실제로
 유휴인지는 시스템이 판단하므로, 당신은 두 차량 action을 모두 만드세요.
+반대로 사용자가 차량 하나를 특정하면("AMR2한테만", "agv1만", "노란 차만",
+"2호차 단독") 그 차량 action을 정확히 하나만 만드세요. 지목되지 않은 차량의
+action을 절대 추가하지 마세요. 복수 지칭이 없는데 두 차량 action을 만드는 것은
+오류입니다. 지목된 차량이 지금 바쁜지 여부는 판단하지 말고, 그대로 그 차량을
+vehicle_id에 넣으세요.
 하나의 action에는 한 차량의 한 이동만 넣으세요. "먼저", "그 다음", "이후",
 "빠져나오면", "도착한 뒤" 같은 순서 표현이 있으면 반드시 서로 다른 action으로
 나누고, 조건을 만족하는 순서대로 배열하세요.
 
-각 action은 아래 14가지 형식 중 하나입니다:
+각 action은 아래 15가지 형식 중 하나입니다:
 
 1) 등록부의 화물 위치만 관리하는 행정 명령:
 {{"type": "cargo_single", "item": "<화물명>", "destination": "<등록된 위치명>"}}
@@ -185,18 +204,42 @@ heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 �
 {{"type": "arm_transfer_by_id", "arm_id": "arm2",
   "source_id": <0..8>, "destination_id": <0..8 또는 11..16>}}
 
-13) ARM2 작업을 즉시 정지하는 경우:
-{{"type": "arm_stop", "arm_id": "arm2"}}
+13) ARM1이 LLM이 선택한 마커 사이에서 Pick/Place 작업을 하는 경우:
+{{"type": "arm1_pick_place", "arm_id": "arm1",
+  "source_id": <0..49>, "destination_id": <0..49>,
+  "vehicle_id": "<agv1|agv2 또는 빈 문자열>",
+  "final_for_vehicle": <true|false>}}
 
-ARM 작업은 위 다섯 형식만 사용할 수 있습니다. ROS 서비스 이름이나 임의 operation을
-만들지 마세요. ARM1은 아직 중앙 서비스 계약이 없으므로 ARM1 작업 요청은 unknown으로
-반환하세요. 같은 ARM2에 여러 작업을 지시하면 반드시 명시된 순서대로 actions에 넣고
+ARM1의 source_id와 destination_id는 launch 설정값이 아니라 사용자 목표와 현재
+PostgreSQL 재고 스냅샷을 바탕으로 매 작업마다 선택하세요. source_id는 집을
+컨테이너 ArUco ID, destination_id는 놓을 support/AGV ArUco ID입니다. 두 ID를
+모르면 추측하지 말고 unknown을 반환하세요. 두 ID는 서로 달라야 합니다.
+
+14) ARM 작업을 즉시 정지하는 경우:
+{{"type": "arm_stop", "arm_id": "<arm1|arm2>"}}
+
+ARM 작업은 위 여섯 형식만 사용할 수 있습니다. ROS 서비스 이름이나 임의 operation을
+만들지 마세요. 같은 로봇팔에 여러 작업을 지시하면 반드시 명시된 순서대로 actions에 넣고
 execution_mode는 sequential로 설정하세요. 차량과 연결된 마지막 하역/상차 작업에만
 final_for_vehicle=true를 지정하세요. 이 값이 true인 작업이 최종 성공한 뒤에만 해당
 차량이 출발할 수 있습니다. 창고 내부 이동 arm_transfer_by_id에는 차량 출발 승인을
 연결하지 마세요.
 
-14) 위 어느 것에도 해당하지 않는 경우:
+차량 상·하차 명령은 단일 ARM action만 반환하지 말고 물리적으로 필요한 전체
+순서를 판단해 actions에 넣으세요. A-1/A-2/A-3 검출 구역은 ARM2가 차량과
+상·하차하는 공용 A 작업 위치입니다.
+- 차량의 컨테이너를 창고 슬롯으로 내리는 명령은 같은 vehicle_id로 A 작업
+  위치의 visual_navigation을 먼저 넣고, 그 다음 arm_transfer_to_slot을 넣으세요.
+- 창고 컨테이너를 차량에 싣는 명령은 같은 vehicle_id로 A 작업 위치의
+  visual_navigation, arm_load_to_trailer, 사용자가 요청한 최종 목적지
+  navigation 순서로 넣으세요.
+- 현재 차량이 A 위치에 있어 보여도 A 위치 navigation을 생략하지 마세요.
+  중앙 Fleet이 이미 도착한 동일 목표를 중복 제거합니다.
+- 이 법칙은 AMR1(agv1)과 AMR2(agv2) 모두에 동일하게 적용하세요.
+- 창고 하역 슬롯이 명시되지 않았다면 임의로 추측하지 말고 unknown을
+  반환하세요.
+
+15) 위 어느 것에도 해당하지 않는 경우:
 {{"type": "unknown", "reason": "<간단한 이유>"}}
 
 주의:
@@ -272,6 +315,7 @@ final_for_vehicle=true를 지정하세요. 이 값이 true인 작업이 최종 �
   {{"type": "park_command", "vehicle_id": "agv1"}},
   {{"type": "park_command", "vehicle_id": "agv2"}}
 ]}}
+
 """
 
 
@@ -352,6 +396,7 @@ _ARM_ACTION_TYPES = {
     'arm_transfer_to_slot',
     'arm_load_to_trailer',
     'arm_transfer_by_id',
+    'arm1_pick_place',
     'arm_stop',
 }
 _ARM_COMMAND_TERMS = (
@@ -408,8 +453,19 @@ def _finalize_navigation_result(command: str, result: Dict, actions) -> Dict:
     finalized['actions'] = actions
 
     lowered = str(command).lower()
-    requests_all = any(term in lowered for term in _ALL_VEHICLE_TERMS)
-    if requests_all and len(actions) == 1 and isinstance(actions[0], dict):
+    # "차들"/"차량들" match as substrings, so a single-vehicle phrase like
+    # "노란 차들을 항구로" would otherwise fan out to both vehicles and throw
+    # the colour away. Naming exactly one vehicle always wins over the
+    # plural wording.
+    requests_all = (
+        any(term in lowered for term in _ALL_VEHICLE_TERMS)
+        and len(_mentioned_vehicle_ids(command)) != 1
+    )
+    if (
+        requests_all
+        and len(actions) == 1
+        and isinstance(actions[0], dict)
+    ):
         action = actions[0]
         if action.get('type') in _VEHICLE_NAVIGATION_TYPES:
             finalized['actions'] = []
@@ -592,6 +648,223 @@ def normalize_navigation_result(
             )
         ],
     )
+
+
+def _cargo_workflow_issues(result, yolo_detections):
+    """Validate physical prerequisites without interpreting user wording."""
+    actions = result.get('actions') if isinstance(result, dict) else None
+    if not isinstance(actions, list):
+        return []
+    labels_by_index = {
+        item.get('detection_index'): str(item.get('label') or '')
+        for item in (yolo_detections or [])
+        if isinstance(item, dict)
+    }
+    issues = []
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict) or action.get('type') not in {
+            'arm_transfer_to_slot', 'arm_load_to_trailer'
+        }:
+            continue
+        vehicle_id = str(action.get('vehicle_id') or '').strip().lower()
+        if vehicle_id not in {'agv1', 'agv2'}:
+            issues.append(
+                f'actions[{index}] ARM 작업에 vehicle_id가 없음'
+            )
+            continue
+        arrived_at_arm = any(
+            isinstance(previous, dict)
+            and previous.get('type') == 'visual_navigation'
+            and str(previous.get('vehicle_id') or '').strip().lower()
+            == vehicle_id
+            and labels_by_index.get(previous.get('detection_index'))
+            in {'A-1', 'A-2', 'A-3'}
+            for previous in actions[:index]
+        )
+        if not arrived_at_arm:
+            issues.append(
+                f'actions[{index}] {vehicle_id} ARM 작업 전에 '
+                'A 작업 위치 visual_navigation이 없음'
+            )
+    if issues and str(result.get('execution_mode') or '').lower() != 'sequential':
+        issues.append('ARM 연계 계획의 execution_mode가 sequential이 아님')
+    return issues
+
+
+_WAREHOUSE_SLOTS = (
+    'A-1-1', 'A-1-2', 'A-2-1',
+    'A-2-2', 'A-3-1', 'A-3-2',
+)
+
+
+def _mentioned_inventory_slots(command):
+    """Return exact warehouse slots named in free-form Korean/English text."""
+    compact = re.sub(r'\s+', '', str(command or '')).upper()
+    return [slot for slot in _WAREHOUSE_SLOTS if slot in compact]
+
+
+def _requests_container_loading(command):
+    """Conservatively identify a request to put cargo onto an AMR."""
+    text = re.sub(r'\s+', '', str(command or '')).lower()
+    cargo_terms = ('컨테이너', '화물', 'cargo', 'container')
+    load_terms = (
+        '싣', '실어', '실고', '실은다음', '상차', '적재',
+        'load',
+    )
+    return (
+        any(term in text for term in cargo_terms)
+        and any(term in text for term in load_terms)
+    )
+
+
+def inventory_workflow_issues(command, result, inventory_snapshot):
+    """Validate ARM source IDs against the fresh read-only DB snapshot.
+
+    The LLM chooses the container, while this function prevents a guessed or
+    stale ID from reaching central control.  A location-only request always
+    means the physically accessible top layer at that location.
+    """
+    actions = result.get('actions') if isinstance(result, dict) else None
+    if not isinstance(actions, list):
+        return []
+    load_actions = [
+        (index, action)
+        for index, action in enumerate(actions)
+        if isinstance(action, dict)
+        and action.get('type') == 'arm_load_to_trailer'
+    ]
+    arm1_actions = [
+        (index, action)
+        for index, action in enumerate(actions)
+        if isinstance(action, dict)
+        and action.get('type') == 'arm1_pick_place'
+    ]
+    load_requested = _requests_container_loading(command)
+    if not load_actions and not arm1_actions and not load_requested:
+        return []
+    cargos = (
+        inventory_snapshot.get('cargos')
+        if isinstance(inventory_snapshot, dict)
+        else None
+    )
+    if not isinstance(cargos, list):
+        return ['ARM 상차 판단에 필요한 PostgreSQL 재고 스냅샷이 없음']
+
+    if load_requested and not load_actions and not arm1_actions:
+        return ['사용자 상차 요청에 arm_load_to_trailer 단계가 없음']
+
+    valid_cargos = []
+    by_id = {}
+    for cargo in cargos:
+        if not isinstance(cargo, dict):
+            continue
+        container_id = str(cargo.get('container_id') or '').strip()
+        location = str(cargo.get('location') or '').strip().upper()
+        try:
+            floor = int(cargo.get('floor'))
+        except (TypeError, ValueError):
+            continue
+        if not container_id or not location or floor < 1:
+            continue
+        normalized = {
+            'container_id': container_id,
+            'location': location,
+            'floor': floor,
+        }
+        valid_cargos.append(normalized)
+        by_id[container_id] = normalized
+
+    issues = []
+    mentioned_slots = _mentioned_inventory_slots(command)
+    expected_top = None
+    if len(mentioned_slots) == 1:
+        at_location = [
+            cargo for cargo in valid_cargos
+            if cargo['location'] == mentioned_slots[0]
+        ]
+        if not at_location:
+            issues.append(
+                f'{mentioned_slots[0]}에 DB상 컨테이너가 없음'
+            )
+        else:
+            highest_floor = max(cargo['floor'] for cargo in at_location)
+            top = [
+                cargo for cargo in at_location
+                if cargo['floor'] == highest_floor
+            ]
+            if len(top) != 1:
+                issues.append(
+                    f'{mentioned_slots[0]}의 최상단 컨테이너를 하나로 '
+                    '결정할 수 없음'
+                )
+            else:
+                expected_top = top[0]
+
+    for index, action in load_actions:
+        raw_source_id = action.get('source_id')
+        selected_id = (
+            '' if raw_source_id is None else str(raw_source_id).strip()
+        )
+        selected = by_id.get(selected_id)
+        if selected is None:
+            issues.append(
+                f'actions[{index}] source_id={selected_id or "empty"}가 '
+                'DB에 존재하지 않음'
+            )
+            continue
+        if selected['location'] in _WAREHOUSE_SLOTS:
+            same_slot = [
+                cargo for cargo in valid_cargos
+                if cargo['location'] == selected['location']
+            ]
+            highest_floor = max(cargo['floor'] for cargo in same_slot)
+            if selected['floor'] != highest_floor:
+                issues.append(
+                    f'actions[{index}] source_id={selected_id}는 '
+                    f'{selected["location"]} floor={selected["floor"]}이며 '
+                    f'최상단 floor={highest_floor} 아래에 있음'
+                )
+                continue
+        if expected_top is not None and selected_id != expected_top['container_id']:
+            issues.append(
+                f'actions[{index}] {expected_top["location"]} 최상단은 '
+                f'container_id={expected_top["container_id"]} '
+                f'(floor={expected_top["floor"]})인데 source_id='
+                f'{selected_id}를 선택함'
+            )
+    for index, action in arm1_actions:
+        raw_source_id = action.get('source_id')
+        selected_id = (
+            '' if raw_source_id is None else str(raw_source_id).strip()
+        )
+        selected = by_id.get(selected_id)
+        if selected is None:
+            issues.append(
+                f'actions[{index}] ARM1 source_id='
+                f'{selected_id or "empty"}가 DB에 존재하지 않음'
+            )
+            continue
+        if selected['location'] in _WAREHOUSE_SLOTS:
+            same_slot = [
+                cargo for cargo in valid_cargos
+                if cargo['location'] == selected['location']
+            ]
+            highest_floor = max(cargo['floor'] for cargo in same_slot)
+            if selected['floor'] != highest_floor:
+                issues.append(
+                    f'actions[{index}] ARM1 source_id={selected_id}는 '
+                    f'{selected["location"]} floor={selected["floor"]}이며 '
+                    f'최상단 floor={highest_floor} 아래에 있음'
+                )
+                continue
+        if expected_top is not None and selected_id != expected_top['container_id']:
+            issues.append(
+                f'actions[{index}] ARM1 대상 슬롯 '
+                f'{expected_top["location"]} 최상단은 container_id='
+                f'{expected_top["container_id"]}인데 source_id='
+                f'{selected_id}를 선택함'
+            )
+    return issues
 
 
 def _infer_visual_transfer(command, detections, action=None):
@@ -814,7 +1087,25 @@ def _visual_action_from_detection(
     }
 
 
+def _mentioned_vehicle_ids(command):
+    """Return every vehicle the command names outright.
+
+    An empty set means the request never says which vehicle; two entries mean
+    it addressed both by name. Only a single entry marks a request that one
+    specific vehicle must serve alone.
+    """
+    text = str(command or '').strip().lower()
+    return {
+        vehicle_id
+        for vehicle_id, aliases in _VEHICLE_TERMS
+        if any(alias in text for alias in aliases)
+    }
+
+
 def _infer_vehicle_id(command, current_value):
+    mentioned = _mentioned_vehicle_ids(command)
+    if len(mentioned) == 1:
+        return next(iter(mentioned))
     current = str(current_value or '').strip().lower()
     if current in {'agv1', 'agv2'}:
         return current
@@ -823,6 +1114,28 @@ def _infer_vehicle_id(command, current_value):
         if any(alias in text for alias in aliases):
             return vehicle_id
     return ''
+
+
+def _decode_llm_response(response):
+    raw_text = (response['message']['content'] or '').strip()
+    if raw_text.startswith('```'):
+        raw_text = raw_text.strip('`')
+        if raw_text.startswith('json'):
+            raw_text = raw_text[4:]
+        raw_text = raw_text.strip()
+    try:
+        result = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise LLMParseError(
+            f'모델 응답을 JSON으로 해석하지 못했습니다: {raw_text!r}'
+        ) from exc
+    if not isinstance(result, dict) or not isinstance(
+        result.get('actions'), list
+    ):
+        raise LLMParseError(
+            f'예상한 JSON 형식이 아닙니다 (actions 배열 없음): {result!r}'
+        )
+    return result, raw_text
 
 
 def parse_command_with_llm(
@@ -838,11 +1151,12 @@ def parse_command_with_llm(
     image_height: int = 480,
     yolo_detections: Optional[List[Dict]] = None,
     normalization_command: Optional[str] = None,
+    inventory_snapshot: Optional[Dict] = None,
 ) -> Dict:
     """
     자연어 명령을 로컬 Ollama 모델로 해석해서 구조화된 dict로 반환합니다.
     반환 형식은 항상 {"actions": [action, ...]} 이며, 각 action은
-    _SYSTEM_PROMPT_TEMPLATE에 정의된 14가지 type 중 하나입니다.
+    _SYSTEM_PROMPT_TEMPLATE에 정의된 15가지 type 중 하나입니다.
     (한 문장에 지시가 여러 개 섞여 있으면 actions에 여러 개가 들어옵니다)
 
     실패(패키지 미설치, Ollama 서버 미실행, 모델 미설치, JSON 파싱 실패 등) 시
@@ -864,6 +1178,11 @@ def parse_command_with_llm(
         cargo_types=", ".join(known_cargo_types) if known_cargo_types else "(등록된 화물종류 없음)",
         image_width=image_width,
         image_height=image_height,
+        inventory_snapshot=json.dumps(
+            inventory_snapshot,
+            ensure_ascii=False,
+            separators=(',', ':'),
+        ) if inventory_snapshot is not None else 'unavailable',
     )
 
     client = ollama.Client(host=host or OLLAMA_HOST, timeout=timeout)
@@ -917,30 +1236,70 @@ def parse_command_with_llm(
             # 모델이 설치되어 있지 않을 때도 여기로 들어옵니다 (예: "ollama pull qwen2.5:7b" 필요)
             raise LLMParseError(f"로컬 LLM 호출 실패: {exc}") from exc
 
-    raw_text = (response["message"]["content"] or "").strip()
-
-    # 혹시 모델이 ```json ... ``` 코드블록으로 감싸서 응답하면 벗겨냄 (안전장치)
-    if raw_text.startswith("```"):
-        raw_text = raw_text.strip("`")
-        if raw_text.startswith("json"):
-            raw_text = raw_text[4:]
-        raw_text = raw_text.strip()
-
-    try:
-        result = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        raise LLMParseError(f"모델 응답을 JSON으로 해석하지 못했습니다: {raw_text!r}") from exc
-
-    if not isinstance(result, dict) or not isinstance(result.get("actions"), list):
-        raise LLMParseError(f"예상한 JSON 형식이 아닙니다 (actions 배열 없음): {result!r}")
-
-    return normalize_navigation_result(
+    result, raw_text = _decode_llm_response(response)
+    normalized = normalize_navigation_result(
         normalization_command or command,
         result,
         yolo_detections,
         image_width,
         image_height,
     )
+    issues = _cargo_workflow_issues(normalized, yolo_detections)
+    issues.extend(inventory_workflow_issues(
+        normalization_command or command,
+        normalized,
+        inventory_snapshot,
+    ))
+    if not issues:
+        return normalized
+
+    correction = (
+        '방금 생성한 계획은 물리적 선행조건을 누락했습니다. '
+        '아래 검증 오류를 모두 해결하여 전체 JSON 계획을 다시 '
+        '생성하세요. 사용자 명령을 다시 해석하고, 주어진 YOLO '
+        '검출에 있는 detection_index만 사용하세요.\n'
+        + '\n'.join(f'- {issue}' for issue in issues)
+    )
+    review_kwargs = dict(chat_kwargs)
+    review_kwargs['messages'] = [
+        *chat_kwargs['messages'],
+        {'role': 'assistant', 'content': raw_text},
+        {'role': 'user', 'content': correction},
+    ]
+    try:
+        reviewed_response = client.chat(think=False, **review_kwargs)
+    except Exception:
+        try:
+            reviewed_response = client.chat(**review_kwargs)
+        except Exception as exc:
+            raise LLMParseError(f'LLM 계획 보정 실패: {exc}') from exc
+    reviewed, _ = _decode_llm_response(reviewed_response)
+    normalized = normalize_navigation_result(
+        normalization_command or command,
+        reviewed,
+        yolo_detections,
+        image_width,
+        image_height,
+    )
+    remaining_issues = _cargo_workflow_issues(normalized, yolo_detections)
+    remaining_issues.extend(inventory_workflow_issues(
+        normalization_command or command,
+        normalized,
+        inventory_snapshot,
+    ))
+    if remaining_issues:
+        return {
+            'execution_mode': 'sequential',
+            'actions': [{
+                'type': 'unknown',
+                'reason': (
+                    'LLM 계획이 ARM 안전 선행조건을 충족하지 '
+                    '못함: ' + '; '.join(remaining_issues)
+                ),
+            }],
+            'suppress_rule_fallback': True,
+        }
+    return normalized
 
 
 if __name__ == "__main__":

@@ -7,14 +7,19 @@
 
 ## 로봇팔 중앙 연동
 
-중앙은 `/central/arms/dispatch` 액션으로 ARM 명령을 FIFO 처리합니다. 현재 ARM2만
-설정되어 있고 ARM1은 서비스 계약을 받기 전까지 `UNCONFIGURED`로 표시됩니다.
-ARM2는 직접 서비스 응답을 작업 완료로 간주하지 않습니다. 반드시
+중앙은 `/central/arms/dispatch` 액션으로 ARM 명령을 FIFO 처리합니다. ARM1은
+`/arm/pick_place/execute`, `/arm/pick_place/stop` 서비스와
+`/arm/pick_place/work_state` 상태 계약을 사용합니다. 중앙은 새 `WORK_STARTED` 이후
+`WORK_COMPLETED`, `FAILED`, `STOPPED` 중 하나가 올 때까지 명령을 완료하지 않습니다.
+`execute` 요청의 `pick_id/place_id`는 중앙 action의
+`source_id/destination_id`에서 매 작업마다 전달됩니다.
+ARM2도 직접 서비스 응답을 작업 완료로 간주하지 않습니다. 반드시
 `/arm2/transfer_events`에서 같은 `operation_id`의 최종 `COMPLETED` 또는 `FAILED`
 이벤트를 받은 뒤 중앙 결과를 확정합니다.
 
 허용 작업은 다음으로 제한됩니다.
 
+- ARM1: `pick_place`, `stop`
 - `scan_destinations`
 - `transfer_to_slot`: 차량에서 창고로 이동
 - `load_to_trailer`: 창고에서 차량으로 이동
@@ -24,6 +29,27 @@ ARM2는 직접 서비스 응답을 작업 완료로 간주하지 않습니다. �
 차량 출발 승인은 `transfer_to_slot` 또는 `load_to_trailer`가 최종 성공하고 요청의
 `final_for_vehicle`가 참일 때만 `/central/autonomy/vehicle_release`에 발행됩니다.
 `transfer_by_id` 성공은 차량 출발 조건이 아닙니다.
+
+### 출발 게이트
+
+같은 조건(`final_for_vehicle` + 차량 지정 + 위 두 이송 작업)을 만족하는 명령이
+큐에 들어가는 순간부터 종료될 때까지, `arm_dispatcher`는 해당 차량을 붙잡고
+있다고 `/central/arms/vehicle_holds`에 2Hz로 알립니다. `fleet_dispatcher`는 이
+스냅샷을 구독해서, 붙잡힌 차량의 주행 명령을 바퀴가 돌기 직전 단계에서
+대기시킵니다(피드백 상태 `WAITING_FOR_ARM`). 팔 작업이 끝나면 대기가 풀리고
+주행이 이어집니다.
+
+- 스냅샷은 **주기 발행**이며 매번 집합 전체를 교체합니다. 메시지를 놓쳐도 다음
+  스냅샷에서 스스로 복구되고, latch로 인해 낡은 hold가 재생되는 일도 없습니다.
+- 작업이 **실패해도** hold는 풀립니다. 차가 갇히는 쪽이 더 위험하기 때문이며,
+  실패 사실은 작업 결과로 별도 통보됩니다.
+- 대기는 `cargo_hold_timeout_sec`(기본 300초)에서 끊기고 명령은 abort 됩니다.
+- 대시보드의 수동 목표(`/agvX/goal_pose`)는 `fleet_dispatcher`를 거치지 않으므로
+  이 게이트의 적용을 받지 않습니다. 운용자 비상 수단으로 열어둔 경로입니다.
+
+```bash
+ros2 topic echo /central/arms/vehicle_holds
+```
 
 HTTP API 예시:
 
@@ -45,6 +71,7 @@ curl -X POST http://127.0.0.1:8100/api/v1/arms/commands \
 작업 상태 확인:
 
 ```bash
+ros2 topic echo /central/arms/arm1/state
 ros2 topic echo /central/arms/arm2/state
 ros2 topic echo /central/arms/results
 ros2 topic echo /central/autonomy/vehicle_release
@@ -55,8 +82,8 @@ ros2 topic echo /central/autonomy/vehicle_release
 `port_event_detector`는 대시보드에서 지정한 탑다운 카메라 ROI 안의 YOLO OBB를
 검사합니다. 신뢰도 `0.65` 이상, ROI 겹침 `30%` 이상이 최근 5프레임 중 3프레임에
 있으면 입항으로 판정합니다. 10초 동안 사라지면 출항으로 판정합니다. 입항 시
-`autonomy_orchestrator`가 ARM2 목적지 스캔을 요청하고, ARM1 계약과 화물 정책이
-준비될 때까지 `WAITING_FOR_CARGO_POLICY`로 대기합니다.
+`autonomy_orchestrator`가 ARM2 목적지 스캔을 요청하고 화물 정책이 준비될 때까지
+`WAITING_FOR_CARGO_POLICY`로 대기합니다.
 
 ## 2대 차량 Fleet 제어
 
