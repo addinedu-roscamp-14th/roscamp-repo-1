@@ -1,5 +1,12 @@
 # porter_interfaces
 
+Shared ROS interfaces for fleet navigation, robot-arm dispatch, and port events.
+
+- `DispatchNavigation`: namespaced AGV navigation dispatch.
+- `DispatchArmCommand`: queued ARM1/ARM2 work with mission and vehicle correlation.
+- `VehicleState` / `ArmState`: central readiness and execution state.
+- `PortEvent`: debounced vessel arrival/departure events.
+
 Port-ER의 2대 AGV 관제를 위한 ROS 2 인터페이스 패키지입니다.
 
 ## Interfaces

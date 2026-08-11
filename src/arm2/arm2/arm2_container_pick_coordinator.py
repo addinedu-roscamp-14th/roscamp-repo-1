@@ -2,15 +2,22 @@
 
 from collections import deque
 import copy
+from datetime import datetime, timezone
+import json
 import math
+from pathlib import Path
 import threading
 import time
+import uuid
 
+from builtin_interfaces.msg import Duration
+from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped
+from arm2_interfaces.srv import TransferById
 import numpy as np
 from pymycobot.mycobot280 import MyCobot280
-import rclpy
 from rcl_interfaces.msg import SetParametersResult
+import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import (
@@ -24,6 +31,7 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
+from trajectory_msgs.msg import JointTrajectoryPoint
 
 from .arm2_joint_limits import JOINT_LIMITS_DEG
 
@@ -31,14 +39,16 @@ try:
     from moveit_msgs.action import ExecuteTrajectory, MoveGroup
     from moveit_msgs.msg import (
         Constraints,
+        JointConstraint,
         MoveItErrorCodes,
         OrientationConstraint,
         PositionConstraint,
     )
-    from moveit_msgs.srv import GetCartesianPath
+    from moveit_msgs.srv import GetCartesianPath, GetPositionIK
 except ImportError:
     ExecuteTrajectory = None
     GetCartesianPath = None
+    GetPositionIK = None
     MoveGroup = None
 
 
@@ -132,9 +142,91 @@ def apply_base_frame_correction(translation, correction):
     )
 
 
+def apply_marker_yaw_correction(
+    translation,
+    correction,
+    marker_yaw_degrees,
+):
+    """Apply an XYZ correction expressed in the marker's yaw frame."""
+    correction = np.asarray(correction, dtype=np.float64)
+    if correction.shape != (3,):
+        raise ValueError('marker correction must contain three values')
+    angle = math.radians(float(marker_yaw_degrees))
+    cosine, sine = math.cos(angle), math.sin(angle)
+    rotated = np.array([
+        cosine * correction[0] - sine * correction[1],
+        sine * correction[0] + cosine * correction[1],
+        correction[2],
+    ])
+    return np.asarray(translation, dtype=np.float64) + rotated
+
+
+def bounded_visual_servo_step(
+    error_xy,
+    yaw_error_degrees,
+    xy_gain,
+    yaw_gain,
+    max_xy_step,
+    max_yaw_step_degrees,
+):
+    """Return gain-scaled XY/yaw corrections with independent hard limits."""
+    xy_step = np.asarray(error_xy, dtype=np.float64) * float(xy_gain)
+    norm = float(np.linalg.norm(xy_step))
+    if norm > max_xy_step:
+        xy_step *= float(max_xy_step) / norm
+    yaw_step = float(yaw_error_degrees) * float(yaw_gain)
+    yaw_step = float(np.clip(
+        yaw_step,
+        -float(max_yaw_step_degrees),
+        float(max_yaw_step_degrees),
+    ))
+    return xy_step, yaw_step
+
+
+def visual_servo_within_tolerance(
+    error_xy,
+    yaw_error_degrees,
+    xy_tolerance,
+    yaw_tolerance_degrees,
+):
+    """Return whether XY and yaw errors satisfy refinement tolerances."""
+    return (
+        float(np.max(np.abs(error_xy))) <= float(xy_tolerance)
+        and abs(float(yaw_error_degrees)) <= float(yaw_tolerance_degrees)
+    )
+
+
 def wrap_degrees(angle):
     """Wrap an angle to [-180, 180)."""
     return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def duration_message(seconds):
+    """Convert positive fractional seconds to a ROS Duration message."""
+    seconds = float(seconds)
+    whole_seconds = int(seconds)
+    nanoseconds = int(round((seconds - whole_seconds) * 1_000_000_000))
+    if nanoseconds >= 1_000_000_000:
+        whole_seconds += 1
+        nanoseconds -= 1_000_000_000
+    return Duration(sec=whole_seconds, nanosec=nanoseconds)
+
+
+def trajectory_joint_travel_degrees(start, trajectory, joint_name):
+    """Return cumulative travel for one named trajectory joint."""
+    names = list(trajectory.joint_trajectory.joint_names)
+    if joint_name not in names:
+        return math.inf
+    joint_index = names.index(joint_name)
+    previous = float(start)
+    travel = 0.0
+    for point in trajectory.joint_trajectory.points:
+        if len(point.positions) <= joint_index:
+            return math.inf
+        following = float(point.positions[joint_index])
+        travel += abs(math.degrees(following - previous))
+        previous = following
+    return travel
 
 
 def wrap_symmetric_degrees(angle, symmetry_degrees):
@@ -143,6 +235,29 @@ def wrap_symmetric_degrees(angle, symmetry_degrees):
     if period <= 0.0 or period > 360.0:
         raise ValueError('yaw symmetry must be in the range (0, 360]')
     return (float(angle) + period / 2.0) % period - period / 2.0
+
+
+def nearest_symmetric_yaw_degrees(
+    target_yaw, current_yaw, symmetry_degrees
+):
+    """Choose the target-equivalent yaw closest to the current TCP yaw."""
+    delta = wrap_symmetric_degrees(
+        float(target_yaw) - float(current_yaw),
+        symmetry_degrees,
+    )
+    return wrap_degrees(float(current_yaw) + delta)
+
+
+def symmetric_marker_yaw_degrees(
+    marker_yaw,
+    reference_marker_yaw,
+    symmetry_degrees,
+):
+    """Map equivalent marker headings onto one correction-frame heading."""
+    return float(reference_marker_yaw) + wrap_symmetric_degrees(
+        float(marker_yaw) - float(reference_marker_yaw),
+        symmetry_degrees,
+    )
 
 
 def compose_yaw_follow_pose(
@@ -237,6 +352,7 @@ def calculate_heading_aligned_stack_poses(
     extra_depth,
     xy_offset,
     yaw_symmetry_degrees=360.0,
+    z_offset=0.0,
 ):
     """Place the held container with its heading aligned to the destination."""
     if container_height <= 0.0 or approach_clearance <= 0.0:
@@ -257,7 +373,7 @@ def calculate_heading_aligned_stack_poses(
     )
     release = np.asarray(release, dtype=np.float64)
     release[:2] += offset
-    release[2] += container_height - extra_depth
+    release[2] += container_height - extra_depth + float(z_offset)
     approach = release.copy()
     approach[2] += approach_clearance
     return release, approach, rotation, yaw_delta
@@ -279,6 +395,27 @@ def lift_distance_candidates(requested, minimum, step):
     return candidates
 
 
+def stack_layer_z_offset(base_offset, container_height, placed_count):
+    """Return placement Z offset for the next zero-based stack layer."""
+    if container_height <= 0.0:
+        raise ValueError('container height must be positive')
+    if placed_count < 0:
+        raise ValueError('placed count must be non-negative')
+    return float(base_offset) + float(container_height) * int(placed_count)
+
+
+def grouped_marker_locks_satisfied(
+    locked,
+    required_indices,
+    any_of_indices,
+):
+    """Require every source lock and at least one alternative target lock."""
+    return (
+        all(locked[index] is not None for index in required_indices)
+        and any(locked[index] is not None for index in any_of_indices)
+    )
+
+
 def cartesian_path_acceptable(
     fraction,
     requested_distance,
@@ -289,9 +426,19 @@ def cartesian_path_acceptable(
     """Accept a nearly complete path only when its residual is bounded."""
     if fraction >= preferred_fraction:
         return True
-    if requested_distance is None or fraction < absolute_min_fraction:
+    if requested_distance is None:
         return False
     shortfall = max(0.0, requested_distance * (1.0 - fraction))
+    # Percentage thresholds are misleading for millimetre-scale settling:
+    # 80% of a 4.5 mm correction leaves less than 1 mm. Permit only that
+    # tightly bounded case; longer paths retain the normal fraction limit.
+    if (
+        0.0 < fraction < absolute_min_fraction
+        and requested_distance <= max_shortfall
+    ):
+        return shortfall <= 0.001
+    if fraction < absolute_min_fraction:
+        return False
     return shortfall <= max_shortfall
 
 
@@ -363,8 +510,32 @@ class ContainerPickCoordinator(Node):
             ).value
         )
         self.grasp_offset = self._vector_parameter('grasp_offset_xyz_m', 3)
-        self.base_correction = self._vector_parameter(
-            'base_correction_xyz_m', 3
+        self.pick_correction = self._vector_parameter(
+            'pick_correction_xyz_m', 3
+        )
+        self.saved_destination_pick_correction = self._vector_parameter(
+            'saved_destination_pick_correction_xyz_m', 3
+        )
+        self.id_transfer_pick_correction = self._vector_parameter(
+            'id_transfer_pick_correction_xyz_m', 3
+        )
+        self.place_correction = self._vector_parameter(
+            'place_correction_xyz_m', 3
+        )
+        self.saved_destination_correction = self._vector_parameter(
+            'saved_destination_correction_xyz_m', 3
+        )
+        self.id_transfer_correction = self._vector_parameter(
+            'id_transfer_correction_xyz_m', 3
+        )
+        self.id_transfer_a2_place_correction = self._vector_parameter(
+            'id_transfer_a2_place_correction_xyz_m', 3
+        )
+        self.trailer_correction = self._vector_parameter(
+            'trailer_correction_xyz_m', 3
+        )
+        self.trailer_a3_pick_correction = self._vector_parameter(
+            'trailer_a3_pick_correction_xyz_m', 3
         )
         self.grasp_rpy = self._vector_parameter('grasp_offset_rpy_deg', 3)
         self.grasp_rotation = quaternion_from_rpy_degrees(*self.grasp_rpy)
@@ -373,6 +544,9 @@ class ContainerPickCoordinator(Node):
         )
         self.container_yaw_symmetry = float(
             self.get_parameter('container_yaw_symmetry_deg').value
+        )
+        self.prefer_current_gripper_yaw = bool(
+            self.get_parameter('prefer_current_gripper_yaw').value
         )
         self.max_yaw_spread = float(
             self.get_parameter('max_yaw_spread_deg').value
@@ -397,6 +571,54 @@ class ContainerPickCoordinator(Node):
         self.refresh_marker_before_descent = bool(
             self.get_parameter('refresh_marker_before_descent').value
         )
+        self.visual_servo_enabled = bool(
+            self.get_parameter('visual_servo_enabled').value
+        )
+        self.visual_servo_samples = int(
+            self.get_parameter('visual_servo_samples').value
+        )
+        self.visual_servo_xy_tolerance = float(
+            self.get_parameter('visual_servo_xy_tolerance_m').value
+        )
+        self.visual_servo_yaw_tolerance = float(
+            self.get_parameter('visual_servo_yaw_tolerance_deg').value
+        )
+        self.visual_servo_xy_gain = float(
+            self.get_parameter('visual_servo_xy_gain').value
+        )
+        self.visual_servo_yaw_gain = float(
+            self.get_parameter('visual_servo_yaw_gain').value
+        )
+        self.visual_servo_max_xy_step = float(
+            self.get_parameter('visual_servo_max_xy_step_m').value
+        )
+        self.visual_servo_max_yaw_step = float(
+            self.get_parameter('visual_servo_max_yaw_step_deg').value
+        )
+        self.visual_servo_max_initial_error = float(
+            self.get_parameter(
+                'visual_servo_max_initial_error_m'
+            ).value
+        )
+        self.visual_servo_max_iterations = int(
+            self.get_parameter('visual_servo_max_iterations').value
+        )
+        self.visual_servo_required_successes = int(
+            self.get_parameter(
+                'visual_servo_required_consecutive_successes'
+            ).value
+        )
+        self.visual_servo_timeout = float(
+            self.get_parameter('visual_servo_timeout_sec').value
+        )
+        self.visual_servo_marker_loss_timeout = float(
+            self.get_parameter(
+                'visual_servo_marker_loss_timeout_sec'
+            ).value
+        )
+        self.visual_servo_settle = float(
+            self.get_parameter('visual_servo_settle_sec').value
+        )
         self.pregrasp_test_keep_orientation = bool(
             self.get_parameter(
                 'pregrasp_test_keep_current_orientation'
@@ -410,6 +632,15 @@ class ContainerPickCoordinator(Node):
         )
         self.lift_search_step = float(
             self.get_parameter('lift_search_step_m').value
+        )
+        self.bad_pick_branch_j2 = float(
+            self.get_parameter('bad_pick_branch_j2_deg').value
+        )
+        self.bad_pick_branch_j3 = float(
+            self.get_parameter('bad_pick_branch_j3_deg').value
+        )
+        self.bad_pick_branch_tolerance = float(
+            self.get_parameter('bad_pick_branch_tolerance_deg').value
         )
         self.stack_container_height = float(
             self.get_parameter('stack_container_height_m').value
@@ -425,8 +656,19 @@ class ContainerPickCoordinator(Node):
         self.stack_approach_search_step = float(
             self.get_parameter('stack_approach_search_step_m').value
         )
+        self.stack_yaw_fallback_offsets = [
+            float(value) for value in self.get_parameter(
+                'stack_yaw_fallback_offsets_deg'
+            ).value
+        ]
         self.stack_xy_offset = self._vector_parameter(
             'stack_xy_offset_m', 2
+        )
+        self.stack_z_offset = float(
+            self.get_parameter('stack_z_offset_m').value
+        )
+        self.max_stack_levels = int(
+            self.get_parameter('max_stack_levels').value
         )
         self.stack_source_orientation_mode = str(
             self.get_parameter('stack_source_orientation_mode').value
@@ -513,6 +755,18 @@ class ContainerPickCoordinator(Node):
         self.moveit_planning_attempts = int(
             self.get_parameter('moveit_planning_attempts').value
         )
+        self.ik_timeout = float(
+            self.get_parameter('ik_timeout_sec').value
+        )
+        self.motion_ik_timeout = float(
+            self.get_parameter('motion_ik_timeout_sec').value
+        )
+        self.preferred_pick_seed_j2_j6 = np.radians(
+            self._vector_parameter('preferred_pick_seed_j2_j6_deg', 5)
+        )
+        self.preferred_place_seed_j2_j6 = np.radians(
+            self._vector_parameter('preferred_place_seed_j2_j6_deg', 5)
+        )
         self.moveit_velocity_scale = float(
             self.get_parameter('moveit_velocity_scale').value
         )
@@ -540,6 +794,58 @@ class ContainerPickCoordinator(Node):
         self.moveit_state_settle = float(
             self.get_parameter('moveit_state_settle_sec').value
         )
+        self.stack_preflight_joint_margin = math.radians(float(
+            self.get_parameter('stack_preflight_joint_margin_deg').value
+        ))
+        self.max_j6_trajectory_travel = float(
+            self.get_parameter('max_j6_trajectory_travel_deg').value
+        )
+        self.scan_marker_pause = float(
+            self.get_parameter('scan_marker_pause_sec').value
+        )
+        self.scan_timeout = float(
+            self.get_parameter('scan_timeout_sec').value
+        )
+        self.prefer_z_last_motion = bool(
+            self.get_parameter('prefer_z_last_motion').value
+        )
+        zone_j1_values = self._vector_parameter(
+            'destination_zone_j1_deg', 3
+        )
+        self.destination_zone_j1 = {
+            f'A-{index + 1}': math.radians(float(value))
+            for index, value in enumerate(zone_j1_values)
+        }
+        self.j2_fallback_min_tcp_height = float(
+            self.get_parameter('j2_fallback_min_tcp_height_m').value
+        )
+        self.j3_fallback_min_tcp_height = float(
+            self.get_parameter('j3_fallback_min_tcp_height_m').value
+        )
+        self.release_verify_xy_tolerance = float(
+            self.get_parameter('release_verify_xy_tolerance_m').value
+        )
+        self.release_verify_z_tolerance = float(
+            self.get_parameter('release_verify_z_tolerance_m').value
+        )
+        self.release_verify_yaw_tolerance = float(
+            self.get_parameter('release_verify_yaw_tolerance_deg').value
+        )
+        self.pick_profile_xy_merge = float(
+            self.get_parameter('pick_profile_xy_merge_m').value
+        )
+        self.pick_profile_z_merge = float(
+            self.get_parameter('pick_profile_z_merge_m').value
+        )
+        self.pick_profile_yaw_merge = float(
+            self.get_parameter('pick_profile_yaw_merge_deg').value
+        )
+        self.pick_profile_max_entries = int(
+            self.get_parameter('pick_profile_max_entries').value
+        )
+        self.pick_profile_cache_path = str(
+            self.get_parameter('pick_profile_cache_path').value
+        ).strip()
 
         if self.minimum_samples < 3:
             raise ValueError('minimum_stable_samples must be at least 3')
@@ -564,6 +870,35 @@ class ContainerPickCoordinator(Node):
             )
         if self.grasp_extra_depth < 0.0:
             raise ValueError('grasp_extra_depth_m must be non-negative')
+        if self.visual_servo_samples < 3:
+            raise ValueError('visual_servo_samples must be at least 3')
+        if (
+            self.visual_servo_xy_tolerance <= 0.0
+            or self.visual_servo_yaw_tolerance <= 0.0
+        ):
+            raise ValueError('visual servo tolerances must be positive')
+        if not 0.0 < self.visual_servo_xy_gain <= 1.0:
+            raise ValueError('visual_servo_xy_gain must be within (0, 1]')
+        if not 0.0 < self.visual_servo_yaw_gain <= 1.0:
+            raise ValueError('visual_servo_yaw_gain must be within (0, 1]')
+        if (
+            self.visual_servo_max_xy_step <= 0.0
+            or self.visual_servo_max_yaw_step <= 0.0
+            or self.visual_servo_max_initial_error <= 0.0
+        ):
+            raise ValueError('visual servo limits must be positive')
+        if self.visual_servo_max_iterations < 1:
+            raise ValueError('visual_servo_max_iterations must be positive')
+        if self.visual_servo_required_successes < 1:
+            raise ValueError(
+                'visual_servo_required_consecutive_successes must be positive'
+            )
+        if (
+            self.visual_servo_timeout <= 0.0
+            or self.visual_servo_marker_loss_timeout <= 0.0
+            or self.visual_servo_settle < 0.0
+        ):
+            raise ValueError('visual servo timing values are invalid')
         if not (
             0.0 <= self.cartesian_absolute_min_fraction
             <= self.cartesian_min_fraction <= 1.0
@@ -574,6 +909,18 @@ class ContainerPickCoordinator(Node):
             )
         if self.cartesian_max_shortfall < 0.0:
             raise ValueError('cartesian_max_shortfall_m must be non-negative')
+        if self.ik_timeout <= 0.0:
+            raise ValueError('ik_timeout_sec must be positive')
+        if self.motion_ik_timeout <= 0.0:
+            raise ValueError('motion_ik_timeout_sec must be positive')
+        if self.stack_preflight_joint_margin < 0.0:
+            raise ValueError(
+                'stack_preflight_joint_margin_deg must be non-negative'
+            )
+        if self.max_j6_trajectory_travel <= 0.0:
+            raise ValueError(
+                'max_j6_trajectory_travel_deg must be positive'
+            )
         if any(
             scale < 0.0 or scale >= 1.0
             for scale in self.grasp_yaw_fallback_scales
@@ -588,8 +935,18 @@ class ContainerPickCoordinator(Node):
         )
         if self.stack_container_height <= 0.0:
             raise ValueError('stack_container_height_m must be positive')
+        if self.max_stack_levels < 1:
+            raise ValueError('max_stack_levels must be positive')
         if self.stack_approach_clearance <= 0.0:
             raise ValueError('stack_approach_clearance_m must be positive')
+        if any(
+            not math.isfinite(offset) or abs(offset) > 180.0
+            for offset in self.stack_yaw_fallback_offsets
+        ):
+            raise ValueError(
+                'stack_yaw_fallback_offsets_deg values must be finite and '
+                'within [-180, 180]'
+            )
         if self.stack_source_orientation_mode not in ('fixed', 'marker_yaw'):
             raise ValueError(
                 'stack_source_orientation_mode must be fixed or marker_yaw'
@@ -606,6 +963,43 @@ class ContainerPickCoordinator(Node):
             raise ValueError(
                 'stack_pose_goal_finish_max_distance_m must be positive'
             )
+        if not 0.0 < self.bad_pick_branch_tolerance <= 30.0:
+            raise ValueError(
+                'bad_pick_branch_tolerance_deg must be within (0, 30]'
+            )
+        if self.scan_marker_pause < 0.5:
+            raise ValueError('scan_marker_pause_sec must be at least 0.5')
+        if self.scan_timeout <= 0.0:
+            raise ValueError('scan_timeout_sec must be positive')
+        if not (
+            self.workspace_min[2]
+            <= self.j2_fallback_min_tcp_height
+            <= self.workspace_max[2]
+        ):
+            raise ValueError(
+                'j2_fallback_min_tcp_height_m must be inside Z workspace'
+            )
+        if not (
+            self.workspace_min[2]
+            <= self.j3_fallback_min_tcp_height
+            <= self.workspace_max[2]
+        ):
+            raise ValueError(
+                'j3_fallback_min_tcp_height_m must be inside Z workspace'
+            )
+        if (
+            self.release_verify_xy_tolerance <= 0.0
+            or self.release_verify_z_tolerance <= 0.0
+            or self.release_verify_yaw_tolerance <= 0.0
+        ):
+            raise ValueError('release verification tolerances must be positive')
+        if (
+            self.pick_profile_xy_merge <= 0.0
+            or self.pick_profile_z_merge <= 0.0
+            or self.pick_profile_yaw_merge <= 0.0
+            or self.pick_profile_max_entries < 1
+        ):
+            raise ValueError('pick profile cache limits must be positive')
         lift_distance_candidates(
             self.stack_approach_clearance,
             self.stack_minimum_approach_clearance,
@@ -618,31 +1012,133 @@ class ContainerPickCoordinator(Node):
         self.stack_target_history = deque(
             maxlen=max(100, self.minimum_samples * 3)
         )
+        self.source_frames = {
+            0: self.marker_frame,
+            1: 'arm2/container_marker_1',
+            2: 'arm2/container_marker_2',
+            3: 'arm2/container_marker_3',
+            4: 'arm2/container_marker_4',
+            5: 'arm2/container_marker_5',
+            6: 'arm2/container_marker_6',
+            7: 'arm2/container_marker_7',
+            8: 'arm2/container_marker_8',
+        }
+        self.destination_ids = {
+            'A-1-1': 11,
+            'A-1-2': 12,
+            'A-2-1': 13,
+            'A-2-2': 14,
+            'A-3-1': 15,
+            'A-3-2': 16,
+        }
+        self.destination_frames = {
+            marker_id: f'arm2/destination_marker_{marker_id}'
+            for marker_id in self.destination_ids.values()
+        }
+        self.trailer_frames = {
+            9: 'arm2/trailer_marker_9',
+            10: 'arm2/trailer_marker_10',
+        }
+        tracked_frames = {
+            **self.source_frames,
+            **self.trailer_frames,
+            **self.destination_frames,
+        }
+        history_size = max(100, self.minimum_samples * 3)
+        self.marker_histories = {
+            marker_id: (
+                self.history if marker_id == 0 else deque(maxlen=history_size)
+            )
+            for marker_id in tracked_frames
+        }
+        self.marker_stamp_attributes = {}
+        for marker_id in tracked_frames:
+            attribute = f'last_marker_{marker_id}_stamp'
+            self.marker_stamp_attributes[marker_id] = attribute
+            setattr(self, attribute, None)
         self.history_lock = threading.Lock()
         self.last_transform_stamp = None
         self.last_stack_target_stamp = None
+        self.last_stack_target_a2_stamp = None
+        self.last_stack_target_a3_stamp = None
+        self.saved_destination_poses = {}
+        self.saved_marker_poses = {}
+        self.saved_destination_stack_counts = {
+            name: 0 for name in self.destination_ids
+        }
+        self.saved_destination_stack_counts['TRAILER'] = 0
+        self.saved_destination_stack_counts.update({
+            f'ID-{marker_id}': 0 for marker_id in range(9)
+        })
         self.tracking_errors = {}
+        # During scan-and-transfer, each marker becomes immutable as soon as
+        # its stationary pose has been accepted.  The next scan command clears
+        # these locks and starts a new acquisition.
+        self.scan_locked_frames = set()
         self.motion_lock = threading.Lock()
         self.tracking_suspended = threading.Event()
+        # Destination IDs 11-16 are only camera-sampled while the explicit
+        # destination scan is running.  Once accepted, their base-frame poses
+        # in saved_destination_poses are the sole source used by transfers.
+        self.destination_scan_active = threading.Event()
         self.serial_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.motion_thread = None
+        # Active only while one ID-to-ID transfer is being planned.  It lets
+        # a previously proven route be tried first without changing J1 or
+        # bypassing any IK, collision, or Cartesian preflight checks.
+        self.active_id_transfer_pair = None
+        self.active_source_scan_zone = None
+        # Successful pick profiles are keyed by source/destination IDs and
+        # scan zone.  A cached profile only changes candidate order; every
+        # IK, collision, joint-branch, and Cartesian descent check still runs.
+        self.pick_success_profiles = []
+        self._load_pick_success_profiles()
+        self.stack_level_lock = threading.Lock()
+        self.placed_stack_count = 0
         self.robot = None
         self.move_group_client = None
         self.cartesian_path_client = None
+        self.position_ik_client = None
         self.execute_trajectory_client = None
+        self.follow_joint_trajectory_client = None
         self.gripper_open_client = None
         self.gripper_close_client = None
         self.stop_robot_client = None
+        self.return_home_client = None
+        self.go_a1_client = None
+        self.go_a2_client = None
+        self.go_a3_client = None
+        self.sweep_joint1_client = None
+        self.pause_sweep_client = None
+        self.resume_sweep_client = None
+        self.scan_state_client = None
         self.current_moveit_goal = None
         self.moveit_goal_lock = threading.Lock()
+        self.joint_state_lock = threading.Lock()
+        self.latest_joint_positions = None
+        self.latest_joint_state_time = None
+        self.j2_fallback_used = False
+        self.j3_fallback_used = False
+        self.ik_seed_fallback_index = 0
+        self.ik_seed_fallback_solutions = set()
         self.last_status_text = ''
+        self.transfer_event_lock = threading.Lock()
+        self.transfer_event_sequence = 0
         self.add_on_set_parameters_callback(
             self._on_tuning_parameters_changed
         )
 
         self.status_publisher = self.create_publisher(
             String, '/arm2/container_pick/status', 10
+        )
+        event_qos = QoSProfile(
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.transfer_event_publisher = self.create_publisher(
+            String, '/arm2/transfer_events', event_qos
         )
         self.marker_pose_publisher = self.create_publisher(
             PoseStamped, '/arm2/container_pick/marker_pose', 10
@@ -677,8 +1173,57 @@ class ContainerPickCoordinator(Node):
             Trigger, '/arm2/move_to_pregrasp', self.start_pregrasp_test
         )
         self.create_service(Trigger, '/arm2/stop_pick', self.stop_pick)
+        self.create_service(
+            Trigger,
+            '/arm2/scan_and_transfer',
+            self.start_scan_and_transfer,
+        )
+        self.create_service(
+            Trigger,
+            '/arm2/reset_stack_level',
+            self.reset_stack_level,
+        )
+        self.create_service(
+            Trigger, '/arm2/scan_destinations', self.start_destination_scan
+        )
+        self.create_service(
+            TransferById,
+            '/arm2/transfer_by_id',
+            self.start_id_to_id_transfer,
+        )
+        for destination_name, service_name in (
+            ('A-1-1', '/arm2/transfer_to_a1_1'),
+            ('A-1-2', '/arm2/transfer_to_a1_2'),
+            ('A-2-1', '/arm2/transfer_to_a2_1'),
+            ('A-2-2', '/arm2/transfer_to_a2_2'),
+            ('A-3-1', '/arm2/transfer_to_a3_1'),
+            ('A-3-2', '/arm2/transfer_to_a3_2'),
+        ):
+            self.create_service(
+                Trigger,
+                service_name,
+                lambda request, response, name=destination_name:
+                    self.start_saved_destination_transfer(
+                        request, response, name
+                    ),
+            )
+        for marker_id in range(9):
+            self.create_service(
+                Trigger,
+                f'/arm2/load_id{marker_id}_to_trailer',
+                lambda request, response, selected_id=marker_id:
+                    self.start_loading_transfer(
+                        request, response, selected_id
+                    ),
+            )
         self.create_timer(0.1, self.update_tracking)
         self.create_timer(1.0, self._republish_status)
+        self.create_subscription(
+            JointState,
+            '/arm2/joint_states',
+            self._joint_state_callback,
+            10,
+        )
 
         if self.execute_motion and self.motion_backend == 'direct':
             self._connect_robot()
@@ -695,7 +1240,16 @@ class ContainerPickCoordinator(Node):
         self.get_logger().info(
             'Loaded grasp tuning: '
             f'grasp_offset={self.grasp_offset.tolist()}, '
-            f'base_correction={self.base_correction.tolist()}, '
+            f'pick_correction={self.pick_correction.tolist()}, '
+            'saved_destination_pick_correction='
+            f'{self.saved_destination_pick_correction.tolist()}, '
+            'id_transfer_pick_correction='
+            f'{self.id_transfer_pick_correction.tolist()}, '
+            f'place_correction={self.place_correction.tolist()}, '
+            'saved_destination_correction='
+            f'{self.saved_destination_correction.tolist()}, '
+            f'id_transfer_correction={self.id_transfer_correction.tolist()}, '
+            f'trailer_correction={self.trailer_correction.tolist()}, '
             f'grasp_rpy={self.grasp_rpy.tolist()}, '
             f'reference_yaw={self.reference_marker_yaw:.3f}deg, '
             f'yaw_symmetry={self.container_yaw_symmetry:.1f}deg'
@@ -707,7 +1261,13 @@ class ContainerPickCoordinator(Node):
             'allow_full_pick',
             'offsets_configured',
             'grasp_offset_xyz_m',
-            'base_correction_xyz_m',
+            'pick_correction_xyz_m',
+            'saved_destination_pick_correction_xyz_m',
+            'id_transfer_pick_correction_xyz_m',
+            'place_correction_xyz_m',
+            'saved_destination_correction_xyz_m',
+            'id_transfer_correction_xyz_m',
+            'trailer_correction_xyz_m',
             'grasp_offset_rpy_deg',
             'reference_marker_yaw_deg',
             'container_yaw_symmetry_deg',
@@ -735,11 +1295,63 @@ class ContainerPickCoordinator(Node):
                     limit=0.5,
                 )
 
-            base_correction = self.base_correction
-            if 'base_correction_xyz_m' in requested:
-                base_correction = self._validated_tuning_vector(
-                    'base_correction_xyz_m',
-                    requested['base_correction_xyz_m'],
+            pick_correction = self.pick_correction
+            if 'pick_correction_xyz_m' in requested:
+                pick_correction = self._validated_tuning_vector(
+                    'pick_correction_xyz_m',
+                    requested['pick_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            saved_destination_pick_correction = (
+                self.saved_destination_pick_correction
+            )
+            if 'saved_destination_pick_correction_xyz_m' in requested:
+                saved_destination_pick_correction = (
+                    self._validated_tuning_vector(
+                        'saved_destination_pick_correction_xyz_m',
+                        requested['saved_destination_pick_correction_xyz_m'],
+                        limit=0.2,
+                    )
+                )
+
+            id_transfer_pick_correction = self.id_transfer_pick_correction
+            if 'id_transfer_pick_correction_xyz_m' in requested:
+                id_transfer_pick_correction = self._validated_tuning_vector(
+                    'id_transfer_pick_correction_xyz_m',
+                    requested['id_transfer_pick_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            place_correction = self.place_correction
+            if 'place_correction_xyz_m' in requested:
+                place_correction = self._validated_tuning_vector(
+                    'place_correction_xyz_m',
+                    requested['place_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            saved_destination_correction = self.saved_destination_correction
+            if 'saved_destination_correction_xyz_m' in requested:
+                saved_destination_correction = self._validated_tuning_vector(
+                    'saved_destination_correction_xyz_m',
+                    requested['saved_destination_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            id_transfer_correction = self.id_transfer_correction
+            if 'id_transfer_correction_xyz_m' in requested:
+                id_transfer_correction = self._validated_tuning_vector(
+                    'id_transfer_correction_xyz_m',
+                    requested['id_transfer_correction_xyz_m'],
+                    limit=0.2,
+                )
+
+            trailer_correction = self.trailer_correction
+            if 'trailer_correction_xyz_m' in requested:
+                trailer_correction = self._validated_tuning_vector(
+                    'trailer_correction_xyz_m',
+                    requested['trailer_correction_xyz_m'],
                     limit=0.2,
                 )
 
@@ -769,7 +1381,15 @@ class ContainerPickCoordinator(Node):
             return SetParametersResult(successful=False, reason=str(exc))
 
         self.grasp_offset = grasp_offset
-        self.base_correction = base_correction
+        self.pick_correction = pick_correction
+        self.saved_destination_pick_correction = (
+            saved_destination_pick_correction
+        )
+        self.id_transfer_pick_correction = id_transfer_pick_correction
+        self.place_correction = place_correction
+        self.saved_destination_correction = saved_destination_correction
+        self.id_transfer_correction = id_transfer_correction
+        self.trailer_correction = trailer_correction
         self.grasp_rpy = grasp_rpy
         self.grasp_rotation = quaternion_from_rpy_degrees(*grasp_rpy)
         self.reference_marker_yaw = reference_yaw
@@ -787,7 +1407,16 @@ class ContainerPickCoordinator(Node):
             f'allow_full_pick={self.allow_full_pick}, '
             f'offsets_configured={self.offsets_configured}, '
             f'grasp_offset={self.grasp_offset.tolist()}, '
-            f'base_correction={self.base_correction.tolist()}, '
+            f'pick_correction={self.pick_correction.tolist()}, '
+            'saved_destination_pick_correction='
+            f'{self.saved_destination_pick_correction.tolist()}, '
+            'id_transfer_pick_correction='
+            f'{self.id_transfer_pick_correction.tolist()}, '
+            f'place_correction={self.place_correction.tolist()}, '
+            'saved_destination_correction='
+            f'{self.saved_destination_correction.tolist()}, '
+            f'id_transfer_correction={self.id_transfer_correction.tolist()}, '
+            f'trailer_correction={self.trailer_correction.tolist()}, '
             f'grasp_rpy={self.grasp_rpy.tolist()}'
         )
         return SetParametersResult(successful=True)
@@ -821,10 +1450,31 @@ class ContainerPickCoordinator(Node):
             'rotate_grasp_offset_with_marker_yaw', True
         )
         self.declare_parameter('grasp_offset_xyz_m', [0.0, 0.0, 0.0])
-        self.declare_parameter('base_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('pick_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter(
+            'saved_destination_pick_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter(
+            'id_transfer_pick_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter('place_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter(
+            'saved_destination_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter(
+            'id_transfer_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter(
+            'id_transfer_a2_place_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
+        self.declare_parameter('trailer_correction_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter(
+            'trailer_a3_pick_correction_xyz_m', [0.0, 0.0, 0.0]
+        )
         self.declare_parameter('grasp_offset_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('reference_marker_yaw_deg', 0.0)
         self.declare_parameter('container_yaw_symmetry_deg', 360.0)
+        self.declare_parameter('prefer_current_gripper_yaw', True)
         self.declare_parameter('max_yaw_spread_deg', 8.0)
         self.declare_parameter('max_container_yaw_delta_deg', 90.0)
         self.declare_parameter(
@@ -834,19 +1484,46 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('grasp_extra_depth_m', 0.0)
         self.declare_parameter('grasp_stop_above_m', 0.0)
         self.declare_parameter('refresh_marker_before_descent', True)
+        self.declare_parameter('visual_servo_enabled', False)
+        self.declare_parameter('visual_servo_samples', 10)
+        self.declare_parameter('visual_servo_xy_tolerance_m', 0.002)
+        self.declare_parameter('visual_servo_yaw_tolerance_deg', 2.0)
+        self.declare_parameter('visual_servo_xy_gain', 0.6)
+        self.declare_parameter('visual_servo_yaw_gain', 0.6)
+        self.declare_parameter('visual_servo_max_xy_step_m', 0.005)
+        self.declare_parameter('visual_servo_max_yaw_step_deg', 2.0)
+        self.declare_parameter('visual_servo_max_initial_error_m', 0.020)
+        self.declare_parameter('visual_servo_max_iterations', 5)
+        self.declare_parameter(
+            'visual_servo_required_consecutive_successes', 3
+        )
+        self.declare_parameter('visual_servo_timeout_sec', 10.0)
+        self.declare_parameter(
+            'visual_servo_marker_loss_timeout_sec', 2.0
+        )
+        self.declare_parameter('visual_servo_settle_sec', 0.6)
         self.declare_parameter(
             'pregrasp_test_keep_current_orientation', True
         )
-        self.declare_parameter('lift_after_pick_m', 0.08)
-        self.declare_parameter('minimum_lift_after_pick_m', 0.05)
+        self.declare_parameter('lift_after_pick_m', 0.14)
+        self.declare_parameter('minimum_lift_after_pick_m', 0.14)
         self.declare_parameter('lift_search_step_m', 0.02)
+        self.declare_parameter('bad_pick_branch_j2_deg', -62.31)
+        self.declare_parameter('bad_pick_branch_j3_deg', 85.69)
+        self.declare_parameter('bad_pick_branch_tolerance_deg', 12.0)
         self.declare_parameter('stack_container_height_m', 0.035)
         self.declare_parameter('stack_approach_clearance_m', 0.08)
         self.declare_parameter(
             'stack_minimum_approach_clearance_m', 0.03
         )
         self.declare_parameter('stack_approach_search_step_m', 0.01)
+        self.declare_parameter(
+            'stack_yaw_fallback_offsets_deg',
+            [0.0, 15.0, -15.0, 30.0, -30.0, 180.0],
+        )
         self.declare_parameter('stack_xy_offset_m', [0.0, 0.0])
+        self.declare_parameter('stack_z_offset_m', 0.0)
+        self.declare_parameter('max_stack_levels', 3)
         self.declare_parameter('stack_source_orientation_mode', 'marker_yaw')
         self.declare_parameter(
             'stack_segmented_descent_min_fraction', 0.65
@@ -898,6 +1575,18 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('moveit_orientation_tolerance_deg', 7.0)
         self.declare_parameter('moveit_planning_time_sec', 15.0)
         self.declare_parameter('moveit_planning_attempts', 30)
+        self.declare_parameter('ik_timeout_sec', 0.3)
+        self.declare_parameter('motion_ik_timeout_sec', 3.0)
+        # Warm-start IK from the last proven arm shape. J1 is deliberately
+        # omitted because it must follow the current source/destination.
+        self.declare_parameter(
+            'preferred_pick_seed_j2_j6_deg',
+            [-10.1, -124.9, 50.6, 6.1, -7.0],
+        )
+        self.declare_parameter(
+            'preferred_place_seed_j2_j6_deg',
+            [12.2, -112.0, 13.3, 6.4, -35.9],
+        )
         self.declare_parameter('moveit_velocity_scale', 0.35)
         self.declare_parameter('moveit_acceleration_scale', 0.25)
         self.declare_parameter('cartesian_max_step_m', 0.005)
@@ -907,6 +1596,27 @@ class ContainerPickCoordinator(Node):
         self.declare_parameter('cartesian_max_speed_mps', 0.04)
         self.declare_parameter('cartesian_max_joint_jump_deg', 20.0)
         self.declare_parameter('moveit_state_settle_sec', 0.4)
+        self.declare_parameter('stack_preflight_joint_margin_deg', 0.9)
+        self.declare_parameter('max_j6_trajectory_travel_deg', 170.0)
+        self.declare_parameter('scan_marker_pause_sec', 0.5)
+        self.declare_parameter('scan_timeout_sec', 90.0)
+        self.declare_parameter('prefer_z_last_motion', False)
+        self.declare_parameter(
+            'destination_zone_j1_deg', [16.96, -28.74, -79.98]
+        )
+        self.declare_parameter('j2_fallback_min_tcp_height_m', 0.12)
+        self.declare_parameter('j3_fallback_min_tcp_height_m', 0.12)
+        self.declare_parameter('release_verify_xy_tolerance_m', 0.01)
+        self.declare_parameter('release_verify_z_tolerance_m', 0.008)
+        self.declare_parameter('release_verify_yaw_tolerance_deg', 3.0)
+        self.declare_parameter('pick_profile_xy_merge_m', 0.03)
+        self.declare_parameter('pick_profile_z_merge_m', 0.01)
+        self.declare_parameter('pick_profile_yaw_merge_deg', 15.0)
+        self.declare_parameter('pick_profile_max_entries', 30)
+        self.declare_parameter(
+            'pick_profile_cache_path',
+            'config/arm2/pick_success_profiles.json',
+        )
 
     def _vector_parameter(self, name, length):
         values = np.asarray(self.get_parameter(name).value, dtype=np.float64)
@@ -939,8 +1649,16 @@ class ContainerPickCoordinator(Node):
         self.execute_trajectory_client = ActionClient(
             self, ExecuteTrajectory, self.execute_trajectory_action
         )
+        self.follow_joint_trajectory_client = ActionClient(
+            self,
+            FollowJointTrajectory,
+            '/arm2/arm_group_controller/follow_joint_trajectory',
+        )
         self.cartesian_path_client = self.create_client(
             GetCartesianPath, self.compute_cartesian_path_service
+        )
+        self.position_ik_client = self.create_client(
+            GetPositionIK, '/arm2/compute_ik'
         )
         self.gripper_open_client = self.create_client(
             Trigger, '/arm2/gripper/open'
@@ -951,6 +1669,30 @@ class ContainerPickCoordinator(Node):
         self.stop_robot_client = self.create_client(
             Trigger, '/arm2/stop_robot'
         )
+        self.return_home_client = self.create_client(
+            Trigger, '/arm2/return_home'
+        )
+        self.go_a1_client = self.create_client(
+            Trigger, '/arm2/go_a1_pose'
+        )
+        self.go_a2_client = self.create_client(
+            Trigger, '/arm2/go_a2_pose'
+        )
+        self.go_a3_client = self.create_client(
+            Trigger, '/arm2/go_a3_pose'
+        )
+        self.sweep_joint1_client = self.create_client(
+            Trigger, '/arm2/scan_joint1'
+        )
+        self.pause_sweep_client = self.create_client(
+            Trigger, '/arm2/pause_joint1_sweep'
+        )
+        self.resume_sweep_client = self.create_client(
+            Trigger, '/arm2/resume_joint1_sweep'
+        )
+        self.scan_state_client = self.create_client(
+            Trigger, '/arm2/joint1_scan_state'
+        )
 
     def publish_status(self, text):
         self.last_status_text = text
@@ -958,6 +1700,65 @@ class ContainerPickCoordinator(Node):
         message.data = text
         self.status_publisher.publish(message)
         self.get_logger().info(text)
+
+    @staticmethod
+    def _new_operation_id(label):
+        """Create a compact identifier shared by one operation's events."""
+        safe_label = str(label).lower().replace('_', '-')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+        return f'{safe_label}-{timestamp}-{uuid.uuid4().hex[:6]}'
+
+    def publish_transfer_event(
+        self,
+        operation_id,
+        phase,
+        state,
+        message,
+        destination_zone=None,
+        source_zone=None,
+        source_id=None,
+        destination_id=None,
+        progress=None,
+        error=None,
+        operation='transfer',
+    ):
+        """Publish one machine-readable transfer lifecycle event as JSON."""
+        with self.transfer_event_lock:
+            self.transfer_event_sequence += 1
+            sequence = self.transfer_event_sequence
+        payload = {
+            'schema_version': '1.0',
+            'timestamp': datetime.now(timezone.utc).isoformat(
+                timespec='milliseconds'
+            ).replace('+00:00', 'Z'),
+            'sequence': sequence,
+            'robot': 'arm2',
+            'operation_id': operation_id,
+            'operation': operation,
+            'source': {
+                'zone': source_zone,
+                'container_id': source_id,
+            },
+            'destination': {
+                'zone': destination_zone,
+                'container_id': destination_id,
+            },
+            'recognized_ids': {
+                'source': source_id,
+                'destination': destination_id,
+            },
+            'phase': phase,
+            'state': state,
+            'progress': progress,
+            'message': message,
+            'error': error,
+        }
+        ros_message = String()
+        ros_message.data = json.dumps(
+            payload, ensure_ascii=False, separators=(',', ':')
+        )
+        self.transfer_event_publisher.publish(ros_message)
+        self.get_logger().info(f'TRANSFER EVENT: {ros_message.data}')
 
     def _republish_status(self):
         if self.last_status_text:
@@ -971,43 +1772,74 @@ class ContainerPickCoordinator(Node):
         if self.tracking_suspended.is_set() or (
             self.motion_lock.locked()
             and not self.refresh_marker_before_descent
+            and not self.visual_servo_enabled
         ):
             return
 
-        self._collect_marker_sample(
-            self.marker_frame,
-            self.history,
-            'last_transform_stamp',
-            self.marker_pose_publisher,
-            'source',
-        )
-        self._collect_marker_sample(
-            self.stack_target_frame,
-            self.stack_target_history,
-            'last_stack_target_stamp',
-            self.stack_target_pose_publisher,
-            'stack target',
-        )
+        for marker_id, frame in self.source_frames.items():
+            self._collect_marker_sample(
+                frame,
+                self.marker_histories[marker_id],
+                self.marker_stamp_attributes[marker_id],
+                self.marker_pose_publisher,
+                f'container ID {marker_id}',
+                warn_if_missing=False,
+            )
+        if self.destination_scan_active.is_set():
+            for marker_id, frame in self.destination_frames.items():
+                self._collect_marker_sample(
+                    frame,
+                    self.marker_histories[marker_id],
+                    self.marker_stamp_attributes[marker_id],
+                    self.stack_target_pose_publisher,
+                    f'destination ID {marker_id}',
+                    warn_if_missing=False,
+                )
+        for marker_id, frame in self.trailer_frames.items():
+            self._collect_marker_sample(
+                frame,
+                self.marker_histories[marker_id],
+                self.marker_stamp_attributes[marker_id],
+                self.stack_target_pose_publisher,
+                f'trailer ID {marker_id}',
+                warn_if_missing=False,
+            )
 
     def _collect_marker_sample(
-        self, frame, history, stamp_attribute, publisher, label
+        self,
+        frame,
+        history,
+        stamp_attribute,
+        publisher,
+        label,
+        warn_if_missing=True,
     ):
+        with self.history_lock:
+            if frame in self.scan_locked_frames:
+                return
         try:
             transform = self.buffer.lookup_transform(
                 self.base_frame, frame, Time()
             )
         except TransformException as exc:
+            if not warn_if_missing:
+                return
             error = str(exc)
+            error_key = (
+                'marker transform is older than the robot TF buffer'
+                if 'extrapolation into the past' in error.lower()
+                else error
+            )
             previous_error, previous_time = self.tracking_errors.get(
                 frame, ('', 0.0)
             )
             now = time.monotonic()
-            if error != previous_error or now - previous_time >= 5.0:
+            if error_key != previous_error or now - previous_time >= 5.0:
                 self.get_logger().warning(
                     f'Cannot collect {label} marker sample: '
                     f'{self.base_frame} -> {frame}: {error}'
                 )
-                self.tracking_errors[frame] = (error, now)
+                self.tracking_errors[frame] = (error_key, now)
             return
 
         stamp = (
@@ -1040,12 +1872,17 @@ class ContainerPickCoordinator(Node):
         yaw_only=False,
         history=None,
         position_only=False,
+        sample_count=None,
     ):
         selected_history = self.history if history is None else history
+        required_samples = (
+            self.minimum_samples
+            if sample_count is None else int(sample_count)
+        )
         with self.history_lock:
-            samples = list(selected_history)[-self.minimum_samples:]
-        if len(samples) < self.minimum_samples:
-            return None, f'need {self.minimum_samples - len(samples)} more samples'
+            samples = list(selected_history)[-required_samples:]
+        if len(samples) < required_samples:
+            return None, f'need {required_samples - len(samples)} more samples'
 
         now_ns = self.get_clock().now().nanoseconds
         age = (now_ns - samples[-1][0]) / 1e9
@@ -1122,8 +1959,32 @@ class ContainerPickCoordinator(Node):
         )
         if marker_pose is None:
             return None, reason
+        return self.calculate_targets_from_marker_pose(
+            marker_pose,
+            validate_workspace=validate_workspace,
+            orientation_mode=mode,
+        )
+
+    def calculate_targets_from_marker_pose(
+        self,
+        marker_pose,
+        validate_workspace=True,
+        orientation_mode=None,
+        pick_correction=None,
+    ):
+        """Build pick targets from a marker pose locked during scanning."""
+        if pick_correction is None:
+            pick_correction = self.pick_correction
+        mode = orientation_mode or self.grasp_orientation_mode
         marker_translation, marker_rotation = marker_pose
+        correction_yaw = None
         if mode == 'marker_full':
+            marker_yaw = quaternion_to_rpy_degrees(marker_rotation)[2]
+            correction_yaw = symmetric_marker_yaw_degrees(
+                marker_yaw,
+                self.reference_marker_yaw,
+                self.container_yaw_symmetry,
+            )
             grasp_translation, grasp_rotation = compose_pose(
                 marker_translation,
                 marker_rotation,
@@ -1132,6 +1993,11 @@ class ContainerPickCoordinator(Node):
             )
         elif mode == 'marker_yaw':
             marker_yaw = quaternion_to_rpy_degrees(marker_rotation)[2]
+            correction_yaw = symmetric_marker_yaw_degrees(
+                marker_yaw,
+                self.reference_marker_yaw,
+                self.container_yaw_symmetry,
+            )
             grasp_translation, grasp_rotation, yaw_delta = (
                 compose_yaw_follow_pose(
                     marker_translation,
@@ -1147,16 +2013,38 @@ class ContainerPickCoordinator(Node):
                 return None, (
                     f'container yaw delta {yaw_delta:.2f}deg exceeds limit'
                 )
+            current_yaw = self._current_tcp_yaw_degrees()
+            if (
+                self.prefer_current_gripper_yaw
+                and current_yaw is not None
+                and self.container_yaw_symmetry < 360.0
+            ):
+                target_rpy = quaternion_to_rpy_degrees(grasp_rotation)
+                nearest_yaw = nearest_symmetric_yaw_degrees(
+                    target_rpy[2],
+                    current_yaw,
+                    self.container_yaw_symmetry,
+                )
+                grasp_rotation = quaternion_from_rpy_degrees(
+                    target_rpy[0], target_rpy[1], nearest_yaw
+                )
         else:
             grasp_translation, grasp_rotation = compose_fixed_base_pose(
                 marker_translation,
                 self.grasp_offset,
                 self.grasp_rotation,
             )
-        grasp_translation = apply_base_frame_correction(
-            grasp_translation,
-            self.base_correction,
-        )
+        if correction_yaw is None:
+            grasp_translation = apply_base_frame_correction(
+                grasp_translation,
+                pick_correction,
+            )
+        else:
+            grasp_translation = apply_marker_yaw_correction(
+                grasp_translation,
+                pick_correction,
+                correction_yaw,
+            )
         grasp_translation, pregrasp_translation = apply_vertical_pick_offsets(
             grasp_translation,
             self.pregrasp_lift,
@@ -1176,6 +2064,192 @@ class ContainerPickCoordinator(Node):
         self.grasp_pose_publisher.publish(grasp)
         self.pregrasp_pose_publisher.publish(pregrasp)
         return (grasp, pregrasp), 'targets valid'
+
+    def _current_tcp_yaw_degrees(self):
+        """Return current TCP yaw in the fixed robot base frame."""
+        pose = self._current_tcp_pose()
+        if pose is None:
+            return None
+        return quaternion_to_rpy_degrees(pose[1])[2]
+
+    def _current_tcp_pose(self):
+        """Return current TCP translation and rotation in the base frame."""
+        try:
+            transform = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException:
+            return None
+        translation = np.array([
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            transform.transform.translation.z,
+        ], dtype=np.float64)
+        rotation = normalize_quaternion([
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
+        ])
+        return translation, rotation
+
+    def _wait_for_visual_servo_targets(
+        self, marker_frame, marker_history, deadline
+    ):
+        """Collect a fresh stable marker batch for one refinement cycle."""
+        with self.history_lock:
+            marker_history.clear()
+            self.scan_locked_frames.discard(marker_frame)
+        marker_deadline = min(
+            deadline,
+            time.monotonic() + self.visual_servo_marker_loss_timeout,
+        )
+        reason = 'no new marker samples'
+        while time.monotonic() < marker_deadline:
+            if self.stop_event.wait(0.05):
+                return None, 'pick stopped'
+            marker_pose, reason = self.stable_marker_pose(
+                history=marker_history,
+                yaw_only=True,
+                sample_count=self.visual_servo_samples,
+            )
+            if marker_pose is None:
+                continue
+            return self.calculate_targets_from_marker_pose(
+                marker_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+            )
+        return None, f'marker lost or unstable: {reason}'
+
+    def refine_pregrasp_with_visual_feedback(
+        self,
+        initial_targets,
+        marker_frame,
+        marker_history,
+        marker_id,
+        correct_yaw=True,
+    ):
+        """Correct pregrasp XY/yaw iteratively from fresh camera feedback."""
+        latest_targets = copy.deepcopy(initial_targets)
+        deadline = time.monotonic() + self.visual_servo_timeout
+        consecutive_successes = 0
+        previous_metric = None
+        increasing_count = 0
+
+        for iteration in range(1, self.visual_servo_max_iterations + 1):
+            if time.monotonic() >= deadline:
+                raise RuntimeError('visual servo timed out')
+            refreshed, reason = self._wait_for_visual_servo_targets(
+                marker_frame, marker_history, deadline
+            )
+            if refreshed is None:
+                raise RuntimeError(f'visual servo failed: {reason}')
+            latest_targets = refreshed
+            _grasp, desired_pregrasp = refreshed
+            current = self._current_tcp_pose()
+            if current is None:
+                raise RuntimeError('visual servo cannot read current TCP TF')
+            current_translation, current_rotation = current
+            desired_translation = np.array([
+                desired_pregrasp.pose.position.x,
+                desired_pregrasp.pose.position.y,
+                desired_pregrasp.pose.position.z,
+            ])
+            error_xy = desired_translation[:2] - current_translation[:2]
+            desired_yaw = quaternion_to_rpy_degrees([
+                desired_pregrasp.pose.orientation.x,
+                desired_pregrasp.pose.orientation.y,
+                desired_pregrasp.pose.orientation.z,
+                desired_pregrasp.pose.orientation.w,
+            ])[2]
+            current_rpy = quaternion_to_rpy_degrees(current_rotation)
+            yaw_error = wrap_degrees(desired_yaw - current_rpy[2])
+            xy_error_norm = float(np.linalg.norm(error_xy))
+            if xy_error_norm > self.visual_servo_max_initial_error:
+                raise RuntimeError(
+                    'visual servo XY error exceeds safety limit: '
+                    f'{xy_error_norm * 1000.0:.1f}mm'
+                )
+            controlled_yaw_error = yaw_error if correct_yaw else 0.0
+            metric = max(
+                xy_error_norm / self.visual_servo_xy_tolerance,
+                abs(controlled_yaw_error)
+                / self.visual_servo_yaw_tolerance,
+            )
+            self.publish_status(
+                f'VISUAL SERVO: ID {marker_id} iteration '
+                f'{iteration}/{self.visual_servo_max_iterations}: '
+                f'error_xy_mm='
+                f'{np.round(error_xy * 1000.0, 2).tolist()}, '
+                f'yaw_error_deg={yaw_error:.2f}'
+                + (
+                    ''
+                    if correct_yaw
+                    else ' (yaw locked for final alignment)'
+                )
+            )
+
+            if visual_servo_within_tolerance(
+                error_xy,
+                controlled_yaw_error,
+                self.visual_servo_xy_tolerance,
+                self.visual_servo_yaw_tolerance,
+            ):
+                consecutive_successes += 1
+                if (
+                    consecutive_successes
+                    >= self.visual_servo_required_successes
+                ):
+                    self.publish_status(
+                        'VISUAL SERVO: converged; locking final marker pose'
+                    )
+                    return latest_targets
+                continue
+
+            consecutive_successes = 0
+            if previous_metric is not None and metric > previous_metric:
+                increasing_count += 1
+            else:
+                increasing_count = 0
+            if increasing_count >= 2:
+                raise RuntimeError(
+                    'visual servo error increased twice consecutively'
+                )
+            previous_metric = metric
+
+            xy_step, yaw_step = bounded_visual_servo_step(
+                error_xy,
+                controlled_yaw_error,
+                self.visual_servo_xy_gain,
+                self.visual_servo_yaw_gain,
+                self.visual_servo_max_xy_step,
+                self.visual_servo_max_yaw_step,
+            )
+            correction_translation = current_translation.copy()
+            correction_translation[:2] += xy_step
+            correction_rotation = quaternion_from_rpy_degrees(
+                current_rpy[0],
+                current_rpy[1],
+                current_rpy[2] + (yaw_step if correct_yaw else 0.0),
+            )
+            correction = self.make_pose(
+                correction_translation,
+                correction_rotation,
+                self.get_clock().now().to_msg(),
+            )
+            self.publish_status(
+                'VISUAL SERVO: Cartesian correction '
+                f'xy_mm={np.round(xy_step * 1000.0, 2).tolist()}, '
+                f'yaw_deg={yaw_step:.2f}'
+            )
+            self.move_cartesian_to_pose(correction)
+            if self.stop_event.wait(self.visual_servo_settle):
+                raise RuntimeError('pick stopped')
+
+        raise RuntimeError(
+            'visual servo did not converge within '
+            f'{self.visual_servo_max_iterations} iterations'
+        )
 
     def wait_for_new_stable_targets(self):
         with self.history_lock:
@@ -1215,7 +2289,31 @@ class ContainerPickCoordinator(Node):
         )
         if destination_pose is None:
             return None, f'stack target marker: {reason}'
+        return self.calculate_stack_targets_from_locked_poses(
+            source_targets,
+            destination_pose,
+            validate_workspace=validate_workspace,
+        )
 
+    def calculate_stack_targets_from_locked_poses(
+        self,
+        source_targets,
+        destination_pose,
+        validate_workspace=True,
+        placed_count=None,
+        destination_correction=None,
+    ):
+        """Build release targets from scan-locked source/destination poses."""
+        if destination_correction is None:
+            destination_correction = self.place_correction
+        if placed_count is None:
+            with self.stack_level_lock:
+                placed_count = self.placed_stack_count
+        layer_z_offset = stack_layer_z_offset(
+            self.stack_z_offset,
+            self.stack_container_height,
+            placed_count,
+        )
         destination_yaw = quaternion_to_rpy_degrees(destination_pose[1])[2]
         (
             release_translation,
@@ -1233,14 +2331,17 @@ class ContainerPickCoordinator(Node):
             self.grasp_extra_depth,
             self.stack_xy_offset,
             self.container_yaw_symmetry,
+            layer_z_offset,
         )
-        release_translation = apply_base_frame_correction(
+        release_translation = apply_marker_yaw_correction(
             release_translation,
-            self.base_correction,
+            destination_correction,
+            self.reference_marker_yaw + destination_yaw_delta,
         )
-        approach_translation = apply_base_frame_correction(
+        approach_translation = apply_marker_yaw_correction(
             approach_translation,
-            self.base_correction,
+            destination_correction,
+            self.reference_marker_yaw + destination_yaw_delta,
         )
         if abs(destination_yaw_delta) > self.max_yaw_delta:
             return None, (
@@ -1268,13 +2369,18 @@ class ContainerPickCoordinator(Node):
         )
         self.stack_release_pose_publisher.publish(release)
         self.stack_approach_pose_publisher.publish(approach)
-        return (source_targets, release, approach), 'stack targets valid'
+        return (
+            source_targets,
+            release,
+            approach,
+        ), f'stack layer {placed_count + 1} targets valid'
 
     def wait_for_new_stable_stack_targets(self):
         """Wait until source and destination markers are fresh and stable."""
         with self.history_lock:
             self.history.clear()
             self.stack_target_history.clear()
+            self.scan_locked_frames.clear()
         deadline = time.monotonic() + self.stabilization_timeout
         reason = 'no new marker samples'
         last_report_time = 0.0
@@ -1440,6 +2546,1629 @@ class ContainerPickCoordinator(Node):
         self.publish_status('STACK: source and destination targets locked')
         self.execute_stack(targets)
 
+    def start_scan_and_transfer(self, _request, response):
+        """Start legacy scanning for primary container ID 0 and A-1 ID 11."""
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.success = False
+            response.message = 'Scan transfer requires MoveIt execution'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.success = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        with self.stack_level_lock:
+            if self.placed_stack_count >= self.max_stack_levels:
+                response.success = False
+                response.message = (
+                    f'Maximum stack level {self.max_stack_levels} reached; '
+                    'call /arm2/reset_stack_level'
+                )
+                return response
+        self.stop_event.clear()
+        self.motion_thread = threading.Thread(
+            target=self.execute_scan_and_transfer,
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = 'Scanning for container ID 0 and A-1 ID 11 started'
+        return response
+
+    def start_destination_scan(self, _request, response):
+        """Scan and persist six destination poses and an optional trailer."""
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.success = False
+            response.message = 'Destination scan requires MoveIt execution'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        self.stop_event.clear()
+        self.destination_scan_active.set()
+        operation_id = self._new_operation_id('destination-scan')
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='destination_scan',
+            phase='ACCEPTED',
+            state='STARTED',
+            progress=0,
+            message='목적지 및 트레일러 위치 스캔 요청 접수',
+        )
+        self.motion_thread = threading.Thread(
+            target=self.execute_destination_scan,
+            args=(operation_id,),
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = (
+            'Scanning destinations along HOME-A1-A2-A3, then returning home'
+        )
+        return response
+
+    def execute_destination_scan(self, operation_id):
+        try:
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='destination_scan',
+                phase='SCANNING',
+                state='RUNNING',
+                progress=10,
+                message='HOME-A1-A2-A3 목적지 스캔 중',
+            )
+            destination_marker_ids = tuple(range(11, 17))
+            trailer_marker_ids = tuple(self.trailer_frames)
+            scan_marker_ids = destination_marker_ids + trailer_marker_ids
+            specs = tuple(
+                (
+                    (
+                        f'ID {marker_id}'
+                        if marker_id not in self.trailer_frames
+                        else f'trailer ID {marker_id} (optional)'
+                    ),
+                    (
+                        self.destination_frames[marker_id]
+                        if marker_id not in self.trailer_frames
+                        else self.trailer_frames[marker_id]
+                    ),
+                    self.marker_histories[marker_id],
+                )
+                for marker_id in scan_marker_ids
+            )
+            self.saved_destination_poses.clear()
+            self.saved_marker_poses.clear()
+            locked, reason = self._scan_destination_route(
+                specs,
+                required_count=len(destination_marker_ids),
+            )
+            if locked is None:
+                self.publish_status(f'DESTINATION SCAN FAILED: {reason}')
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='destination_scan',
+                    phase='FAILED',
+                    state='FAILED',
+                    message='목적지 스캔 실패',
+                    error=reason,
+                )
+                return
+            # All required destinations are now locked in base_frame.  Freeze
+            # marker collection for the entire home return so IDs 11-16 seen
+            # again by the wrist camera cannot affect the first accepted
+            # poses.
+            self.tracking_suspended.set()
+            for marker_id, pose in zip(scan_marker_ids, locked):
+                if pose is not None:
+                    self.saved_marker_poses[marker_id] = pose
+            self.saved_destination_poses = {
+                name: self.saved_marker_poses[marker_id]
+                for name, marker_id in self.destination_ids.items()
+            }
+            with self.stack_level_lock:
+                for name in self.saved_destination_stack_counts:
+                    self.saved_destination_stack_counts[name] = 0
+            self.publish_status(
+                'DESTINATION SCAN: IDs 11-16 saved; route ended at home'
+            )
+        except Exception as exc:
+            self.publish_status(
+                f'DESTINATION SCAN FAILED during pose route: {exc}'
+            )
+            self._recover_home_after_failure('DESTINATION SCAN')
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='destination_scan',
+                phase='FAILED',
+                state='FAILED',
+                message='목적지 스캔 실패',
+                error=str(exc),
+            )
+            return
+        finally:
+            self.tracking_suspended.clear()
+            self.destination_scan_active.clear()
+        self.publish_status(
+            'DESTINATION SCAN COMPLETED: A-1-1=11, A-1-2=12, '
+            'A-2-1=13, A-2-2=14, A-3-1=15, A-3-2=16; '
+            'trailer IDs '
+            + ', '.join(
+                f'{marker_id}='
+                f'{"saved" if marker_id in self.saved_marker_poses else "not seen"}'
+                for marker_id in self.trailer_frames
+            )
+        )
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='destination_scan',
+            phase='COMPLETED',
+            state='COMPLETED',
+            progress=100,
+            message='목적지 ID 11-16 및 트레일러 위치 스캔 완료',
+        )
+
+    def _scan_destination_route(self, specs, required_count):
+        """Visit home/A poses and lock stable destination marker poses."""
+        route = (
+            ('HOME', self.return_home_client, 'always'),
+            ('A-1', self.go_a1_client, 'always'),
+            ('A-2', self.go_a2_client, 'always'),
+            ('A-3', self.go_a3_client, 'always'),
+            ('A-2', self.go_a2_client, 'if_missing'),
+            ('A-1', self.go_a1_client, 'if_missing'),
+            ('HOME', self.return_home_client, 'if_missing'),
+        )
+        if any(
+            client is None or not client.wait_for_service(timeout_sec=3.0)
+            for _name, client, _scan_mode in route
+        ):
+            return None, 'destination route service is unavailable'
+
+        locked = [None] * len(specs)
+        with self.history_lock:
+            self.scan_locked_frames.clear()
+            for _label, _frame, history in specs:
+                history.clear()
+
+        for route_index, (pose_name, client, scan_mode) in enumerate(
+            route, start=1
+        ):
+            if self.stop_event.is_set():
+                return None, 'destination route stopped'
+            required_missing = any(
+                locked[index] is None for index in range(required_count)
+            )
+            scan_here = (
+                scan_mode == 'always'
+                or (scan_mode == 'if_missing' and required_missing)
+            )
+            if not scan_here:
+                self.tracking_suspended.set()
+            else:
+                self.tracking_suspended.clear()
+            self.publish_status(
+                f'DESTINATION SCAN: route {route_index}/{len(route)} '
+                f'moving to {pose_name}'
+            )
+            self._call_scan_service(
+                client,
+                f'destination route {pose_name}',
+                timeout=self.motion_timeout + 5.0,
+            )
+            if not scan_here:
+                self.publish_status(
+                    f'DESTINATION SCAN: route {route_index}/{len(route)} '
+                    f'at {pose_name}; all required IDs saved, '
+                    'return scan skipped'
+                )
+                continue
+            with self.history_lock:
+                for index, (_label, _frame, history) in enumerate(specs):
+                    if locked[index] is None:
+                        history.clear()
+
+            zone_started = time.monotonic()
+            deadline = zone_started + self.scan_marker_pause + 2.0
+            hard_deadline = (
+                zone_started + 2.0 * self.scan_marker_pause + 4.0
+            )
+            stabilization_hold_announced = False
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.05):
+                    return None, 'destination route stopped'
+                visible_but_unlocked = any(
+                    locked[index] is None
+                    and self._history_sample_count(specs[index][2]) > 0
+                    for index in range(required_count)
+                )
+                if visible_but_unlocked:
+                    if not stabilization_hold_announced:
+                        self.publish_status(
+                            'DESTINATION SCAN: required marker visible at '
+                            f'{pose_name}; holding until its pose is stable'
+                        )
+                        stabilization_hold_announced = True
+                    deadline = min(
+                        hard_deadline,
+                        max(
+                            deadline,
+                            time.monotonic() + self.scan_marker_pause + 0.5,
+                        ),
+                    )
+                for index, (label, frame, history) in enumerate(specs):
+                    if locked[index] is not None:
+                        continue
+                    pose, _reason = self.stable_marker_pose(
+                        history=history,
+                        yaw_only=True,
+                    )
+                    if pose is None:
+                        continue
+                    locked[index] = (
+                        np.array(pose[0], dtype=np.float64),
+                        np.array(pose[1], dtype=np.float64),
+                    )
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'DESTINATION SCAN: {label} saved at {pose_name}'
+                    )
+                if all(pose is not None for pose in locked):
+                    break
+
+        missing = [
+            specs[index][0]
+            for index in range(required_count)
+            if locked[index] is None
+        ]
+        if missing:
+            return None, (
+                'route ended before stabilizing ' + ', '.join(missing)
+            )
+        return tuple(locked), 'destination route completed'
+
+    def start_loading_transfer(self, _request, response, source_marker_id):
+        """Scan one selected container and trailer ID 9 or 10, then load it."""
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.success = False
+            response.message = 'Trailer loading requires MoveIt execution'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.success = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        self.stop_event.clear()
+        operation_id = self._new_operation_id(
+            f'trailer-load-id{source_marker_id}'
+        )
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='trailer_load',
+            phase='ACCEPTED',
+            state='STARTED',
+            source_id=source_marker_id,
+            destination_zone='TRAILER',
+            progress=0,
+            message=f'ID {source_marker_id} 트레일러 적재 요청 접수',
+        )
+        self.motion_thread = threading.Thread(
+            target=self.execute_loading_transfer,
+            args=(source_marker_id, operation_id),
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = (
+            f'Scanning container ID {source_marker_id} and trailer ID 9/10 '
+            'along HOME-A1-A2-A3, then loading the selected container'
+        )
+        return response
+
+    def start_id_to_id_transfer(self, request, response):
+        """Accept a source/destination ID pair supplied by another system."""
+        source_id = int(request.source_id)
+        destination_id = int(request.destination_id)
+        valid_source_ids = set(self.source_frames)
+        valid_destination_ids = (
+            valid_source_ids | set(self.destination_frames)
+        )
+        if (
+            source_id not in valid_source_ids
+            or destination_id not in valid_destination_ids
+        ):
+            response.accepted = False
+            response.message = (
+                'source_id must be within 0..8; destination_id must be '
+                'within 0..8 or 11..16'
+            )
+            return response
+        if source_id == destination_id:
+            response.accepted = False
+            response.message = 'source_id and destination_id must be different'
+            return response
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.accepted = False
+            response.message = 'ID transfer requires MoveIt execution'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.accepted = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.accepted = False
+            response.message = 'A robot motion is already running'
+            return response
+        destination_zone = next(
+            (
+                name for name, marker_id in self.destination_ids.items()
+                if marker_id == destination_id
+            ),
+            None,
+        )
+        stack_name = (
+            destination_zone
+            if destination_zone is not None else f'ID-{destination_id}'
+        )
+        with self.stack_level_lock:
+            placed_count = self.saved_destination_stack_counts[stack_name]
+        if placed_count >= self.max_stack_levels:
+            response.accepted = False
+            response.message = (
+                f'Destination ID {destination_id} already has the maximum '
+                f'{self.max_stack_levels} layers'
+            )
+            return response
+        self.stop_event.clear()
+        operation_id = self._new_operation_id(
+            f'id-transfer-{source_id}-to-{destination_id}'
+        )
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='id_transfer',
+            phase='ACCEPTED',
+            state='STARTED',
+            source_id=source_id,
+            destination_zone=destination_zone,
+            destination_id=destination_id,
+            progress=0,
+            message=f'ID {source_id}에서 ID {destination_id} 이송 요청 접수',
+        )
+        self.motion_thread = threading.Thread(
+            target=self.execute_id_to_id_transfer,
+            args=(source_id, destination_id, operation_id),
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.accepted = True
+        response.message = (
+            f'Scanning only requested source ID {source_id} and '
+            f'destination ID {destination_id}, then starting transfer'
+            + (
+                f' ({destination_zone})'
+                if destination_zone is not None else ''
+            )
+        )
+        return response
+
+    def execute_id_to_id_transfer(
+        self, source_id, destination_id, operation_id
+    ):
+        """Scan a source and transfer to a container or saved stack marker."""
+        destination_zone = next(
+            (
+                name for name, marker_id in self.destination_ids.items()
+                if marker_id == destination_id
+            ),
+            None,
+        )
+        specs = [(
+            f'source container ID {source_id}',
+            self.source_frames[source_id],
+            self.marker_histories[source_id],
+        )]
+        if destination_zone is not None:
+            specs.append((
+                f'destination stack ID {destination_id} '
+                f'({destination_zone})',
+                self.destination_frames[destination_id],
+                self.marker_histories[destination_id],
+            ))
+        else:
+            specs.append((
+                f'destination container ID {destination_id}',
+                self.source_frames[destination_id],
+                self.marker_histories[destination_id],
+            ))
+        if destination_zone is not None:
+            self.destination_scan_active.set()
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='id_transfer',
+            phase='SCANNING',
+            state='RUNNING',
+            source_id=source_id,
+            destination_zone=destination_zone,
+            destination_id=destination_id,
+            progress=10,
+            message=f'ID {source_id}와 ID {destination_id} 위치 스캔 중',
+        )
+        try:
+            scan_result, reason = self._scan_id_transfer_route(specs)
+        finally:
+            if destination_zone is not None:
+                self.destination_scan_active.clear()
+        if scan_result is None:
+            self.publish_status(
+                f'ID {source_id} -> ID {destination_id} FAILED: {reason}'
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='id_transfer',
+                phase='FAILED',
+                state='FAILED',
+                source_id=source_id,
+                destination_zone=destination_zone,
+                destination_id=destination_id,
+                message='ID 간 이송 스캔 실패',
+                error=reason,
+            )
+            return
+        locked, source_scan_zone, destination_scan_zone = scan_result
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='id_transfer',
+            phase='SOURCE_LOCKED',
+            state='COMPLETED',
+            source_zone=source_scan_zone,
+            source_id=source_id,
+            destination_zone=destination_scan_zone or destination_zone,
+            destination_id=destination_id,
+            progress=20,
+            message=(
+                f'카메라가 출발 ID {source_id}와 목적지 ID '
+                f'{destination_id}를 인식했습니다'
+            ),
+        )
+        self.tracking_suspended.set()
+        source_pose = copy.deepcopy(locked[0])
+        destination_pose = copy.deepcopy(locked[1])
+        if destination_zone is None:
+            stack_name = f'ID-{destination_id}'
+            destination_correction = self.id_transfer_correction
+            if destination_scan_zone == 'A-2':
+                destination_correction = (
+                    destination_correction
+                    + self.id_transfer_a2_place_correction
+                )
+                self.publish_status(
+                    'ID TRANSFER: applying A-2-only place correction '
+                    f'{self.id_transfer_a2_place_correction.tolist()}'
+                )
+        else:
+            self.saved_destination_poses[destination_zone] = copy.deepcopy(
+                destination_pose
+            )
+            stack_name = destination_zone
+            destination_correction = self.saved_destination_correction
+        try:
+            self.active_id_transfer_pair = (source_id, destination_id)
+            self.active_source_scan_zone = source_scan_zone
+            source_targets, reason = self.calculate_targets_from_marker_pose(
+                source_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+                pick_correction=self.id_transfer_pick_correction,
+            )
+            if source_targets is None:
+                raise RuntimeError(f'source target: {reason}')
+            with self.stack_level_lock:
+                placed_count = self.saved_destination_stack_counts[stack_name]
+            targets, reason = self.calculate_stack_targets_from_locked_poses(
+                source_targets,
+                destination_pose,
+                placed_count=placed_count,
+                destination_correction=destination_correction,
+            )
+            if targets is None:
+                raise RuntimeError(f'destination target: {reason}')
+            self.publish_status(
+                f'ID TRANSFER: source ID {source_id} and destination '
+                f'ID {destination_id}'
+                + (
+                    f' ({destination_zone}) saved and locked'
+                    if destination_zone is not None else ' saved and locked'
+                )
+                + '; starting transfer'
+            )
+            self.execute_scanned_transfer(
+                targets,
+                destination_name=(
+                    destination_zone
+                    if destination_zone is not None else f'ID {destination_id}'
+                ),
+                count_stack=False,
+                saved_stack_name=stack_name,
+                source_marker_id=source_id,
+                align_source_before_pick=True,
+                source_scan_zone=source_scan_zone,
+                source_bearing_xy=source_pose[0][:2],
+                operation_id=operation_id,
+                event_operation='id_transfer',
+                destination_marker_id=destination_id,
+            )
+        except Exception as exc:
+            self.publish_status(
+                f'ID {source_id} -> ID {destination_id} FAILED: {exc}'
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='id_transfer',
+                phase='FAILED',
+                state='FAILED',
+                source_zone=source_scan_zone,
+                source_id=source_id,
+                destination_zone=destination_scan_zone or destination_zone,
+                destination_id=destination_id,
+                message='ID 간 이송 실패',
+                error=str(exc),
+            )
+            self._recover_home_after_failure(
+                f'ID {source_id} -> ID {destination_id}'
+            )
+        finally:
+            self.active_id_transfer_pair = None
+            self.active_source_scan_zone = None
+            self.tracking_suspended.clear()
+
+    def _scan_id_transfer_route(self, specs):
+        """Lock both ID-transfer markers along the fixed A-zone route."""
+        route = (
+            ('HOME', self.return_home_client),
+            ('A-1', self.go_a1_client),
+            ('A-2', self.go_a2_client),
+            ('A-3', self.go_a3_client),
+            ('A-2', self.go_a2_client),
+            ('A-1', self.go_a1_client),
+        )
+        if any(
+            client is None or not client.wait_for_service(timeout_sec=3.0)
+            for _name, client in route
+        ):
+            return None, 'ID transfer route service is unavailable'
+
+        locked = [None] * len(specs)
+        source_scan_zone = None
+        destination_scan_zone = None
+        with self.history_lock:
+            for _label, frame, history in specs:
+                history.clear()
+                self.scan_locked_frames.discard(frame)
+
+        for route_index, (pose_name, client) in enumerate(route, start=1):
+            if self.stop_event.is_set():
+                return None, 'ID transfer route stopped'
+            self.tracking_suspended.clear()
+            self.publish_status(
+                f'ID TRANSFER SCAN: route {route_index}/{len(route)} '
+                f'moving to {pose_name}'
+            )
+            self._call_scan_service(
+                client,
+                f'ID transfer route {pose_name}',
+                timeout=self.motion_timeout + 5.0,
+            )
+            with self.history_lock:
+                for index, (_label, _frame, history) in enumerate(specs):
+                    if locked[index] is None:
+                        history.clear()
+
+            zone_started = time.monotonic()
+            deadline = zone_started + self.scan_marker_pause + 2.0
+            hard_deadline = (
+                zone_started + 2.0 * self.scan_marker_pause + 3.0
+            )
+            grouped_hold_announced = False
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.05):
+                    return None, 'ID transfer route stopped'
+                all_requested_visible = all(
+                    locked[index] is not None
+                    or self._history_sample_count(history) > 0
+                    for index, (_label, _frame, history)
+                    in enumerate(specs)
+                )
+                if all_requested_visible:
+                    if not grouped_hold_announced:
+                        self.publish_status(
+                            'ID TRANSFER SCAN: all requested IDs visible at '
+                            f'{pose_name}; holding this zone until saved'
+                        )
+                        grouped_hold_announced = True
+                    deadline = min(
+                        hard_deadline,
+                        max(
+                            deadline,
+                            time.monotonic() + self.scan_marker_pause + 0.5,
+                        ),
+                    )
+                for index, (label, frame, history) in enumerate(specs):
+                    if locked[index] is not None:
+                        continue
+                    pose, _reason = self.stable_marker_pose(
+                        history=history,
+                        yaw_only=True,
+                    )
+                    if pose is None:
+                        continue
+                    locked[index] = (
+                        np.array(pose[0], dtype=np.float64),
+                        np.array(pose[1], dtype=np.float64),
+                    )
+                    if index == 0:
+                        source_scan_zone = pose_name
+                    elif index == 1:
+                        destination_scan_zone = pose_name
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'ID TRANSFER SCAN: {label} saved at {pose_name}'
+                    )
+                if all(pose is not None for pose in locked):
+                    self.publish_status(
+                        'ID TRANSFER SCAN: all requested IDs saved; '
+                        'remaining route skipped'
+                    )
+                    return (
+                        (
+                            tuple(locked),
+                            source_scan_zone,
+                            destination_scan_zone,
+                        ),
+                        'ID transfer markers locked',
+                    )
+
+        missing = [
+            label for (label, _frame, _history), pose
+            in zip(specs, locked) if pose is None
+        ]
+        return None, (
+            'HOME-A1-A2-A3-A2-A1 route ended before detecting '
+            + ', '.join(missing)
+        )
+
+    def execute_loading_transfer(self, source_marker_id, operation_id):
+        """Scan a selected source and trailer, then execute the transfer."""
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='trailer_load',
+            phase='SCANNING',
+            state='RUNNING',
+            source_id=source_marker_id,
+            destination_zone='TRAILER',
+            progress=10,
+            message=f'ID {source_marker_id}와 트레일러 위치 스캔 중',
+        )
+        specs = [(
+            f'container ID {source_marker_id}',
+            self.source_frames[source_marker_id],
+            self.marker_histories[source_marker_id],
+        )]
+        specs.extend(
+            (
+                f'trailer ID {marker_id}',
+                frame,
+                self.marker_histories[marker_id],
+            )
+            for marker_id, frame in self.trailer_frames.items()
+        )
+        scan_result, reason = self._scan_trailer_route(tuple(specs))
+        if scan_result is None:
+            self.publish_status(
+                f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='trailer_load',
+                phase='FAILED',
+                state='FAILED',
+                source_id=source_marker_id,
+                destination_zone='TRAILER',
+                message='트레일러 적재 스캔 실패',
+                error=reason,
+            )
+            return
+        locked, source_scan_zone = scan_result
+        # Freeze both accepted base-frame poses for the complete operation.
+        # Re-observing either marker from the moving wrist camera must not
+        # change the pick or trailer target after this point.
+        self.tracking_suspended.set()
+        source_pose = copy.deepcopy(locked[0])
+        selected_offset = next(
+            index for index in (1, 2) if locked[index] is not None
+        )
+        trailer_pose = copy.deepcopy(locked[selected_offset])
+        trailer_marker_id = tuple(self.trailer_frames)[selected_offset - 1]
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='trailer_load',
+            phase='SOURCE_LOCKED',
+            state='COMPLETED',
+            source_zone=source_scan_zone,
+            source_id=source_marker_id,
+            destination_zone='TRAILER',
+            destination_id=trailer_marker_id,
+            progress=20,
+            message=(
+                f'카메라가 출발 ID {source_marker_id}와 트레일러 ID '
+                f'{trailer_marker_id}를 인식했습니다'
+            ),
+        )
+        try:
+            source_pick_correction = self.pick_correction
+            if source_scan_zone == 'A-3':
+                source_pick_correction = (
+                    self.pick_correction
+                    + self.trailer_a3_pick_correction
+                )
+                self.publish_status(
+                    'TRAILER LOAD: applying A-3-only pick correction '
+                    f'{self.trailer_a3_pick_correction.tolist()}'
+                )
+            source_targets, reason = self.calculate_targets_from_marker_pose(
+                source_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+                pick_correction=source_pick_correction,
+            )
+            if source_targets is None:
+                self.publish_status(
+                    f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
+                )
+                self._recover_home_after_failure(
+                    f'TRAILER LOAD ID {source_marker_id}'
+                )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='trailer_load',
+                    phase='FAILED',
+                    state='FAILED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone='TRAILER',
+                    destination_id=trailer_marker_id,
+                    message='트레일러 집기 목표 계산 실패',
+                    error=reason,
+                )
+                return
+            with self.stack_level_lock:
+                placed_count = self.saved_destination_stack_counts['TRAILER']
+            if placed_count >= self.max_stack_levels:
+                self.publish_status(
+                    f'TRAILER LOAD ID {source_marker_id} FAILED: '
+                    f'maximum {self.max_stack_levels} layers reached'
+                )
+                self._recover_home_after_failure(
+                    f'TRAILER LOAD ID {source_marker_id}'
+                )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='trailer_load',
+                    phase='FAILED',
+                    state='FAILED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone='TRAILER',
+                    destination_id=trailer_marker_id,
+                    message='트레일러 최대 적재 층수 도달',
+                    error='maximum stack level reached',
+                )
+                return
+            targets, reason = self.calculate_stack_targets_from_locked_poses(
+                source_targets,
+                trailer_pose,
+                placed_count=placed_count,
+                destination_correction=self.trailer_correction,
+            )
+            if targets is None:
+                self.publish_status(
+                    f'TRAILER LOAD ID {source_marker_id} FAILED: {reason}'
+                )
+                self._recover_home_after_failure(
+                    f'TRAILER LOAD ID {source_marker_id}'
+                )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='trailer_load',
+                    phase='FAILED',
+                    state='FAILED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone='TRAILER',
+                    destination_id=trailer_marker_id,
+                    message='트레일러 놓기 목표 계산 실패',
+                    error=reason,
+                )
+                return
+            self.publish_status(
+                f'TRAILER LOAD: ID {source_marker_id} and trailer ID '
+                f'{trailer_marker_id} locked; '
+                'tracking frozen until home return; '
+                'destination IDs 11-16 preserved'
+            )
+            self.execute_scanned_transfer(
+                targets,
+                destination_name='TRAILER',
+                count_stack=False,
+                saved_stack_name='TRAILER',
+                source_marker_id=source_marker_id,
+                source_scan_zone=source_scan_zone,
+                operation_id=operation_id,
+                event_operation='trailer_load',
+                destination_marker_id=trailer_marker_id,
+            )
+        except Exception as exc:
+            self.publish_status(
+                f'TRAILER LOAD ID {source_marker_id} FAILED: {exc}'
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                operation='trailer_load',
+                phase='FAILED',
+                state='FAILED',
+                source_zone=source_scan_zone,
+                source_id=source_marker_id,
+                destination_zone='TRAILER',
+                destination_id=trailer_marker_id,
+                message='트레일러 적재 실패',
+                error=str(exc),
+            )
+            self._recover_home_after_failure(
+                f'TRAILER LOAD ID {source_marker_id}'
+            )
+        finally:
+            self.tracking_suspended.clear()
+
+    def _scan_trailer_route(self, specs):
+        """Visit HOME/A1/A2/A3 and lock one source plus either trailer."""
+        route = (
+            ('HOME', self.return_home_client),
+            ('A-1', self.go_a1_client),
+            ('A-2', self.go_a2_client),
+            ('A-3', self.go_a3_client),
+        )
+        if any(
+            client is None or not client.wait_for_service(timeout_sec=3.0)
+            for _name, client in route
+        ):
+            return None, 'trailer scan route service is unavailable'
+
+        locked = [None] * len(specs)
+        source_scan_zone = None
+        with self.history_lock:
+            for _label, frame, history in specs:
+                history.clear()
+                self.scan_locked_frames.discard(frame)
+
+        for route_index, (pose_name, client) in enumerate(route, start=1):
+            if self.stop_event.is_set():
+                return None, 'trailer scan route stopped'
+            self.publish_status(
+                f'TRAILER SCAN: route {route_index}/{len(route)} '
+                f'moving to {pose_name}'
+            )
+            self._call_scan_service(
+                client,
+                f'trailer scan route {pose_name}',
+                timeout=self.motion_timeout + 5.0,
+            )
+            with self.history_lock:
+                for index, (_label, _frame, history) in enumerate(specs):
+                    if locked[index] is None:
+                        history.clear()
+
+            deadline = time.monotonic() + self.scan_marker_pause + 2.0
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.05):
+                    return None, 'trailer scan route stopped'
+                for index, (label, frame, history) in enumerate(specs):
+                    if locked[index] is not None:
+                        continue
+                    pose, _reason = self.stable_marker_pose(
+                        history=history,
+                        yaw_only=True,
+                    )
+                    if pose is None:
+                        continue
+                    locked[index] = (
+                        np.array(pose[0], dtype=np.float64),
+                        np.array(pose[1], dtype=np.float64),
+                    )
+                    if index == 0:
+                        source_scan_zone = pose_name
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'TRAILER SCAN: {label} saved at {pose_name}'
+                    )
+                if grouped_marker_locks_satisfied(
+                    locked,
+                    required_indices=(0,),
+                    any_of_indices=(1, 2),
+                ):
+                    return (
+                        (tuple(locked), source_scan_zone),
+                        'trailer route markers locked',
+                    )
+
+        missing = []
+        if locked[0] is None:
+            missing.append(specs[0][0])
+        if locked[1] is None and locked[2] is None:
+            missing.append('trailer ID 9/10')
+        return None, (
+            'HOME-A1-A2-A3 route ended before detecting '
+            + ', '.join(missing)
+        )
+
+    def start_saved_destination_transfer(
+        self, _request, response, destination_name
+    ):
+        """Scan one container ID 0-8 and transfer it to a saved destination."""
+        if not self.execute_motion or self.motion_backend != 'moveit':
+            response.success = False
+            response.message = 'Saved transfer requires MoveIt execution'
+            return response
+        if not self.allow_full_pick or not self.offsets_configured:
+            response.success = False
+            response.message = 'Full pick and calibrated offsets are required'
+            return response
+        if destination_name not in self.saved_destination_poses:
+            response.success = False
+            response.message = (
+                f'{destination_name} is not saved; call '
+                '/arm2/scan_destinations first'
+            )
+            return response
+        with self.stack_level_lock:
+            placed_count = self.saved_destination_stack_counts[
+                destination_name
+            ]
+        if placed_count >= self.max_stack_levels:
+            response.success = False
+            response.message = (
+                f'{destination_name} already has the maximum '
+                f'{self.max_stack_levels} layers'
+            )
+            return response
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'A robot motion is already running'
+            return response
+        self.stop_event.clear()
+        operation_id = self._new_operation_id(
+            f'transfer-{destination_name}'
+        )
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            phase='ACCEPTED',
+            state='STARTED',
+            destination_zone=destination_name,
+            destination_id=self.destination_ids[destination_name],
+            progress=0,
+            message=(
+                f'{destination_name}(ID '
+                f'{self.destination_ids[destination_name]}) 이송 요청 접수'
+            ),
+        )
+        self.motion_thread = threading.Thread(
+            target=self.execute_saved_destination_transfer,
+            args=(destination_name, operation_id),
+            daemon=True,
+        )
+        self.motion_thread.start()
+        response.success = True
+        response.message = (
+            f'Scanning container ID 0-8 for transfer to {destination_name}'
+        )
+        return response
+
+    def execute_saved_destination_transfer(
+        self, destination_name, operation_id
+    ):
+        destination_marker_id = self.destination_ids[destination_name]
+        try:
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                phase='SCANNING',
+                state='RUNNING',
+                destination_zone=destination_name,
+                destination_id=destination_marker_id,
+                progress=10,
+                message='출발 컨테이너 검색 중',
+            )
+            specs = tuple(
+                (
+                    f'container ID {marker_id}',
+                    frame,
+                    self.marker_histories[marker_id],
+                )
+                for marker_id, frame in self.source_frames.items()
+            )
+            locked, reason = self._scan_named_markers(
+                specs,
+                required_count=len(specs),
+                minimum_required_locks=1,
+                accept_initial_pose=True,
+            )
+            if locked is None:
+                self.publish_status(
+                    f'{destination_name} TRANSFER FAILED: {reason}'
+                )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    phase='FAILED',
+                    state='FAILED',
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=10,
+                    message='출발 컨테이너 검색 실패',
+                    error=reason,
+                )
+                return
+            source_marker_id, source_pose = next(
+                (marker_id, pose)
+                for marker_id, pose in zip(self.source_frames, locked)
+                if pose is not None
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                phase='SOURCE_LOCKED',
+                state='COMPLETED',
+                source_id=source_marker_id,
+                destination_zone=destination_name,
+                destination_id=destination_marker_id,
+                progress=20,
+                message=(
+                    f'카메라가 출발 컨테이너 ID {source_marker_id}를 '
+                    '인식했습니다'
+                ),
+            )
+            source_targets, reason = self.calculate_targets_from_marker_pose(
+                source_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+                pick_correction=(
+                    self.pick_correction
+                    + self.saved_destination_pick_correction
+                ),
+            )
+            if source_targets is None:
+                self.publish_status(
+                    f'{destination_name} TRANSFER FAILED: '
+                    f'container ID {source_marker_id} target: {reason}'
+                )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    phase='FAILED',
+                    state='FAILED',
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=20,
+                    message='집기 목표 계산 실패',
+                    error=reason,
+                )
+                self._recover_home_after_failure(destination_name)
+                return
+            destination_pose = self.saved_destination_poses[destination_name]
+            with self.stack_level_lock:
+                placed_count = self.saved_destination_stack_counts[
+                    destination_name
+                ]
+            targets, reason = self.calculate_stack_targets_from_locked_poses(
+                source_targets,
+                destination_pose,
+                placed_count=placed_count,
+                destination_correction=self.saved_destination_correction,
+            )
+            if targets is None:
+                self.publish_status(
+                    f'{destination_name} TRANSFER FAILED: {reason}'
+                )
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    phase='FAILED',
+                    state='FAILED',
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=20,
+                    message='목적지 목표 계산 실패',
+                    error=reason,
+                )
+                self._recover_home_after_failure(destination_name)
+                return
+            self.execute_scanned_transfer(
+                targets,
+                destination_name=destination_name,
+                count_stack=False,
+                saved_stack_name=destination_name,
+                source_marker_id=source_marker_id,
+                operation_id=operation_id,
+                destination_marker_id=destination_marker_id,
+            )
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(
+                f'{destination_name} TRANSFER FAILED: {exc}'
+            )
+            self.publish_transfer_event(
+                operation_id=operation_id,
+                phase='FAILED',
+                state='FAILED',
+                destination_zone=destination_name,
+                destination_id=destination_marker_id,
+                message=f'{destination_name} 이송 실패',
+                error=str(exc),
+            )
+            self._recover_home_after_failure(destination_name)
+
+    def _scan_named_markers(
+        self,
+        specs,
+        required_count=None,
+        minimum_required_locks=None,
+        accept_initial_pose=False,
+        required_indices=None,
+        any_of_indices=None,
+    ):
+        """Sweep J1 until every named marker has a stationary locked pose."""
+        use_grouped_requirements = (
+            required_indices is not None or any_of_indices is not None
+        )
+        if use_grouped_requirements:
+            if required_count is not None or minimum_required_locks is not None:
+                raise ValueError(
+                    'grouped marker requirements cannot use count requirements'
+                )
+            required_indices = tuple(required_indices or ())
+            any_of_indices = tuple(any_of_indices or ())
+            selected_indices = required_indices + any_of_indices
+            if not selected_indices or any(
+                index < 0 or index >= len(specs)
+                for index in selected_indices
+            ):
+                raise ValueError('marker requirement index is out of range')
+            if len(set(selected_indices)) != len(selected_indices):
+                raise ValueError('marker requirement indices must be unique')
+            if not required_indices or not any_of_indices:
+                raise ValueError(
+                    'grouped marker requirements need required and any-of indices'
+                )
+        if required_count is None:
+            required_count = len(specs)
+        if not 1 <= required_count <= len(specs):
+            raise ValueError('required_count must select at least one spec')
+        if minimum_required_locks is None:
+            minimum_required_locks = required_count
+        if not 1 <= minimum_required_locks <= required_count:
+            raise ValueError(
+                'minimum_required_locks must be within required specs'
+            )
+
+        def scan_complete():
+            if use_grouped_requirements:
+                return grouped_marker_locks_satisfied(
+                    locked,
+                    required_indices,
+                    any_of_indices,
+                )
+            return sum(
+                pose is not None for pose in locked[:required_count]
+            ) >= minimum_required_locks
+
+        locked = [None] * len(specs)
+        if accept_initial_pose:
+            with self.history_lock:
+                for _label, frame, history in specs:
+                    history.clear()
+                    self.scan_locked_frames.discard(frame)
+            initial_deadline = time.monotonic() + self.scan_marker_pause + 2.0
+            last_reason = 'no marker samples'
+            while time.monotonic() < initial_deadline:
+                for index, (label, frame, history) in enumerate(specs):
+                    pose, last_reason = self.stable_marker_pose(
+                        history=history,
+                        yaw_only=True,
+                    )
+                    if pose is None:
+                        continue
+                    locked[index] = (
+                        np.array(pose[0], dtype=np.float64),
+                        np.array(pose[1], dtype=np.float64),
+                    )
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'INITIAL VIEW: {label} position saved; '
+                        'skipping J1 scan'
+                    )
+                    return tuple(locked), 'initial marker locked'
+                if self.stop_event.wait(0.05):
+                    return None, 'scan stopped'
+            self.publish_status(
+                'INITIAL VIEW: no stable container visible; starting J1 scan '
+                f'({last_reason})'
+            )
+
+        clients = (
+            self.sweep_joint1_client,
+            self.pause_sweep_client,
+            self.resume_sweep_client,
+            self.stop_robot_client,
+            self.scan_state_client,
+        )
+        if any(
+            client is None or not client.wait_for_service(timeout_sec=3.0)
+            for client in clients
+        ):
+            return None, 'scan control service is unavailable'
+        with self.history_lock:
+            for _label, frame, history in specs:
+                history.clear()
+                self.scan_locked_frames.discard(frame)
+        deadline = time.monotonic() + self.scan_timeout
+        pass_number = 0
+        while time.monotonic() < deadline and not scan_complete():
+            pass_number += 1
+            missing = ', '.join(
+                label for (label, _frame, _history), pose
+                in zip(specs, locked) if pose is None
+            )
+            self.publish_status(
+                f'SCAN: J1 pass {pass_number}; missing {missing}'
+            )
+            sweep_future = self.sweep_joint1_client.call_async(
+                Trigger.Request()
+            )
+            if not self._wait_for_joint1_scan_active(5.0):
+                self.stop_robot_client.call_async(Trigger.Request())
+                return None, 'J1 scan did not become active'
+            # Discard samples collected before the sweep owned the hardware.
+            # Otherwise an already-visible marker can be accepted before the
+            # scan callback starts, and its early stop request can be lost.
+            with self.history_lock:
+                for index, (_label, _frame, history) in enumerate(specs):
+                    if locked[index] is None:
+                        history.clear()
+            while not sweep_future.done():
+                if self.stop_event.is_set():
+                    self.stop_robot_client.call_async(Trigger.Request())
+                    return None, 'scan stopped'
+                candidate = next((
+                    index for index, (_label, _frame, history)
+                    in enumerate(specs)
+                    if locked[index] is None
+                    and self._history_sample_count(history) > 0
+                ), None)
+                if candidate is None:
+                    time.sleep(0.05)
+                    continue
+                label, frame, history = specs[candidate]
+                pose, reason = self._pause_and_lock_marker(label, history)
+                if pose is not None:
+                    locked[candidate] = pose
+                    with self.history_lock:
+                        self.scan_locked_frames.add(frame)
+                    self.publish_status(
+                        f'SCAN: {label} position saved and locked'
+                    )
+                else:
+                    self.publish_status(
+                        f'SCAN: {label} lock retry: {reason}'
+                    )
+                if scan_complete():
+                    self._call_scan_service(
+                        self.stop_robot_client,
+                        'stop completed scan',
+                        timeout=5.0,
+                    )
+                    if not self._wait_for_joint1_scan_inactive(5.0):
+                        return None, 'J1 scan did not stop after marker lock'
+                    # The physical sweep is stopped and its execution lock has
+                    # been released.  Do not wait on the original long-running
+                    # Trigger future: DDS may deliver that response late even
+                    # though the hardware is already idle.
+                    return tuple(locked), 'markers locked'
+                self._call_scan_service(
+                    self.resume_sweep_client, 'resume sweep'
+                )
+            if not sweep_future.done():
+                self._wait_future(sweep_future, 10.0)
+            result = sweep_future.result()
+            if result is None or not result.success:
+                message = 'no response' if result is None else result.message
+                self._return_home_after_failed_scan()
+                return None, f'J1 scan failed: {message}'
+        if not scan_complete():
+            self._return_home_after_failed_scan()
+            missing = ', '.join(
+                label for (label, _frame, _history), pose
+                in zip(specs[:required_count], locked[:required_count])
+                if pose is None
+            )
+            return None, (
+                f'{self.scan_timeout:.0f}s scan ended before detecting '
+                f'{missing}'
+            )
+        return tuple(locked), 'markers locked'
+
+    def _wait_for_joint1_scan_active(self, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            future = self.scan_state_client.call_async(Trigger.Request())
+            try:
+                self._wait_future(future, 1.0)
+            except RuntimeError:
+                continue
+            result = future.result()
+            if result is not None and result.success:
+                return True
+            if self.stop_event.wait(0.05):
+                return False
+        return False
+
+    def _wait_for_joint1_scan_inactive(self, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            future = self.scan_state_client.call_async(Trigger.Request())
+            try:
+                self._wait_future(future, 1.0)
+            except RuntimeError:
+                continue
+            result = future.result()
+            if result is not None and not result.success:
+                return True
+            if self.stop_event.wait(0.05):
+                return False
+        return False
+
+    def reset_stack_level(self, _request, response):
+        """Reset automatic stacking so the next placement uses layer one."""
+        if self.motion_thread is not None and self.motion_thread.is_alive():
+            response.success = False
+            response.message = 'Cannot reset while robot motion is running'
+            return response
+        with self.stack_level_lock:
+            self.placed_stack_count = 0
+            for name in self.saved_destination_stack_counts:
+                self.saved_destination_stack_counts[name] = 0
+        self.publish_status(
+            'STACK: all layer counters reset; next layer is 1'
+        )
+        self.publish_transfer_event(
+            operation_id=self._new_operation_id('stack-reset'),
+            operation='stack_level_reset',
+            phase='COMPLETED',
+            state='COMPLETED',
+            progress=100,
+            message='전체 적재 층수 초기화 완료',
+        )
+        response.success = True
+        response.message = (
+            'A-1-1 through A-3-2 stack levels reset; next placement is layer 1'
+        )
+        return response
+
+    def execute_scan_and_transfer(self):
+        """Scan and transfer primary container ID 0 to A-1 ID 11."""
+        try:
+            locked, reason = self.scan_and_lock_marker_poses()
+            if locked is None:
+                self.publish_status(f'SCAN TRANSFER FAILED: {reason}')
+                return
+            source_pose, destination_pose = locked
+            source_targets, reason = self.calculate_targets_from_marker_pose(
+                source_pose,
+                orientation_mode=self.stack_source_orientation_mode,
+            )
+            if source_targets is None:
+                self.publish_status(
+                    f'SCAN TRANSFER FAILED: ID 0 target: {reason}'
+                )
+                self._recover_home_after_failure('SCAN TRANSFER')
+                return
+            targets, reason = self.calculate_stack_targets_from_locked_poses(
+                source_targets,
+                destination_pose,
+            )
+            if targets is None:
+                self.publish_status(f'SCAN TRANSFER FAILED: {reason}')
+                self._recover_home_after_failure('SCAN TRANSFER')
+                return
+            self.execute_scanned_transfer(targets)
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(f'SCAN TRANSFER FAILED: {exc}')
+            self._recover_home_after_failure('SCAN TRANSFER')
+
+    def scan_and_lock_marker_poses(self):
+        """Sweep J1 and pause at whichever required marker appears."""
+        clients = (
+            self.sweep_joint1_client,
+            self.pause_sweep_client,
+            self.resume_sweep_client,
+            self.stop_robot_client,
+        )
+        if any(
+            not client.wait_for_service(timeout_sec=3.0)
+            for client in clients
+        ):
+            return None, 'scan control service is unavailable'
+        with self.history_lock:
+            self.history.clear()
+            self.stack_target_history.clear()
+            self.scan_locked_frames.clear()
+        locked = [None, None]
+        histories = (self.history, self.stack_target_history)
+        labels = ('ID 0', 'ID 11')
+        scan_deadline = time.monotonic() + self.scan_timeout
+        scan_error = None
+        pass_number = 0
+        while (
+            time.monotonic() < scan_deadline
+            and not all(value is not None for value in locked)
+        ):
+            pass_number += 1
+            self.publish_status(
+                f'SCAN: J1 pass {pass_number} for missing ID 0/ID 11'
+            )
+            sweep_future = self.sweep_joint1_client.call_async(
+                Trigger.Request()
+            )
+            while not sweep_future.done():
+                if self.stop_event.is_set():
+                    self.stop_robot_client.call_async(Trigger.Request())
+                    return None, 'scan stopped'
+                candidate = next(
+                    (
+                        index
+                        for index, history in enumerate(histories)
+                        if locked[index] is None
+                        and self._history_sample_count(history) > 0
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    time.sleep(0.05)
+                    continue
+                pose, reason = self._pause_and_lock_marker(
+                    labels[candidate],
+                    histories[candidate],
+                )
+                if pose is not None:
+                    locked[candidate] = pose
+                    with self.history_lock:
+                        self.scan_locked_frames.add(
+                            (
+                                self.marker_frame,
+                                self.stack_target_frame,
+                            )[candidate]
+                        )
+                    self.publish_status(
+                        f'SCAN: {labels[candidate]} position saved and locked'
+                    )
+                else:
+                    self.publish_status(
+                        f'SCAN: {labels[candidate]} lock retry: {reason}'
+                    )
+                if all(value is not None for value in locked):
+                    self.publish_status(
+                        'SCAN: ID 0 and ID 11 saved; stopping scan'
+                    )
+                    self.stop_robot_client.call_async(Trigger.Request())
+                    break
+                self._call_scan_service(
+                    self.resume_sweep_client, 'resume sweep'
+                )
+            if not sweep_future.done():
+                self._wait_future(sweep_future, 10.0)
+            result = sweep_future.result()
+            if result is None or not result.success:
+                message = 'no response' if result is None else result.message
+                scan_error = f'J1 scan failed: {message}'
+                break
+        if scan_error is not None:
+            self._return_home_after_failed_scan()
+            return None, scan_error
+        if not all(value is not None for value in locked):
+            self._return_home_after_failed_scan()
+            missing = ', '.join(
+                label for label, value in zip(labels, locked)
+                if value is None
+            )
+            return None, (
+                f'{self.scan_timeout:.0f}s scan ended before detecting '
+                f'{missing}'
+            )
+        return tuple(locked), 'markers locked'
+
+    def _return_home_after_failed_scan(self):
+        """Return home when scanning cannot proceed to a transfer."""
+        self._recover_home_after_failure('SCAN')
+
+    def _recover_home_after_failure(self, label):
+        """Stop, wait five seconds, then make a best-effort home return."""
+        self._stop_active_motion()
+        self.publish_status(
+            f'{label}: failure recovery; returning home in 5 seconds'
+        )
+        time.sleep(5.0)
+        self.stop_event.clear()
+        try:
+            self.command_return_home()
+        except Exception as exc:
+            self.publish_status(
+                f'{label}: automatic failure home return failed: {exc}'
+            )
+            return
+        self.publish_status(
+            f'{label}: automatic failure home return completed'
+        )
+
+    def _history_sample_count(self, history):
+        with self.history_lock:
+            return len(history)
+
+    def _pause_and_lock_marker(self, label, history):
+        self._call_scan_service(
+            self.pause_sweep_client, 'pause sweep', timeout=5.0
+        )
+        # The bridge checks its pause event every 0.1 s and stops serial
+        # motion there. Wait before clearing samples so the 0.5 s capture
+        # window contains only stationary observations.
+        if self.stop_event.wait(0.2):
+            return None, 'scan stopped'
+        with self.history_lock:
+            history.clear()
+        self.publish_status(
+            f'SCAN: {label} detected; holding '
+            f'{self.scan_marker_pause:.1f}s'
+        )
+        deadline = time.monotonic() + self.scan_marker_pause + 2.0
+        minimum_hold_end = time.monotonic() + self.scan_marker_pause
+        reason = 'no stable samples'
+        while time.monotonic() < deadline:
+            if self.stop_event.wait(0.05):
+                return None, 'scan stopped'
+            if time.monotonic() < minimum_hold_end:
+                continue
+            pose, reason = self.stable_marker_pose(
+                history=history,
+                yaw_only=True,
+            )
+            if pose is not None:
+                return (
+                    np.array(pose[0], dtype=np.float64),
+                    np.array(pose[1], dtype=np.float64),
+                ), 'stable'
+        return None, reason
+
+    def _call_scan_service(self, client, label, timeout=3.0):
+        future = client.call_async(Trigger.Request())
+        self._wait_future(future, timeout)
+        result = future.result()
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            raise RuntimeError(f'{label} failed: {message}')
+
     def start_pregrasp_test(self, _request, response):
         if not self.execute_motion:
             response.success = False
@@ -1524,6 +4253,14 @@ class ContainerPickCoordinator(Node):
         return response
 
     def stop_pick(self, _request, response):
+        operation_id = self._new_operation_id('emergency-stop')
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='emergency_stop',
+            phase='STOP_REQUESTED',
+            state='STARTED',
+            message='긴급 정지 요청 수신',
+        )
         self.stop_event.set()
         if self.motion_backend == 'moveit':
             self._stop_moveit_motion()
@@ -1532,10 +4269,26 @@ class ContainerPickCoordinator(Node):
                 with self.serial_lock:
                     self.robot.stop()
             except Exception as exc:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation='emergency_stop',
+                    phase='FAILED',
+                    state='FAILED',
+                    message='긴급 정지 명령 실패',
+                    error=str(exc),
+                )
                 response.success = False
                 response.message = f'Stop command failed: {exc}'
                 return response
         self.publish_status('STOP requested')
+        self.publish_transfer_event(
+            operation_id=operation_id,
+            operation='emergency_stop',
+            phase='STOPPED',
+            state='COMPLETED',
+            progress=100,
+            message='로봇팔 정지 명령 전달 완료',
+        )
         response.success = True
         response.message = 'Stop command sent'
         return response
@@ -1546,32 +4299,507 @@ class ContainerPickCoordinator(Node):
         try:
             self.publish_pick_target('PICK', initial_targets[0])
             self._perform_pick(initial_targets)
+            self.publish_status('PICK: returning to home')
+            self.command_return_home()
             self.publish_status('PICK: completed')
         except Exception as exc:
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'PICK FAILED: {exc}')
+            self._recover_home_after_failure('PICK')
         finally:
             self.motion_lock.release()
+
+    def _load_pick_success_profiles(self):
+        """Load a bounded cache; malformed entries never block startup."""
+        if not self.pick_profile_cache_path:
+            return
+        path = Path(self.pick_profile_cache_path)
+        if not path.exists():
+            return
+        try:
+            raw_profiles = json.loads(path.read_text(encoding='utf-8'))
+            profiles = []
+            for raw in raw_profiles:
+                position = np.asarray(raw['position'], dtype=np.float64)
+                seed = np.asarray(raw['seed_j2_j6'], dtype=np.float64)
+                if (
+                    position.shape != (3,)
+                    or seed.shape != (5,)
+                    or not np.all(np.isfinite(position))
+                    or not np.all(np.isfinite(seed))
+                ):
+                    continue
+                profiles.append({
+                    'position': position,
+                    'yaw_deg': float(raw['yaw_deg']),
+                    'zone': str(raw['zone']),
+                    'yaw_offset_deg': float(raw['yaw_offset_deg']),
+                    'height_offset_m': float(raw['height_offset_m']),
+                    'approach_mode': str(
+                        raw.get('approach_mode', 'vertical')
+                    ),
+                    'oblique_dx_m': float(raw.get('oblique_dx_m', 0.0)),
+                    'oblique_dy_m': float(raw.get('oblique_dy_m', 0.0)),
+                    'seed_j2_j6': seed,
+                    'last_used': time.monotonic(),
+                })
+            self.pick_success_profiles.extend(
+                profiles[-self.pick_profile_max_entries:]
+            )
+            self.get_logger().info(
+                'Loaded successful-pick pose profiles: '
+                f'{len(self.pick_success_profiles)}'
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.get_logger().warning(
+                f'Ignoring invalid pick profile cache {path}: {exc}'
+            )
+
+    def _save_pick_success_profiles(self):
+        """Atomically persist the bounded successful-pick pose cache."""
+        if not self.pick_profile_cache_path:
+            return
+        path = Path(self.pick_profile_cache_path)
+        temporary = path.with_suffix(path.suffix + '.tmp')
+        payload = [{
+            'position': profile['position'].tolist(),
+            'yaw_deg': profile['yaw_deg'],
+            'zone': profile['zone'],
+            'yaw_offset_deg': profile['yaw_offset_deg'],
+            'height_offset_m': profile['height_offset_m'],
+            'approach_mode': profile.get('approach_mode', 'vertical'),
+            'oblique_dx_m': profile.get('oblique_dx_m', 0.0),
+            'oblique_dy_m': profile.get('oblique_dy_m', 0.0),
+            'seed_j2_j6': profile['seed_j2_j6'].tolist(),
+        } for profile in self.pick_success_profiles]
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, indent=2), encoding='utf-8'
+            )
+            temporary.replace(path)
+        except OSError as exc:
+            self.get_logger().warning(
+                f'Could not persist pick profile cache {path}: {exc}'
+            )
+
+    def _matching_pick_profile(self, position, yaw, zone):
+        """Return the nearest successful profile for a similar pick pose."""
+        matches = []
+        for profile in self.pick_success_profiles:
+            if profile['zone'] != zone:
+                continue
+            delta = np.asarray(profile['position']) - position
+            xy_distance = float(np.linalg.norm(delta[:2]))
+            z_distance = abs(float(delta[2]))
+            yaw_distance = abs(wrap_degrees(profile['yaw_deg'] - yaw))
+            if (
+                xy_distance > self.pick_profile_xy_merge
+                or z_distance > self.pick_profile_z_merge
+                or yaw_distance > self.pick_profile_yaw_merge
+            ):
+                continue
+            score = (
+                xy_distance / self.pick_profile_xy_merge
+                + z_distance / self.pick_profile_z_merge
+                + yaw_distance / self.pick_profile_yaw_merge
+            )
+            matches.append((score, profile))
+        if not matches:
+            return None
+        profile = min(matches, key=lambda item: item[0])[1]
+        profile['last_used'] = time.monotonic()
+        return profile
+
+    def _store_pick_success_profile(
+        self,
+        position,
+        yaw,
+        zone,
+        yaw_offset,
+        height_offset,
+        approach_mode='vertical',
+        oblique_dx=0.0,
+        oblique_dy=0.0,
+    ):
+        """Update a similar profile or add one bounded LRU cache entry."""
+        profile = self._matching_pick_profile(position, yaw, zone)
+        new_values = {
+            'position': np.asarray(position, dtype=np.float64).copy(),
+            'yaw_deg': float(yaw),
+            'zone': zone,
+            'yaw_offset_deg': float(yaw_offset),
+            'height_offset_m': float(height_offset),
+            'approach_mode': str(approach_mode),
+            'oblique_dx_m': float(oblique_dx),
+            'oblique_dy_m': float(oblique_dy),
+            'seed_j2_j6': self.preferred_pick_seed_j2_j6.copy(),
+            'last_used': time.monotonic(),
+        }
+        if profile is not None:
+            profile.update(new_values)
+            self._save_pick_success_profiles()
+            return 'updated similar profile'
+        if len(self.pick_success_profiles) >= self.pick_profile_max_entries:
+            oldest_index = min(
+                range(len(self.pick_success_profiles)),
+                key=lambda index: self.pick_success_profiles[index][
+                    'last_used'
+                ],
+            )
+            self.pick_success_profiles.pop(oldest_index)
+        self.pick_success_profiles.append(new_values)
+        self._save_pick_success_profiles()
+        return 'stored new profile'
 
     def _perform_pick(
         self,
         initial_targets,
         allow_yaw_fallback=True,
         allow_segmented_descent=False,
+        marker_frame=None,
+        marker_history=None,
+        marker_id=0,
+        search_higher_pregrasp=False,
     ):
-        grasp, pregrasp = initial_targets
+        grasp, pregrasp = map(copy.deepcopy, initial_targets)
+        nominal_position = np.array([
+            grasp.pose.position.x,
+            grasp.pose.position.y,
+            grasp.pose.position.z,
+        ], dtype=np.float64)
+        nominal_yaw = quaternion_to_rpy_degrees([
+            grasp.pose.orientation.x,
+            grasp.pose.orientation.y,
+            grasp.pose.orientation.z,
+            grasp.pose.orientation.w,
+        ])[2]
+        profile_zone = self.active_source_scan_zone
+        cached_profile = None
+        if profile_zone is not None:
+            cached_profile = self._matching_pick_profile(
+                nominal_position, nominal_yaw, profile_zone
+            )
+            if cached_profile is not None:
+                cached_seed = cached_profile.get('seed_j2_j6')
+                if cached_seed is not None:
+                    self.preferred_pick_seed_j2_j6 = np.array(
+                        cached_seed, dtype=np.float64
+                    )
+                self.publish_status(
+                    'PICK: prioritizing nearest cached safe pose for '
+                    f'zone={profile_zone}, '
+                    f'mode={cached_profile.get("approach_mode", "vertical")}, '
+                    f'yaw={cached_profile["yaw_offset_deg"]:+.0f}deg, '
+                    'pregrasp='
+                    f'{cached_profile["height_offset_m"] * 1000.0:.0f}mm'
+                )
         self.publish_status('PICK: opening gripper')
         self.command_gripper(open_gripper=True)
         self.publish_status('PICK: moving to pregrasp')
-        self.move_to_pose(
-            pregrasp,
-            keep_current_orientation=self.pregrasp_test_keep_orientation,
-        )
+
+        def move_to_pick_pregrasp(base_pregrasp, yaw_offset):
+            nonlocal pregrasp
+            height_offsets = list(
+                (0.0, 0.02, 0.04, 0.06)
+                if search_higher_pregrasp else (0.0,)
+            )
+            if (
+                cached_profile is not None
+                and abs(
+                    cached_profile['yaw_offset_deg'] - yaw_offset
+                ) <= 1e-6
+            ):
+                preferred_height = cached_profile['height_offset_m']
+                if preferred_height in height_offsets:
+                    height_offsets.remove(preferred_height)
+                    height_offsets.insert(0, preferred_height)
+            failures = []
+            for height_offset in height_offsets:
+                candidate = copy.deepcopy(base_pregrasp)
+                candidate.pose.position.z += height_offset
+                translation = np.array([
+                    candidate.pose.position.x,
+                    candidate.pose.position.y,
+                    candidate.pose.position.z,
+                ])
+                if not self.in_workspace(translation):
+                    failures.append(
+                        f'+{height_offset * 100.0:.0f}cm outside workspace'
+                    )
+                    continue
+                pregrasp = candidate
+                try:
+                    if self.prefer_z_last_motion:
+                        self.move_to_pose_z_last(
+                            pregrasp,
+                            keep_current_orientation=(
+                                self.pregrasp_test_keep_orientation
+                            ),
+                            require_preferred_pick_branch=True,
+                            descent_preflight_target=(
+                                grasp if search_higher_pregrasp else None
+                            ),
+                        )
+                    else:
+                        self.move_to_pose(
+                            pregrasp,
+                            keep_current_orientation=(
+                                self.pregrasp_test_keep_orientation
+                            ),
+                            require_preferred_pick_branch=True,
+                            descent_preflight_target=(
+                                grasp if search_higher_pregrasp else None
+                            ),
+                        )
+                    if height_offset > 0.0:
+                        self.publish_status(
+                            'PICK: selected higher pregrasp '
+                            f'+{height_offset * 100.0:.0f}cm'
+                        )
+                    return height_offset
+                except RuntimeError as exc:
+                    if self.stop_event.is_set():
+                        raise
+                    failures.append(
+                        f'+{height_offset * 100.0:.0f}cm: {exc}'
+                    )
+            raise RuntimeError('; '.join(failures))
+
+        nominal_grasp = copy.deepcopy(grasp)
+        nominal_pregrasp = copy.deepcopy(pregrasp)
+        yaw_offsets = [0.0]
+        if abs(self.container_yaw_symmetry - 180.0) <= 1e-6:
+            # The equivalent wrist orientation is often much easier for IK.
+            # Test it immediately after the exact marker yaw instead of only
+            # after every small yaw deviation has timed out.
+            yaw_offsets.append(180.0)
+        if search_higher_pregrasp:
+            # Near the edge of the workspace, an exact marker yaw can force
+            # the vertical descent through an IK branch discontinuity. Test
+            # small symmetric deviations after the equivalent 180-degree
+            # wrist orientation; execute only a candidate whose complete
+            # descent passed preflight.
+            yaw_offsets.extend((15.0, -15.0, 30.0, -30.0))
+        if cached_profile is not None:
+            preferred_yaw = cached_profile['yaw_offset_deg']
+            if preferred_yaw in yaw_offsets:
+                yaw_offsets.remove(preferred_yaw)
+                yaw_offsets.insert(0, preferred_yaw)
+            if cached_profile.get('approach_mode') == 'oblique':
+                # This pose already proved that vertical approaches waste the
+                # full yaw search. Revalidate the successful oblique profile
+                # first; its IK/collision/descent checks are still complete.
+                yaw_offsets = []
+                self.publish_status(
+                    'PICK: cached pose uses a short oblique approach; '
+                    'skipping vertical candidate ordering'
+                )
+        if (
+            self.active_id_transfer_pair == (6, 4)
+            and self.active_source_scan_zone == 'A-1'
+        ):
+            # The proven 6 -> 4 pick did not use a vertical pregrasp at any
+            # yaw.  It succeeded with the nominal yaw and a short +X oblique
+            # approach, handled immediately by the fallback block below.
+            yaw_offsets = []
+            self.publish_status(
+                'PICK: prioritizing proven ID 6 -> 4 nominal-yaw '
+                'short oblique profile'
+            )
+
+        yaw_failures = []
+        selected = False
+        for yaw_offset in yaw_offsets:
+            grasp = copy.deepcopy(nominal_grasp)
+            candidate_pregrasp = copy.deepcopy(nominal_pregrasp)
+            for pose in (grasp, candidate_pregrasp):
+                rpy = quaternion_to_rpy_degrees([
+                    pose.pose.orientation.x,
+                    pose.pose.orientation.y,
+                    pose.pose.orientation.z,
+                    pose.pose.orientation.w,
+                ])
+                rotation = quaternion_from_rpy_degrees(
+                    rpy[0], rpy[1], wrap_degrees(rpy[2] + yaw_offset)
+                )
+                (
+                    pose.pose.orientation.x,
+                    pose.pose.orientation.y,
+                    pose.pose.orientation.z,
+                    pose.pose.orientation.w,
+                ) = map(float, rotation)
+            if yaw_offset != 0.0:
+                candidate_yaw = quaternion_to_rpy_degrees([
+                    candidate_pregrasp.pose.orientation.x,
+                    candidate_pregrasp.pose.orientation.y,
+                    candidate_pregrasp.pose.orientation.z,
+                    candidate_pregrasp.pose.orientation.w,
+                ])[2]
+                equivalent = (
+                    ' equivalent' if abs(yaw_offset) == 180.0 else ''
+                )
+                self.publish_status(
+                    'PICK: retrying pregrasp/descent preflight with '
+                    f'yaw offset {yaw_offset:+.0f}deg{equivalent} '
+                    f'(target={candidate_yaw:.2f}deg)'
+                )
+            try:
+                selected_height = move_to_pick_pregrasp(
+                    candidate_pregrasp, yaw_offset
+                )
+                selected = True
+                if profile_zone is not None:
+                    cache_result = self._store_pick_success_profile(
+                        nominal_position,
+                        nominal_yaw,
+                        profile_zone,
+                        yaw_offset,
+                        selected_height,
+                    )
+                    self.publish_status(
+                        'PICK: cached fully validated safe pose: '
+                        f'{cache_result}, zone={profile_zone}, '
+                        f'entries={len(self.pick_success_profiles)}'
+                    )
+                if yaw_offset != 0.0:
+                    self.publish_status(
+                        'PICK: selected preflight-safe grasp yaw offset '
+                        f'{yaw_offset:+.0f}deg'
+                    )
+                break
+            except RuntimeError as exc:
+                if self.stop_event.is_set():
+                    raise
+                yaw_failures.append(f'yaw {yaw_offset:+.0f}deg: {exc}')
+        if not selected and search_higher_pregrasp:
+            # A vertical line can cross an IK singularity even though the
+            # grasp itself is reachable.  As a final safe fallback, approach
+            # the last few centimetres on a shallow diagonal.  The same
+            # bottom-up IK and full Cartesian preflight are still required,
+            # so this does not relax the joint-jump protection.
+            oblique_offsets = [
+                (0.010, 0.0),
+                (-0.010, 0.0),
+                (0.0, 0.010),
+                (0.0, -0.010),
+            ]
+            if (
+                cached_profile is not None
+                and cached_profile.get('approach_mode') == 'oblique'
+            ):
+                preferred_oblique = (
+                    cached_profile.get('oblique_dx_m', 0.0),
+                    cached_profile.get('oblique_dy_m', 0.0),
+                )
+                if preferred_oblique in oblique_offsets:
+                    oblique_offsets.remove(preferred_oblique)
+                    oblique_offsets.insert(0, preferred_oblique)
+            grasp = copy.deepcopy(nominal_grasp)
+            for dx, dy in oblique_offsets:
+                candidate_pregrasp = copy.deepcopy(nominal_grasp)
+                candidate_pregrasp.pose.position.x += dx
+                candidate_pregrasp.pose.position.y += dy
+                candidate_pregrasp.pose.position.z += 0.025
+                translation = np.array([
+                    candidate_pregrasp.pose.position.x,
+                    candidate_pregrasp.pose.position.y,
+                    candidate_pregrasp.pose.position.z,
+                ])
+                if not self.in_workspace(translation):
+                    yaw_failures.append(
+                        'oblique '
+                        f'dx={dx * 1000.0:+.0f}mm, '
+                        f'dy={dy * 1000.0:+.0f}mm outside workspace'
+                    )
+                    continue
+                self.publish_status(
+                    'PICK: testing short oblique approach '
+                    f'dx={dx * 1000.0:+.0f}mm, '
+                    f'dy={dy * 1000.0:+.0f}mm, dz=+25mm'
+                )
+                try:
+                    if self.prefer_z_last_motion:
+                        self.move_to_pose_z_last(
+                            candidate_pregrasp,
+                            keep_current_orientation=(
+                                self.pregrasp_test_keep_orientation
+                            ),
+                            require_preferred_pick_branch=True,
+                            descent_preflight_target=grasp,
+                        )
+                    else:
+                        self.move_to_pose(
+                            candidate_pregrasp,
+                            keep_current_orientation=(
+                                self.pregrasp_test_keep_orientation
+                            ),
+                            require_preferred_pick_branch=True,
+                            descent_preflight_target=grasp,
+                        )
+                    pregrasp = candidate_pregrasp
+                    selected = True
+                    if profile_zone is not None:
+                        cache_result = self._store_pick_success_profile(
+                            nominal_position,
+                            nominal_yaw,
+                            profile_zone,
+                            yaw_offset=0.0,
+                            height_offset=0.025,
+                            approach_mode='oblique',
+                            oblique_dx=dx,
+                            oblique_dy=dy,
+                        )
+                        self.publish_status(
+                            'PICK: cached validated oblique pose: '
+                            f'{cache_result}, zone={profile_zone}, '
+                            f'entries={len(self.pick_success_profiles)}'
+                        )
+                    self.publish_status(
+                        'PICK: selected preflight-safe short oblique '
+                        f'approach dx={dx * 1000.0:+.0f}mm, '
+                        f'dy={dy * 1000.0:+.0f}mm'
+                    )
+                    break
+                except RuntimeError as exc:
+                    if self.stop_event.is_set():
+                        raise
+                    yaw_failures.append(
+                        'oblique '
+                        f'dx={dx * 1000.0:+.0f}mm, '
+                        f'dy={dy * 1000.0:+.0f}mm: {exc}'
+                    )
+        if not selected:
+            raise RuntimeError(
+                'no pregrasp/grasp yaw or short oblique candidate passed '
+                'complete descent preflight: ' + '; '.join(yaw_failures)
+            )
+        if (
+            self.visual_servo_enabled
+            and marker_frame is not None
+            and marker_history is not None
+        ):
+            # The wrist camera loses the top marker after final grasp-yaw
+            # alignment. Refine XY while retaining the visible wrist attitude,
+            # then use the last observed marker yaw for one final alignment.
+            grasp, pregrasp = self.refine_pregrasp_with_visual_feedback(
+                (grasp, pregrasp),
+                marker_frame,
+                marker_history,
+                marker_id,
+                correct_yaw=False,
+            )
         if self.pregrasp_test_keep_orientation:
             self.publish_status('PICK: aligning at pregrasp')
-            self.move_to_pose(pregrasp)
-        if self.refresh_marker_before_descent:
+            self.move_to_pose(
+                pregrasp,
+                require_preferred_pick_branch=True,
+            )
+        if (
+            not self.visual_servo_enabled
+            and self.refresh_marker_before_descent
+        ):
             refreshed, reason = self.wait_for_new_stable_targets()
             if refreshed is None:
                 raise RuntimeError(
@@ -1583,38 +4811,112 @@ class ContainerPickCoordinator(Node):
                 'PICK: marker refresh skipped; using locked base target'
             )
         self.publish_status('PICK: descending to grasp pose')
+        self.avoid_known_bad_pick_branch(grasp)
         try:
             self.move_cartesian_to_pose(
-                grasp, allow_segmented=allow_segmented_descent
+                grasp,
+                allow_segmented=allow_segmented_descent,
+                prefer_j2_branch_fallback=allow_segmented_descent,
             )
         except CartesianPlanningError as initial_error:
-            remaining_distance = self._cartesian_request_distance(grasp)
-            can_finish_with_pose_goal = (
-                allow_segmented_descent
-                and initial_error.executed_segments > 0
-                and remaining_distance is not None
-                and remaining_distance
-                <= self.stack_pose_goal_finish_max_distance
-            )
-            if can_finish_with_pose_goal:
+            if (
+                initial_error.executed_segments == 0
+                and 'ik_only=1.000' in str(initial_error)
+                and 'no_joint_jump=' in str(initial_error)
+                and self.try_opposite_ik_branch(
+                    grasp, 'PICK vertical descent'
+                )
+            ):
                 self.publish_status(
-                    'PICK: finishing locked grasp pose without marker: '
-                    f'remaining={remaining_distance * 1000.0:.1f}mm'
+                    'PICK: retrying vertical descent on opposite J2 branch'
                 )
-                self.move_to_pose(grasp)
-            elif not allow_yaw_fallback:
-                raise
+                self.move_cartesian_to_pose(
+                    grasp,
+                    allow_segmented=allow_segmented_descent,
+                    prefer_j2_branch_fallback=allow_segmented_descent,
+                )
+                initial_error = None
+            if initial_error is None:
+                pass
             else:
-                grasp = self.move_with_yaw_fallbacks(
-                    grasp, pregrasp, initial_error
+                remaining_distance = self._cartesian_request_distance(grasp)
+                can_finish_with_pose_goal = (
+                    allow_segmented_descent
+                    and initial_error.executed_segments > 0
+                    and remaining_distance is not None
+                    and remaining_distance
+                    <= self.stack_pose_goal_finish_max_distance
                 )
+                if can_finish_with_pose_goal:
+                    self.publish_status(
+                        'PICK: finishing locked grasp pose without marker: '
+                        f'remaining={remaining_distance * 1000.0:.1f}mm'
+                    )
+                    self.move_to_pose(grasp)
+                elif not allow_yaw_fallback:
+                    raise initial_error
+                else:
+                    grasp = self.move_with_yaw_fallbacks(
+                        grasp, pregrasp, initial_error
+                    )
         self.publish_status('PICK: closing gripper')
         self.command_gripper(open_gripper=False)
+        self.publish_status(
+            'PICK: retreating along the validated grasp approach'
+        )
+        try:
+            self.move_cartesian_to_pose(
+                pregrasp,
+                allow_segmented=False,
+            )
+        except CartesianPlanningError as exc:
+            raise RuntimeError(
+                'validated grasp-path retreat failed before vertical lift: '
+                f'{exc}'
+            ) from exc
         self.publish_status('PICK: finding vertical lift path')
-        self.move_adaptive_cartesian_lift(grasp)
+        self.move_adaptive_cartesian_lift(pregrasp)
         return grasp
 
-    def publish_pick_target(self, label, grasp):
+    def avoid_known_bad_pick_branch(self, grasp):
+        """Leave a measured bad J2/J3 branch before grasp descent."""
+        if self.motion_backend != 'moveit':
+            return
+        with self.joint_state_lock:
+            joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+        j2_deg = math.degrees(float(joints[1]))
+        j3_deg = math.degrees(float(joints[2]))
+        is_bad_branch = (
+            abs(j2_deg - self.bad_pick_branch_j2)
+            <= self.bad_pick_branch_tolerance
+            and abs(j3_deg - self.bad_pick_branch_j3)
+            <= self.bad_pick_branch_tolerance
+        )
+        if not is_bad_branch:
+            return
+        self.publish_status(
+            'PICK: known bad pregrasp branch rejected: '
+            f'J2={j2_deg:.1f}deg, J3={j3_deg:.1f}deg; '
+            'switching J2 and J3 together before descent'
+        )
+        if self._try_opposite_j2_j3_branch('PICK known bad branch'):
+            return
+        raise RuntimeError(
+            'known bad pick branch detected and no safe IK solution with '
+            'both J2 and J3 reversed was found'
+        )
+
+    def publish_pick_target(self, label, grasp, marker_id=0):
         yaw = quaternion_to_rpy_degrees([
             grasp.pose.orientation.x,
             grasp.pose.orientation.y,
@@ -1622,7 +4924,7 @@ class ContainerPickCoordinator(Node):
             grasp.pose.orientation.w,
         ])[2]
         self.publish_status(
-            f'{label}: ID 0 grasp target '
+            f'{label}: ID {marker_id} grasp target '
             f'x={grasp.pose.position.x:.4f}, '
             f'y={grasp.pose.position.y:.4f}, '
             f'z={grasp.pose.position.z:.4f}, yaw={yaw:.2f}deg'
@@ -1633,16 +4935,25 @@ class ContainerPickCoordinator(Node):
             return
         self.tracking_suspended.set()
         try:
+            self.j2_fallback_used = False
+            self.j3_fallback_used = False
+            self.ik_seed_fallback_index = 0
+            self.ik_seed_fallback_solutions = set()
             source_targets, release, approach = targets
             self.publish_status(
                 'STACK: using locked initial ID 0 and ID 1 poses'
             )
             source_targets = copy.deepcopy(source_targets)
             self.publish_pick_target('STACK', source_targets[0])
-            self._perform_pick(
+            picked_grasp = self._perform_pick(
                 source_targets,
                 allow_yaw_fallback=False,
                 allow_segmented_descent=True,
+            )
+            self.raise_to_common_clearance_before_j1(release)
+            self.move_joint1_toward_destination(picked_grasp, release)
+            transit_approach = (
+                self.move_to_destination_radius_at_clearance(release)
             )
             destination_yaw = quaternion_to_rpy_degrees([
                 release.pose.orientation.x,
@@ -1654,63 +4965,1413 @@ class ContainerPickCoordinator(Node):
                 'STACK: moving above ID 1 and aligning heading: '
                 f'tcp_yaw={destination_yaw:.2f}deg'
             )
-            approach = self.move_to_reachable_stack_approach(
-                release, approach.pose.orientation
+            approach = self.move_to_reachable_stack_release(
+                release,
+                approach.pose.orientation,
+                'STACK release',
+                alignment_pose=transit_approach,
             )
-            self.publish_status('STACK: descending vertically to release')
-            self.move_cartesian_to_pose(release)
+            try:
+                self.verify_release_pose(release, 'STACK release')
+            except RuntimeError:
+                self.publish_status(
+                    'STACK: release verification failed; retreating '
+                    'without opening gripper'
+                )
+                self.move_segmented_cartesian_with_pose_finish(
+                    approach, 'STACK verification retreat'
+                )
+                raise
             self.publish_status('STACK: opening gripper')
             self.command_gripper(open_gripper=True)
             self.publish_status('STACK: retreating vertically')
-            self.move_cartesian_to_pose(approach)
+            self.move_segmented_cartesian_with_pose_finish(
+                approach, 'STACK retreat'
+            )
+            self.publish_status('STACK: returning to home')
+            self.command_return_home()
             self.publish_status('STACK: completed ID 0 onto ID 1')
         except Exception as exc:
             self.stop_event.set()
             self._stop_active_motion()
             self.publish_status(f'STACK FAILED: {exc}')
+            self._recover_home_after_failure('STACK')
         finally:
             self.tracking_suspended.clear()
             self.motion_lock.release()
 
-    def move_to_reachable_stack_approach(self, release, orientation):
-        """Use the highest reachable clearance above the stack target."""
-        failures = []
-        for clearance in lift_distance_candidates(
-            self.stack_approach_clearance,
-            self.stack_minimum_approach_clearance,
-            self.stack_approach_search_step,
-        ):
-            approach = copy.deepcopy(release)
-            approach.pose.position.z += clearance
-            approach.pose.orientation = copy.deepcopy(orientation)
-            translation = np.array([
-                approach.pose.position.x,
-                approach.pose.position.y,
-                approach.pose.position.z,
-            ])
-            if not self.in_workspace(translation):
-                failures.append(f'{clearance:.3f}m: outside workspace')
-                continue
+    def execute_scanned_transfer(
+        self,
+        targets,
+        destination_name='A-1',
+        count_stack=True,
+        saved_stack_name=None,
+        source_marker_id=0,
+        align_source_before_pick=False,
+        source_scan_zone=None,
+        source_bearing_xy=None,
+        operation_id=None,
+        event_operation='transfer',
+        destination_marker_id=None,
+    ):
+        """Move a scan-locked container to one locked destination."""
+        if not self.motion_lock.acquire(blocking=False):
+            return
+        source_label = f'ID {source_marker_id}'
+        if destination_marker_id is None:
+            destination_label = str(destination_name)
+        elif str(destination_name).startswith('ID '):
+            destination_label = f'ID {destination_marker_id}'
+        else:
+            destination_label = (
+                f'{destination_name}(ID {destination_marker_id})'
+            )
+        try:
+            self.j2_fallback_used = False
+            self.j3_fallback_used = False
+            self.ik_seed_fallback_index = 0
+            self.ik_seed_fallback_solutions = set()
+            source_targets, release, approach = targets
+            self.publish_status('TRANSFER: moving to saved container pose')
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='MOVING_TO_SOURCE',
+                    state='RUNNING',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=25,
+                    message=f'{source_label} 집기 위치로 이동 중',
+                )
+            self.publish_pick_target(
+                'TRANSFER', source_targets[0], marker_id=source_marker_id
+            )
+            if align_source_before_pick:
+                self.move_joint1_toward_source(
+                    source_targets[0],
+                    source_scan_zone,
+                    source_bearing_xy=source_bearing_xy,
+                )
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='PICKING',
+                    state='STARTED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=35,
+                    message=f'{source_label} 컨테이너 집기 시작',
+                )
+            picked_grasp = self._perform_pick(
+                copy.deepcopy(source_targets),
+                allow_yaw_fallback=False,
+                allow_segmented_descent=True,
+                marker_frame=self.source_frames[source_marker_id],
+                marker_history=self.marker_histories[source_marker_id],
+                marker_id=source_marker_id,
+                search_higher_pregrasp=align_source_before_pick,
+            )
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='PICK_COMPLETE',
+                    state='COMPLETED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=50,
+                    message=(
+                        f'카메라가 인식한 {source_label} 컨테이너를 '
+                        '집었습니다'
+                    ),
+                )
+            self.raise_to_common_clearance_before_j1(release)
+            self.move_joint1_toward_destination(
+                picked_grasp,
+                release,
+                destination_name=destination_name,
+            )
+            transit_approach = (
+                self.move_to_destination_radius_at_clearance(release)
+            )
+            self.tracking_suspended.set()
+            destination_yaw = quaternion_to_rpy_degrees([
+                release.pose.orientation.x,
+                release.pose.orientation.y,
+                release.pose.orientation.z,
+                release.pose.orientation.w,
+            ])[2]
             self.publish_status(
-                'STACK: trying approach clearance '
-                f'{clearance * 100.0:.1f} cm'
+                f'TRANSFER: container picked; moving to {destination_name}: '
+                f'tcp_yaw={destination_yaw:.2f}deg'
+            )
+            if operation_id is not None:
+                route = source_scan_zone or f'ID {source_marker_id} 위치'
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='MOVING_TO_DESTINATION',
+                    state='RUNNING',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=65,
+                    message=(
+                        f'{source_label} 컨테이너를 {route}에서 '
+                        f'{destination_label}로 이동 중'
+                    ),
+                )
+            approach = self.move_to_reachable_stack_release(
+                release,
+                approach.pose.orientation,
+                f'{destination_name} release',
+                alignment_pose=transit_approach,
             )
             try:
-                self.move_to_pose(approach)
-                self.stack_approach_pose_publisher.publish(approach)
-                self.publish_status(
-                    'STACK: selected approach clearance '
-                    f'{clearance * 100.0:.1f} cm'
+                self.verify_release_pose(
+                    release, f'{destination_name} release'
                 )
-                return approach
-            except RuntimeError as exc:
-                if 'code=99999' not in str(exc):
+            except RuntimeError:
+                self.publish_status(
+                    f'TRANSFER: {destination_name} release verification '
+                    'failed; retreating without opening gripper'
+                )
+                self.move_segmented_cartesian_with_pose_finish(
+                    approach, f'{destination_name} verification retreat'
+                )
+                raise
+            self.publish_status(
+                f'TRANSFER: releasing container at {destination_name}'
+            )
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='PLACING',
+                    state='STARTED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=80,
+                    message=(
+                        f'{source_label} 컨테이너를 '
+                        f'{destination_label}에 놓기 시작'
+                    ),
+                )
+            self.command_gripper(open_gripper=True)
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='PLACE_COMPLETE',
+                    state='COMPLETED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=90,
+                    message=(
+                        f'{source_label} 컨테이너를 '
+                        f'{destination_label}에 놓았습니다'
+                    ),
+                )
+            self.publish_status(
+                f'TRANSFER: retreating from {destination_name}'
+            )
+            self.move_segmented_cartesian_with_pose_finish(
+                approach, f'{destination_name} retreat'
+            )
+            if count_stack:
+                with self.stack_level_lock:
+                    self.placed_stack_count += 1
+                    completed_layer = self.placed_stack_count
+                self.publish_status(
+                    f'TRANSFER: stack layer {completed_layer} placed'
+                )
+            elif saved_stack_name is not None:
+                with self.stack_level_lock:
+                    self.saved_destination_stack_counts[
+                        saved_stack_name
+                    ] += 1
+                    completed_layer = self.saved_destination_stack_counts[
+                        saved_stack_name
+                    ]
+                self.publish_status(
+                    f'TRANSFER: {saved_stack_name} layer '
+                    f'{completed_layer}/{self.max_stack_levels} placed'
+                )
+            self.publish_status('TRANSFER: returning to final home')
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='RETURNING_HOME',
+                    state='RUNNING',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=95,
+                    message='초기 위치로 복귀 중',
+                )
+            self.command_return_home()
+            self.publish_status(
+                f'TRANSFER: container to {destination_name} completed'
+            )
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='COMPLETED',
+                    state='COMPLETED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    progress=100,
+                    message=(
+                        f'{source_label} 컨테이너를 '
+                        f'{destination_label}에 놓는 작업이 '
+                        '성공했습니다'
+                    ),
+                )
+        except Exception as exc:
+            self.stop_event.set()
+            self._stop_active_motion()
+            self.publish_status(f'TRANSFER FAILED: {exc}')
+            if operation_id is not None:
+                self.publish_transfer_event(
+                    operation_id=operation_id,
+                    operation=event_operation,
+                    phase='FAILED',
+                    state='FAILED',
+                    source_zone=source_scan_zone,
+                    source_id=source_marker_id,
+                    destination_zone=destination_name,
+                    destination_id=destination_marker_id,
+                    message=(
+                        f'{source_label} 컨테이너를 '
+                        f'{destination_label}에 놓는 작업이 '
+                        '실패했습니다'
+                    ),
+                    error=str(exc),
+                )
+            self._recover_home_after_failure('TRANSFER')
+        finally:
+            self.tracking_suspended.clear()
+            self.motion_lock.release()
+
+    def raise_to_common_clearance_before_j1(self, release):
+        """Reach the source/destination common safe Z before rotating J1."""
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_z = float(current.transform.translation.z)
+        destination_z = (
+            float(release.pose.position.z)
+            + self.stack_approach_clearance
+        )
+        common_z = max(current_z, destination_z)
+        if current_z >= common_z - 0.003:
+            return
+        vertical = copy.deepcopy(release)
+        vertical.pose.position.x = float(current.transform.translation.x)
+        vertical.pose.position.y = float(current.transform.translation.y)
+        vertical.pose.position.z = common_z
+        vertical.pose.orientation = copy.deepcopy(
+            current.transform.rotation
+        )
+        self.publish_status(
+            'TRANSFER: raising to common destination clearance before J1: '
+            f'extra={(common_z - current_z) * 1000.0:.1f}mm'
+        )
+        try:
+            self.move_segmented_cartesian_with_pose_finish(
+                vertical, 'TRANSFER pre-J1 clearance rise'
+            )
+            return
+        except CartesianPlanningError as initial_error:
+            if initial_error.executed_segments > 0:
+                raise
+            initial_failure = str(initial_error)
+
+        current_rpy = quaternion_to_rpy_degrees([
+            current.transform.rotation.x,
+            current.transform.rotation.y,
+            current.transform.rotation.z,
+            current.transform.rotation.w,
+        ])
+        failures = [f'fixed orientation: {initial_failure}']
+        for roll_adjustment, pitch_adjustment in (
+            (0.0, 5.0), (0.0, -5.0),
+            (5.0, 0.0), (-5.0, 0.0),
+            (0.0, 10.0), (0.0, -10.0),
+            (10.0, 0.0), (-10.0, 0.0),
+            (5.0, 5.0), (5.0, -5.0),
+            (-5.0, 5.0), (-5.0, -5.0),
+        ):
+            candidate = copy.deepcopy(vertical)
+            rotation = quaternion_from_rpy_degrees(
+                current_rpy[0] + roll_adjustment,
+                current_rpy[1] + pitch_adjustment,
+                current_rpy[2],
+            )
+            (
+                candidate.pose.orientation.x,
+                candidate.pose.orientation.y,
+                candidate.pose.orientation.z,
+                candidate.pose.orientation.w,
+            ) = map(float, rotation)
+            self.publish_status(
+                'TRANSFER: retrying clearance rise with bounded tilt: '
+                f'roll={roll_adjustment:+.0f}deg, '
+                f'pitch={pitch_adjustment:+.0f}deg'
+            )
+            try:
+                self.move_segmented_cartesian_with_pose_finish(
+                    candidate, 'TRANSFER bounded-tilt clearance rise'
+                )
+                return
+            except CartesianPlanningError as exc:
+                if exc.executed_segments > 0:
                     raise
-                failures.append(f'{clearance:.3f}m: {exc}')
+                failures.append(
+                    f'roll {roll_adjustment:+.0f}/'
+                    f'pitch {pitch_adjustment:+.0f}: {exc}'
+                )
+        if self.try_opposite_ik_branch(
+            release, 'TRANSFER pre-J1 clearance rise'
+        ):
+            return self.raise_to_common_clearance_before_j1(release)
         raise RuntimeError(
-            'No reachable stack approach; move ID 1 closer to the robot: '
+            'No safe pre-J1 clearance rise within 10deg tilt: '
             + '; '.join(failures)
         )
+
+    def move_to_destination_radius_at_clearance(self, release):
+        """Match destination XY at safe Z without rotating the wrist."""
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        destination_z = (
+            float(release.pose.position.z)
+            + self.stack_approach_clearance
+        )
+        transit_z = max(
+            float(current.transform.translation.z), destination_z
+        )
+        orientation = copy.deepcopy(current.transform.rotation)
+
+        if float(current.transform.translation.z) < transit_z - 0.003:
+            vertical = copy.deepcopy(release)
+            vertical.pose.position.x = float(
+                current.transform.translation.x
+            )
+            vertical.pose.position.y = float(
+                current.transform.translation.y
+            )
+            vertical.pose.position.z = transit_z
+            vertical.pose.orientation = copy.deepcopy(orientation)
+            self.publish_status(
+                'TRANSFER: restoring configured clearance after J1: '
+                f'{self.stack_approach_clearance * 1000.0:.0f}mm'
+            )
+            self.move_segmented_cartesian_with_pose_finish(
+                vertical, 'TRANSFER clearance rise'
+            )
+
+        radial = copy.deepcopy(release)
+        radial.pose.position.z = transit_z
+        radial.pose.orientation = copy.deepcopy(orientation)
+        radial_translation = np.array([
+            radial.pose.position.x,
+            radial.pose.position.y,
+            radial.pose.position.z,
+        ])
+        if not self.in_workspace(radial_translation):
+            raise RuntimeError(
+                'destination radial waypoint outside workspace: '
+                f'{np.round(radial_translation, 4).tolist()}'
+            )
+        self.publish_status(
+            'TRANSFER: matching destination XY radius at safe height '
+            'while holding wrist orientation'
+        )
+        current_rpy = quaternion_to_rpy_degrees([
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w,
+        ])
+        radial_failures = []
+        radial_aligned = False
+        yaw_candidates = (
+            0.0, 5.0, -5.0, 10.0, -10.0, 15.0, -15.0,
+            30.0, -30.0, 45.0, -45.0, 90.0, -90.0, 180.0,
+        )
+        orientation_candidates = [
+            (yaw, 0.0, 0.0) for yaw in yaw_candidates
+        ]
+        orientation_candidates.extend(
+            (yaw, roll, pitch)
+            for yaw in (0.0, 45.0, 90.0)
+            for roll, pitch in (
+                (0.0, -5.0), (0.0, 5.0),
+                (0.0, -10.0), (0.0, 10.0),
+                (-5.0, 0.0), (5.0, 0.0),
+            )
+        )
+        for yaw_adjustment, roll_adjustment, pitch_adjustment in (
+            orientation_candidates
+        ):
+            candidate = copy.deepcopy(radial)
+            candidate_rotation = quaternion_from_rpy_degrees(
+                current_rpy[0] + roll_adjustment,
+                current_rpy[1] + pitch_adjustment,
+                wrap_degrees(current_rpy[2] + yaw_adjustment),
+            )
+            (
+                candidate.pose.orientation.x,
+                candidate.pose.orientation.y,
+                candidate.pose.orientation.z,
+                candidate.pose.orientation.w,
+            ) = map(float, candidate_rotation)
+            try:
+                # This is a loaded horizontal transit. Never enter a partial
+                # XY move that can strand the arm between destination zones.
+                self.move_cartesian_to_pose(
+                    candidate,
+                    allow_segmented=False,
+                )
+                radial = candidate
+                radial_aligned = True
+                self.publish_status(
+                    'TRANSFER: destination radius matched with wrist '
+                    f'yaw={yaw_adjustment:+.0f}deg, '
+                    f'roll={roll_adjustment:+.0f}deg, '
+                    f'pitch={pitch_adjustment:+.0f}deg'
+                )
+                break
+            except CartesianPlanningError as exc:
+                if exc.executed_segments > 0:
+                    raise
+                radial_failures.append(
+                    f'yaw {yaw_adjustment:+.0f}/'
+                    f'roll {roll_adjustment:+.0f}/'
+                    f'pitch {pitch_adjustment:+.0f}deg: {exc}'
+                )
+        if not radial_aligned:
+            if self.try_opposite_ik_branch(
+                release, 'TRANSFER radial alignment'
+            ):
+                return self.move_to_destination_radius_at_clearance(
+                    release
+                )
+            raise RuntimeError(
+                'No Cartesian radial path at safe height with bounded wrist '
+                'yaw changes: ' + '; '.join(radial_failures)
+            )
+
+        return radial
+
+    def move_to_reachable_stack_approach(
+        self,
+        release,
+        orientation,
+        excluded_yaw_offsets=None,
+        alignment_pose=None,
+        descent_orientation=None,
+    ):
+        """Find a reachable clearance and yaw without changing target XYZ."""
+        failures = []
+        excluded_yaw_offsets = set(excluded_yaw_offsets or ())
+        base_rpy = quaternion_to_rpy_degrees([
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w,
+        ])
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_yaw = quaternion_to_rpy_degrees([
+            current.transform.rotation.x,
+            current.transform.rotation.y,
+            current.transform.rotation.z,
+            current.transform.rotation.w,
+        ])[2]
+        yaw_offsets = sorted(
+            self.stack_yaw_fallback_offsets,
+            key=lambda offset: abs(wrap_degrees(
+                base_rpy[2] + offset - current_yaw
+            )),
+        )
+        # Placement is tied to destination ID 4, so its proven approach is
+        # reusable after any source has been lifted and radially aligned.
+        # Picking, in contrast, is additionally keyed by the source zone.
+        proven_6_to_4 = self.active_id_transfer_pair == (6, 4)
+        if proven_6_to_4 and 180.0 in yaw_offsets:
+            yaw_offsets.remove(180.0)
+            yaw_offsets.insert(0, 180.0)
+        self.publish_status(
+            'STACK: yaw candidates ordered for minimum wrist rotation: '
+            + ', '.join(f'{offset:+.0f}deg' for offset in yaw_offsets)
+        )
+        if alignment_pose is None:
+            approach_candidates = [
+                (
+                    clearance,
+                    None,
+                )
+                for clearance in lift_distance_candidates(
+                    self.stack_approach_clearance,
+                    self.stack_minimum_approach_clearance,
+                    self.stack_approach_search_step,
+                )
+            ]
+        else:
+            clearance = (
+                float(alignment_pose.pose.position.z)
+                - float(release.pose.position.z)
+            )
+            approach_candidates = [(clearance, alignment_pose)]
+        if proven_6_to_4:
+            # This exact route repeatedly failed every vertical approach and
+            # succeeded with the short -X oblique profile.  Go directly to
+            # that fully preflighted search; normal routes retain the broad
+            # vertical-first search.
+            approach_candidates = []
+            self.publish_status(
+                'STACK: prioritizing proven ID 6 -> 4 short oblique profile'
+            )
+        for clearance, fixed_approach in approach_candidates:
+            for yaw_offset in yaw_offsets:
+                if yaw_offset in excluded_yaw_offsets:
+                    continue
+                candidate_rotation = quaternion_from_rpy_degrees(
+                    base_rpy[0],
+                    base_rpy[1],
+                    wrap_degrees(base_rpy[2] + yaw_offset),
+                )
+                approach = copy.deepcopy(
+                    release if fixed_approach is None else fixed_approach
+                )
+                if fixed_approach is None:
+                    approach.pose.position.z += clearance
+                (
+                    approach.pose.orientation.x,
+                    approach.pose.orientation.y,
+                    approach.pose.orientation.z,
+                    approach.pose.orientation.w,
+                ) = map(float, candidate_rotation)
+                translation = np.array([
+                    approach.pose.position.x,
+                    approach.pose.position.y,
+                    approach.pose.position.z,
+                ])
+                if not self.in_workspace(translation):
+                    failures.append(
+                        f'yaw {yaw_offset:+.0f}deg/{clearance:.3f}m: '
+                        'outside workspace'
+                    )
+                    continue
+                self.publish_status(
+                    'STACK: trying approach '
+                    f'yaw offset {yaw_offset:+.0f} deg, '
+                    f'clearance {clearance * 100.0:.1f} cm '
+                    'with prioritized J2/J3 branches'
+                )
+                try:
+                    if self.motion_backend == 'moveit':
+                        exact_approach = copy.deepcopy(approach)
+                        exact_approach.pose.orientation = copy.deepcopy(
+                            descent_orientation or approach.pose.orientation
+                        )
+                        solution, exact_approach = (
+                            self._preflight_stack_approach_and_descent(
+                                approach,
+                                exact_approach,
+                                release,
+                                'STACK approach',
+                            )
+                        )
+                        self._execute_planned_joint_goal(solution)
+                        approach = exact_approach
+                    elif self.prefer_z_last_motion:
+                        self.move_to_pose_z_last(approach)
+                    else:
+                        self.move_to_pose(approach)
+                    release.pose.orientation = copy.deepcopy(
+                        approach.pose.orientation
+                    )
+                    self.stack_approach_pose_publisher.publish(approach)
+                    self.publish_status(
+                        'STACK: selected approach '
+                        f'yaw offset {yaw_offset:+.0f} deg, '
+                        f'clearance {clearance * 100.0:.1f} cm'
+                    )
+                    return approach, yaw_offset
+                except RuntimeError as exc:
+                    error = str(exc)
+                    retryable = (
+                        'code=99999' in error
+                        or 'code=-4' in error
+                        or 'IK branch passed plan-only validation' in error
+                        or 'passed descent preflight' in error
+                    )
+                    if not retryable:
+                        raise
+                    if 'code=-4' in error:
+                        self.publish_status(
+                            'STACK: controller rejected this yaw branch; '
+                            'trying the next yaw candidate'
+                        )
+                    failures.append(
+                        f'yaw {yaw_offset:+.0f}deg/{clearance:.3f}m: {error}'
+                    )
+        if self.motion_backend == 'moveit':
+            # A destination may be reachable while a purely vertical release
+            # crosses an IK discontinuity.  Keep the exact release XYZ and
+            # test a short, shallow final approach from four lateral sides.
+            # The full diagonal is collision/joint-jump checked before the
+            # loaded arm moves to the candidate.
+            for yaw_offset in yaw_offsets:
+                if yaw_offset in excluded_yaw_offsets:
+                    continue
+                candidate_rotation = quaternion_from_rpy_degrees(
+                    base_rpy[0],
+                    base_rpy[1],
+                    wrap_degrees(base_rpy[2] + yaw_offset),
+                )
+                oblique_offsets = [
+                    (0.010, 0.0),
+                    (-0.010, 0.0),
+                    (0.0, 0.010),
+                    (0.0, -0.010),
+                ]
+                if proven_6_to_4:
+                    oblique_offsets.remove((-0.010, 0.0))
+                    oblique_offsets.insert(0, (-0.010, 0.0))
+                for dx, dy in oblique_offsets:
+                    approach = copy.deepcopy(release)
+                    approach.pose.position.x += dx
+                    approach.pose.position.y += dy
+                    approach.pose.position.z += 0.025
+                    (
+                        approach.pose.orientation.x,
+                        approach.pose.orientation.y,
+                        approach.pose.orientation.z,
+                        approach.pose.orientation.w,
+                    ) = map(float, candidate_rotation)
+                    translation = np.array([
+                        approach.pose.position.x,
+                        approach.pose.position.y,
+                        approach.pose.position.z,
+                    ])
+                    if not self.in_workspace(translation):
+                        failures.append(
+                            f'oblique yaw {yaw_offset:+.0f}deg '
+                            f'dx={dx * 1000.0:+.0f}mm '
+                            f'dy={dy * 1000.0:+.0f}mm: outside workspace'
+                        )
+                        continue
+                    self.publish_status(
+                        'STACK: testing short oblique release approach '
+                        f'yaw={yaw_offset:+.0f}deg, '
+                        f'dx={dx * 1000.0:+.0f}mm, '
+                        f'dy={dy * 1000.0:+.0f}mm, dz=+25mm'
+                    )
+                    exact_approach = copy.deepcopy(approach)
+                    exact_approach.pose.orientation = copy.deepcopy(
+                        descent_orientation or approach.pose.orientation
+                    )
+                    try:
+                        solution, exact_approach = (
+                            self._preflight_stack_approach_and_descent(
+                                approach,
+                                exact_approach,
+                                release,
+                                'STACK short oblique approach',
+                            )
+                        )
+                        self._execute_planned_joint_goal(solution)
+                        release.pose.orientation = copy.deepcopy(
+                            exact_approach.pose.orientation
+                        )
+                        self.stack_approach_pose_publisher.publish(
+                            exact_approach
+                        )
+                        self.publish_status(
+                            'STACK: selected preflight-safe short oblique '
+                            f'approach yaw={yaw_offset:+.0f}deg, '
+                            f'dx={dx * 1000.0:+.0f}mm, '
+                            f'dy={dy * 1000.0:+.0f}mm'
+                        )
+                        return exact_approach, yaw_offset
+                    except RuntimeError as exc:
+                        if self.stop_event.is_set():
+                            raise
+                        failures.append(
+                            f'oblique yaw {yaw_offset:+.0f}deg '
+                            f'dx={dx * 1000.0:+.0f}mm '
+                            f'dy={dy * 1000.0:+.0f}mm: {exc}'
+                        )
+        raise RuntimeError(
+            'No reachable vertical or short oblique stack approach: '
+            + '; '.join(failures)
+        )
+
+    def _request_pose_ik(self, target, seed):
+        """Return one collision-free IK solution seeded by six joints."""
+        return self._request_seeded_pose_ik(target, seed, self.ik_timeout)
+
+    def _request_motion_pose_ik(self, target, seed):
+        """Return collision-free IK using the full motion timeout."""
+        return self._request_seeded_pose_ik(
+            target, seed, self.motion_ik_timeout
+        )
+
+    def _request_seeded_pose_ik(self, target, seed, timeout):
+        """Return one collision-free IK solution from an explicit seed."""
+        request = GetPositionIK.Request()
+        ik_request = request.ik_request
+        ik_request.group_name = self.moveit_group
+        ik_request.ik_link_name = self.moveit_ee_link
+        ik_request.avoid_collisions = True
+        ik_request.timeout = duration_message(timeout)
+        ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+        ik_request.robot_state.joint_state.position = [
+            float(value) for value in seed
+        ]
+        ik_request.pose_stamped = copy.deepcopy(target)
+        ik_request.pose_stamped.header.frame_id = self.base_frame
+        ik_request.pose_stamped.header.stamp = Time().to_msg()
+        future = self.position_ik_client.call_async(request)
+        self._wait_future(future, 5.0)
+        response = future.result()
+        if (
+            response is None
+            or response.error_code.val != MoveItErrorCodes.SUCCESS
+        ):
+            return None
+        solution_map = dict(zip(
+            response.solution.joint_state.name,
+            response.solution.joint_state.position,
+        ))
+        if any(name not in solution_map for name in JOINT_NAMES):
+            return None
+        return np.array(
+            [solution_map[name] for name in JOINT_NAMES],
+            dtype=np.float64,
+        )
+
+    def _preflight_vertical_descent(self, start_joints, release):
+        """Validate descent across expected physical joint tracking error."""
+        test_states = [('nominal', np.array(start_joints, dtype=np.float64))]
+        margin = self.stack_preflight_joint_margin
+        if margin > 0.0:
+            # Vertical placement reachability is dominated by the shoulder
+            # and elbow tracking error.  Other joints retain the controller's
+            # normal goal tolerance and must not reject an otherwise valid
+            # descent merely because the hardware cannot settle to sub-degree
+            # accuracy on every axis.
+            for joint_index in (1, 2):
+                for sign in (-1.0, 1.0):
+                    perturbed = np.array(start_joints, dtype=np.float64)
+                    perturbed[joint_index] += sign * margin
+                    lower, upper = JOINT_LIMITS_DEG[joint_index]
+                    perturbed[joint_index] = min(
+                        max(perturbed[joint_index], math.radians(lower)),
+                        math.radians(upper),
+                    )
+                    test_states.append((
+                        f'J{joint_index + 1}{sign:+.0f}', perturbed
+                    ))
+
+        minimum_fraction = 1.0
+        minimum_label = 'nominal'
+        for state_label, state in test_states:
+            request = GetCartesianPath.Request()
+            request.header = copy.deepcopy(release.header)
+            request.header.frame_id = self.base_frame
+            request.header.stamp = Time().to_msg()
+            request.start_state.is_diff = True
+            request.start_state.joint_state.name = list(JOINT_NAMES)
+            request.start_state.joint_state.position = [
+                float(value) for value in state
+            ]
+            request.group_name = self.moveit_group
+            request.link_name = self.moveit_ee_link
+            request.waypoints = [copy.deepcopy(release.pose)]
+            request.max_step = self.cartesian_max_step
+            request.jump_threshold = 0.0
+            request.prismatic_jump_threshold = 0.0
+            request.revolute_jump_threshold = self.cartesian_joint_jump
+            request.avoid_collisions = True
+            request.max_velocity_scaling_factor = self.moveit_velocity_scale
+            request.max_acceleration_scaling_factor = (
+                self.moveit_acceleration_scale
+            )
+            request.cartesian_speed_limited_link = self.moveit_ee_link
+            request.max_cartesian_speed = self.cartesian_max_speed
+            response = self._compute_cartesian_path(request)
+            if (
+                response is None
+                or response.error_code.val != MoveItErrorCodes.SUCCESS
+            ):
+                return False, f'{state_label}=planner error'
+            if response.fraction < minimum_fraction:
+                minimum_fraction = response.fraction
+                minimum_label = state_label
+            if response.fraction < self.cartesian_min_fraction:
+                return False, (
+                    f'{state_label} margin fraction={response.fraction:.3f}'
+                )
+            if not response.solution.joint_trajectory.points:
+                return False, f'{state_label}=empty Cartesian path'
+            j6_travel = trajectory_joint_travel_degrees(
+                state[5], response.solution, JOINT_NAMES[5]
+            )
+            if j6_travel > self.max_j6_trajectory_travel:
+                return False, (
+                    f'{state_label} J6 path travel={j6_travel:.1f}deg '
+                    f'exceeds {self.max_j6_trajectory_travel:.1f}deg'
+                )
+        return True, (
+            f'robust fraction={minimum_fraction:.3f} at {minimum_label}'
+        )
+
+    def _preflight_stack_approach_and_descent(
+        self,
+        branch_approach,
+        exact_approach,
+        release,
+        context,
+    ):
+        """Select a branch and 180-degree-equivalent release orientation."""
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+        if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(
+                'MoveIt /arm2/compute_cartesian_path service is unavailable'
+            )
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+
+        # For placement, prefer the elbow-out J3-positive families so the
+        # third link stays away from the gripper/container during descent.
+        # Elbow-in J3-negative solutions remain available as fallbacks.
+        branch_patterns = (
+            ('place preferred elbow-out (J2-/J3+)', -1.0, 1.0),
+            ('place elbow-out (J2+/J3+)', 1.0, 1.0),
+            ('place fallback elbow-in (J2-/J3-)', -1.0, -1.0),
+            ('place fallback elbow-in (J2+/J3-)', 1.0, -1.0),
+        )
+        preferred_seed = current_joints.copy()
+        preferred_seed[1:] = self.preferred_place_seed_j2_j6
+        preferred_j2_sign = 1.0 if preferred_seed[1] >= 0.0 else -1.0
+        preferred_j3_sign = 1.0 if preferred_seed[2] >= 0.0 else -1.0
+        branch_seed_groups = [(
+            'last successful J2-J6 priority',
+            preferred_j2_sign,
+            preferred_j3_sign,
+            (preferred_seed,),
+        )]
+        branch_seed_groups.extend(
+            (
+                label,
+                j2_sign,
+                j3_sign,
+                tuple(
+                    self._branch_seed(current_joints, j2_sign, j3_sign, magnitude)
+                    for magnitude in (30.0, 60.0, 90.0)
+                ),
+            )
+            for label, j2_sign, j3_sign in branch_patterns
+        )
+        exact_rpy = quaternion_to_rpy_degrees([
+            exact_approach.pose.orientation.x,
+            exact_approach.pose.orientation.y,
+            exact_approach.pose.orientation.z,
+            exact_approach.pose.orientation.w,
+        ])
+        equivalent_approaches = []
+        for symmetry_offset in (0.0, 180.0):
+            candidate = copy.deepcopy(exact_approach)
+            rotation = quaternion_from_rpy_degrees(
+                exact_rpy[0],
+                exact_rpy[1],
+                wrap_degrees(exact_rpy[2] + symmetry_offset),
+            )
+            (
+                candidate.pose.orientation.x,
+                candidate.pose.orientation.y,
+                candidate.pose.orientation.z,
+                candidate.pose.orientation.w,
+            ) = map(float, rotation)
+            equivalent_approaches.append((symmetry_offset, candidate))
+        failures = []
+        for label, j2_sign, j3_sign, seeds in branch_seed_groups:
+            for seed in seeds:
+                branch_solution = self._request_pose_ik(
+                    branch_approach, seed
+                )
+                if branch_solution is None:
+                    continue
+                j2_deg = math.degrees(float(branch_solution[1]))
+                j3_deg = math.degrees(float(branch_solution[2]))
+                if j2_deg * j2_sign < 5.0 or j3_deg * j3_sign < 5.0:
+                    continue
+                exact_solutions = []
+                for symmetry_offset, candidate in equivalent_approaches:
+                    exact_solution = self._request_pose_ik(
+                        candidate, branch_solution
+                    )
+                    if exact_solution is None:
+                        failures.append(
+                            f'{label}: yaw{symmetry_offset:+.0f} IK failed'
+                        )
+                        continue
+                    j6_travel = abs(math.degrees(float(
+                        exact_solution[5] - current_joints[5]
+                    )))
+                    exact_solutions.append((
+                        j6_travel,
+                        symmetry_offset,
+                        candidate,
+                        exact_solution,
+                    ))
+                exact_solutions.sort(key=lambda item: item[0])
+                for (
+                    j6_travel,
+                    symmetry_offset,
+                    candidate,
+                    exact_solution,
+                ) in exact_solutions:
+                    if j6_travel > 170.0:
+                        failures.append(
+                            f'{label}: yaw{symmetry_offset:+.0f} direct '
+                            f'J6 travel {j6_travel:.1f}deg'
+                        )
+                        continue
+                    try:
+                        self._execute_planned_joint_goal(
+                            exact_solution, plan_only=True
+                        )
+                    except RuntimeError as exc:
+                        failures.append(
+                            f'{label}: yaw{symmetry_offset:+.0f} {exc}'
+                        )
+                        continue
+                    candidate_release = copy.deepcopy(release)
+                    candidate_release.pose.orientation = copy.deepcopy(
+                        candidate.pose.orientation
+                    )
+                    descent_ok, descent_detail = (
+                        self._preflight_vertical_descent(
+                            exact_solution, candidate_release
+                        )
+                    )
+                    if not descent_ok:
+                        failures.append(
+                            f'{label}: yaw{symmetry_offset:+.0f} descent '
+                            f'{descent_detail}'
+                        )
+                        continue
+                    self.publish_status(
+                        f'{context}: preflight passed {label}, '
+                        f'equivalent yaw {symmetry_offset:+.0f}deg: '
+                        f'J2={math.degrees(float(exact_solution[1])):.1f}deg, '
+                        f'J3={math.degrees(float(exact_solution[2])):.1f}deg, '
+                        f'J6 travel={j6_travel:.1f}deg, {descent_detail}'
+                    )
+                    self.preferred_place_seed_j2_j6 = exact_solution[1:].copy()
+                    return exact_solution, candidate
+            failures.append(f'{label}: no complete approach/descent')
+        raise RuntimeError(
+            f'no {context} IK branch passed descent preflight: '
+            + '; '.join(failures)
+        )
+
+    @staticmethod
+    def _branch_seed(current_joints, j2_sign, j3_sign, magnitude):
+        """Build a conventional J2/J3 seed while preserving J1/J4-J6."""
+        seed = current_joints.copy()
+        for joint_index, sign in ((1, j2_sign), (2, j3_sign)):
+            lower, upper = JOINT_LIMITS_DEG[joint_index]
+            seed[joint_index] = math.radians(min(
+                max(sign * magnitude, lower + 1.0), upper - 1.0
+            ))
+        return seed
+
+    def _move_to_pose_with_j2_j3_branch_priority(
+        self,
+        target,
+        context,
+        descent_preflight_target=None,
+    ):
+        """Plan a target pose using explicit J2/J3 branch priority."""
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+
+        # Keep J3 negative first for picking: on this arm that folds the third
+        # link away from the gripper/container.  Exhaust both J2 families in
+        # that separated geometry before considering a J3-positive fallback.
+        # Multiple magnitudes help the numerical IK solver reach the requested
+        # family without weakening the sign check on its returned solution.
+        branch_patterns = (
+            ('preferred separated (J2+/J3-)', 1.0, -1.0),
+            ('separated J2 fallback (J2-/J3-)', -1.0, -1.0),
+            ('close-side fallback (J2+/J3+)', 1.0, 1.0),
+            ('last close-side fallback (J2-/J3+)', -1.0, 1.0),
+        )
+        preferred_seed = current_joints.copy()
+        preferred_seed[1:] = self.preferred_pick_seed_j2_j6
+        preferred_j2_sign = 1.0 if preferred_seed[1] >= 0.0 else -1.0
+        preferred_j3_sign = 1.0 if preferred_seed[2] >= 0.0 else -1.0
+        branch_seed_groups = [(
+            'last successful J2-J6 priority',
+            preferred_j2_sign,
+            preferred_j3_sign,
+            (preferred_seed,),
+        )]
+        branch_seed_groups.extend(
+            (
+                label,
+                j2_sign,
+                j3_sign,
+                tuple(
+                    self._branch_seed(current_joints, j2_sign, j3_sign, magnitude)
+                    for magnitude in (30.0, 60.0, 90.0)
+                ),
+            )
+            for label, j2_sign, j3_sign in branch_patterns
+        )
+        failures = []
+        for label, j2_sign, j3_sign, seeds in branch_seed_groups:
+            for seed in seeds:
+
+                # When validating a pick descent, solve the final grasp first
+                # and use that exact branch as the seed for the pregrasp.  A
+                # pregrasp-first solve can look reachable yet cross an IK
+                # discontinuity immediately after descent begins.
+                if descent_preflight_target is not None:
+                    grasp_solution = self._request_motion_pose_ik(
+                        descent_preflight_target, seed
+                    )
+                    if grasp_solution is None:
+                        continue
+                    grasp_j2_deg = math.degrees(float(grasp_solution[1]))
+                    grasp_j3_deg = math.degrees(float(grasp_solution[2]))
+                    if (
+                        grasp_j2_deg * j2_sign < 5.0
+                        or grasp_j3_deg * j3_sign < 5.0
+                    ):
+                        continue
+                    solution = self._request_motion_pose_ik(
+                        target, grasp_solution
+                    )
+                else:
+                    grasp_solution = None
+                    solution = self._request_motion_pose_ik(target, seed)
+                if solution is None:
+                    continue
+                solution_j2_deg = math.degrees(float(solution[1]))
+                solution_j3_deg = math.degrees(float(solution[2]))
+                if (
+                    solution_j2_deg * j2_sign < 5.0
+                    or solution_j3_deg * j3_sign < 5.0
+                ):
+                    continue
+                if (
+                    abs(solution_j2_deg - self.bad_pick_branch_j2)
+                    <= self.bad_pick_branch_tolerance
+                    and abs(solution_j3_deg - self.bad_pick_branch_j3)
+                    <= self.bad_pick_branch_tolerance
+                ):
+                    failures.append(
+                        f'{label}: rejected known close J3/gripper '
+                        f'pregrasp J2={solution_j2_deg:.1f}deg, '
+                        f'J3={solution_j3_deg:.1f}deg'
+                    )
+                    continue
+                try:
+                    validated_trajectory = self._execute_planned_joint_goal(
+                        solution,
+                        plan_only=True,
+                    )
+                except RuntimeError as exc:
+                    failures.append(f'{label}: {exc}')
+                    continue
+                if descent_preflight_target is not None:
+                    branch_drift = max(
+                        abs(solution_j2_deg - grasp_j2_deg),
+                        abs(solution_j3_deg - grasp_j3_deg),
+                    )
+                    descent_ok, descent_detail = (
+                        self._preflight_vertical_descent(
+                            solution, descent_preflight_target
+                        )
+                    )
+                    if not descent_ok:
+                        failures.append(
+                            f'{label}: descent {descent_detail}'
+                        )
+                        continue
+                    descent_detail = (
+                        f'{descent_detail}, paired branch drift='
+                        f'{branch_drift:.1f}deg'
+                    )
+                else:
+                    descent_detail = None
+                self.publish_status(
+                    f'{context}: selected planned J2/J3 branch '
+                    f'{label}: J2={solution_j2_deg:.1f}deg, '
+                    f'J3={solution_j3_deg:.1f}deg'
+                    + (
+                        f', descent {descent_detail}'
+                        if descent_detail is not None else ''
+                    )
+                )
+                self.preferred_pick_seed_j2_j6 = solution[1:].copy()
+                self.publish_status(
+                    f'{context}: executing the already validated trajectory'
+                )
+                self._execute_cartesian_trajectory(
+                    validated_trajectory,
+                    label='validated joint trajectory',
+                )
+                return
+            failures.append(f'{label}: no valid planned IK solution')
+        raise RuntimeError(
+            f'no {context} IK branch passed plan-only validation: '
+            + '; '.join(failures)
+        )
+
+    def move_to_reachable_stack_release(
+        self,
+        release,
+        orientation,
+        label,
+        alignment_pose=None,
+    ):
+        """Use fallback yaw only for approach, then place at exact yaw."""
+        desired_release_orientation = copy.deepcopy(
+            release.pose.orientation
+        )
+        excluded_yaw_offsets = set()
+        descent_failures = []
+        while len(excluded_yaw_offsets) < len(
+            self.stack_yaw_fallback_offsets
+        ):
+            approach, yaw_offset = self.move_to_reachable_stack_approach(
+                release,
+                orientation,
+                excluded_yaw_offsets=excluded_yaw_offsets,
+                alignment_pose=alignment_pose,
+                descent_orientation=desired_release_orientation,
+            )
+            exact_approach = copy.deepcopy(approach)
+            exact_approach.pose.orientation = copy.deepcopy(
+                release.pose.orientation
+            )
+            self.publish_status(
+                f'{label}: approach yaw {yaw_offset:+.0f} deg selected; '
+                'aligning exact destination yaw before descent'
+            )
+            try:
+                self.move_to_pose(exact_approach)
+            except RuntimeError as exc:
+                descent_failures.append(
+                    f'approach yaw {yaw_offset:+.0f}deg exact-yaw '
+                    f'alignment: {exc}'
+                )
+                excluded_yaw_offsets.add(yaw_offset)
+                self.publish_status(
+                    f'{label}: exact destination yaw is not reachable from '
+                    f'approach yaw {yaw_offset:+.0f} deg; trying next branch'
+                )
+                continue
+            # Keep the 180-degree-equivalent orientation selected by
+            # preflight. Restoring desired_release_orientation here makes the
+            # real descent differ from the validated path and can force J3/J6
+            # onto the opposite IK branch.
+            release.pose.orientation = copy.deepcopy(
+                exact_approach.pose.orientation
+            )
+            approach = exact_approach
+            self.publish_status(
+                f'{label}: testing vertical descent at exact destination yaw'
+            )
+            try:
+                self.move_segmented_cartesian_with_pose_finish(
+                    release,
+                    label,
+                    prefer_j2_branch_fallback=True,
+                )
+                return approach
+            except CartesianPlanningError as exc:
+                if (
+                    exc.executed_segments == 0
+                    and 'ik_only=1.000' in str(exc)
+                    and 'no_joint_jump=' in str(exc)
+                    and self.try_opposite_ik_branch(
+                        release, f'{label} vertical descent'
+                    )
+                ):
+                    self.publish_status(
+                        f'{label}: retrying vertical descent on opposite '
+                        'J2 branch'
+                    )
+                    continue
+                descent_failures.append(
+                    f'yaw {yaw_offset:+.0f}deg: {exc}'
+                )
+                excluded_yaw_offsets.add(yaw_offset)
+                self.publish_status(
+                    f'{label}: vertical descent failed with '
+                    f'yaw offset {yaw_offset:+.0f} deg; '
+                    'retreating and trying the next yaw'
+                )
+                if exc.executed_segments > 0:
+                    self.move_segmented_cartesian_with_pose_finish(
+                        approach, f'{label} retry retreat'
+                    )
+        raise RuntimeError(
+            f'No yaw supports the complete vertical descent for {label}: '
+            + '; '.join(descent_failures)
+        )
+
+    def move_segmented_cartesian_with_pose_finish(
+        self,
+        target,
+        label,
+        prefer_j2_branch_fallback=False,
+    ):
+        """Move in safe Cartesian segments, then finish a short remainder."""
+        try:
+            self.move_cartesian_to_pose(
+                target,
+                allow_segmented=True,
+                prefer_j2_branch_fallback=prefer_j2_branch_fallback,
+            )
+        except CartesianPlanningError as exc:
+            remaining_distance = self._cartesian_request_distance(target)
+            can_finish_with_pose_goal = (
+                exc.executed_segments > 0
+                and remaining_distance is not None
+                and remaining_distance
+                <= self.stack_pose_goal_finish_max_distance
+            )
+            if not can_finish_with_pose_goal:
+                raise
+            self.publish_status(
+                f'{label}: finishing short Cartesian remainder with pose goal: '
+                f'remaining={remaining_distance * 1000.0:.1f}mm'
+            )
+            self.move_to_pose(target)
+
+    def verify_release_pose(self, target, label):
+        """Refuse to release unless the measured TCP reached the target."""
+        try:
+            current = self.buffer.lookup_transform(
+                target.header.frame_id,
+                self.moveit_ee_link,
+                Time(),
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'{label}: current TCP transform unavailable: {exc}'
+            ) from exc
+        dx = float(current.transform.translation.x) - float(
+            target.pose.position.x
+        )
+        dy = float(current.transform.translation.y) - float(
+            target.pose.position.y
+        )
+        dz = abs(
+            float(current.transform.translation.z)
+            - float(target.pose.position.z)
+        )
+        xy_error = math.hypot(dx, dy)
+        actual_yaw = quaternion_to_rpy_degrees([
+            current.transform.rotation.x,
+            current.transform.rotation.y,
+            current.transform.rotation.z,
+            current.transform.rotation.w,
+        ])[2]
+        target_yaw = quaternion_to_rpy_degrees([
+            target.pose.orientation.x,
+            target.pose.orientation.y,
+            target.pose.orientation.z,
+            target.pose.orientation.w,
+        ])[2]
+        yaw_error = abs(wrap_degrees(actual_yaw - target_yaw))
+        self.publish_status(
+            f'{label}: release verification xy={xy_error * 1000.0:.1f}mm, '
+            f'z={dz * 1000.0:.1f}mm, yaw={yaw_error:.1f}deg'
+        )
+        if (
+            xy_error > self.release_verify_xy_tolerance
+            or dz > self.release_verify_z_tolerance
+            or yaw_error > self.release_verify_yaw_tolerance
+        ):
+            raise RuntimeError(
+                f'{label}: release pose outside tolerance: '
+                f'xy={xy_error * 1000.0:.1f}mm '
+                f'(max {self.release_verify_xy_tolerance * 1000.0:.1f}mm), '
+                f'z={dz * 1000.0:.1f}mm '
+                f'(max {self.release_verify_z_tolerance * 1000.0:.1f}mm), '
+                f'yaw={yaw_error:.1f}deg '
+                f'(max {self.release_verify_yaw_tolerance:.1f}deg)'
+            )
 
     def move_with_yaw_fallbacks(self, grasp, pregrasp, initial_error):
         """Retry descent with progressively reduced marker-yaw following."""
@@ -1777,7 +6438,13 @@ class ContainerPickCoordinator(Node):
         finally:
             self.motion_lock.release()
 
-    def move_to_pose(self, pose, keep_current_orientation=False):
+    def move_to_pose(
+        self,
+        pose,
+        keep_current_orientation=False,
+        require_preferred_pick_branch=False,
+        descent_preflight_target=None,
+    ):
         if self.stop_event.is_set():
             raise RuntimeError('pick stopped')
         translation = np.array([
@@ -1788,7 +6455,31 @@ class ContainerPickCoordinator(Node):
         if not self.in_workspace(translation):
             raise RuntimeError(f'motion target outside workspace: {translation}')
         if self.motion_backend == 'moveit':
-            self._move_to_pose_moveit(pose, keep_current_orientation)
+            if require_preferred_pick_branch:
+                target = copy.deepcopy(pose)
+                if keep_current_orientation:
+                    try:
+                        current = self.buffer.lookup_transform(
+                            self.base_frame, self.moveit_ee_link, Time()
+                        )
+                    except TransformException as exc:
+                        raise RuntimeError(
+                            f'current TCP transform unavailable: {exc}'
+                        ) from exc
+                    target.pose.orientation = copy.deepcopy(
+                        current.transform.rotation
+                    )
+                self._move_to_pose_with_j2_j3_branch_priority(
+                    target,
+                    'PICK pregrasp',
+                    descent_preflight_target=descent_preflight_target,
+                )
+                return
+            self._move_to_pose_moveit(
+                pose,
+                keep_current_orientation,
+                False,
+            )
             return
         rpy = quaternion_to_rpy_degrees([
             pose.pose.orientation.x,
@@ -1848,7 +6539,96 @@ class ContainerPickCoordinator(Node):
                     return
         raise RuntimeError('robot motion timed out')
 
-    def _move_to_pose_moveit(self, pose, keep_current_orientation):
+    def move_to_pose_z_last(
+        self,
+        target,
+        keep_current_orientation=False,
+        require_preferred_pick_branch=False,
+        descent_preflight_target=None,
+    ):
+        """Delay only descent; upward targets use the normal direct move."""
+        try:
+            current = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_z = float(current.transform.translation.z)
+        target_z = float(target.pose.position.z)
+        if target_z >= current_z - 0.003:
+            self.move_to_pose(
+                target,
+                keep_current_orientation,
+                require_preferred_pick_branch,
+                descent_preflight_target,
+            )
+            return
+        intermediate = copy.deepcopy(target)
+        intermediate.pose.position.z = current_z
+        if keep_current_orientation:
+            intermediate.pose.orientation = copy.deepcopy(
+                current.transform.rotation
+            )
+        translation = np.array([
+            intermediate.pose.position.x,
+            intermediate.pose.position.y,
+            intermediate.pose.position.z,
+        ])
+        if not self.in_workspace(translation):
+            self.get_logger().warning(
+                'Z-last intermediate is outside workspace; using direct move'
+            )
+            self.move_to_pose(
+                target,
+                keep_current_orientation,
+                require_preferred_pick_branch,
+                descent_preflight_target,
+            )
+            return
+        self.publish_status(
+            'MOTION: moving XY/orientation first at current Z '
+            '(favoring base rotation)'
+        )
+        try:
+            self.move_to_pose(
+                intermediate,
+                keep_current_orientation=keep_current_orientation,
+                require_preferred_pick_branch=(
+                    require_preferred_pick_branch
+                ),
+                descent_preflight_target=descent_preflight_target,
+            )
+        except RuntimeError as exc:
+            if self.stop_event.is_set():
+                raise
+            self.get_logger().warning(
+                f'Z-last intermediate failed; using direct move: {exc}'
+            )
+            self.move_to_pose(
+                target,
+                keep_current_orientation,
+                require_preferred_pick_branch,
+                descent_preflight_target,
+            )
+            return
+        descent = copy.deepcopy(target)
+        if keep_current_orientation:
+            descent.pose.orientation = copy.deepcopy(
+                intermediate.pose.orientation
+            )
+        self.publish_status('MOTION: descending Z last at target XY')
+        self.move_segmented_cartesian_with_pose_finish(
+            descent, 'MOTION Z-last descent'
+        )
+
+    def _move_to_pose_moveit(
+        self,
+        pose,
+        keep_current_orientation,
+        require_preferred_pick_branch=False,
+    ):
         target = copy.deepcopy(pose)
         if keep_current_orientation:
             try:
@@ -1861,7 +6641,10 @@ class ContainerPickCoordinator(Node):
                 ) from exc
             target.pose.orientation = current.transform.rotation
             try:
-                self._execute_moveit_pose_goal(target)
+                self._execute_moveit_pose_goal(
+                    target,
+                    require_preferred_pick_branch,
+                )
                 return
             except RuntimeError as exc:
                 if self.stop_event.is_set():
@@ -1870,9 +6653,16 @@ class ContainerPickCoordinator(Node):
                     'MoveIt failed with current TCP orientation; retrying '
                     f'the taught grasp orientation: {exc}'
                 )
-        self._execute_moveit_pose_goal(pose)
+        self._execute_moveit_pose_goal(
+            pose,
+            require_preferred_pick_branch,
+        )
 
-    def _execute_moveit_pose_goal(self, target):
+    def _execute_moveit_pose_goal(
+        self,
+        target,
+        require_preferred_pick_branch=False,
+    ):
         if not self.move_group_client.wait_for_server(timeout_sec=5.0):
             raise RuntimeError('MoveIt /arm2/move_action server is unavailable')
 
@@ -1909,7 +6699,10 @@ class ContainerPickCoordinator(Node):
         request.workspace_parameters.max_corner.z = float(
             self.workspace_max[2]
         )
-        request.goal_constraints = [self._moveit_pose_constraints(target)]
+        request.goal_constraints = [self._moveit_pose_constraints(
+            target,
+            require_preferred_pick_branch,
+        )]
 
         goal.planning_options.plan_only = False
         goal.planning_options.look_around = False
@@ -1969,7 +6762,677 @@ class ContainerPickCoordinator(Node):
         except Exception:
             pass
 
-    def _moveit_pose_constraints(self, pose):
+    def _joint_state_callback(self, message):
+        """Cache a complete, name-ordered arm joint state."""
+        positions = dict(zip(message.name, message.position))
+        if any(name not in positions for name in JOINT_NAMES):
+            return
+        with self.joint_state_lock:
+            self.latest_joint_positions = np.array(
+                [positions[name] for name in JOINT_NAMES],
+                dtype=np.float64,
+            )
+            self.latest_joint_state_time = time.monotonic()
+
+    def move_joint1_toward_destination(
+        self,
+        source_pose,
+        destination_pose,
+        destination_name=None,
+    ):
+        """Rotate J1 first so the lifted arm faces its destination zone."""
+        if self.motion_backend != 'moveit':
+            raise RuntimeError('J1-priority transfer requires MoveIt')
+        source_bearing = math.atan2(
+            source_pose.pose.position.y,
+            source_pose.pose.position.x,
+        )
+        destination_bearing = math.atan2(
+            destination_pose.pose.position.y,
+            destination_pose.pose.position.x,
+        )
+        bearing_delta = math.atan2(
+            math.sin(destination_bearing - source_bearing),
+            math.cos(destination_bearing - source_bearing),
+        )
+        with self.joint_state_lock:
+            positions = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            positions is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+
+        destination_zone = None
+        if destination_name:
+            parts = str(destination_name).split('-')
+            if len(parts) >= 2 and parts[0] == 'A':
+                destination_zone = f'A-{parts[1]}'
+        if destination_zone in self.destination_zone_j1:
+            target_j1 = self.destination_zone_j1[destination_zone]
+            heading_description = (
+                f'zone={destination_zone}, '
+                f'target={math.degrees(target_j1):.1f}deg'
+            )
+        else:
+            target_j1 = float(positions[0] + bearing_delta)
+            heading_description = (
+                f'bearing delta={math.degrees(bearing_delta):.1f}deg'
+            )
+        lower = math.radians(JOINT_LIMITS_DEG[0][0])
+        upper = math.radians(JOINT_LIMITS_DEG[0][1])
+        candidates = [
+            target_j1 - 2.0 * math.pi,
+            target_j1,
+            target_j1 + 2.0 * math.pi,
+        ]
+        valid = [value for value in candidates if lower <= value <= upper]
+        if not valid:
+            raise RuntimeError(
+                'J1 destination bearing is outside joint limits: '
+                f'{math.degrees(target_j1):.1f}deg'
+            )
+        positions[0] = min(
+            valid,
+            key=lambda value: abs(value - positions[0]),
+        )
+        self.publish_status(
+            'TRANSFER: facing destination before place IK while holding '
+            f'J2-J6: {heading_description}'
+        )
+        self._execute_moveit_joint_goal(positions)
+
+    def move_joint1_toward_source(
+        self, source_pose, scan_zone=None, source_bearing_xy=None
+    ):
+        """Face the exact source marker while preserving J2-J6."""
+        if self.motion_backend != 'moveit':
+            raise RuntimeError('J1-priority pick requires MoveIt')
+        if source_bearing_xy is None:
+            source_x = float(source_pose.pose.position.x)
+            source_y = float(source_pose.pose.position.y)
+        else:
+            source_xy = np.asarray(source_bearing_xy, dtype=np.float64)
+            if source_xy.shape != (2,) or not np.all(np.isfinite(source_xy)):
+                raise RuntimeError('source marker bearing XY is invalid')
+            source_x, source_y = map(float, source_xy)
+        target_j1 = math.atan2(source_y, source_x)
+        target_description = (
+            f'source marker bearing in {scan_zone or "unknown zone"}: '
+            f'x={source_x:.4f}m, y={source_y:.4f}m'
+        )
+        with self.joint_state_lock:
+            positions = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            positions is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+
+        lower = math.radians(JOINT_LIMITS_DEG[0][0])
+        upper = math.radians(JOINT_LIMITS_DEG[0][1])
+        candidates = (
+            target_j1 - 2.0 * math.pi,
+            target_j1,
+            target_j1 + 2.0 * math.pi,
+        )
+        valid = [value for value in candidates if lower <= value <= upper]
+        if not valid:
+            raise RuntimeError(
+                'J1 source bearing is outside joint limits: '
+                f'{math.degrees(target_j1):.1f}deg'
+            )
+        current_j1 = float(positions[0])
+        positions[0] = min(valid, key=lambda value: abs(value - current_j1))
+        self.publish_status(
+            'TRANSFER: facing exact source marker before pick IK with '
+            'J2-J6 fixed: '
+            f'{target_description}, '
+            f'current={math.degrees(current_j1):.1f}deg, '
+            f'target={math.degrees(float(positions[0])):.1f}deg'
+        )
+        self._execute_moveit_joint_goal(positions)
+        self.publish_status(
+            'TRANSFER: exact-source J1 alignment completed; '
+            'starting pick IK from the updated joint state'
+        )
+
+    def _execute_moveit_joint_goal(self, positions):
+        """Execute a trajectory whose J2-J6 positions remain constant."""
+        if not self.follow_joint_trajectory_client.wait_for_server(
+            timeout_sec=5.0
+        ):
+            raise RuntimeError('arm trajectory controller is unavailable')
+        with self.joint_state_lock:
+            start = self.latest_joint_positions.copy()
+        delta = abs(float(positions[0] - start[0]))
+        duration_sec = max(1.0, math.degrees(delta) / 20.0)
+        start_point = JointTrajectoryPoint()
+        start_point.positions = [float(value) for value in start]
+        start_point.time_from_start = Duration(sec=0, nanosec=100000000)
+        target_point = JointTrajectoryPoint()
+        target_point.positions = [float(value) for value in positions]
+        whole_seconds = int(duration_sec)
+        target_point.time_from_start = Duration(
+            sec=whole_seconds,
+            nanosec=int((duration_sec - whole_seconds) * 1e9),
+        )
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(JOINT_NAMES)
+        goal.trajectory.points = [start_point, target_point]
+
+        goal_future = self.follow_joint_trajectory_client.send_goal_async(goal)
+        self._wait_future(goal_future, 5.0)
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError('controller rejected the J1-only trajectory')
+        with self.moveit_goal_lock:
+            self.current_moveit_goal = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            self._wait_future(
+                result_future,
+                duration_sec + self.motion_timeout + 10.0,
+                goal_handle,
+            )
+            wrapped_result = result_future.result()
+            if wrapped_result is None:
+                raise RuntimeError('controller returned no J1 result')
+            result = wrapped_result.result
+            if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+                raise RuntimeError(
+                    'J1-only trajectory failed: '
+                    f'code={result.error_code}, '
+                    f'message={result.error_string}'
+                )
+            if self.stop_event.wait(self.moveit_state_settle):
+                raise RuntimeError('pick stopped')
+        finally:
+            with self.moveit_goal_lock:
+                self.current_moveit_goal = None
+
+    def _try_opposite_j2_j3_branch(self, context):
+        """Keep TCP pose while reversing J3 and moving J2 across/near zero."""
+        try:
+            current_pose = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_tcp_z = float(current_pose.transform.translation.z)
+        minimum_height = max(
+            self.j2_fallback_min_tcp_height,
+            self.j3_fallback_min_tcp_height,
+        )
+        if current_tcp_z < minimum_height:
+            self.publish_status(
+                f'{context}: opposite J2+J3 fallback blocked; TCP Z '
+                f'{current_tcp_z * 1000.0:.1f}mm is below '
+                f'{minimum_height * 1000.0:.1f}mm'
+            )
+            return False
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+
+        current_j2_deg = math.degrees(float(current_joints[1]))
+        current_j3_deg = math.degrees(float(current_joints[2]))
+        seed = current_joints.copy()
+        seed[1] = math.radians(
+            -max(30.0, abs(current_j2_deg))
+            if current_j2_deg >= 0.0
+            else max(30.0, abs(current_j2_deg))
+        )
+        seed[2] = math.radians(
+            -max(30.0, abs(current_j3_deg))
+            if current_j3_deg >= 0.0
+            else max(30.0, abs(current_j3_deg))
+        )
+        request = GetPositionIK.Request()
+        ik_request = request.ik_request
+        ik_request.group_name = self.moveit_group
+        ik_request.ik_link_name = self.moveit_ee_link
+        ik_request.avoid_collisions = True
+        ik_request.timeout = duration_message(self.motion_ik_timeout)
+        ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+        ik_request.robot_state.joint_state.position = [
+            float(value) for value in seed
+        ]
+        ik_request.pose_stamped.header.frame_id = self.base_frame
+        ik_request.pose_stamped.header.stamp = Time().to_msg()
+        ik_request.pose_stamped.pose.position.x = float(
+            current_pose.transform.translation.x
+        )
+        ik_request.pose_stamped.pose.position.y = float(
+            current_pose.transform.translation.y
+        )
+        ik_request.pose_stamped.pose.position.z = float(
+            current_pose.transform.translation.z
+        )
+        ik_request.pose_stamped.pose.orientation = copy.deepcopy(
+            current_pose.transform.rotation
+        )
+        future = self.position_ik_client.call_async(request)
+        self._wait_future(future, 5.0)
+        response = future.result()
+        self.j2_fallback_used = True
+        self.j3_fallback_used = True
+        if (
+            response is None
+            or response.error_code.val != MoveItErrorCodes.SUCCESS
+        ):
+            self.publish_status(
+                f'{context}: no opposite J2+J3 IK solution found'
+            )
+            return False
+        solution_map = dict(zip(
+            response.solution.joint_state.name,
+            response.solution.joint_state.position,
+        ))
+        if any(name not in solution_map for name in JOINT_NAMES):
+            raise RuntimeError(
+                'opposite J2+J3 IK returned incomplete joints'
+            )
+        solution = np.array(
+            [solution_map[name] for name in JOINT_NAMES],
+            dtype=np.float64,
+        )
+        solution_j2_deg = math.degrees(float(solution[1]))
+        solution_j3_deg = math.degrees(float(solution[2]))
+        j3_opposite = (
+            abs(current_j3_deg) >= 5.0
+            and abs(solution_j3_deg) >= 5.0
+            and current_j3_deg * solution_j3_deg < 0.0
+        )
+        j2_opposite_or_neutral = (
+            abs(current_j2_deg) >= 5.0
+            and (
+                abs(solution_j2_deg) < 5.0
+                or current_j2_deg * solution_j2_deg < 0.0
+            )
+        )
+        if not (j3_opposite and j2_opposite_or_neutral):
+            self.publish_status(
+                f'{context}: IK did not reverse J3 with opposite/neutral J2: '
+                f'J2 {current_j2_deg:.1f}->{solution_j2_deg:.1f}deg, '
+                f'J3 {current_j3_deg:.1f}->{solution_j3_deg:.1f}deg'
+            )
+            return False
+        j2_result = (
+            'neutral' if abs(solution_j2_deg) < 5.0 else 'opposite'
+        )
+        self.publish_status(
+            f'{context}: switching J3 with {j2_result} J2 at safe height: '
+            f'J2 {current_j2_deg:.1f}->{solution_j2_deg:.1f}deg, '
+            f'J3 {current_j3_deg:.1f}->{solution_j3_deg:.1f}deg'
+        )
+        self._execute_planned_joint_goal(solution)
+        return True
+
+    def try_opposite_ik_branch(self, release, context):
+        """Try unused opposite-sign J3, then J2 IK branches."""
+        if self.motion_backend != 'moveit':
+            return False
+        if not self.j3_fallback_used and self._try_opposite_joint_branch(
+            2,
+            'J3',
+            'j3_fallback_used',
+            self.j3_fallback_min_tcp_height,
+            context,
+        ):
+            return True
+        if not self.j2_fallback_used and self._try_opposite_joint_branch(
+            1,
+            'J2',
+            'j2_fallback_used',
+            self.j2_fallback_min_tcp_height,
+            context,
+        ):
+            return True
+        return self._try_multi_seed_ik_branch(context)
+
+    def _try_multi_seed_ik_branch(self, context):
+        """Try additional J3-priority seeds without persistent storage."""
+        seed_patterns = (
+            (2, 20.0), (2, -20.0),
+            (2, 40.0), (2, -40.0),
+            (2, 60.0), (2, -60.0),
+            (1, 20.0), (1, -20.0),
+            (1, 40.0), (1, -40.0),
+        )
+        try:
+            current_pose = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_tcp_z = float(current_pose.transform.translation.z)
+        minimum_height = max(
+            self.j2_fallback_min_tcp_height,
+            self.j3_fallback_min_tcp_height,
+        )
+        if current_tcp_z < minimum_height:
+            self.publish_status(
+                f'{context}: multi-seed IK fallback blocked; TCP Z '
+                f'{current_tcp_z * 1000.0:.1f}mm is below '
+                f'{minimum_height * 1000.0:.1f}mm'
+            )
+            return False
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+
+        while self.ik_seed_fallback_index < len(seed_patterns):
+            joint_index, offset_deg = seed_patterns[
+                self.ik_seed_fallback_index
+            ]
+            self.ik_seed_fallback_index += 1
+            joint_label = f'J{joint_index + 1}'
+            seed = current_joints.copy()
+            seed_deg = math.degrees(float(seed[joint_index])) + offset_deg
+            lower, upper = JOINT_LIMITS_DEG[joint_index]
+            seed_deg = min(max(seed_deg, lower + 1.0), upper - 1.0)
+            seed[joint_index] = math.radians(seed_deg)
+
+            request = GetPositionIK.Request()
+            ik_request = request.ik_request
+            ik_request.group_name = self.moveit_group
+            ik_request.ik_link_name = self.moveit_ee_link
+            ik_request.avoid_collisions = True
+            ik_request.timeout = duration_message(self.motion_ik_timeout)
+            ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+            ik_request.robot_state.joint_state.position = [
+                float(value) for value in seed
+            ]
+            ik_request.pose_stamped.header.frame_id = self.base_frame
+            ik_request.pose_stamped.header.stamp = Time().to_msg()
+            ik_request.pose_stamped.pose.position.x = float(
+                current_pose.transform.translation.x
+            )
+            ik_request.pose_stamped.pose.position.y = float(
+                current_pose.transform.translation.y
+            )
+            ik_request.pose_stamped.pose.position.z = float(
+                current_pose.transform.translation.z
+            )
+            ik_request.pose_stamped.pose.orientation = copy.deepcopy(
+                current_pose.transform.rotation
+            )
+            future = self.position_ik_client.call_async(request)
+            self._wait_future(future, 5.0)
+            response = future.result()
+            if (
+                response is None
+                or response.error_code.val != MoveItErrorCodes.SUCCESS
+            ):
+                continue
+            solution_map = dict(zip(
+                response.solution.joint_state.name,
+                response.solution.joint_state.position,
+            ))
+            if any(name not in solution_map for name in JOINT_NAMES):
+                continue
+            solution = np.array(
+                [solution_map[name] for name in JOINT_NAMES],
+                dtype=np.float64,
+            )
+            branch_change_deg = max(
+                abs(math.degrees(float(solution[index] - current_joints[index])))
+                for index in (1, 2)
+            )
+            signature = tuple(
+                round(math.degrees(float(solution[index])), 1)
+                for index in (1, 2, 5)
+            )
+            if (
+                branch_change_deg < 10.0
+                or signature in self.ik_seed_fallback_solutions
+            ):
+                continue
+            self.ik_seed_fallback_solutions.add(signature)
+            self.publish_status(
+                f'{context}: trying dynamic IK seed {joint_label} '
+                f'{offset_deg:+.0f}deg; solution J2/J3/J6='
+                f'{signature}'
+            )
+            self._execute_planned_joint_goal(solution)
+            return True
+        self.publish_status(
+            f'{context}: all dynamic J3/J2 IK seeds exhausted'
+        )
+        return False
+
+    def _try_opposite_joint_branch(
+        self,
+        joint_index,
+        joint_label,
+        used_attribute,
+        minimum_tcp_height,
+        context,
+    ):
+        """Switch once to an opposite-sign IK branch at safe height."""
+        if getattr(self, used_attribute):
+            return False
+        try:
+            current_pose = self.buffer.lookup_transform(
+                self.base_frame, self.moveit_ee_link, Time()
+            )
+        except TransformException as exc:
+            raise RuntimeError(
+                f'current TCP transform unavailable: {exc}'
+            ) from exc
+        current_tcp_z = float(current_pose.transform.translation.z)
+        if current_tcp_z < minimum_tcp_height:
+            self.publish_status(
+                f'{context}: opposite-{joint_label} fallback blocked; TCP Z '
+                f'{current_tcp_z * 1000.0:.1f}mm is below '
+                f'{minimum_tcp_height * 1000.0:.1f}mm'
+            )
+            return False
+        with self.joint_state_lock:
+            current_joints = (
+                None if self.latest_joint_positions is None
+                else self.latest_joint_positions.copy()
+            )
+            state_time = self.latest_joint_state_time
+        if (
+            current_joints is None
+            or state_time is None
+            or time.monotonic() - state_time > 1.0
+        ):
+            raise RuntimeError('fresh arm joint state is unavailable')
+        if not self.position_ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/compute_ik is unavailable')
+
+        request = GetPositionIK.Request()
+        ik_request = request.ik_request
+        ik_request.group_name = self.moveit_group
+        ik_request.ik_link_name = self.moveit_ee_link
+        ik_request.avoid_collisions = True
+        ik_request.timeout = duration_message(self.motion_ik_timeout)
+        ik_request.robot_state.joint_state.name = list(JOINT_NAMES)
+        seed = current_joints.copy()
+        current_joint_deg = math.degrees(
+            float(current_joints[joint_index])
+        )
+        seed_joint_deg = (
+            -max(30.0, abs(current_joint_deg))
+            if current_joint_deg >= 0.0
+            else max(30.0, abs(current_joint_deg))
+        )
+        seed[joint_index] = math.radians(seed_joint_deg)
+        ik_request.robot_state.joint_state.position = [
+            float(value) for value in seed
+        ]
+        ik_request.pose_stamped.header.frame_id = self.base_frame
+        ik_request.pose_stamped.header.stamp = Time().to_msg()
+        ik_request.pose_stamped.pose.position.x = float(
+            current_pose.transform.translation.x
+        )
+        ik_request.pose_stamped.pose.position.y = float(
+            current_pose.transform.translation.y
+        )
+        ik_request.pose_stamped.pose.position.z = float(
+            current_pose.transform.translation.z
+        )
+        ik_request.pose_stamped.pose.orientation = copy.deepcopy(
+            current_pose.transform.rotation
+        )
+        future = self.position_ik_client.call_async(request)
+        self._wait_future(future, 5.0)
+        response = future.result()
+        if (
+            response is None
+            or response.error_code.val != MoveItErrorCodes.SUCCESS
+        ):
+            self.publish_status(
+                f'{context}: no opposite-{joint_label} IK solution found'
+            )
+            setattr(self, used_attribute, True)
+            return False
+        solution_map = dict(zip(
+            response.solution.joint_state.name,
+            response.solution.joint_state.position,
+        ))
+        if any(name not in solution_map for name in JOINT_NAMES):
+            raise RuntimeError(
+                f'opposite-{joint_label} IK returned incomplete joints'
+            )
+        solution = np.array(
+            [solution_map[name] for name in JOINT_NAMES],
+            dtype=np.float64,
+        )
+        solution_joint_deg = math.degrees(
+            float(solution[joint_index])
+        )
+        opposite = (
+            abs(current_joint_deg) >= 5.0
+            and abs(solution_joint_deg) >= 5.0
+            and current_joint_deg * solution_joint_deg < 0.0
+        )
+        setattr(self, used_attribute, True)
+        if not opposite:
+            self.publish_status(
+                f'{context}: IK solver returned the same {joint_label} '
+                f'branch ({current_joint_deg:.1f}deg -> '
+                f'{solution_joint_deg:.1f}deg)'
+            )
+            return False
+        self.publish_status(
+            f'{context}: switching to opposite {joint_label} branch at '
+            f'safe height: {current_joint_deg:.1f}deg -> '
+            f'{solution_joint_deg:.1f}deg'
+        )
+        self._execute_planned_joint_goal(solution)
+        return True
+
+    def _execute_planned_joint_goal(self, positions, plan_only=False):
+        """Collision-check, and optionally execute, a MoveIt joint goal."""
+        if not self.move_group_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError('MoveIt /arm2/move_action server is unavailable')
+        goal = MoveGroup.Goal()
+        request = goal.request
+        request.group_name = self.moveit_group
+        request.num_planning_attempts = self.moveit_planning_attempts
+        request.allowed_planning_time = self.moveit_planning_time
+        request.max_velocity_scaling_factor = self.moveit_velocity_scale
+        request.max_acceleration_scaling_factor = (
+            self.moveit_acceleration_scale
+        )
+        request.start_state.is_diff = True
+        constraints = Constraints()
+        tolerance = math.radians(0.5)
+        for name, position in zip(JOINT_NAMES, positions):
+            joint = JointConstraint()
+            joint.joint_name = name
+            joint.position = float(position)
+            joint.tolerance_above = tolerance
+            joint.tolerance_below = tolerance
+            joint.weight = 1.0
+            constraints.joint_constraints.append(joint)
+        request.goal_constraints = [constraints]
+        goal.planning_options.plan_only = bool(plan_only)
+        goal.planning_options.replan = True
+        goal.planning_options.replan_attempts = 2
+        goal.planning_options.replan_delay = 0.2
+        goal.planning_options.planning_scene_diff.is_diff = True
+        goal.planning_options.planning_scene_diff.robot_state.is_diff = True
+        goal_future = self.move_group_client.send_goal_async(goal)
+        self._wait_future(goal_future, self.moveit_planning_time + 5.0)
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            mode = 'plan-only' if plan_only else 'execution'
+            raise RuntimeError(f'MoveIt rejected joint-goal {mode}')
+        with self.moveit_goal_lock:
+            self.current_moveit_goal = goal_handle
+        try:
+            result_future = goal_handle.get_result_async()
+            self._wait_future(
+                result_future,
+                self.moveit_planning_time + self.motion_timeout + 60.0,
+                goal_handle,
+            )
+            wrapped_result = result_future.result()
+            if wrapped_result is None:
+                raise RuntimeError('MoveIt returned no joint-goal result')
+            result = wrapped_result.result
+            if result.error_code.val != MoveItErrorCodes.SUCCESS:
+                mode = 'plan-only' if plan_only else 'execution'
+                raise RuntimeError(
+                    f'MoveIt joint-goal {mode} failed: '
+                    f'code={result.error_code.val}'
+                )
+            if plan_only:
+                if not result.planned_trajectory.joint_trajectory.points:
+                    raise RuntimeError(
+                        'MoveIt plan-only result contains no trajectory'
+                    )
+                return copy.deepcopy(result.planned_trajectory)
+        finally:
+            with self.moveit_goal_lock:
+                self.current_moveit_goal = None
+
+    def _moveit_pose_constraints(
+        self,
+        pose,
+        require_preferred_pick_branch=False,
+    ):
         constraints = Constraints()
         position = PositionConstraint()
         position.header = pose.header
@@ -2002,10 +7465,31 @@ class ContainerPickCoordinator(Node):
         orientation.weight = 1.0
         constraints.position_constraints = [position]
         constraints.orientation_constraints = [orientation]
+        if require_preferred_pick_branch:
+            # The measured reliable grasp family uses J2 positive and J3
+            # negative. Encode those signs in the goal itself so MoveIt does
+            # not execute a known-bad pregrasp and try to recover afterward.
+            for joint_index, allowed_lower, allowed_upper in (
+                (1, 5.0, JOINT_LIMITS_DEG[1][1]),
+                (2, JOINT_LIMITS_DEG[2][0], -5.0),
+            ):
+                midpoint_deg = (allowed_lower + allowed_upper) / 2.0
+                half_range_deg = (allowed_upper - allowed_lower) / 2.0
+                joint = JointConstraint()
+                joint.joint_name = JOINT_NAMES[joint_index]
+                joint.position = math.radians(midpoint_deg)
+                joint.tolerance_above = math.radians(half_range_deg)
+                joint.tolerance_below = math.radians(half_range_deg)
+                joint.weight = 1.0
+                constraints.joint_constraints.append(joint)
         return constraints
 
     def move_cartesian_to_pose(
-        self, target, allow_segmented=False, segment_count=0
+        self,
+        target,
+        allow_segmented=False,
+        segment_count=0,
+        prefer_j2_branch_fallback=False,
     ):
         """Execute a collision-checked straight TCP path to one waypoint."""
         if self.motion_backend != 'moveit':
@@ -2058,6 +7542,24 @@ class ContainerPickCoordinator(Node):
                 'Cartesian planning failed: '
                 f'code={response.error_code.val}, message={detail}'
             )
+        with self.joint_state_lock:
+            current_j6 = (
+                None if self.latest_joint_positions is None
+                else float(self.latest_joint_positions[5])
+            )
+        if current_j6 is None:
+            raise CartesianPlanningError(
+                'Cannot validate Cartesian J6 travel without joint state'
+            )
+        j6_travel = trajectory_joint_travel_degrees(
+            current_j6, response.solution, JOINT_NAMES[5]
+        )
+        if j6_travel > self.max_j6_trajectory_travel:
+            raise CartesianPlanningError(
+                f'Cartesian J6 path travel {j6_travel:.1f}deg exceeds '
+                f'{self.max_j6_trajectory_travel:.1f}deg limit',
+                executed_segments=segment_count,
+            )
         acceptable = cartesian_path_acceptable(
             response.fraction,
             requested_distance,
@@ -2079,6 +7581,24 @@ class ContainerPickCoordinator(Node):
                 )
             )
             if can_execute_segment:
+                if prefer_j2_branch_fallback and segment_count == 0:
+                    diagnostics = self._diagnose_cartesian_limits(request)
+                    if (
+                        'ik_only=1.000' in diagnostics
+                        and 'no_joint_jump=' in diagnostics
+                    ):
+                        shortfall_mm = (
+                            requested_distance
+                            * (1.0 - response.fraction)
+                            * 1000.0
+                        )
+                        raise CartesianPlanningError(
+                            'Cartesian path rejected before partial descent: '
+                            f'fraction={response.fraction:.3f}, '
+                            f'shortfall={shortfall_mm:.1f}mm; '
+                            f'{diagnostics}',
+                            executed_segments=segment_count,
+                        )
                 progress_mm = (
                     requested_distance * response.fraction * 1000.0
                 )
@@ -2099,6 +7619,9 @@ class ContainerPickCoordinator(Node):
                         target,
                         allow_segmented=True,
                         segment_count=segment_count + 1,
+                        prefer_j2_branch_fallback=(
+                            prefer_j2_branch_fallback
+                        ),
                     )
                 except CartesianPlanningError as exc:
                     exc.executed_segments = max(
@@ -2139,7 +7662,9 @@ class ContainerPickCoordinator(Node):
 
         self._execute_cartesian_trajectory(response.solution)
 
-    def _execute_cartesian_trajectory(self, trajectory):
+    def _execute_cartesian_trajectory(
+        self, trajectory, label='Cartesian trajectory'
+    ):
         if not self.execute_trajectory_client.wait_for_server(
             timeout_sec=5.0
         ):
@@ -2152,7 +7677,7 @@ class ContainerPickCoordinator(Node):
         self._wait_future(goal_future, 5.0)
         goal_handle = goal_future.result()
         if goal_handle is None or not goal_handle.accepted:
-            raise RuntimeError('MoveIt rejected Cartesian trajectory')
+            raise RuntimeError(f'MoveIt rejected {label}')
         with self.moveit_goal_lock:
             self.current_moveit_goal = goal_handle
         try:
@@ -2164,12 +7689,12 @@ class ContainerPickCoordinator(Node):
             )
             wrapped_result = result_future.result()
             if wrapped_result is None:
-                raise RuntimeError('Cartesian execution returned no result')
+                raise RuntimeError(f'{label} execution returned no result')
             error = wrapped_result.result.error_code
             if error.val != MoveItErrorCodes.SUCCESS:
                 detail = error.message or 'no detail'
                 raise RuntimeError(
-                    'Cartesian execution failed: '
+                    f'{label} execution failed: '
                     f'code={error.val}, message={detail}'
                 )
             if self.stop_event.wait(self.moveit_state_settle):
@@ -2237,26 +7762,95 @@ class ContainerPickCoordinator(Node):
         return 'diagnostic plan-only fractions: ' + ', '.join(results)
 
     def move_adaptive_cartesian_lift(self, grasp):
-        """Execute the largest fully feasible vertical lift."""
+        """Raise TCP to a base-frame absolute Z, independent of pick Z."""
         failures = []
-        for distance in lift_distance_candidates(
+        for target_z in lift_distance_candidates(
             self.lift_after_pick,
             self.minimum_lift_after_pick,
             self.lift_search_step,
         ):
             lift = copy.deepcopy(grasp)
-            lift.pose.position.z += distance
-            try:
-                self.move_cartesian_to_pose(lift)
+            lift.pose.position.z = target_z
+            if float(grasp.pose.position.z) >= target_z:
                 self.publish_status(
-                    f'PICK: lifted container {distance * 100.0:.1f} cm'
+                    f'PICK: TCP already at or above absolute Z '
+                    f'{target_z * 1000.0:.0f}mm'
                 )
                 return
-            except CartesianPlanningError as exc:
-                failures.append(f'{distance:.3f}m: {exc}')
+            lift_error = None
+            while True:
+                try:
+                    self.move_cartesian_to_pose(lift, allow_segmented=True)
+                    self.publish_status(
+                        f'PICK: raised container to absolute TCP Z '
+                        f'{target_z * 1000.0:.0f}mm'
+                    )
+                    return
+                except CartesianPlanningError as exc:
+                    lift_error = exc
+                    branch_discontinuity = (
+                        'ik_only=1.000' in str(exc)
+                        and 'no_joint_jump=' in str(exc)
+                    )
+                    if branch_discontinuity and self.try_opposite_ik_branch(
+                        lift, 'PICK vertical lift'
+                    ):
+                        self.publish_status(
+                            'PICK: retrying vertical lift after opposite '
+                            'joint-branch switch'
+                        )
+                        continue
+                    break
+            if lift_error is not None:
+                remaining_distance = self._cartesian_request_distance(lift)
+                try:
+                    current = self.buffer.lookup_transform(
+                        self.base_frame, self.moveit_ee_link, Time()
+                    )
+                    achieved_z = float(current.transform.translation.z)
+                except TransformException:
+                    achieved_z = None
+                if (
+                    lift_error.executed_segments > 0
+                    and achieved_z is not None
+                    and achieved_z >= self.minimum_lift_after_pick
+                ):
+                    self.publish_status(
+                        'PICK: accepting safe partial vertical lift: '
+                        f'TCP Z={achieved_z * 1000.0:.1f}mm, '
+                        f'minimum={self.minimum_lift_after_pick * 1000.0:.0f}mm, '
+                        f'remaining={remaining_distance * 1000.0:.1f}mm; '
+                        'destination clearance stage will continue the rise'
+                    )
+                    return
+                can_finish_with_pose_goal = (
+                    lift_error.executed_segments > 0
+                    and remaining_distance is not None
+                    and remaining_distance
+                    <= self.stack_pose_goal_finish_max_distance
+                )
+                if can_finish_with_pose_goal:
+                    self.publish_status(
+                        'PICK: finishing short remaining vertical lift with '
+                        'pose goal: '
+                        f'remaining={remaining_distance * 1000.0:.1f}mm'
+                    )
+                    try:
+                        self.move_to_pose(lift)
+                        self.publish_status(
+                            f'PICK: raised container to absolute TCP Z '
+                            f'{target_z * 1000.0:.0f}mm'
+                        )
+                        return
+                    except RuntimeError as finish_exc:
+                        failures.append(
+                            f'Z={target_z:.3f}m pose finish: {finish_exc}'
+                        )
+                        continue
+                failures.append(f'Z={target_z:.3f}m: {lift_error}')
                 self.get_logger().warning(
-                    f'Lift {distance * 100.0:.1f} cm is not feasible; '
-                    'trying a shorter path'
+                    f'Absolute lift Z {target_z * 1000.0:.0f}mm is not '
+                    'feasible; trying a lower safe Z'
                 )
         raise RuntimeError(
             'No safe vertical lift path found: ' + '; '.join(failures)
@@ -2273,7 +7867,7 @@ class ContainerPickCoordinator(Node):
                 raise RuntimeError('pick stopped')
         if goal_handle is not None:
             goal_handle.cancel_goal_async()
-        raise RuntimeError('MoveIt request timed out')
+        raise RuntimeError('ROS request timed out')
 
     def command_gripper(self, open_gripper):
         if self.motion_backend == 'moveit':
@@ -2297,6 +7891,21 @@ class ContainerPickCoordinator(Node):
             self.robot.set_gripper_value(value, speed)
         if self.stop_event.wait(1.0):
             raise RuntimeError('pick stopped')
+
+    def command_return_home(self):
+        """Request the serial-owning bridge to return to joint-space home."""
+        if self.motion_backend != 'moveit':
+            raise RuntimeError(
+                'automatic home return requires the MoveIt trajectory bridge'
+            )
+        if not self.return_home_client.wait_for_service(timeout_sec=3.0):
+            raise RuntimeError('JetCobot return-home service is unavailable')
+        future = self.return_home_client.call_async(Trigger.Request())
+        self._wait_future(future, self.motion_timeout + 5.0)
+        result = future.result()
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            raise RuntimeError(f'return home failed: {message}')
 
     def publish_joint_states(self):
         if self.robot is None or not self.serial_lock.acquire(blocking=False):

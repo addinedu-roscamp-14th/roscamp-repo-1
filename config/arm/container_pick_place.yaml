@@ -1,0 +1,114 @@
+/arm/container_pick_place_coordinator:
+  ros__parameters:
+    base_frame: arm/base_link
+    marker_frame: arm/pick_marker
+    place_marker_frame: arm/place_marker
+
+    execute_motion: false
+    motion_backend: direct
+    allow_full_pick: true
+    offsets_configured: true
+    use_marker_rotation_for_grasp: false
+    grasp_orientation_mode: marker_yaw
+    place_orientation_mode: marker_yaw
+
+    # MoveIt commands the modeled TCP directly. Remove the approximately
+    # 80 mm Z compensation that was needed by the Direct controller frame:
+    # 0.110 m - 0.080 m = 0.030 m.
+    # With 15 mm extra depth, final pick Z is marker Z + 15 mm.
+    grasp_offset_xyz_m: [0.0, 0.0, 0.030]
+    grasp_offset_rpy_deg: [-180.0, 0.0, -45.0]
+    reference_marker_yaw_deg: 0.0
+    # Apply the same Direct-to-TCP correction for place:
+    # 0.130 m - 0.080 m = 0.050 m.
+    # Final place Z is marker Z +45 mm and preplace is marker Z +100 mm.
+    place_offset_xyz_m: [0.0, 0.0, 0.050]
+    place_offset_rpy_deg: [-180.0, 0.0, -45.0]
+    place_reference_marker_yaw_deg: 0.0
+    # Applied after marker-yaw/XYZ composition. Positive values move both
+    # final Pick and Place targets farther from the base origin in XY.
+    target_radial_offset_m: 0.0
+
+    max_yaw_spread_deg: 12.0
+    max_container_yaw_delta_deg: 180.0
+    grasp_yaw_fallback_scales: [0.75, 0.5, 0.25, 0.0]
+
+    pregrasp_lift_m: 0.08
+    grasp_extra_depth_m: 0.015
+    place_pregrasp_lift_m: 0.050
+    place_extra_depth_m: 0.005 #건들기 X
+    refresh_marker_before_descent: false
+    pregrasp_test_keep_current_orientation: false
+    pregrasp_position_only_approach: true
+    place_keep_current_orientation_on_approach: false
+    place_position_only_approach: true
+    # If the live vertical place path self-collides, search other joint
+    # branches without changing the requested TCP XYZ, orientation, or depth.
+    place_ik_branch_attempts: 24
+    place_ik_timeout_sec: 0.2
+    place_branch_min_fraction: 0.999
+
+    # Sequential observation joint poses (J1..J6, degrees).
+    # /arm/pick_and_place moves to the first pose. After one marker is locked,
+    # MoveIt plans to the second pose and observes the other marker.
+    # Enter measured safe joint values before enabling each guard.
+    first_observation_pose_configured: true
+    first_observation_joint_angles_deg: [1.0, 57.0, -28.0, -85.0, 16.0, -45.0]
+    second_observation_pose_configured: true
+    second_observation_joint_angles_deg: [141.9, -64.3, 249.1, 176.01, 4.47, -45.17]
+    first_observation_timeout_sec: 3.0
+    observation_joint_tolerance_deg: 3.0
+    startup_joint_state_timeout_sec: 20.0
+
+    lift_after_pick_m: 0.18
+    minimum_lift_after_pick_m: 0.05
+    lift_after_place_m: 0.18
+    minimum_lift_after_place_m: 0.05
+    lift_search_step_m: 0.02
+
+    minimum_stable_samples: 5
+    max_translation_std_m: 0.005
+    max_rotation_spread_deg: 10.0
+    dry_run_max_rotation_spread_deg: 30.0
+    max_marker_age_sec: 3.0
+    stabilization_timeout_sec: 20.0
+
+    workspace_min_xyz_m: [-0.28, -0.28, -0.05]
+    workspace_max_xyz_m: [0.28, 0.28, 0.30]
+    workspace_xy_shape: inverted_l
+    workspace_horizontal_min_xy_m: [-0.28, -0.28]
+    workspace_horizontal_max_xy_m: [0.28, 0.0]
+    workspace_vertical_min_xy_m: [0.0, -0.28]
+    workspace_vertical_max_xy_m: [0.28, 0.28]
+    max_joint_delta_deg: 60.0
+
+    serial_port: /dev/ttyUSB0
+    baud_rate: 1000000
+    speed: 5
+    motion_timeout_sec: 30.0
+    # End-to-end sequence test: log send_coords/get_coords differences but
+    # do not stop the sequence because of pose error.
+    direct_pose_verification: false
+    direct_xy_tolerance_m: 0.010
+    direct_position_tolerance_m: 0.020
+    direct_angle_tolerance_deg: 6.0
+    gripper_open_value: 100
+    gripper_closed_value: 20
+    gripper_speed: 50
+
+    moveit_group: arm_group
+    moveit_ee_link: TCP
+    moveit_position_tolerance_m: 0.005
+    moveit_orientation_tolerance_deg: 5.0
+    moveit_planning_time_sec: 10.0
+    moveit_planning_attempts: 20
+    moveit_velocity_scale: 0.35
+    moveit_acceleration_scale: 0.25
+
+    cartesian_max_step_m: 0.001
+    cartesian_min_fraction: 0.97
+    cartesian_absolute_min_fraction: 0.90
+    cartesian_max_shortfall_m: 0.005
+    cartesian_max_speed_mps: 0.04
+    cartesian_max_joint_jump_deg: 15.0
+    moveit_state_settle_sec: 0.2

@@ -10,8 +10,14 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
-from tf2_ros import TransformBroadcaster
+from tf2_ros import (
+    Buffer,
+    TransformBroadcaster,
+    TransformException,
+    TransformListener,
+)
 
 
 def rotation_matrix_to_quaternion(matrix):
@@ -59,6 +65,23 @@ def rotation_matrix_to_quaternion(matrix):
     return quaternion / norm
 
 
+def quaternion_to_rotation_matrix(quaternion):
+    """Convert a normalized XYZW quaternion to a 3x3 rotation matrix."""
+    x, y, z, w = np.asarray(quaternion, dtype=np.float64)
+    norm = float(np.linalg.norm([x, y, z, w]))
+    if norm < 1e-12:
+        raise ValueError('Cannot convert a zero quaternion')
+    x, y, z, w = np.asarray([x, y, z, w]) / norm
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),
+         2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z),
+         2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w),
+         1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
 class ArucoPosePublisher(Node):
     """Estimate a configured marker pose using calibrated camera intrinsics."""
 
@@ -78,6 +101,7 @@ class ArucoPosePublisher(Node):
             'pose_topic', '/arm2/gripper_camera/aruco_pose'
         )
         self.declare_parameter('camera_frame_id', '')
+        self.declare_parameter('output_frame_id', 'arm2/base_link')
         self.declare_parameter('marker_frame_id', 'arm2/container_marker')
         self.declare_parameter('marker_id', 0)
         self.declare_parameter('secondary_marker_id', -1)
@@ -87,11 +111,37 @@ class ArucoPosePublisher(Node):
         self.declare_parameter(
             'secondary_pose_topic', '/arm2/gripper_camera/stack_target_pose'
         )
-        self.declare_parameter('marker_size_m', 0.015)
+        self.declare_parameter(
+            'additional_marker_ids',
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        )
+        self.declare_parameter(
+            'additional_marker_frame_ids',
+            [
+                'arm2/container_marker_1',
+                'arm2/container_marker_2',
+                'arm2/container_marker_3',
+                'arm2/container_marker_4',
+                'arm2/container_marker_5',
+                'arm2/container_marker_6',
+                'arm2/container_marker_7',
+                'arm2/container_marker_8',
+                'arm2/trailer_marker_9',
+                'arm2/trailer_marker_10',
+                'arm2/destination_marker_11',
+                'arm2/destination_marker_12',
+                'arm2/destination_marker_13',
+                'arm2/destination_marker_14',
+                'arm2/destination_marker_15',
+                'arm2/destination_marker_16',
+            ],
+        )
+        self.declare_parameter('marker_size_m', 0.020)
         self.declare_parameter('dictionary', 'DICT_5X5_50')
         self.declare_parameter('max_reprojection_error_px', 3.0)
         self.declare_parameter('publish_annotated', True)
         self.declare_parameter('use_node_time_for_pose', False)
+        self.declare_parameter('detected_ids_log_period_sec', 2.0)
 
         self.image_topic = str(self.get_parameter('image_topic').value)
         self.camera_info_topic = str(
@@ -104,6 +154,9 @@ class ArucoPosePublisher(Node):
         self.camera_frame_id = str(
             self.get_parameter('camera_frame_id').value
         )
+        self.output_frame_id = str(
+            self.get_parameter('output_frame_id').value
+        )
         self.marker_frame_id = str(
             self.get_parameter('marker_frame_id').value
         )
@@ -114,6 +167,22 @@ class ArucoPosePublisher(Node):
         self.secondary_marker_frame_id = str(
             self.get_parameter('secondary_marker_frame_id').value
         )
+        additional_ids = [
+            int(value)
+            for value in self.get_parameter('additional_marker_ids').value
+        ]
+        additional_frames = [
+            str(value)
+            for value in self.get_parameter(
+                'additional_marker_frame_ids'
+            ).value
+        ]
+        if len(additional_ids) != len(additional_frames):
+            raise ValueError(
+                'additional_marker_ids and additional_marker_frame_ids '
+                'must have the same length'
+            )
+        self.additional_markers = dict(zip(additional_ids, additional_frames))
         self.marker_size = float(
             self.get_parameter('marker_size_m').value
         )
@@ -127,11 +196,16 @@ class ArucoPosePublisher(Node):
         self.use_node_time_for_pose = bool(
             self.get_parameter('use_node_time_for_pose').value
         )
+        self.detected_ids_log_period = float(
+            self.get_parameter('detected_ids_log_period_sec').value
+        )
 
         if self.marker_size <= 0.0:
             raise ValueError('marker_size_m must be greater than zero')
         if self.max_reprojection_error <= 0.0:
             raise ValueError('max_reprojection_error_px must be greater than zero')
+        if self.detected_ids_log_period < 0.0:
+            raise ValueError('detected_ids_log_period_sec must be non-negative')
         if not hasattr(cv2.aruco, dictionary_name):
             raise ValueError(f'Unknown ArUco dictionary: {dictionary_name}')
 
@@ -148,6 +222,8 @@ class ArucoPosePublisher(Node):
             )
             self.detector = None
         self.bridge = CvBridge()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.camera_matrix = None
         self.distortion = None
@@ -155,7 +231,9 @@ class ArucoPosePublisher(Node):
         self.missing_info_warning_count = 0
         self.invalid_info_warning_count = 0
         self.last_detected_ids = None
+        self.last_detected_ids_log_ns = 0
         self.detected_once = False
+        self.last_transform_warning_ns = 0
 
         half_size = self.marker_size * 0.5
         self.object_points = np.array([
@@ -176,6 +254,14 @@ class ArucoPosePublisher(Node):
             self.secondary_pose_publisher = self.create_publisher(
                 PoseStamped, secondary_topic, 10
             )
+        self.additional_pose_publishers = {
+            marker_id: self.create_publisher(
+                PoseStamped,
+                f'/arm2/gripper_camera/destination_{marker_id}_pose',
+                10,
+            )
+            for marker_id in self.additional_markers
+        }
         self.annotated_publisher = self.create_publisher(
             Image, self.annotated_topic, 10
         )
@@ -194,13 +280,18 @@ class ArucoPosePublisher(Node):
             f'size={self.marker_size:g} m on {self.image_topic}'
         )
         self.get_logger().info(
-            f'Publishing marker TF: camera -> {self.marker_frame_id}'
+            f'Publishing marker TF: {self.output_frame_id} -> '
+            f'{self.marker_frame_id}'
         )
         if self.secondary_marker_id >= 0:
             self.get_logger().info(
                 'Also detecting ArUco '
                 f'id={self.secondary_marker_id}: camera -> '
                 f'{self.secondary_marker_frame_id}'
+            )
+        for marker_id, frame_id in self.additional_markers.items():
+            self.get_logger().info(
+                f'Also detecting ArUco id={marker_id}: camera -> {frame_id}'
             )
         if self.use_node_time_for_pose:
             self.get_logger().info(
@@ -241,22 +332,38 @@ class ArucoPosePublisher(Node):
                 parameters=self.detector_parameters,
             )
         detected_ids = (
-            tuple(int(value) for value in ids.flatten())
+            tuple(sorted(int(value) for value in ids.flatten()))
             if ids is not None else ()
         )
         if detected_ids != self.last_detected_ids:
-            if detected_ids:
+            now_ns = self.get_clock().now().nanoseconds
+            log_period_ns = int(self.detected_ids_log_period * 1e9)
+            if (
+                detected_ids
+                and (
+                    log_period_ns == 0
+                    or now_ns - self.last_detected_ids_log_ns
+                    >= log_period_ns
+                )
+            ):
                 self.get_logger().info(f'Detected ArUco IDs: {detected_ids}')
+                self.last_detected_ids_log_ns = now_ns
             self.last_detected_ids = detected_ids
 
         selected_corners = None
         secondary_corners = None
+        additional_corners = {}
         if ids is not None:
             for index, detected_id in enumerate(ids.flatten()):
-                if int(detected_id) == self.marker_id:
+                detected_id = int(detected_id)
+                if detected_id == self.marker_id:
                     selected_corners = corners[index].reshape(4, 2)
-                if int(detected_id) == self.secondary_marker_id:
+                if detected_id == self.secondary_marker_id:
                     secondary_corners = corners[index].reshape(4, 2)
+                if detected_id in self.additional_markers:
+                    additional_corners[detected_id] = corners[index].reshape(
+                        4, 2
+                    )
 
         if selected_corners is not None and self.camera_matrix is None:
             self.missing_info_warning_count += 1
@@ -299,6 +406,29 @@ class ArucoPosePublisher(Node):
                     reprojection_error,
                     self.secondary_marker_frame_id,
                     self.secondary_pose_publisher,
+                )
+                cv2.drawFrameAxes(
+                    frame,
+                    self.camera_matrix,
+                    self.distortion,
+                    rotation_vector,
+                    translation_vector,
+                    self.marker_size * 0.5,
+                )
+
+        if self.camera_matrix is not None:
+            for marker_id, marker_corners in additional_corners.items():
+                pose = self.estimate_pose(marker_corners)
+                if pose is None:
+                    continue
+                rotation_vector, translation_vector, reprojection_error = pose
+                self.publish_pose(
+                    message,
+                    rotation_vector,
+                    translation_vector,
+                    reprojection_error,
+                    self.additional_markers[marker_id],
+                    self.additional_pose_publishers[marker_id],
                 )
                 cv2.drawFrameAxes(
                     frame,
@@ -379,8 +509,36 @@ class ArucoPosePublisher(Node):
             return
 
         rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-        quaternion = rotation_matrix_to_quaternion(rotation_matrix)
         translation = translation_vector.reshape(3)
+
+        try:
+            camera_transform = self.tf_buffer.lookup_transform(
+                self.output_frame_id, camera_frame, Time()
+            )
+        except TransformException as exc:
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self.last_transform_warning_ns >= 5_000_000_000:
+                self.get_logger().warning(
+                    f'Cannot transform detected marker from {camera_frame} '
+                    f'to {self.output_frame_id}: {exc}'
+                )
+                self.last_transform_warning_ns = now_ns
+            return
+
+        camera_translation = np.array([
+            camera_transform.transform.translation.x,
+            camera_transform.transform.translation.y,
+            camera_transform.transform.translation.z,
+        ], dtype=np.float64)
+        camera_rotation = quaternion_to_rotation_matrix([
+            camera_transform.transform.rotation.x,
+            camera_transform.transform.rotation.y,
+            camera_transform.transform.rotation.z,
+            camera_transform.transform.rotation.w,
+        ])
+        translation = camera_translation + camera_rotation @ translation
+        rotation_matrix = camera_rotation @ rotation_matrix
+        quaternion = rotation_matrix_to_quaternion(rotation_matrix)
 
         transform = TransformStamped()
         transform.header.stamp = (
@@ -388,7 +546,7 @@ class ArucoPosePublisher(Node):
             if self.use_node_time_for_pose
             else image_message.header.stamp
         )
-        transform.header.frame_id = camera_frame
+        transform.header.frame_id = self.output_frame_id
         transform.child_frame_id = marker_frame_id
         transform.transform.translation.x = float(translation[0])
         transform.transform.translation.y = float(translation[1])

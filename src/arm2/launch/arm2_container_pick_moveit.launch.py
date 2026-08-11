@@ -10,6 +10,7 @@ from launch.actions import (
     OpaqueFunction,
     SetLaunchConfiguration,
 )
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -33,14 +34,14 @@ def generate_launch_description():
     default_params = 'config/arm2/arm2_container_pick.yaml'
 
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video4'),
+        DeclareLaunchArgument('video_device', default_value='/dev/arm_camera'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value='config/arm2/arm2_gripper_camera_info.yaml',
         ),
         DeclareLaunchArgument('marker_id', default_value='0'),
-        DeclareLaunchArgument('stack_marker_id', default_value='1'),
-        DeclareLaunchArgument('marker_size_m', default_value='0.015'),
+        DeclareLaunchArgument('stack_marker_id', default_value='11'),
+        DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument(
             'stack_container_height_m', default_value='0.035'
         ),
@@ -51,14 +52,20 @@ def generate_launch_description():
             'calibration_name', default_value='arm2_jetcobot_eye_in_hand'
         ),
         DeclareLaunchArgument('params_file', default_value=default_params),
-        DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument('trajectory_speed', default_value='100'),
+        DeclareLaunchArgument('serial_port', default_value='/dev/jetcobot'),
+        DeclareLaunchArgument('trajectory_speed', default_value='70'),
         DeclareLaunchArgument(
-            'goal_correction_speed', default_value='50'
+            'goal_correction_speed', default_value='70'
+        ),
+        DeclareLaunchArgument(
+            'goal_correction_period_sec', default_value='0.5'
         ),
         DeclareLaunchArgument('goal_tolerance_deg', default_value='2.5'),
         DeclareLaunchArgument('goal_timeout_sec', default_value='15.0'),
         DeclareLaunchArgument('use_rviz', default_value='true'),
+        DeclareLaunchArgument('event_udp_enabled', default_value='false'),
+        DeclareLaunchArgument('event_udp_host', default_value='127.0.0.1'),
+        DeclareLaunchArgument('event_udp_port', default_value='15002'),
     ]
 
     moveit = IncludeLaunchDescription(
@@ -75,23 +82,32 @@ def generate_launch_description():
         name='arm2_jetcobot_trajectory_bridge',
         namespace='arm2',
         output='screen',
-        parameters=[{
-            'serial_port': LaunchConfiguration('serial_port'),
-            'speed': ParameterValue(
-                LaunchConfiguration('trajectory_speed'), value_type=int
-            ),
-            'goal_tolerance_deg': ParameterValue(
-                LaunchConfiguration('goal_tolerance_deg'), value_type=float
-            ),
-            'goal_timeout_sec': ParameterValue(
-                LaunchConfiguration('goal_timeout_sec'), value_type=float
-            ),
-            'goal_correction_speed': ParameterValue(
-                LaunchConfiguration('goal_correction_speed'), value_type=int
-            ),
-            'goal_correction_period_sec': 1.0,
-            'gripper_speed': 50,
-        }],
+        sigterm_timeout='20.0',
+        sigkill_timeout='5.0',
+        parameters=[
+            LaunchConfiguration('resolved_params_file'),
+            {
+                'serial_port': LaunchConfiguration('serial_port'),
+                'speed': ParameterValue(
+                    LaunchConfiguration('trajectory_speed'), value_type=int
+                ),
+                'goal_tolerance_deg': ParameterValue(
+                    LaunchConfiguration('goal_tolerance_deg'), value_type=float
+                ),
+                'goal_timeout_sec': ParameterValue(
+                    LaunchConfiguration('goal_timeout_sec'), value_type=float
+                ),
+                'goal_correction_speed': ParameterValue(
+                    LaunchConfiguration('goal_correction_speed'),
+                    value_type=int,
+                ),
+                'goal_correction_period_sec': ParameterValue(
+                    LaunchConfiguration('goal_correction_period_sec'),
+                    value_type=float,
+                ),
+                'gripper_speed': 50,
+            },
+        ],
     )
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -137,6 +153,20 @@ def generate_launch_description():
             },
         ],
     )
+    event_udp_bridge = Node(
+        package='arm2',
+        executable='arm2_json_udp_bridge',
+        name='arm2_json_udp_bridge',
+        namespace='arm2',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('event_udp_enabled')),
+        parameters=[{
+            'remote_host': LaunchConfiguration('event_udp_host'),
+            'remote_port': ParameterValue(
+                LaunchConfiguration('event_udp_port'), value_type=int
+            ),
+        }],
+    )
 
     return LaunchDescription(arguments + [
         OpaqueFunction(function=resolve_params_file),
@@ -145,4 +175,5 @@ def generate_launch_description():
         camera,
         handeye,
         coordinator,
+        event_udp_bridge,
     ])

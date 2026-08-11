@@ -15,3 +15,5 @@ central_control_gateway:
     image_height: 480
     minimum_heading_distance_px: 10.0
     telemetry_stale_timeout_sec: 2.0
+    # Bottom-right vessel berth: x_min, y_min, x_max, y_max.
+    arrival_roi_normalized: [0.78, 0.55, 0.99, 0.98]

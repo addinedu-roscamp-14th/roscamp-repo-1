@@ -114,6 +114,33 @@ def test_a_zone_heading_always_points_image_up():
     assert heading == {'x': 230.0, 'y': 180.0}
 
 
+def test_overlapping_a_zone_boxes_do_not_block_shared_fixed_stop():
+    summary = {
+        'detections': [
+            {
+                'label': 'A-3',
+                'confidence': 0.9,
+                'bbox_xyxy': [200, 200, 260, 260],
+            },
+            {
+                'label': 'A-2',
+                'confidence': 0.88,
+                'bbox_xyxy': [220, 210, 280, 270],
+            },
+        ],
+    }
+
+    target, _heading, selected = resolve_detection_approach(
+        {'type': 'visual_navigation', 'detection_index': 0},
+        summary,
+        640,
+        480,
+    )
+
+    assert selected['label'] == 'A-3'
+    assert target == {'x': 230.0, 'y': 230.0}
+
+
 def test_a_zone_labels_share_the_same_mode():
     assert zone_mode_for_label('A-1') == 'parking_a'
     assert zone_mode_for_label('A-2') == 'parking_a'

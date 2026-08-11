@@ -1,0 +1,5 @@
+int32 pick_id
+int32 place_id
+---
+bool accepted
+string message

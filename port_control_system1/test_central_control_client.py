@@ -93,10 +93,128 @@ def test_send_park_contains_token_and_vehicle_id(monkeypatch):
         base_url='http://central:8100',
         token='porter1234',
     )
-    result = client.send_park(command_id='park-test', vehicle_id='agv1')
+    result = client.send_park(
+        command_id='park-test',
+        vehicle_id='agv1',
+        predecessor_command_id='arm-before-park',
+    )
 
     assert result['accepted']
     assert captured['url'].endswith('/api/v1/navigation/park')
     assert captured['headers']['X-Control-Token'] == 'porter1234'
     assert captured['json']['command_id'] == 'park-test'
     assert captured['json']['vehicle_id'] == 'agv1'
+    assert captured['json']['predecessor_command_id'] == 'arm-before-park'
+
+
+def test_arm_command_uses_whitelisted_gateway_payload(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        text = ''
+
+        @staticmethod
+        def json():
+            return {'accepted': True, 'command_id': 'arm-test'}
+
+    def fake_request(method, url, headers, json, timeout):
+        captured.update({
+            'method': method,
+            'url': url,
+            'headers': headers,
+            'json': json,
+            'timeout': timeout,
+        })
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        'central_control_client.requests.request',
+        fake_request,
+    )
+    client = CentralControlClient(
+        base_url='http://central:8100',
+        token='porter1234',
+    )
+
+    result = client.send_arm_command(
+        arm_id='arm2',
+        operation='load_to_trailer',
+        command_id='arm-test',
+        mission_id='mission-test',
+        source_id=3,
+        vehicle_id='agv1',
+        final_for_vehicle=True,
+    )
+
+    assert result['accepted']
+    assert captured['method'] == 'POST'
+    assert captured['url'].endswith('/api/v1/arms/commands')
+    assert captured['headers']['X-Control-Token'] == 'porter1234'
+    assert captured['json'] == {
+        'command_id': 'arm-test',
+        'mission_id': 'mission-test',
+        'arm_id': 'arm2',
+        'operation': 'load_to_trailer',
+        'destination_slot': '',
+        'source_id': 3,
+        'destination_id': -1,
+        'vehicle_id': 'agv1',
+        'final_for_vehicle': True,
+    }
+
+
+def test_arm_stop_uses_dedicated_endpoint(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        text = ''
+
+        @staticmethod
+        def json():
+            return {'accepted': True}
+
+    def fake_request(method, url, headers, json, timeout):
+        captured.update({'method': method, 'url': url, 'json': json})
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        'central_control_client.requests.request',
+        fake_request,
+    )
+    client = CentralControlClient(base_url='http://central:8100')
+
+    assert client.stop_arm('arm2')['accepted']
+    assert captured == {
+        'method': 'POST',
+        'url': 'http://central:8100/api/v1/arms/arm2/stop',
+        'json': {},
+    }
+
+
+def test_arm1_stop_uses_arm1_endpoint(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        text = ''
+
+        @staticmethod
+        def json():
+            return {'accepted': True}
+
+    def fake_request(method, url, headers, json, timeout):
+        captured.update({'method': method, 'url': url, 'json': json})
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        'central_control_client.requests.request', fake_request
+    )
+    client = CentralControlClient(base_url='http://central:8100')
+
+    assert client.stop_arm('arm1')['accepted']
+    assert captured['url'].endswith('/api/v1/arms/arm1/stop')

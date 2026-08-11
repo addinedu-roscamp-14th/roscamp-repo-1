@@ -214,6 +214,8 @@ class AGVControlCenter(ctk.CTk):
             text = "ROS 연결 중"
             color = "#f0ad4e"
         agent = self.realtime_agent.snapshot()
+        if self.realtime_agent_var.get() != agent.enabled:
+            self.realtime_agent_var.set(agent.enabled)
         agent_text = {
             'DISABLED': 'AI 꺼짐',
             'WAITING_FOR_OBJECTIVE': 'AI 목표 대기',
@@ -223,6 +225,8 @@ class AGVControlCenter(ctk.CTk):
             'MONITORING': 'AI 실시간 관제',
             'ERROR': 'AI 오류',
         }.get(agent.state, f'AI {agent.state}')
+        if agent.mode == 'inventory' and agent.state == 'MONITORING':
+            agent_text = 'AI DB 계획 관제'
         text = f'{text} | {agent_text}'
         self.ros_status_label.configure(text=text, text_color=color)
         self.after(500, self._update_ros_status)

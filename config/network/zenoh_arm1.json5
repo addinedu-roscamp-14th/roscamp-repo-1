@@ -1,0 +1,43 @@
+{
+  "id": "r015",
+  "mode": "client",
+  "scouting": {
+    "multicast": {"enabled": false},
+    "gossip": {"enabled": false}
+  },
+  "plugins": {
+    "ros2dds": {
+      "nodename": "zenoh_bridge_arm1",
+      "domain": 15,
+      "ros_automatic_discovery_range": "LOCALHOST",
+      "allow": {
+        "publishers": [
+          "/arm/pick_place/status",
+          "/arm/pick_place/work_state"
+        ],
+        "subscribers": [],
+        "service_servers": [
+          "/arm/pick_place/execute",
+          "/arm/pick_place/start",
+          "/arm/pick_place/stop"
+        ],
+        "service_clients": [],
+        "action_servers": [],
+        "action_clients": []
+      },
+      "pub_priorities": [
+        "/arm/pick_place/work_state=1:express",
+        "/arm/pick_place/status=2:express"
+      ],
+      "queries_timeout": {
+        "default": 5.0,
+        "services": 5.0,
+        "actions": {
+          "send_goal": 5.0,
+          "cancel_goal": 5.0,
+          "get_result": 1800.0
+        }
+      }
+    }
+  }
+}
