@@ -6,6 +6,7 @@ import cv2
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PoseStamped, TransformStamped
 import numpy as np
+from porter_interfaces.srv import ExecutePickPlace
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -153,11 +154,15 @@ class DualArucoPosePublisher(Node):
         self.last_detected_ids = None
         self.rejection_counts = {marker_id: 0 for marker_id in self.marker_frames}
         self.pose_publishers = {
-            pick_id: self.create_publisher(
+            str(self.get_parameter('pick_marker_frame').value): (
+                self.create_publisher(
                 PoseStamped, '/arm/gripper_camera/pick_aruco_pose', 10
+                )
             ),
-            place_id: self.create_publisher(
+            str(self.get_parameter('place_marker_frame').value): (
+                self.create_publisher(
                 PoseStamped, '/arm/gripper_camera/place_aruco_pose', 10
+                )
             ),
         }
         self.annotated_publisher = self.create_publisher(
@@ -169,6 +174,11 @@ class DualArucoPosePublisher(Node):
         self.create_subscription(
             Image, self.image_topic, self.on_image, qos_profile_sensor_data
         )
+        self.create_service(
+            ExecutePickPlace,
+            '/arm/pick_place/configure_targets',
+            self.configure_targets,
+        )
         self.get_logger().info(
             'Detecting pick/place ArUco markers: '
             + ', '.join(
@@ -176,6 +186,37 @@ class DualArucoPosePublisher(Node):
                 for marker_id, frame in self.marker_frames.items()
             )
         )
+
+    def configure_targets(self, request, response):
+        """Atomically switch the two marker IDs used by the next operation."""
+        if bool(getattr(self, 'detection_enabled', False)):
+            response.accepted = False
+            response.message = 'cannot change targets during active detection'
+            return response
+        pick_id = int(request.pick_id)
+        place_id = int(request.place_id)
+        if not 0 <= pick_id <= 49 or not 0 <= place_id <= 49:
+            response.accepted = False
+            response.message = 'pick_id/place_id must be within 0..49'
+            return response
+        if pick_id == place_id:
+            response.accepted = False
+            response.message = 'pick_id and place_id must be different'
+            return response
+        frames = tuple(self.marker_frames.values())
+        self.marker_frames = {
+            pick_id: frames[0],
+            place_id: frames[1],
+        }
+        self.rejection_counts = {pick_id: 0, place_id: 0}
+        self.last_detected_ids = None
+        response.accepted = True
+        response.message = (
+            f'ArUco targets configured: pick_id={pick_id}, '
+            f'place_id={place_id}'
+        )
+        self.get_logger().info(response.message)
+        return response
 
     def on_camera_info(self, message):
         matrix = np.asarray(message.k, dtype=np.float64).reshape(3, 3)
@@ -305,7 +346,8 @@ class DualArucoPosePublisher(Node):
         pose.pose.position.y = transform.transform.translation.y
         pose.pose.position.z = transform.transform.translation.z
         pose.pose.orientation = transform.transform.rotation
-        self.pose_publishers[marker_id].publish(pose)
+        frame = self.marker_frames[marker_id]
+        self.pose_publishers[frame].publish(pose)
 
     @staticmethod
     def make_image(frame, source):

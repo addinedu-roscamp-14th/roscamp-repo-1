@@ -11,6 +11,7 @@ CCTVMonitorView.SHARED_FRAME을 그대로 읽어와서 보여주기 때문에, "
 여기에도 표시됩니다.
 """
 
+import math
 import threading
 from datetime import datetime, timedelta
 
@@ -21,7 +22,12 @@ from PIL import Image
 
 from cctv_monitor_view import CCTVMonitorView
 from central_control_client import CentralControlClient
-from ros_control_bridge import AMR_DISPLAY_NAMES, RosControlBridge
+from realtime_llm_agent import RealtimeLLMAgent
+from ros_control_bridge import (
+    AMR_DISPLAY_NAMES,
+    ARM_DISPLAY_NAMES,
+    RosControlBridge,
+)
 
 # Tailwind Color Palette
 BG_SURFACE = "#131314"
@@ -37,6 +43,9 @@ ACCENT_ORANGE = "#ee671c"
 ACCENT_ON_BLUE = "#003351"
 ALERT_RED = "#ff6b6b"
 
+# Bottom-right vessel berth in the shared top-down camera image.
+DEFAULT_ARRIVAL_ROI = [0.78, 0.55, 0.99, 0.98]
+
 # 기상청(KMA) / 해양조사원(KHOA) API 키 - 팀원이 쓰던 것을 그대로 재사용합니다.
 _WEATHER_API_KEY = "7d6c81a1615ce0a0dccd7e35568f7c3714d3f37ae515ce17e25a065005419ae3"
 
@@ -50,6 +59,16 @@ _STATE_DESCRIPTIONS = {
     "OFFLINE": ("오프라인 (텔레메트리 끊김)", ALERT_RED),
     "WAITING_FOR_INITIAL_POSE": ("초기 위치 대기 (AMCL 미수렴)", ACCENT_ORANGE),
     "NAV2_INACTIVE": ("Nav2 비활성 (주행 불가)", ACCENT_ORANGE),
+}
+
+_ARM_STATE_DESCRIPTIONS = {
+    0: ("미구성", ACCENT_ORANGE),
+    1: ("연결 끊김", ALERT_RED),
+    2: ("준비 완료", ACCENT_GREEN),
+    3: ("작업 중", ACCENT_BLUE),
+    4: ("정지됨", ACCENT_ORANGE),
+    5: ("작업자 확인 대기", ACCENT_ORANGE),
+    6: ("오류", ALERT_RED),
 }
 
 
@@ -100,6 +119,8 @@ class DashboardView(ctk.CTkFrame):
 
         # CCTV 백그라운드 캡처가 아직 안 돌고 있으면 시작 (대시보드에서도 영상이 보이도록)
         CCTVMonitorView.ensure_capture_running()
+        self.realtime_agent = RealtimeLLMAgent.get_instance()
+        self.realtime_agent.start()
 
         self.font_title = ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold")
         self.font_subtitle = ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold")
@@ -144,7 +165,7 @@ class DashboardView(ctk.CTkFrame):
         self.live_feed_label.grid(
             row=1, column=0, padx=5, pady=5, sticky="nsew"
         )
-        self._arrival_roi = [0.0, 0.0, 0.35, 0.35]
+        self._arrival_roi = list(DEFAULT_ARRIVAL_ROI)
         self._roi_editing = False
         self._roi_drag_start = None
         self._roi_drag_current = None
@@ -184,6 +205,16 @@ class DashboardView(ctk.CTkFrame):
                                      hover_color="#cce5ff", height=40, command=self.open_command_popup)
         self.btn_cmd.pack(side="left", expand=True, fill="x", padx=(0, 8))
 
+        self.btn_autonomy = ctk.CTkButton(
+            btn_row,
+            text="자율 관제모드",
+            font=self.font_subtitle,
+            height=40,
+            command=self.toggle_autonomy_mode,
+        )
+        self.btn_autonomy.pack(side="left", expand=True, fill="x")
+        self.update_autonomy_button()
+
         divider = ctk.CTkFrame(status_frame, height=1, fg_color=BORDER_COLOR)
         divider.pack(side="bottom", fill="x", padx=15, pady=(0, 10))
 
@@ -193,10 +224,9 @@ class DashboardView(ctk.CTkFrame):
         cards_area.pack(side="top", fill="both", expand=True)
 
         self._build_amr_status_card(cards_area)
+        self._build_arm_status_card(cards_area)
 
         cards = [
-            ("안벽 크레인", "6기 가동 중"),
-            ("야드 크레인", "12기 가동 중"),
             ("당일 선박 입항", "총 5척 정박 완료"),
         ]
         for title, val in cards:
@@ -292,6 +322,173 @@ class DashboardView(ctk.CTkFrame):
 
         self.update_amr_status()
 
+    def _build_arm_status_card(self, parent) -> None:
+        """Build live connection and task rows for ARM1 and ARM2."""
+        card = ctk.CTkFrame(
+            parent,
+            fg_color=BG_CARD,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            corner_radius=8,
+        )
+        card.pack(fill="x", padx=5, pady=5, ipady=8)
+
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkLabel(
+            header,
+            text="로봇팔 (ARM)",
+            font=self.font_mini,
+            text_color=TEXT_SECONDARY,
+        ).pack(side="left")
+        self.lbl_arm_link = ctk.CTkLabel(
+            header,
+            text="상태 수신 대기",
+            font=self.font_mini,
+            text_color=ACCENT_ORANGE,
+        )
+        self.lbl_arm_link.pack(side="right")
+
+        self.arm_state_labels = {}
+        self.arm_detail_labels = {}
+        self.arm_error_labels = {}
+        for arm_id, display_name in ARM_DISPLAY_NAMES.items():
+            row = ctk.CTkFrame(card, fg_color=BG_CARD_INNER, corner_radius=6)
+            row.pack(fill="x", padx=10, pady=3, ipady=4)
+            ctk.CTkLabel(
+                row,
+                text=display_name,
+                font=self.font_mini,
+                text_color=TEXT_SECONDARY,
+            ).pack(anchor="w", padx=8)
+            state_label = ctk.CTkLabel(
+                row,
+                text="연결 상태 확인 중",
+                font=self.font_body,
+                text_color=TEXT_SECONDARY,
+                justify="left",
+                wraplength=270,
+            )
+            state_label.pack(anchor="w", padx=8)
+            self.arm_state_labels[arm_id] = state_label
+
+            detail_label = ctk.CTkLabel(
+                row,
+                text="",
+                font=self.font_mini,
+                text_color=TEXT_SECONDARY,
+                justify="left",
+                wraplength=270,
+            )
+            detail_label.pack(anchor="w", padx=8)
+            self.arm_detail_labels[arm_id] = detail_label
+
+            error_label = ctk.CTkLabel(
+                row,
+                text="",
+                font=self.font_mini,
+                text_color=ALERT_RED,
+                justify="left",
+                wraplength=270,
+            )
+            self.arm_error_labels[arm_id] = error_label
+
+        self.update_arm_status()
+
+    def update_arm_status(self) -> None:
+        """Render structured central ARM telemetry every 500 ms."""
+        if not self._ui_alive:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        snapshot = self.ros_bridge.snapshot()
+        states = {arm.arm_id: arm for arm in snapshot.arm_states}
+        if states:
+            self.lbl_arm_link.configure(
+                text="중앙 상태 수신됨", text_color=ACCENT_GREEN
+            )
+        elif snapshot.error:
+            self.lbl_arm_link.configure(
+                text="ROS 연결 실패", text_color=ALERT_RED
+            )
+        else:
+            self.lbl_arm_link.configure(
+                text="상태 수신 대기", text_color=ACCENT_ORANGE
+            )
+
+        raw_status = {
+            "arm1": snapshot.arm_status,
+            "arm2": snapshot.arm2_status,
+        }
+        for arm_id in ARM_DISPLAY_NAMES:
+            state_label = self.arm_state_labels[arm_id]
+            detail_label = self.arm_detail_labels[arm_id]
+            error_label = self.arm_error_labels[arm_id]
+            arm = states.get(arm_id)
+            if arm is None:
+                raw = raw_status.get(arm_id)
+                if raw:
+                    state_label.configure(
+                        text="직접 상태 토픽 연결됨",
+                        text_color=ACCENT_GREEN,
+                    )
+                    detail_label.configure(text=str(raw))
+                else:
+                    state_label.configure(
+                        text="연결 상태 수신 없음",
+                        text_color=TEXT_SECONDARY,
+                    )
+                    detail_label.configure(text="")
+                error_label.configure(text="")
+                error_label.pack_forget()
+                continue
+
+            label, color = _ARM_STATE_DESCRIPTIONS.get(
+                arm.state,
+                (arm.state_text or "알 수 없음", TEXT_PRIMARY),
+            )
+            raw_state = arm.state_text.strip()
+            state_text = label
+            if raw_state and raw_state.lower() != label.lower():
+                state_text = f"{label} · {raw_state}"
+            raw = raw_status.get(arm_id)
+            if arm.state == 0 and raw:
+                state_text = "직접 상태 연결 · 중앙 제어 미구성"
+            state_label.configure(text=state_text, text_color=color)
+
+            details = []
+            if arm.current_operation:
+                details.append(f"작업: {arm.current_operation}")
+            else:
+                details.append("작업: 없음")
+            if arm.phase:
+                details.append(f"단계: {arm.phase}")
+            if arm.current_operation or arm.state == 3:
+                progress = min(100.0, max(0.0, arm.progress))
+                details.append(f"진행률: {progress:.0f}%")
+            if arm.current_command_id:
+                details.append(f"명령: {arm.current_command_id}")
+            if arm.current_mission_id:
+                details.append(f"미션: {arm.current_mission_id}")
+            if math.isfinite(arm.telemetry_age_sec):
+                details.append(f"텔레메트리: {arm.telemetry_age_sec:.1f}초 전")
+            if raw and (arm.state in {0, 1} or not arm.current_operation):
+                details.append(f"직접 상태: {raw}")
+            detail_label.configure(text="\n".join(details))
+
+            if arm.last_error:
+                error_label.configure(text=f"오류: {arm.last_error}")
+                error_label.pack(anchor="w", padx=8)
+            else:
+                error_label.configure(text="")
+                error_label.pack_forget()
+
+        self.after(500, self.update_arm_status)
+
     def update_amr_status(self) -> None:
         if not self._ui_alive:
             return
@@ -385,6 +582,44 @@ class DashboardView(ctk.CTkFrame):
     def open_command_popup(self) -> None:
         from command_center import open_command_popup
         open_command_popup(self)
+
+    def toggle_autonomy_mode(self) -> None:
+        """Start or stop the shared realtime LLM supervisor."""
+        snapshot = self.realtime_agent.snapshot()
+        self.realtime_agent.set_enabled(not snapshot.enabled)
+        self.update_autonomy_button(schedule_next=False)
+
+    def update_autonomy_button(self, schedule_next=True) -> None:
+        """Keep the dashboard control synchronized with agent state."""
+        if not getattr(self, '_ui_alive', False):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+            snapshot = self.realtime_agent.snapshot()
+            if snapshot.enabled:
+                state_suffix = {
+                    'WAITING_FOR_OBJECTIVE': ' · 목표 대기',
+                    'EVALUATING': ' · 판단 중',
+                    'ERROR': ' · 오류',
+                }.get(snapshot.state, '')
+                self.btn_autonomy.configure(
+                    text=f'⏹ 자율 관제모드 중지{state_suffix}',
+                    fg_color=ALERT_RED if snapshot.state == 'ERROR' else ACCENT_GREEN,
+                    hover_color='#c94f4f' if snapshot.state == 'ERROR' else '#45b96f',
+                    text_color=BG_SURFACE,
+                )
+            else:
+                self.btn_autonomy.configure(
+                    text='▶ 자율 관제모드 시작',
+                    fg_color=ACCENT_ORANGE,
+                    hover_color='#c65317',
+                    text_color=TEXT_PRIMARY,
+                )
+        except Exception:
+            return
+        if schedule_next:
+            self.after(500, self.update_autonomy_button)
 
     def _toggle_roi_editor(self):
         self._roi_editing = not self._roi_editing

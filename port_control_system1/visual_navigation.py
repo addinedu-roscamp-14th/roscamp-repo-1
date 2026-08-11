@@ -351,13 +351,22 @@ def _resolve_fixed_zone_goal(
 
     target = {'x': float(center_x), 'y': float(center_y)}
     heading = {'x': float(center_x), 'y': float(heading_y)}
+    # All A detections are storage-bin views of the same server-side fixed
+    # vehicle stop. Their boxes frequently overlap in the camera image and
+    # must not reject one another as obstacles. Non-A detections (people,
+    # vehicles, cargo) remain part of the safety check.
+    ignored_a_indices = {
+        detection['detection_index']
+        for detection in compact_detections(summary)
+        if detection['label'] in FIXED_ZONE_LABELS
+    }
     validate_pixel_navigation(
         target,
         heading,
         image_width,
         image_height,
         summary,
-        ignored_detection_index=selected['detection_index'],
+        ignored_detection_indices=ignored_a_indices,
     )
     return target, heading, selected
 

@@ -167,6 +167,7 @@ class FleetDispatcher(Node):
         self.declare_parameter('auto_park_idle_sec', 0.0)
         self.declare_parameter('auto_park_check_interval_sec', 3.0)
         self.declare_parameter('park_action_wait_timeout_sec', 10.0)
+        self.declare_parameter('park_predecessor_ready_timeout_sec', 30.0)
         self.declare_parameter('park_exit_forward_distance_m', 0.20)
         self.declare_parameter('park_exit_forward_speed_mps', 0.05)
         self.declare_parameter('park_exit_behavior_timeout_sec', 20.0)
@@ -187,7 +188,9 @@ class FleetDispatcher(Node):
         self.declare_parameter('park_exit_open_loop_rate_hz', 20.0)
         self.declare_parameter('duplicate_goal_distance_m', 0.12)
         self.declare_parameter('duplicate_goal_yaw_tolerance_deg', 20.0)
-        self.declare_parameter('sequence_dependency_timeout_sec', 300.0)
+        # Must exceed ARM2's default 600 s operation timeout because an ARM
+        # command can now be a predecessor of a vehicle departure.
+        self.declare_parameter('sequence_dependency_timeout_sec', 660.0)
         self.declare_parameter('cargo_hold_timeout_sec', 300.0)
         self.declare_parameter('subscribe_odom_fallback', False)
 
@@ -393,6 +396,13 @@ class FleetDispatcher(Node):
             raise ValueError(
                 'park_action_wait_timeout_sec must be non-negative'
             )
+        self.park_predecessor_ready_timeout_sec = float(
+            self.get_parameter('park_predecessor_ready_timeout_sec').value
+        )
+        if self.park_predecessor_ready_timeout_sec <= 0.0:
+            raise ValueError(
+                'park_predecessor_ready_timeout_sec must be positive'
+            )
         self.duplicate_goal_distance_m = float(
             self.get_parameter('duplicate_goal_distance_m').value
         )
@@ -433,6 +443,7 @@ class FleetDispatcher(Node):
         self._preempted_commands = set()
         self._command_condition = threading.Condition(self._lock)
         self._command_outcomes = {}
+        self._pending_parks = {}
         self._zone_condition = threading.Condition(self._lock)
         self._zone_owner = {zone_id: '' for zone_id in self.exclusive_zone_ids}
         self._zone_unknown = {
@@ -564,6 +575,17 @@ class FleetDispatcher(Node):
             '/central/arms/vehicle_holds',
             self._on_vehicle_holds,
             10,
+            callback_group=self.callback_group,
+        )
+        self.create_subscription(
+            String,
+            '/central/arms/results',
+            self._on_arm_result,
+            QoSProfile(
+                depth=50,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
             callback_group=self.callback_group,
         )
         self.zone_publisher = self.create_publisher(
@@ -1052,6 +1074,18 @@ class FleetDispatcher(Node):
                 f'{vehicle_id} released by the arm dispatcher'
             )
 
+    def _on_arm_result(self, message):
+        """Add ARM completion to the shared mission predecessor timeline."""
+        try:
+            payload = json.loads(message.data)
+            command_id = str(payload.get('command_id') or '').strip()
+            succeeded = payload.get('success')
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            return
+        if not command_id or not isinstance(succeeded, bool):
+            return
+        self._record_command_outcome(command_id, succeeded)
+
     def _wait_for_cargo_release(self, goal_handle, vehicle_id):
         """Block a departure until the arm finishes its cargo work.
 
@@ -1087,7 +1121,19 @@ class FleetDispatcher(Node):
             while len(self._command_outcomes) > 512:
                 oldest = next(iter(self._command_outcomes))
                 self._command_outcomes.pop(oldest)
+            pending_parks = getattr(self, '_pending_parks', {}).pop(
+                command_id, []
+            )
             self._command_condition.notify_all()
+        if succeeded:
+            for vehicle_id in pending_parks:
+                self.executor.create_task(
+                    self._dispatch_park(vehicle_id, wait_until_ready=True)
+                )
+        elif pending_parks:
+            self.get_logger().warning(
+                f'park skipped because predecessor {command_id} failed'
+            )
 
     def _infer_zone_owner_from_pose(self, zone_id, target_pose):
         """Recover a zone lock after restart from fresh AMCL positions."""
@@ -2478,8 +2524,37 @@ class FleetDispatcher(Node):
 
     def _on_park_request(self, message):
         """Kick off an async park dispatch from a synchronous topic callback."""
-        vehicle_id = str(message.data).strip().strip('/')
-        self.executor.create_task(self._dispatch_park(vehicle_id))
+        raw = str(message.data).strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            # Backward compatibility for old gateways that published only ID.
+            payload = {'vehicle_id': raw, 'predecessor_command_id': ''}
+        if not isinstance(payload, dict):
+            self.get_logger().warning('invalid park request payload ignored')
+            return
+        vehicle_id = str(payload.get('vehicle_id') or '').strip().strip('/')
+        predecessor = str(
+            payload.get('predecessor_command_id') or ''
+        ).strip()
+        if not predecessor:
+            self.executor.create_task(self._dispatch_park(vehicle_id))
+            return
+        with self._command_condition:
+            outcome = self._command_outcomes.get(predecessor)
+            if outcome is None:
+                self._pending_parks.setdefault(predecessor, []).append(
+                    vehicle_id
+                )
+                return
+        if outcome:
+            self.executor.create_task(
+                self._dispatch_park(vehicle_id, wait_until_ready=True)
+            )
+        else:
+            self.get_logger().warning(
+                f'park skipped because predecessor {predecessor} failed'
+            )
 
     def _check_auto_park(self):
         """Send any vehicle that has been idle long enough to its own spot."""
@@ -2506,7 +2581,9 @@ class FleetDispatcher(Node):
             )
             self.executor.create_task(self._dispatch_park(vehicle_id))
 
-    async def _dispatch_park(self, requested_vehicle_id):
+    async def _dispatch_park(
+        self, requested_vehicle_id, wait_until_ready=False
+    ):
         """
         Reserve a ready vehicle and run its own dedicated ParkInSpot action.
 
@@ -2522,6 +2599,35 @@ class FleetDispatcher(Node):
                 f'park request ignored: unknown vehicle_id={requested_vehicle_id!r}'
             )
             return
+
+        if wait_until_ready and requested_vehicle_id:
+            deadline = (
+                time.monotonic() + self.park_predecessor_ready_timeout_sec
+            )
+            announced = False
+            while True:
+                with self._lock:
+                    runtime = self.vehicles[requested_vehicle_id]
+                    if runtime.locked_zone == self.park_zone_ids[
+                        requested_vehicle_id
+                    ]:
+                        return
+                    ready = self._vehicle_ready(requested_vehicle_id)
+                if ready:
+                    break
+                if time.monotonic() >= deadline:
+                    self.get_logger().error(
+                        f'{requested_vehicle_id} did not become ready for '
+                        'predecessor-linked parking before timeout'
+                    )
+                    return
+                if not announced:
+                    announced = True
+                    self.get_logger().info(
+                        f'{requested_vehicle_id} parking is waiting for READY '
+                        'after predecessor completion'
+                    )
+                await self._sleep_async(0.1)
 
         with self._lock:
             candidates = (

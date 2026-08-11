@@ -12,12 +12,6 @@ from typing import Dict, Optional
 
 import cv2
 
-from cargo_dispatch_tool import (
-    load_cargo_details,
-    load_cargo_registry,
-    load_named_locations,
-)
-from cctv_monitor_view import CCTVMonitorView
 from central_control_client import (
     CentralControlApiError,
     CentralControlClient,
@@ -27,6 +21,8 @@ from llm_command_parser import (
     parse_command_with_llm,
     resolve_execution_mode,
 )
+from inventory_client import InventoryClientError
+from inventory_decision_planner import InventoryDecisionPlanner
 from visual_navigation import (
     VisualNavigationError,
     compact_detections,
@@ -45,6 +41,24 @@ VEHICLE_IDS = ('agv1', 'agv2')
 READY_STATE = 'READY'
 
 
+def _cctv_monitor_view():
+    """Import GUI-backed capture only when visual supervision needs it."""
+    from cctv_monitor_view import CCTVMonitorView
+    return CCTVMonitorView
+
+
+def _load_cargo_context():
+    """Load legacy local cargo context for visual control mode."""
+    from cargo_dispatch_tool import load_cargo_details, load_cargo_registry
+    return load_cargo_registry(), load_cargo_details()
+
+
+def _load_registered_locations():
+    """Load destination names without coupling module import to the GUI."""
+    from cargo_dispatch_tool import load_named_locations
+    return load_named_locations()
+
+
 @dataclass(frozen=True)
 class RealtimeAgentSnapshot:
     """Thread-safe status exposed to the dashboard UI."""
@@ -56,6 +70,7 @@ class RealtimeAgentSnapshot:
     last_error: str = ''
     last_evaluation_at: float = 0.0
     dispatched_actions: int = 0
+    mode: str = 'control'
 
 
 def _rounded(value, quantum):
@@ -156,7 +171,7 @@ class RealtimeLLMAgent:
                 cls._instance = cls()
             return cls._instance
 
-    def __init__(self):
+    def __init__(self, inventory_planner=None, location_loader=None):
         self.interval_sec = max(
             0.5,
             float(os.environ.get('PORT_CONTROL_REALTIME_LLM_INTERVAL_SEC', '2.0')),
@@ -182,12 +197,17 @@ class RealtimeLLMAgent:
         self._last_observation = ''
         self._last_evaluation_monotonic = 0.0
         self._not_before_monotonic = 0.0
+        self._last_inventory_snapshot_id = ''
+        self.inventory_planner = (
+            inventory_planner or InventoryDecisionPlanner()
+        )
+        self.location_loader = location_loader or _load_registered_locations
 
     def start(self):
         """Start the background evaluation loop once."""
         if self._thread is not None and self._thread.is_alive():
             return
-        CCTVMonitorView.ensure_capture_running()
+        _cctv_monitor_view().ensure_capture_running()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -237,6 +257,7 @@ class RealtimeLLMAgent:
                 if action_signature(action)
             }
             self._last_observation = ''
+            self._last_inventory_snapshot_id = ''
             self._last_evaluation_monotonic = time.monotonic()
             self._not_before_monotonic = (
                 self._last_evaluation_monotonic + self.initial_delay_sec
@@ -250,8 +271,39 @@ class RealtimeLLMAgent:
                 ),
                 last_decision='사용자 명령을 지속 목표로 등록',
                 last_error='',
+                mode='control',
             )
         print(f'[실시간 LLM 관제] 지속 목표 등록: {objective}')
+        self._wake_event.set()
+
+    def set_inventory_objective(self, objective, initial_plan=None):
+        """Continuously reassess a read-only inventory objective."""
+        objective = str(objective or '').strip()
+        if not objective:
+            return
+        initial_plan = initial_plan if isinstance(initial_plan, dict) else None
+        with self._lock:
+            self._objective_revision += 1
+            self._sent_actions = set()
+            self._last_observation = ''
+            self._last_inventory_snapshot_id = str(
+                (initial_plan or {}).get('snapshot_id', '')
+            )
+            self._last_evaluation_monotonic = time.monotonic()
+            self._not_before_monotonic = self._last_evaluation_monotonic
+            decision = (
+                json.dumps(initial_plan, ensure_ascii=False, indent=2)
+                if initial_plan else '원격 DB 기반 지속 판단 목표 등록'
+            )
+            self._snapshot = replace(
+                self._snapshot,
+                objective=objective,
+                state='MONITORING' if self._snapshot.enabled else 'DISABLED',
+                last_decision=decision,
+                last_error=str((initial_plan or {}).get('error', '')),
+                mode='inventory',
+            )
+        print(f'[실시간 LLM 재고 판단] 지속 목표 등록: {objective}')
         self._wake_event.set()
 
     def _update_snapshot(self, **changes):
@@ -269,14 +321,69 @@ class RealtimeLLMAgent:
                 if time.monotonic() < self._not_before_monotonic:
                     continue
             try:
-                self._evaluate(snapshot.objective)
+                if snapshot.mode == 'inventory':
+                    self._evaluate_inventory(snapshot.objective)
+                else:
+                    self._evaluate(snapshot.objective)
             except Exception as exc:
                 message = f'unexpected supervisor failure: {exc}'
                 self._update_snapshot(state='ERROR', last_error=message)
                 print(f'[실시간 LLM 관제 오류] {message}')
 
+    def _evaluate_inventory(self, objective):
+        """Generate a plan without reading ROS state or dispatching commands."""
+        try:
+            inventory = self.inventory_planner.inventory_client.fetch_snapshot()
+        except InventoryClientError as exc:
+            with self._lock:
+                # Replan immediately after recovery, even if the remote side
+                # returns the same snapshot ID it used before the outage.
+                self._last_inventory_snapshot_id = ''
+            result = self.inventory_planner.error_result(objective, '', exc)
+            self._update_snapshot(
+                state='ERROR',
+                last_decision=json.dumps(result, ensure_ascii=False, indent=2),
+                last_error=str(exc),
+                last_evaluation_at=time.time(),
+            )
+            return result
+
+        now = time.monotonic()
+        with self._lock:
+            changed = inventory.snapshot_id != self._last_inventory_snapshot_id
+            heartbeat_due = (
+                now - self._last_evaluation_monotonic >= self.heartbeat_sec
+            )
+            if not changed and not heartbeat_due:
+                return None
+            self._last_inventory_snapshot_id = inventory.snapshot_id
+            self._last_evaluation_monotonic = now
+            revision = self._objective_revision
+
+        self._update_snapshot(state='EVALUATING', last_error='')
+        result = self.inventory_planner.plan_snapshot(
+            objective,
+            inventory,
+            list(self.location_loader().keys()),
+        )
+        with self._lock:
+            if revision != self._objective_revision:
+                return None
+        error = str(result.get('error', ''))
+        self._update_snapshot(
+            state='ERROR' if result.get('status') == 'error' else 'MONITORING',
+            last_decision=json.dumps(result, ensure_ascii=False, indent=2),
+            last_error=error,
+            last_evaluation_at=time.time(),
+        )
+        print(
+            '[실시간 LLM 재고 판단] '
+            f'status={result.get("status")}, moves={len(result.get("moves", []))}'
+        )
+        return result
+
     def _evaluate(self, objective):
-        shared_frame = CCTVMonitorView.SHARED_FRAME
+        shared_frame = _cctv_monitor_view().SHARED_FRAME
         if shared_frame is None:
             self._update_snapshot(
                 state='WAITING_FOR_IMAGE',
@@ -315,8 +422,7 @@ class RealtimeLLMAgent:
             self._update_snapshot(state='ERROR', last_error='JPEG encode failed')
             return
         compact = compact_detections(detection_summary)
-        cargo_registry = load_cargo_registry()
-        cargo_details = load_cargo_details()
+        cargo_registry, cargo_details = _load_cargo_context()
         known_types = sorted({
             detail.get('화물종류', '')
             for detail in cargo_details.values()
@@ -330,7 +436,7 @@ class RealtimeLLMAgent:
             result = parse_command_with_llm(
                 prompt,
                 list(cargo_registry.keys()),
-                list(load_named_locations().keys()),
+                list(self.location_loader().keys()),
                 known_types,
                 image_jpeg=encoded.tobytes(),
                 image_width=width,

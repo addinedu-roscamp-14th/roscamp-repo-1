@@ -37,6 +37,9 @@ from .control_protocol import (
 )
 
 
+DEFAULT_ARRIVAL_ROI = [0.78, 0.55, 0.99, 0.98]
+
+
 def _json_safe(value):
     """
     Replace NaN/Infinity floats with None (JSON null).
@@ -101,7 +104,7 @@ class CentralControlGateway(Node):
         self.declare_parameter('minimum_heading_distance_px', 10.0)
         self.declare_parameter('telemetry_stale_timeout_sec', 2.0)
         self.declare_parameter(
-            'arrival_roi_normalized', [0.0, 0.0, 0.35, 0.35]
+            'arrival_roi_normalized', DEFAULT_ARRIVAL_ROI
         )
 
         self.host = str(self.get_parameter('host').value)
@@ -242,9 +245,12 @@ class CentralControlGateway(Node):
             DispatchArmCommand,
             '/central/arms/dispatch',
         )
-        self._arm_stop_client = self.create_client(
-            Trigger, '/central/arms/arm2/stop'
-        )
+        self._arm_stop_clients = {
+            arm_id: self.create_client(
+                Trigger, f'/central/arms/{arm_id}/stop'
+            )
+            for arm_id in ('arm1', 'arm2')
+        }
         self._fleet_emergency_client = self.create_client(
             SetBool, '/central/fleet/emergency_stop'
         )
@@ -476,22 +482,28 @@ class CentralControlGateway(Node):
             )
 
     def stop_arm(self, arm_id, timeout_sec=3.0):
-        if str(arm_id).lower() != 'arm2':
-            raise CommandValidationError(
-                'ARM1 stop is unavailable until ARM1 is configured'
+        arm_id = str(arm_id).lower()
+        if arm_id not in self._arm_stop_clients:
+            raise CommandValidationError('arm_id must be arm1 or arm2')
+        client = self._arm_stop_clients[arm_id]
+        if not client.wait_for_service(timeout_sec=0.5):
+            raise RuntimeError(
+                f'central {arm_id.upper()} stop service is unavailable'
             )
-        if not self._arm_stop_client.wait_for_service(timeout_sec=0.5):
-            raise RuntimeError('central ARM2 stop service is unavailable')
-        future = self._arm_stop_client.call_async(Trigger.Request())
+        future = client.call_async(Trigger.Request())
         deadline = time.monotonic() + timeout_sec
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not future.done():
-            raise RuntimeError('ARM2 stop timed out')
+            raise RuntimeError(f'{arm_id.upper()} stop timed out')
         response = future.result()
         if not response.success:
             raise RuntimeError(response.message)
-        return {'accepted': True, 'arm_id': 'arm2', 'message': response.message}
+        return {
+            'accepted': True,
+            'arm_id': arm_id,
+            'message': response.message,
+        }
 
     def dispatch_pixel_goal(self, payload):
         """Validate and publish a target/heading pixel pair exactly once."""
@@ -659,7 +671,10 @@ class CentralControlGateway(Node):
                     'start fleet_dispatcher first'
                 )
             message = String()
-            message.data = request.requested_vehicle_id
+            message.data = json.dumps({
+                'vehicle_id': request.requested_vehicle_id,
+                'predecessor_command_id': request.predecessor_command_id,
+            }, ensure_ascii=False)
             self.park_request_publisher.publish(message)
             self._recent_command_ids.append(command_id)
 
@@ -672,6 +687,7 @@ class CentralControlGateway(Node):
             'duplicate': False,
             'command_id': command_id,
             'vehicle_id': request.requested_vehicle_id or 'AUTO',
+            'predecessor_command_id': request.predecessor_command_id,
         }
 
     def _point_message(self, x, y, stamp, mode='direct'):

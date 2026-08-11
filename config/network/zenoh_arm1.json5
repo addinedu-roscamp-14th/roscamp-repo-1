@@ -11,13 +11,24 @@
       "domain": 15,
       "ros_automatic_discovery_range": "LOCALHOST",
       "allow": {
-        "publishers": [],
+        "publishers": [
+          "/arm/pick_place/status",
+          "/arm/pick_place/work_state"
+        ],
         "subscribers": [],
-        "service_servers": [],
+        "service_servers": [
+          "/arm/pick_place/execute",
+          "/arm/pick_place/start",
+          "/arm/pick_place/stop"
+        ],
         "service_clients": [],
         "action_servers": [],
         "action_clients": []
       },
+      "pub_priorities": [
+        "/arm/pick_place/work_state=1:express",
+        "/arm/pick_place/status=2:express"
+      ],
       "queries_timeout": {
         "default": 5.0,
         "services": 5.0,

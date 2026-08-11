@@ -21,7 +21,7 @@ MoveIt은 사용하지 않습니다. 관찰 자세는 JetCobot `sync_send_angles
 Cartesian 동작은 `send_coords`를 한 번 전송한 뒤 `get_coords`로 직접 도착을
 확인합니다.
 
-현재 기본값:
+수동 `/start` 호환 경로의 기본값:
 
 - Pick ArUco ID: `2`
 - Place ArUco ID: `8`
@@ -111,8 +111,6 @@ source install/setup.bash
 ros2 launch arm_pick_place container_pick_place.launch.py \
   serial_port:=/dev/ttyUSB0 \
   video_device:=/dev/video2 \
-  pick_id:=2 \
-  place_id:=9 \
   marker_size_m:=0.020
 ```
 
@@ -130,7 +128,19 @@ ros2 launch arm_pick_place container_pick_place.launch.py \
   calibration_file:=/path/to/floor_calibration.yaml
 ```
 
-작업 시작:
+동적 작업 시작(중앙 LLM 경로가 사용하는 서비스):
+
+```bash
+ros2 service call /arm/pick_place/execute \
+  porter_interfaces/srv/ExecutePickPlace \
+  "{pick_id: 2, place_id: 9}"
+```
+
+`pick_id`와 `place_id`는 매 요청마다 변경할 수 있으며 coordinator는 검출기가
+같은 ID로 전환됐다는 응답을 받은 뒤에만 로봇 동작을 시작합니다. launch에서는
+두 ID를 지정하지 않습니다.
+
+현재 기본 ID로 수동 작업 시작:
 
 ```bash
 ros2 service call /arm/pick_place/start \

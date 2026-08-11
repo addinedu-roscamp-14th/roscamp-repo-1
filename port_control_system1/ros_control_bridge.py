@@ -23,6 +23,11 @@ AMR_DISPLAY_NAMES = {
     "agv2": "AMR 2 (노랑)",
 }
 
+ARM_DISPLAY_NAMES = {
+    "arm1": "로봇팔 1 (ARM1)",
+    "arm2": "로봇팔 2 (ARM2)",
+}
+
 # Latch-clearing surface, kept in step with scripts/clear_all_holds.sh.
 COLLISION_SUPERVISOR_SERVICE = "/central/fleet/collision_supervisor/enabled"
 FLEET_EMERGENCY_SERVICE = "/central/fleet/emergency_stop"
@@ -64,6 +69,24 @@ class FleetVehicleState:
 
 
 @dataclass(frozen=True)
+class RobotArmState:
+    """One arm's structured state from the central ARM dispatcher."""
+
+    arm_id: str = ""
+    state: int = 1
+    state_text: str = ""
+    ready: bool = False
+    current_command_id: str = ""
+    current_mission_id: str = ""
+    current_operation: str = ""
+    operation_id: str = ""
+    phase: str = ""
+    progress: float = 0.0
+    last_error: str = ""
+    telemetry_age_sec: float = float("inf")
+
+
+@dataclass(frozen=True)
 class RosSnapshot:
     ready: bool = False
     error: Optional[str] = None
@@ -76,6 +99,7 @@ class RosSnapshot:
     emergency_active: bool = False
     last_command: Optional[str] = None
     fleet_states: tuple = ()
+    arm_states: tuple = ()
     b1_zone: str = "B-1:UNKNOWN"
     # Mirrors /central/fleet/collision_status from fleet_collision_supervisor.
     collision_state: str = ""
@@ -112,6 +136,7 @@ class RosControlBridge:
         self._fleet_emergency = False
         self._emergency_vehicles = set()
         self._fleet_states = {}
+        self._arm_states = {}
 
         self.cmd_vel_topic = os.environ.get(
             "PORT_CONTROL_CMD_VEL_TOPIC", "/cmd_vel"
@@ -162,7 +187,7 @@ class RosControlBridge:
             from action_msgs.srv import CancelGoal
             from std_msgs.msg import Float32, String
             from std_srvs.srv import SetBool, Trigger
-            from porter_interfaces.msg import VehicleState
+            from porter_interfaces.msg import ArmState, VehicleState
         except Exception as exc:
             self._update_snapshot(
                 ready=False,
@@ -248,6 +273,13 @@ class RosControlBridge:
                         owner._on_vehicle_state,
                         10,
                     )
+                for arm_id in ARM_DISPLAY_NAMES:
+                    self.create_subscription(
+                        ArmState,
+                        f"/central/arms/{arm_id}/state",
+                        owner._on_arm_state,
+                        10,
+                    )
                 self.create_subscription(
                     String,
                     "/central/fleet/zones",
@@ -281,7 +313,7 @@ class RosControlBridge:
                 )
                 self.create_subscription(
                     String,
-                    "/arm/container_pick/status",
+                    "/arm/pick_place/status",
                     lambda msg: owner._update_snapshot(arm_status=msg.data),
                     10,
                 )
@@ -365,6 +397,32 @@ class RosControlBridge:
                 for key in sorted(self._fleet_states)
             ),
             emergency_active=self._emergency_active,
+        )
+
+    def _on_arm_state(self, message) -> None:
+        """Store the latest structured connection and work state per arm."""
+        arm_id = str(message.arm_id or "").strip().lower()
+        if arm_id not in ARM_DISPLAY_NAMES:
+            return
+        self._arm_states[arm_id] = RobotArmState(
+            arm_id=arm_id,
+            state=int(message.state),
+            state_text=str(message.state_text),
+            ready=bool(message.ready),
+            current_command_id=str(message.current_command_id),
+            current_mission_id=str(message.current_mission_id),
+            current_operation=str(message.current_operation),
+            operation_id=str(message.operation_id),
+            phase=str(message.phase),
+            progress=float(message.progress),
+            last_error=str(message.last_error),
+            telemetry_age_sec=float(message.telemetry_age_sec),
+        )
+        self._update_snapshot(
+            arm_states=tuple(
+                self._arm_states[key]
+                for key in sorted(self._arm_states)
+            )
         )
 
     def _on_collision_status(self, message) -> None:

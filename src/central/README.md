@@ -7,14 +7,19 @@
 
 ## 로봇팔 중앙 연동
 
-중앙은 `/central/arms/dispatch` 액션으로 ARM 명령을 FIFO 처리합니다. 현재 ARM2만
-설정되어 있고 ARM1은 서비스 계약을 받기 전까지 `UNCONFIGURED`로 표시됩니다.
-ARM2는 직접 서비스 응답을 작업 완료로 간주하지 않습니다. 반드시
+중앙은 `/central/arms/dispatch` 액션으로 ARM 명령을 FIFO 처리합니다. ARM1은
+`/arm/pick_place/execute`, `/arm/pick_place/stop` 서비스와
+`/arm/pick_place/work_state` 상태 계약을 사용합니다. 중앙은 새 `WORK_STARTED` 이후
+`WORK_COMPLETED`, `FAILED`, `STOPPED` 중 하나가 올 때까지 명령을 완료하지 않습니다.
+`execute` 요청의 `pick_id/place_id`는 중앙 action의
+`source_id/destination_id`에서 매 작업마다 전달됩니다.
+ARM2도 직접 서비스 응답을 작업 완료로 간주하지 않습니다. 반드시
 `/arm2/transfer_events`에서 같은 `operation_id`의 최종 `COMPLETED` 또는 `FAILED`
 이벤트를 받은 뒤 중앙 결과를 확정합니다.
 
 허용 작업은 다음으로 제한됩니다.
 
+- ARM1: `pick_place`, `stop`
 - `scan_destinations`
 - `transfer_to_slot`: 차량에서 창고로 이동
 - `load_to_trailer`: 창고에서 차량으로 이동
@@ -66,6 +71,7 @@ curl -X POST http://127.0.0.1:8100/api/v1/arms/commands \
 작업 상태 확인:
 
 ```bash
+ros2 topic echo /central/arms/arm1/state
 ros2 topic echo /central/arms/arm2/state
 ros2 topic echo /central/arms/results
 ros2 topic echo /central/autonomy/vehicle_release
@@ -76,8 +82,8 @@ ros2 topic echo /central/autonomy/vehicle_release
 `port_event_detector`는 대시보드에서 지정한 탑다운 카메라 ROI 안의 YOLO OBB를
 검사합니다. 신뢰도 `0.65` 이상, ROI 겹침 `30%` 이상이 최근 5프레임 중 3프레임에
 있으면 입항으로 판정합니다. 10초 동안 사라지면 출항으로 판정합니다. 입항 시
-`autonomy_orchestrator`가 ARM2 목적지 스캔을 요청하고, ARM1 계약과 화물 정책이
-준비될 때까지 `WAITING_FOR_CARGO_POLICY`로 대기합니다.
+`autonomy_orchestrator`가 ARM2 목적지 스캔을 요청하고 화물 정책이 준비될 때까지
+`WAITING_FOR_CARGO_POLICY`로 대기합니다.
 
 ## 2대 차량 Fleet 제어
 

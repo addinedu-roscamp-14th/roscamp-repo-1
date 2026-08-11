@@ -4,7 +4,7 @@ port_event_detector:
     event_topic: /central/autonomy/port_events
     roi_config_topic: /central/autonomy/arrival_roi_config
     # Normalized top-down image ROI: x_min, y_min, x_max, y_max.
-    roi_normalized: [0.0, 0.0, 0.35, 0.35]
+    roi_normalized: [0.78, 0.55, 0.99, 0.98]
     vessel_label_keywords:
       [container, black, gray, brown, vessel, ship]
     minimum_confidence: 0.65

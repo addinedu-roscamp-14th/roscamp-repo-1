@@ -32,6 +32,8 @@
           "/agv[12]/robot_description",
           "/agv[12]/battery/percent",
           "/agv[12]/battery/voltage",
+          "/arm/pick_place/status",
+          "/arm/pick_place/work_state",
           "/arm2/transfer_events",
           "/arm2/container_pick/status",
           "/arm2/joint_states"
@@ -42,6 +44,9 @@
           "/agv[12]/emergency_stop",
           "/agv[12]/local_costmap/local_costmap/get_parameters",
           "/agv[12]/local_costmap/local_costmap/set_parameters",
+          "/arm/pick_place/execute",
+          "/arm/pick_place/start",
+          "/arm/pick_place/stop",
           "/arm2/scan_destinations",
           "/arm2/transfer_to_a[123]_[12]",
           "/arm2/load_id[0-8]_to_trailer",

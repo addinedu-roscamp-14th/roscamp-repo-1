@@ -88,6 +88,62 @@ def test_image_is_forwarded_to_vlm(monkeypatch):
     assert result['actions'][0]['type'] == 'pixel_navigation'
 
 
+def test_llm_revises_arm_plan_when_a_zone_arrival_is_missing(monkeypatch):
+    responses = [
+        {
+            'message': {
+                'content': (
+                    '{"execution_mode":"sequential","actions":['
+                    '{"type":"arm_transfer_to_slot","arm_id":"arm2",'
+                    '"destination_slot":"A-1-2","vehicle_id":"agv1",'
+                    '"final_for_vehicle":true}]}'
+                )
+            }
+        },
+        {
+            'message': {
+                'content': (
+                    '{"execution_mode":"sequential","actions":['
+                    '{"type":"visual_navigation","detection_index":1,'
+                    '"approach_side":"bottom","vehicle_id":"agv1"},'
+                    '{"type":"arm_transfer_to_slot","arm_id":"arm2",'
+                    '"destination_slot":"A-1-2","vehicle_id":"agv1",'
+                    '"final_for_vehicle":true}]}'
+                )
+            }
+        },
+    ]
+    captured = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def chat(self, **kwargs):
+            captured.append(kwargs)
+            return responses[len(captured) - 1]
+
+    monkeypatch.setitem(
+        sys.modules,
+        'ollama',
+        types.SimpleNamespace(Client=FakeClient),
+    )
+
+    result = parse_command_with_llm(
+        'amr1에 실려있는 1번 컨테이너를 a-1-2에 내려줘',
+        [],
+        [],
+        [],
+        yolo_detections=DETECTIONS,
+    )
+
+    assert len(captured) == 2
+    assert '물리적 선행조건' in captured[1]['messages'][-1]['content']
+    assert [action['type'] for action in result['actions']] == [
+        'visual_navigation', 'arm_transfer_to_slot'
+    ]
+
+
 def test_independent_vehicle_actions_default_to_parallel():
     result = {
         'actions': [
@@ -495,3 +551,56 @@ def test_prompt_states_the_same_colour_mapping_as_the_alias_table():
     assert 'car_yellow=agv2' in prompt
     assert 'car_yellow=agv1' not in prompt
     assert 'car_blue=agv2' not in prompt
+
+
+def test_prompt_requires_complete_llm_cargo_workflow_for_both_amrs():
+    prompt = _SYSTEM_PROMPT_TEMPLATE
+
+    assert 'visual_navigation을 먼저 넣고' in prompt
+    assert 'arm_transfer_to_slot' in prompt
+    assert 'arm_load_to_trailer' in prompt
+    assert 'AMR1(agv1)과 AMR2(agv2) 모두' in prompt
+
+
+def test_prompt_exposes_arm1_dynamic_pick_place_contract():
+    prompt = _SYSTEM_PROMPT_TEMPLATE
+
+    assert '"arm1_pick_place", "arm_id": "arm1"' in prompt
+    assert 'launch 설정값이 아니라 사용자 목표와 현재' in prompt
+    assert '"source_id": <0..49>' in prompt
+    assert '"destination_id": <0..49>' in prompt
+    assert 'ARM1은 아직 중앙 서비스 계약이 없으므로' not in prompt
+
+
+def test_llm_generated_arrival_then_unload_plan_is_preserved():
+    result = normalize_navigation_result(
+        'AMR1의 컨테이너를 A-1-2에 내려줘',
+        {
+            'execution_mode': 'sequential',
+            'actions': [
+                {
+                    'type': 'visual_navigation',
+                    'detection_index': 1,
+                    'approach_side': 'bottom',
+                    'vehicle_id': 'agv1',
+                },
+                {
+                    'type': 'arm_transfer_to_slot',
+                    'arm_id': 'arm2',
+                    'destination_slot': 'A-1-2',
+                    'vehicle_id': 'agv1',
+                    'final_for_vehicle': True,
+                },
+            ],
+        },
+        DETECTIONS,
+    )
+
+    assert result['execution_mode'] == 'sequential'
+    assert [action['type'] for action in result['actions']] == [
+        'visual_navigation', 'arm_transfer_to_slot'
+    ]
+    assert all(
+        action.get('vehicle_id') == 'agv1'
+        for action in result['actions']
+    )

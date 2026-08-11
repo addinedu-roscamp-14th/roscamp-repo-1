@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import types
+import weakref
 
 from central.arm_dispatcher import ArmDispatcher
 from central.fleet_dispatcher import FleetDispatcher
@@ -153,6 +154,75 @@ def test_malformed_snapshot_leaves_the_previous_holds_intact():
 
     assert dispatcher._cargo_held_vehicles == {'agv1'}
     assert dispatcher._logger.messages[-1][0] == 'warning'
+
+
+def test_arm_result_completes_navigation_predecessor_timeline():
+    dispatcher = object.__new__(FleetDispatcher)
+    dispatcher._lock = threading.RLock()
+    dispatcher._command_condition = threading.Condition(dispatcher._lock)
+    dispatcher._command_outcomes = {}
+    message = String()
+    message.data = json.dumps({
+        'command_id': 'arm-step-1',
+        'success': True,
+    })
+
+    dispatcher._on_arm_result(message)
+
+    assert dispatcher._command_outcomes == {'arm-step-1': True}
+
+
+def test_invalid_arm_result_cannot_release_a_navigation_step():
+    dispatcher = object.__new__(FleetDispatcher)
+    dispatcher._lock = threading.RLock()
+    dispatcher._command_condition = threading.Condition(dispatcher._lock)
+    dispatcher._command_outcomes = {}
+    message = String()
+    message.data = json.dumps({
+        'command_id': 'arm-step-1',
+        'success': 'true',
+    })
+
+    dispatcher._on_arm_result(message)
+
+    assert dispatcher._command_outcomes == {}
+
+
+def test_park_waits_for_successful_arm_predecessor():
+    scheduled = []
+
+    class StubExecutor:
+        def create_task(self, task):
+            scheduled.append(task)
+
+    dispatcher = object.__new__(FleetDispatcher)
+    dispatcher._lock = threading.RLock()
+    dispatcher._command_condition = threading.Condition(dispatcher._lock)
+    dispatcher._command_outcomes = {}
+    dispatcher._pending_parks = {}
+    executor = StubExecutor()
+    dispatcher._Node__executor_weakref = weakref.ref(executor)
+    dispatcher._dispatch_park = (
+        lambda vehicle_id, wait_until_ready=False:
+        ('park', vehicle_id, wait_until_ready)
+    )
+    dispatcher._logger = StubLogger()
+    dispatcher.get_logger = lambda: dispatcher._logger
+    request = String()
+    request.data = json.dumps({
+        'vehicle_id': 'agv1',
+        'predecessor_command_id': 'arm-load-1',
+    })
+
+    dispatcher._on_park_request(request)
+
+    assert scheduled == []
+    assert dispatcher._pending_parks == {'arm-load-1': ['agv1']}
+
+    dispatcher._record_command_outcome('arm-load-1', True)
+
+    assert scheduled == [('park', 'agv1', True)]
+    assert dispatcher._pending_parks == {}
 
 
 def test_namespaced_vehicle_ids_are_normalized():

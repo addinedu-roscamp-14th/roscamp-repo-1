@@ -83,8 +83,6 @@ def generate_launch_description():
             'camera_frame_id',
             default_value='arm/gripper_camera_optical_frame',
         ),
-        DeclareLaunchArgument('pick_id', default_value='2'),
-        DeclareLaunchArgument('place_id', default_value='8'),
         DeclareLaunchArgument('marker_size_m', default_value='0.020'),
         DeclareLaunchArgument('dictionary', default_value='DICT_5X5_50'),
         DeclareLaunchArgument(
@@ -175,12 +173,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'camera_frame_id': LaunchConfiguration('camera_frame_id'),
-            'pick_marker_id': ParameterValue(
-                LaunchConfiguration('pick_id'), value_type=int
-            ),
-            'place_marker_id': ParameterValue(
-                LaunchConfiguration('place_id'), value_type=int
-            ),
+            'pick_marker_id': 2,
+            'place_marker_id': 8,
             'pick_marker_frame': 'arm/pick_marker',
             'place_marker_frame': 'arm/place_marker',
             'marker_size_m': ParameterValue(
@@ -200,12 +194,6 @@ def generate_launch_description():
             LaunchConfiguration('params_file'),
             {
                 'serial_port': LaunchConfiguration('serial_port'),
-                'pick_marker_id': ParameterValue(
-                    LaunchConfiguration('pick_id'), value_type=int
-                ),
-                'place_marker_id': ParameterValue(
-                    LaunchConfiguration('place_id'), value_type=int
-                ),
                 'calibration_file': LaunchConfiguration(
                     'resolved_calibration_file'
                 ),

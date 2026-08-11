@@ -10,6 +10,8 @@ from ament_index_python.packages import get_package_share_directory
 
 import numpy as np
 
+from porter_interfaces.srv import ExecutePickPlace
+
 from pymycobot.mycobot280 import MyCobot280
 
 import rclpy
@@ -98,6 +100,8 @@ class HomographyPickPlace(Node):
         self.command_frame = str(self.parameter('command_frame'))
         self.pick_frame = str(self.parameter('pick_marker_frame'))
         self.place_frame = str(self.parameter('place_marker_frame'))
+        self.pick_marker_id = int(self.parameter('pick_marker_id'))
+        self.place_marker_id = int(self.parameter('place_marker_id'))
         self.stations = parse_stations(str(self.parameter('stations_json')))
         self.floors = load_floor_calibration(
             str(self.parameter('calibration_file'))
@@ -140,6 +144,7 @@ class HomographyPickPlace(Node):
         self.history_lock = threading.Lock()
         self.serial_lock = threading.Lock()
         self.operation_lock = threading.Lock()
+        self.command_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.external_stop_requested = False
         self.motion_thread = None
@@ -167,6 +172,17 @@ class HomographyPickPlace(Node):
             control_qos,
         )
         self.current_work_state = ''
+        self.configure_targets_client = self.create_client(
+            ExecutePickPlace,
+            '/arm/pick_place/configure_targets',
+            callback_group=self.callback_group,
+        )
+        self.create_service(
+            ExecutePickPlace,
+            '/arm/pick_place/execute',
+            self.execute,
+            callback_group=self.callback_group,
+        )
         self.create_service(
             Trigger,
             '/arm/pick_place/start',
@@ -208,8 +224,9 @@ class HomographyPickPlace(Node):
         self.publish_status(
             'READY: direct send_coords + get_coords polling; '
             f'stations={[item.name for item in self.stations]}, '
-            f'pick_id={self.parameter("pick_marker_id")}, '
-            f'place_id={self.parameter("place_marker_id")}'
+            f'default_pick_id={self.pick_marker_id}, '
+            f'default_place_id={self.place_marker_id}; '
+            'dynamic service=/arm/pick_place/execute'
         )
 
     def _declare_parameters(self):
@@ -496,20 +513,78 @@ class HomographyPickPlace(Node):
         )
 
     def start(self, _request, response):
-        """Accept one asynchronous Pick/Place operation."""
-        if self.motion_thread is not None and self.motion_thread.is_alive():
-            response.success = False
-            response.message = 'another Pick/Place operation is running'
-            return response
-        self.stop_event.clear()
-        self.external_stop_requested = False
-        self.motion_thread = threading.Thread(
-            target=self.run_operation, daemon=True
+        """Start the current target pair as a manual compatibility path."""
+        accepted, message = self._accept_operation(
+            self.pick_marker_id, self.place_marker_id
         )
-        self.motion_thread.start()
-        response.success = True
-        response.message = 'Pick/Place accepted'
+        response.success = accepted
+        response.message = message
         return response
+
+    def execute(self, request, response):
+        """Accept one LLM-selected Pick/Place marker pair."""
+        accepted, message = self._accept_operation(
+            int(request.pick_id), int(request.place_id)
+        )
+        response.accepted = accepted
+        response.message = message
+        return response
+
+    @staticmethod
+    def _validate_target_ids(pick_id, place_id):
+        if not 0 <= int(pick_id) <= 49:
+            return 'pick_id must be within the DICT_5X5_50 range 0..49'
+        if not 0 <= int(place_id) <= 49:
+            return 'place_id must be within the DICT_5X5_50 range 0..49'
+        if int(pick_id) == int(place_id):
+            return 'pick_id and place_id must be different'
+        return ''
+
+    def _configure_detector_targets(self, pick_id, place_id):
+        if not self.configure_targets_client.wait_for_service(
+            timeout_sec=3.0
+        ):
+            return False, 'dynamic ArUco target service is unavailable'
+        request = ExecutePickPlace.Request()
+        request.pick_id = int(pick_id)
+        request.place_id = int(place_id)
+        completed = threading.Event()
+        future = self.configure_targets_client.call_async(request)
+        future.add_done_callback(lambda _future: completed.set())
+        if not completed.wait(3.0):
+            return False, 'dynamic ArUco target service timed out'
+        try:
+            response = future.result()
+        except Exception as exc:
+            return False, f'dynamic ArUco target service failed: {exc}'
+        return bool(response.accepted), str(response.message)
+
+    def _accept_operation(self, pick_id, place_id):
+        with self.command_lock:
+            if self.motion_thread is not None and self.motion_thread.is_alive():
+                return False, 'another Pick/Place operation is running'
+            error = self._validate_target_ids(pick_id, place_id)
+            if error:
+                return False, error
+            configured, message = self._configure_detector_targets(
+                pick_id, place_id
+            )
+            if not configured:
+                return False, message
+            self.pick_marker_id = int(pick_id)
+            self.place_marker_id = int(place_id)
+            self.last_stamps.clear()
+            self.set_detection_enabled(False)
+            self.stop_event.clear()
+            self.external_stop_requested = False
+            self.motion_thread = threading.Thread(
+                target=self.run_operation, daemon=True
+            )
+            self.motion_thread.start()
+            return True, (
+                f'Pick/Place accepted: pick_id={self.pick_marker_id}, '
+                f'place_id={self.place_marker_id}'
+            )
 
     def stop(self, _request, response):
         """Request detector shutdown and immediate JetCobot stop."""
@@ -536,7 +611,11 @@ class HomographyPickPlace(Node):
             return
         try:
             self.publish_work_state('WORK_STARTED')
-            self.publish_status('작업 시작: ArUco Pick/Place')
+            self.publish_status(
+                '작업 시작: ArUco Pick/Place '
+                f'pick_id={self.pick_marker_id}, '
+                f'place_id={self.place_marker_id}'
+            )
             self.publish_work_state('SEARCHING')
             detections = self.search_stations()
             calibrated = {}

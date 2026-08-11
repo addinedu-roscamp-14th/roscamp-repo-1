@@ -99,7 +99,12 @@ class CentralControlClient:
             )
         return body
 
-    def send_park(self, command_id=None, vehicle_id=''):
+    def send_park(
+        self,
+        command_id=None,
+        vehicle_id='',
+        predecessor_command_id='',
+    ):
         """Ask the fleet to send one AGV (or the next idle one) to park."""
         command_id = command_id or f'park-{uuid.uuid4()}'
         headers = {'Content-Type': 'application/json'}
@@ -113,6 +118,7 @@ class CentralControlClient:
                 json={
                     'command_id': command_id,
                     'vehicle_id': vehicle_id,
+                    'predecessor_command_id': predecessor_command_id,
                 },
                 timeout=self.timeout_sec,
             )
