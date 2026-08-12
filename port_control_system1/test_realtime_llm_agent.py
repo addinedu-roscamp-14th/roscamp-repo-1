@@ -109,3 +109,32 @@ def test_new_objective_seeds_actions_already_sent_by_manual_command():
     assert action_signature(action) in agent._sent_actions
     assert agent.snapshot().objective == 'agv1을 B-1로 보내'
     assert agent._not_before_monotonic > agent._last_evaluation_monotonic
+
+
+def test_waiting_mode_requests_parking_only_once_per_vehicle():
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def send_park(self, vehicle_id):
+            self.calls.append(vehicle_id)
+            return {'command_id': f'park-{vehicle_id}'}
+
+    agent = object.__new__(RealtimeLLMAgent)
+    agent._autonomy_park_requests = set()
+    client = Client()
+    status = fleet_status()
+
+    agent._park_idle_vehicles(client, status)
+    agent._park_idle_vehicles(client, status)
+
+    assert client.calls == ['agv1', 'agv2']
+
+
+def test_work_assignment_allows_vehicle_to_be_parked_again_later():
+    agent = object.__new__(RealtimeLLMAgent)
+    agent._autonomy_park_requests = {'agv1'}
+
+    agent._autonomy_park_requests.discard('agv1')
+
+    assert 'agv1' not in agent._autonomy_park_requests

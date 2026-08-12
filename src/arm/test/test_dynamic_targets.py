@@ -1,7 +1,9 @@
 """Tests for per-command ARM1 ArUco target selection."""
 
+import threading
 import types
 
+import arm_pick_place.coordinator as coordinator_module
 from arm_pick_place.coordinator import HomographyPickPlace
 from arm_pick_place.dual_aruco_pose_publisher import DualArucoPosePublisher
 
@@ -49,3 +51,37 @@ def test_detector_rejects_target_change_during_detection():
 
     assert not result.accepted
     assert 'active detection' in result.message
+
+
+def test_explicit_ship_scan_runs_even_when_cache_is_complete(monkeypatch):
+    """A central restart must trigger physical scanning, not a cache no-op."""
+    coordinator = object.__new__(HomographyPickPlace)
+    coordinator.command_lock = threading.Lock()
+    coordinator.saved_marker_poses = {
+        marker_id: object() for marker_id in range(18, 24)
+    }
+    coordinator.motion_thread = None
+    coordinator.stop_event = threading.Event()
+    coordinator.external_stop_requested = True
+    started = []
+
+    class FakeThread:
+        def __init__(self, target, daemon):
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            started.append(self.target)
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(coordinator_module.threading, 'Thread', FakeThread)
+    response = types.SimpleNamespace(success=False, message='')
+
+    result = coordinator.scan_ship_destinations(None, response)
+
+    assert result.success
+    assert 'fresh two-view' in result.message
+    assert started == [coordinator._run_ship_destination_scan]
+    assert not coordinator.external_stop_requested

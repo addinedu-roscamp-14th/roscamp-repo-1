@@ -37,7 +37,12 @@ from .control_protocol import (
 )
 
 
-DEFAULT_ARRIVAL_ROI = [0.78, 0.55, 0.99, 0.98]
+DEFAULT_ARRIVAL_ROI = [
+    0.8424657534246576,
+    0.6316695352839932,
+    0.9575342465753425,
+    0.8399311531841652,
+]
 
 
 def _json_safe(value):
