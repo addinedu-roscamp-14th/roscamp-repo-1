@@ -443,6 +443,11 @@ class RealtimeLLMAgent:
                 image_height=height,
                 yolo_detections=compact,
                 normalization_command=objective,
+                zone_status=str(
+                    (fleet_status.get('telemetry') or {}).get(
+                        'b1_zone', ''
+                    )
+                ),
             )
         except LLMParseError as exc:
             self._update_snapshot(state='ERROR', last_error=str(exc))

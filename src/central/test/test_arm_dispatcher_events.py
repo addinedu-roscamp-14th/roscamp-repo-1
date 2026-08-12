@@ -106,6 +106,43 @@ def test_arm1_work_state_updates_structured_central_state():
     assert dispatcher.arm1_events == [(1, 'PICK_STARTED')]
 
 
+def test_arm1_failed_state_preserves_the_detailed_status_reason():
+    dispatcher = object.__new__(ArmDispatcher)
+    dispatcher.condition = threading.Condition()
+    dispatcher.arm1_event_sequence = 0
+    dispatcher.arm1_events = []
+    dispatcher.arm1_last_error = ''
+    dispatcher.arm1_status_text = '작업 실패 및 정지: marker 10 not found'
+    dispatcher.arm1_state = ArmState.BUSY
+    dispatcher.arm1_state_text = 'SEARCHING'
+    dispatcher.arm1_latest_state_at = None
+
+    message = String()
+    message.data = 'FAILED'
+    dispatcher._on_arm1_work_state(message)
+
+    assert dispatcher.arm1_state == ArmState.ERROR
+    assert dispatcher.arm1_last_error == (
+        '작업 실패 및 정지: marker 10 not found'
+    )
+
+
+def test_arm1_status_arriving_after_failed_replaces_generic_error():
+    dispatcher = object.__new__(ArmDispatcher)
+    dispatcher.condition = threading.Condition()
+    dispatcher.arm1_state = ArmState.ERROR
+    dispatcher.arm1_last_error = 'ARM1 pick/place reported FAILED'
+    dispatcher.arm1_status_text = ''
+    message = String()
+    message.data = '작업 실패 및 정지: marker 6 not found'
+
+    dispatcher._on_arm1_status(message)
+
+    assert dispatcher.arm1_last_error == (
+        '작업 실패 및 정지: marker 6 not found'
+    )
+
+
 def test_arm1_wait_requires_fresh_start_then_completion():
     dispatcher = object.__new__(ArmDispatcher)
     dispatcher.condition = threading.Condition()
@@ -139,3 +176,58 @@ def test_arm1_wait_requires_fresh_start_then_completion():
     assert goal_handle.feedback == [
         'WORK_STARTED', 'PICK_COMPLETED', 'WORK_COMPLETED'
     ]
+
+
+class StubServiceClient:
+    def __init__(self, ready):
+        self.ready = ready
+
+    def service_is_ready(self):
+        return self.ready
+
+
+def make_arm2_connectivity_dispatcher(service_ready):
+    dispatcher = object.__new__(ArmDispatcher)
+    dispatcher.trigger_clients = {
+        'stop_pick': StubServiceClient(service_ready),
+        'scan_destinations': StubServiceClient(False),
+    }
+    dispatcher.transfer_by_id_client = StubServiceClient(False)
+    dispatcher.active_command = None
+    dispatcher.arm2_state = ArmState.OFFLINE
+    dispatcher.arm2_state_text = 'waiting for ARM2 event or service'
+    dispatcher.arm2_last_error = ''
+    return dispatcher
+
+
+def test_arm2_idle_service_changes_initial_offline_to_ready():
+    dispatcher = make_arm2_connectivity_dispatcher(service_ready=True)
+
+    dispatcher._refresh_arm2_idle_connectivity()
+
+    assert dispatcher.arm2_state == ArmState.READY
+    assert dispatcher.arm2_state_text == 'SERVICE_CONNECTED'
+
+
+def test_arm2_service_disappearance_returns_service_only_state_offline():
+    dispatcher = make_arm2_connectivity_dispatcher(service_ready=True)
+    dispatcher._refresh_arm2_idle_connectivity()
+    dispatcher.trigger_clients['stop_pick'].ready = False
+
+    dispatcher._refresh_arm2_idle_connectivity()
+
+    assert dispatcher.arm2_state == ArmState.OFFLINE
+    assert dispatcher.arm2_state_text == 'waiting for ARM2 event or service'
+
+
+def test_arm2_service_probe_does_not_overwrite_event_error():
+    dispatcher = make_arm2_connectivity_dispatcher(service_ready=True)
+    dispatcher.arm2_state = ArmState.ERROR
+    dispatcher.arm2_state_text = 'FAILED'
+    dispatcher.arm2_last_error = 'pick failed'
+
+    dispatcher._refresh_arm2_idle_connectivity()
+
+    assert dispatcher.arm2_state == ArmState.ERROR
+    assert dispatcher.arm2_state_text == 'FAILED'
+    assert dispatcher.arm2_last_error == 'pick failed'

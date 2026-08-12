@@ -56,6 +56,7 @@ def hold_message(vehicle_ids):
 def test_only_final_vehicle_cargo_operations_gate_departure():
     assert ArmDispatcher._gates_vehicle(make_goal(), 'transfer_to_slot')
     assert ArmDispatcher._gates_vehicle(make_goal(), 'load_to_trailer')
+    assert ArmDispatcher._gates_vehicle(make_goal(), 'pick_place')
     # A scan touches no vehicle, so it must never hold one.
     assert not ArmDispatcher._gates_vehicle(make_goal(), 'scan_destinations')
     # Warehouse-internal moves are not tied to a vehicle either.
@@ -242,6 +243,12 @@ def make_arrival_dispatcher(zone='A', max_age_sec=5.0):
     return dispatcher
 
 
+def make_per_arm_arrival_dispatcher(max_age_sec=5.0):
+    dispatcher = make_arrival_dispatcher(max_age_sec=max_age_sec)
+    dispatcher.vehicle_arrival_zones = {'arm1': 'B-1', 'arm2': 'A'}
+    return dispatcher
+
+
 def vehicle_state(state=VehicleState.READY, locked_zone='A'):
     message = VehicleState()
     message.vehicle_id = 'agv1'
@@ -273,6 +280,24 @@ def test_vehicle_ready_in_another_zone_has_not_arrived():
     dispatcher._on_vehicle_state('agv1', vehicle_state(locked_zone='B-1'))
 
     assert not dispatcher._vehicle_has_arrived('agv1')
+
+
+def test_arm1_recognizes_b1_arrival_but_arm2_does_not():
+    dispatcher = make_per_arm_arrival_dispatcher()
+    dispatcher._on_vehicle_state(
+        'agv1', vehicle_state(locked_zone='B-1')
+    )
+
+    assert dispatcher._vehicle_has_arrived('agv1', 'arm1')
+    assert not dispatcher._vehicle_has_arrived('agv1', 'arm2')
+
+
+def test_arm2_recognizes_a_arrival_but_arm1_does_not():
+    dispatcher = make_per_arm_arrival_dispatcher()
+    dispatcher._on_vehicle_state('agv1', vehicle_state(locked_zone='A'))
+
+    assert dispatcher._vehicle_has_arrived('agv1', 'arm2')
+    assert not dispatcher._vehicle_has_arrived('agv1', 'arm1')
 
 
 def test_unknown_vehicle_has_not_arrived():

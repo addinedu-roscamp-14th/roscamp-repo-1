@@ -47,6 +47,17 @@ def _positive_int_env(name: str, default: int) -> int:
 
 LLM_NUM_CTX = _positive_int_env("LOCAL_LLM_NUM_CTX", 8192)
 
+# Fixed physical ArUco registry for the six vessel placement positions.
+# A natural-language "vessel slot N" uses the Nth marker in this sequence.
+ARM1_SHIP_DESTINATION_MARKERS = tuple(range(18, 24))
+ARM1_SHIP_SLOT_MARKERS = dict(
+    enumerate(ARM1_SHIP_DESTINATION_MARKERS, start=1)
+)
+VEHICLE_TRAILER_MARKERS = {
+    'agv1': 10,  # AMR1
+    'agv2': 9,   # AMR2
+}
+
 _SYSTEM_PROMPT_TEMPLATE = """당신은 항만 자율주행 로봇 시스템의 자연어 명령 해석기입니다.
 사용자가 어떤 언어로 말하든, 어떤 동의어/약어를 쓰든 아래 "등록된 이름" 목록 중
 정확히 일치하는 이름으로 매핑해야 합니다.
@@ -55,6 +66,7 @@ _SYSTEM_PROMPT_TEMPLATE = """당신은 항만 자율주행 로봇 시스템의 �
 등록된 위치명: {locations}
 등록된 화물종류: {cargo_types}
 현재 탑다운 영상 크기: {image_width}x{image_height}
+현재 Fleet 구역 점유 상태: {zone_status}
 
 현재 PostgreSQL 재고 스냅샷(JSON):
 {inventory_snapshot}
@@ -64,7 +76,7 @@ location은 창고 슬롯, floor는 같은 location 안의 적층 층수입니�
 창고 슬롯의 컨테이너를 차량에 실으라고 했지만 컨테이너 번호를 생략했다면, 그
 location에서 floor가 가장 큰 최상단 컨테이너를 골라 arm_load_to_trailer의
 source_id로 사용하세요. 아래층 컨테이너를 위 컨테이너보다 먼저 집지 마세요.
-재고 스냅샷이 unavailable이면 source_id를 추측하지 말고 unknown을 반환하세요.
+{inventory_policy}
 
 우리 AGV 차량은 YOLO 검출 JSON에서 label로 구분됩니다: car_blue=agv1(파란색
 차량, AMR1), car_yellow=agv2(노란색 차량, AMR2). 이 둘은 화물이나 장애물이 아니라
@@ -214,6 +226,14 @@ ARM1의 source_id와 destination_id는 launch 설정값이 아니라 사용자 �
 PostgreSQL 재고 스냅샷을 바탕으로 매 작업마다 선택하세요. source_id는 집을
 컨테이너 ArUco ID, destination_id는 놓을 support/AGV ArUco ID입니다. 두 ID를
 모르면 추측하지 말고 unknown을 반환하세요. 두 ID는 서로 달라야 합니다.
+선박의 고정 배치 위치는 6개이며 "선박 1번 자리"부터 "선박 6번 자리"까지의
+destination_id는 각각 18, 19, 20, 21, 22, 23입니다. ship/vessel도 선박과 같은
+뜻입니다. 사용자가 선박 자리 번호를 지정하지 않았다면 선박 목적지에는 반드시
+18..23 중 하나만 선택하고, 9번이나 컨테이너의 base_aruco_id를 목적지로 사용하지
+마세요.
+차량 트레일러의 고정 ArUco 매핑은 AMR1(agv1)=10, AMR2(agv2)=9입니다.
+ARM1이 컨테이너를 차량에 놓는 경우 destination_id는 반드시 해당 vehicle_id의
+트레일러 마커를 사용하세요. AMR1에 ID 9를, AMR2에 ID 10을 사용하지 마세요.
 
 14) ARM 작업을 즉시 정지하는 경우:
 {{"type": "arm_stop", "arm_id": "<arm1|arm2>"}}
@@ -228,11 +248,18 @@ final_for_vehicle=true를 지정하세요. 이 값이 true인 작업이 최종 �
 차량 상·하차 명령은 단일 ARM action만 반환하지 말고 물리적으로 필요한 전체
 순서를 판단해 actions에 넣으세요. A-1/A-2/A-3 검출 구역은 ARM2가 차량과
 상·하차하는 공용 A 작업 위치입니다.
+- 현재 Fleet 구역 점유 상태가 `B-1:agv1` 또는 `A:agv1`처럼 해당 차량의
+  도착을 명확히 나타내면 그 구역으로 가는 중복 visual_navigation은 생략하세요.
+  `FREE`, `UNKNOWN`, 다른 차량 점유는 도착으로 간주하지 마세요.
 - 차량의 컨테이너를 창고 슬롯으로 내리는 명령은 같은 vehicle_id로 A 작업
   위치의 visual_navigation을 먼저 넣고, 그 다음 arm_transfer_to_slot을 넣으세요.
 - 창고 컨테이너를 차량에 싣는 명령은 같은 vehicle_id로 A 작업 위치의
   visual_navigation, arm_load_to_trailer, 사용자가 요청한 최종 목적지
   navigation 순서로 넣으세요.
+- 차량에 실린 컨테이너를 선박에 놓는 명령은 같은 vehicle_id로 B-1의
+  visual_navigation을 먼저 넣고, 그 다음 ARM1의 arm1_pick_place를 넣으세요.
+  이때 선박 destination_id는 위에 등록된 18..23만 사용하고 마지막 ARM1 작업에
+  final_for_vehicle=true를 지정하세요.
 - 현재 차량이 A 위치에 있어 보여도 A 위치 navigation을 생략하지 마세요.
   중앙 Fleet이 이미 도착한 동일 목표를 중복 제거합니다.
 - 이 법칙은 AMR1(agv1)과 AMR2(agv2) 모두에 동일하게 적용하세요.
@@ -586,6 +613,26 @@ def normalize_navigation_result(
             )
             normalized_actions.append(repaired)
             continue
+        if action_type in _ARM_ACTION_TYPES:
+            repaired = dict(action)
+            repaired['vehicle_id'] = _infer_vehicle_id(
+                command, repaired.get('vehicle_id')
+            )
+            if action_type == 'arm1_pick_place':
+                try:
+                    destination_id = int(repaired.get('destination_id'))
+                except (TypeError, ValueError):
+                    destination_id = -1
+                vehicle_id = repaired['vehicle_id']
+                if (
+                    destination_id in set(VEHICLE_TRAILER_MARKERS.values())
+                    and vehicle_id in VEHICLE_TRAILER_MARKERS
+                ):
+                    repaired['destination_id'] = (
+                        VEHICLE_TRAILER_MARKERS[vehicle_id]
+                    )
+            normalized_actions.append(repaired)
+            continue
         if action_type != 'visual_navigation':
             normalized_actions.append(action)
             continue
@@ -650,7 +697,120 @@ def normalize_navigation_result(
     )
 
 
-def _cargo_workflow_issues(result, yolo_detections):
+def _zone_is_owned_by(zone_status, zone_id, vehicle_id):
+    """Read one owner from the fleet's compact ``ZONE:owner`` snapshot."""
+    expected_zone = str(zone_id or '').strip().upper()
+    expected_vehicle = str(vehicle_id or '').strip().lower()
+    if not expected_zone or not expected_vehicle:
+        return False
+    for entry in str(zone_status or '').split(';'):
+        parts = [part.strip() for part in entry.split(':')]
+        if len(parts) >= 2 and parts[0].upper() == expected_zone:
+            return parts[1].lower() == expected_vehicle
+    return False
+
+
+def _repair_arm_before_departure(result, yolo_detections, zone_status=''):
+    """Keep an already-arrived vehicle at its arm until cargo work finishes."""
+    if not isinstance(result, dict):
+        return result
+    actions = result.get('actions')
+    if not isinstance(actions, list):
+        return result
+    labels_by_index = {
+        item.get('detection_index'): str(item.get('label') or '')
+        for item in (yolo_detections or [])
+        if isinstance(item, dict)
+    }
+    repaired = list(actions)
+    index = 0
+    while index < len(repaired):
+        action = repaired[index]
+        if not isinstance(action, dict) or action.get('type') not in {
+            'arm1_pick_place', 'arm_transfer_to_slot',
+            'arm_load_to_trailer',
+        }:
+            index += 1
+            continue
+        vehicle_id = str(action.get('vehicle_id') or '').strip().lower()
+        required_zone = (
+            'B-1' if action.get('type') == 'arm1_pick_place' else 'A'
+        )
+        if not _zone_is_owned_by(zone_status, required_zone, vehicle_id):
+            index += 1
+            continue
+        required_labels = (
+            {'B-1'} if required_zone == 'B-1' else {'A-1', 'A-2', 'A-3'}
+        )
+        prior_nav_indices = [
+            prior_index
+            for prior_index, previous in enumerate(repaired[:index])
+            if isinstance(previous, dict)
+            and previous.get('type') == 'visual_navigation'
+            and str(previous.get('vehicle_id') or '').strip().lower()
+            == vehicle_id
+        ]
+        already_revisited = any(
+            labels_by_index.get(repaired[prior_index].get('detection_index'))
+            in required_labels
+            for prior_index in prior_nav_indices
+        )
+        if prior_nav_indices and not already_revisited:
+            insert_at = prior_nav_indices[0]
+            repaired.pop(index)
+            repaired.insert(insert_at, action)
+            index = insert_at + 1
+            continue
+        index += 1
+    # Moving an ARM step ahead of a departure can place the LLM's earlier
+    # (incorrectly ordered) destination navigation immediately beside the
+    # navigation it had already generated for the real next leg. Sending
+    # both creates two chained goals for the same physical A/B-1 stop.
+    deduplicated = []
+    for action in repaired:
+        if (
+            deduplicated
+            and isinstance(action, dict)
+            and action.get('type') == 'visual_navigation'
+            and isinstance(deduplicated[-1], dict)
+            and deduplicated[-1].get('type') == 'visual_navigation'
+        ):
+            previous = deduplicated[-1]
+            same_vehicle = (
+                str(previous.get('vehicle_id') or '').strip().lower()
+                == str(action.get('vehicle_id') or '').strip().lower()
+            )
+            previous_label = labels_by_index.get(
+                previous.get('detection_index'), ''
+            )
+            current_label = labels_by_index.get(
+                action.get('detection_index'), ''
+            )
+            previous_zone = (
+                'A' if previous_label in {'A-1', 'A-2', 'A-3'}
+                else previous_label
+            )
+            current_zone = (
+                'A' if current_label in {'A-1', 'A-2', 'A-3'}
+                else current_label
+            )
+            if (
+                same_vehicle
+                and previous_zone
+                and previous_zone == current_zone
+            ):
+                continue
+        deduplicated.append(action)
+    repaired = deduplicated
+    if repaired == actions:
+        return result
+    normalized = dict(result)
+    normalized['actions'] = repaired
+    normalized['execution_mode'] = 'sequential'
+    return normalized
+
+
+def _cargo_workflow_issues(result, yolo_detections, zone_status=''):
     """Validate physical prerequisites without interpreting user wording."""
     actions = result.get('actions') if isinstance(result, dict) else None
     if not isinstance(actions, list):
@@ -663,28 +823,63 @@ def _cargo_workflow_issues(result, yolo_detections):
     issues = []
     for index, action in enumerate(actions):
         if not isinstance(action, dict) or action.get('type') not in {
-            'arm_transfer_to_slot', 'arm_load_to_trailer'
+            'arm_transfer_to_slot', 'arm_load_to_trailer',
+            'arm1_pick_place',
         }:
             continue
         vehicle_id = str(action.get('vehicle_id') or '').strip().lower()
+        if (
+            action.get('type') == 'arm1_pick_place'
+            and not vehicle_id
+            and not bool(action.get('final_for_vehicle', False))
+        ):
+            # ARM1 also supports station-only manual Pick/Place operations.
+            # Only vehicle-linked operations need a preceding B-1 arrival.
+            continue
         if vehicle_id not in {'agv1', 'agv2'}:
             issues.append(
                 f'actions[{index}] ARM 작업에 vehicle_id가 없음'
             )
             continue
+        required_labels = (
+            {'B-1'}
+            if action.get('type') == 'arm1_pick_place'
+            else {'A-1', 'A-2', 'A-3'}
+        )
+        required_zone = (
+            'B-1'
+            if action.get('type') == 'arm1_pick_place'
+            else 'A 작업 위치'
+        )
+        required_zone_id = (
+            'B-1' if action.get('type') == 'arm1_pick_place' else 'A'
+        )
         arrived_at_arm = any(
             isinstance(previous, dict)
             and previous.get('type') == 'visual_navigation'
             and str(previous.get('vehicle_id') or '').strip().lower()
             == vehicle_id
             and labels_by_index.get(previous.get('detection_index'))
-            in {'A-1', 'A-2', 'A-3'}
+            in required_labels
             for previous in actions[:index]
+        )
+        vehicle_moved_before_arm = any(
+            isinstance(previous, dict)
+            and previous.get('type') == 'visual_navigation'
+            and str(previous.get('vehicle_id') or '').strip().lower()
+            == vehicle_id
+            for previous in actions[:index]
+        )
+        arrived_at_arm = arrived_at_arm or (
+            not vehicle_moved_before_arm
+            and _zone_is_owned_by(
+                zone_status, required_zone_id, vehicle_id
+            )
         )
         if not arrived_at_arm:
             issues.append(
                 f'actions[{index}] {vehicle_id} ARM 작업 전에 '
-                'A 작업 위치 visual_navigation이 없음'
+                f'{required_zone} visual_navigation이 없음'
             )
     if issues and str(result.get('execution_mode') or '').lower() != 'sequential':
         issues.append('ARM 연계 계획의 execution_mode가 sequential이 아님')
@@ -696,6 +891,115 @@ _WAREHOUSE_SLOTS = (
     'A-2-2', 'A-3-1', 'A-3-2',
 )
 
+_SHIP_TERMS = ('선박', 'ship', 'vessel')
+_SHIP_PLACE_TERMS = (
+    '놓', '내려', '하역', '적재', '싣', '실어', '선적', 'place', 'unload',
+)
+
+
+def _requests_arm1_ship_place(command):
+    """Return whether cargo is explicitly being placed onto the vessel."""
+    lowered = re.sub(r'\s+', ' ', str(command or '')).lower()
+    return (
+        any(term in lowered for term in _SHIP_TERMS)
+        and any(term in lowered for term in _SHIP_PLACE_TERMS)
+        and any(
+            term in lowered
+            for term in ('컨테이너', '화물', 'container', 'cargo')
+        )
+    )
+
+
+def _mentioned_ship_destination_id(command):
+    """Resolve an explicitly numbered vessel slot to its registered marker."""
+    text = str(command or '').lower()
+    patterns = (
+        r'(?:선박|ship|vessel)\s*[- ]?([1-6])\s*(?:번\s*)?(?:자리|슬롯|slot)',
+        r'(?:선박|ship|vessel)\s*(?:의\s*)?(?:자리|슬롯|slot)\s*[- ]?([1-6])',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return ARM1_SHIP_SLOT_MARKERS[int(match.group(1))]
+    marker_match = re.search(
+        r'(?:선박|ship|vessel).*?(?:aruco|아루코|마커)\s*'
+        r'(18|19|20|21|22|23)\b',
+        text,
+    )
+    return int(marker_match.group(1)) if marker_match else None
+
+
+def _mentioned_container_id(command):
+    """Extract one container ID explicitly stated by the operator."""
+    text = str(command or '').lower()
+    patterns = (
+        r'\b(\d{1,2})\s*번\s*(?:컨테이너|화물|container|cargo)',
+        r'(?:컨테이너|화물|container|cargo)\s*(?:id\s*)?'
+        r'(\d{1,2})\s*번?',
+    )
+    matches = {
+        int(match.group(1))
+        for pattern in patterns
+        for match in re.finditer(pattern, text)
+    }
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
+
+
+def _manual_inventory_bypass_issues(
+    command, load_actions, arm1_actions, load_requested, ship_place_requested
+):
+    """Validate explicit operator IDs without consulting PostgreSQL."""
+    if load_requested and not load_actions and not arm1_actions:
+        return ['사용자 상차 요청에 arm_load_to_trailer 단계가 없음']
+    if ship_place_requested and not arm1_actions:
+        return ['사용자 선박 배치 요청에 arm1_pick_place 단계가 없음']
+
+    explicit_source_id = _mentioned_container_id(command)
+    issues = []
+    relevant_actions = [*load_actions, *arm1_actions]
+    if relevant_actions and explicit_source_id is None:
+        issues.append(
+            'DB 없는 테스트 모드에서는 컨테이너 ID를 명령에 하나만 '
+            '명시해야 함'
+        )
+    for index, action in relevant_actions:
+        try:
+            source_id = int(action.get('source_id'))
+        except (TypeError, ValueError):
+            source_id = -1
+        if (
+            explicit_source_id is not None
+            and source_id != explicit_source_id
+        ):
+            issues.append(
+                f'actions[{index}] 명시한 컨테이너 ID는 '
+                f'{explicit_source_id}인데 source_id={source_id}를 선택함'
+            )
+
+    for index, action in arm1_actions:
+        if not ship_place_requested:
+            continue
+        try:
+            destination_id = int(action.get('destination_id'))
+        except (TypeError, ValueError):
+            destination_id = -1
+        requested_destination_id = _mentioned_ship_destination_id(command)
+        if requested_destination_id is not None:
+            if destination_id != requested_destination_id:
+                issues.append(
+                    f'actions[{index}] 지정한 선박 자리는 ArUco '
+                    f'{requested_destination_id}인데 destination_id='
+                    f'{destination_id}를 선택함'
+                )
+        elif destination_id not in ARM1_SHIP_DESTINATION_MARKERS:
+            issues.append(
+                f'actions[{index}] 선박 destination_id={destination_id}는 '
+                '등록된 ArUco 범위 18..23에 없음'
+            )
+    return issues
+
 
 def _mentioned_inventory_slots(command):
     """Return exact warehouse slots named in free-form Korean/English text."""
@@ -705,6 +1009,10 @@ def _mentioned_inventory_slots(command):
 
 def _requests_container_loading(command):
     """Conservatively identify a request to put cargo onto an AMR."""
+    if _requests_arm1_ship_place(command):
+        # Korean commonly says "선박에 싣다". That is an ARM1 vessel Place,
+        # not an ARM2 request to load the container onto an AMR trailer.
+        return False
     text = re.sub(r'\s+', '', str(command or '')).lower()
     cargo_terms = ('컨테이너', '화물', 'cargo', 'container')
     load_terms = (
@@ -717,7 +1025,9 @@ def _requests_container_loading(command):
     )
 
 
-def inventory_workflow_issues(command, result, inventory_snapshot):
+def inventory_workflow_issues(
+    command, result, inventory_snapshot, allow_inventory_bypass=False
+):
     """Validate ARM source IDs against the fresh read-only DB snapshot.
 
     The LLM chooses the container, while this function prevents a guessed or
@@ -740,8 +1050,22 @@ def inventory_workflow_issues(command, result, inventory_snapshot):
         and action.get('type') == 'arm1_pick_place'
     ]
     load_requested = _requests_container_loading(command)
-    if not load_actions and not arm1_actions and not load_requested:
+    ship_place_requested = _requests_arm1_ship_place(command)
+    if (
+        not load_actions
+        and not arm1_actions
+        and not load_requested
+        and not ship_place_requested
+    ):
         return []
+    if allow_inventory_bypass:
+        return _manual_inventory_bypass_issues(
+            command,
+            load_actions,
+            arm1_actions,
+            load_requested,
+            ship_place_requested,
+        )
     cargos = (
         inventory_snapshot.get('cargos')
         if isinstance(inventory_snapshot, dict)
@@ -752,6 +1076,8 @@ def inventory_workflow_issues(command, result, inventory_snapshot):
 
     if load_requested and not load_actions and not arm1_actions:
         return ['사용자 상차 요청에 arm_load_to_trailer 단계가 없음']
+    if ship_place_requested and not arm1_actions:
+        return ['사용자 선박 배치 요청에 arm1_pick_place 단계가 없음']
 
     valid_cargos = []
     by_id = {}
@@ -844,6 +1170,27 @@ def inventory_workflow_issues(command, result, inventory_snapshot):
                 f'{selected_id or "empty"}가 DB에 존재하지 않음'
             )
             continue
+        if ship_place_requested:
+            raw_destination_id = action.get('destination_id')
+            try:
+                destination_id = int(raw_destination_id)
+            except (TypeError, ValueError):
+                destination_id = -1
+            requested_destination_id = _mentioned_ship_destination_id(
+                command
+            )
+            if requested_destination_id is not None:
+                if destination_id != requested_destination_id:
+                    issues.append(
+                        f'actions[{index}] 지정한 선박 자리는 ArUco '
+                        f'{requested_destination_id}인데 destination_id='
+                        f'{destination_id}를 선택함'
+                    )
+            elif destination_id not in ARM1_SHIP_DESTINATION_MARKERS:
+                issues.append(
+                    f'actions[{index}] 선박 destination_id={destination_id}는 '
+                    '등록된 ArUco 범위 18..23에 없음'
+                )
         if selected['location'] in _WAREHOUSE_SLOTS:
             same_slot = [
                 cargo for cargo in valid_cargos
@@ -1152,6 +1499,8 @@ def parse_command_with_llm(
     yolo_detections: Optional[List[Dict]] = None,
     normalization_command: Optional[str] = None,
     inventory_snapshot: Optional[Dict] = None,
+    allow_inventory_bypass: bool = False,
+    zone_status: str = '',
 ) -> Dict:
     """
     자연어 명령을 로컬 Ollama 모델로 해석해서 구조화된 dict로 반환합니다.
@@ -1178,11 +1527,20 @@ def parse_command_with_llm(
         cargo_types=", ".join(known_cargo_types) if known_cargo_types else "(등록된 화물종류 없음)",
         image_width=image_width,
         image_height=image_height,
+        zone_status=str(zone_status or 'unavailable'),
         inventory_snapshot=json.dumps(
             inventory_snapshot,
             ensure_ascii=False,
             separators=(',', ':'),
         ) if inventory_snapshot is not None else 'unavailable',
+        inventory_policy=(
+            'DB 없는 수동 테스트 모드입니다. 사용자가 명령에 직접 '
+            '지정한 컨테이너 ID는 source_id로 사용할 수 있지만, 생략된 '
+            'ID나 적층 상태는 추측하지 말고 unknown을 반환하세요.'
+            if allow_inventory_bypass
+            else '재고 스냅샷이 unavailable이면 source_id를 추측하지 말고 '
+            'unknown을 반환하세요.'
+        ),
     )
 
     client = ollama.Client(host=host or OLLAMA_HOST, timeout=timeout)
@@ -1244,11 +1602,17 @@ def parse_command_with_llm(
         image_width,
         image_height,
     )
-    issues = _cargo_workflow_issues(normalized, yolo_detections)
+    normalized = _repair_arm_before_departure(
+        normalized, yolo_detections, zone_status
+    )
+    issues = _cargo_workflow_issues(
+        normalized, yolo_detections, zone_status
+    )
     issues.extend(inventory_workflow_issues(
         normalization_command or command,
         normalized,
         inventory_snapshot,
+        allow_inventory_bypass=allow_inventory_bypass,
     ))
     if not issues:
         return normalized
@@ -1281,11 +1645,17 @@ def parse_command_with_llm(
         image_width,
         image_height,
     )
-    remaining_issues = _cargo_workflow_issues(normalized, yolo_detections)
+    normalized = _repair_arm_before_departure(
+        normalized, yolo_detections, zone_status
+    )
+    remaining_issues = _cargo_workflow_issues(
+        normalized, yolo_detections, zone_status
+    )
     remaining_issues.extend(inventory_workflow_issues(
         normalization_command or command,
         normalized,
         inventory_snapshot,
+        allow_inventory_bypass=allow_inventory_bypass,
     ))
     if remaining_issues:
         return {

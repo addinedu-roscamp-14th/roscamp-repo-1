@@ -2,9 +2,12 @@ arm_dispatcher:
   ros__parameters:
     dispatch_action: /central/arms/dispatch
     arm1_work_state_topic: /arm/pick_place/work_state
+    arm1_status_topic: /arm/pick_place/status
     arm2_event_topic: /arm2/transfer_events
     state_publish_rate_hz: 2.0
     service_wait_timeout_sec: 5.0
     service_retry_count: 3
     operation_timeout_sec: 600.0
     scan_timeout_sec: 240.0
+    arm1_vehicle_arrival_zone: B-1
+    arm2_vehicle_arrival_zone: A
