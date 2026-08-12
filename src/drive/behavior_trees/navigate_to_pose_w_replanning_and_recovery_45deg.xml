@@ -37,7 +37,7 @@
         <ReactiveFallback name="RecoveryFallback">
           <GoalUpdated/>
           <RoundRobin name="RecoveryActions">
-            <BackUp name="BackUpRecoveryInitial" backup_dist="0.08" backup_speed="0.12" time_allowance="8.0" error_code_id="{backup_code_id}"/>
+            <BackUp name="BackUpRecoveryInitial" backup_dist="0.05" backup_speed="0.08" time_allowance="8.0" error_code_id="{backup_code_id}"/>
             <Sequence name="ClearingActions">
               <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
               <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>

@@ -14,11 +14,13 @@ ament_export_dependencies(rosidl_default_runtime)
 
 install(
   PROGRAMS
+    scripts/amcl_pose_heartbeat
     scripts/send_nav_goal
     scripts/parking_action_server
     scripts/reverse_parking
     scripts/parking_new
     scripts/navigation_event_publisher
+    scripts/other_robot_obstacle
     scripts/target_map_pose_to_nav_goal
     scripts/target_waypoints_to_nav_goal
   DESTINATION lib/${PROJECT_NAME}
