@@ -13,13 +13,17 @@
       "allow": {
         "publishers": [
           "/arm/pick_place/status",
-          "/arm/pick_place/work_state"
+          "/arm/pick_place/work_state",
+          "/arm/pick_place/scan_events",
+          "/central/inventory/movements"
         ],
         "subscribers": [],
         "service_servers": [
           "/arm/pick_place/execute",
           "/arm/pick_place/start",
-          "/arm/pick_place/stop"
+          "/arm/pick_place/stop",
+          "/arm/pick_place/scan_ship_destinations",
+          "/arm/pick_place/scan_inbound"
         ],
         "service_clients": [],
         "action_servers": [],
