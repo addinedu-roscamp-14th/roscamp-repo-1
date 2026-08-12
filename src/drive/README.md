@@ -28,8 +28,9 @@ Nav2의 최종 속도는 `/<vehicle_id>/cmd_vel_safe_input`으로 전달되어 P
 
 ### 상대 AGV 가상 장애물
 
-다중 차량 launch는 기본적으로 상대 차량의 AMCL 위치를 각 차량의 local
-costmap에만 가상 장애물로 추가합니다.
+다중 차량 launch는 기본적으로 상대 차량의 AMCL 위치를 각 차량의 local 및 global
+costmap에 가상 장애물로 추가합니다. local costmap은 근접 충돌을 막고, global
+costmap은 planner가 상대 차량을 우회하는 경로를 다시 생성하게 합니다.
 
 ```text
 AGV1 AMCL -> /agv1/shared_amcl_pose -> AGV2 obstacle node
@@ -40,8 +41,8 @@ AGV2 AMCL -> /agv2/shared_amcl_pose -> AGV1 obstacle node
 `other_robot_obstacle` 노드는 상대 위치 주변을 원형 PointCloud2로 발행합니다.
 기본 반경은 `0.13m`, pose timeout은 `1.0s`입니다. 상대 위치가 이동하거나
 timeout되면 별도의 clearing PointCloud2로 이전 위치를 지웁니다. 두 토픽은
-독립적인 `local_costmap.other_robot_layer`에서만 사용하며 다음 항목에는 연결하지
-않습니다.
+local/global costmap의 독립적인 `other_robot_layer`에서 사용하며 다음 항목에는
+연결하지 않습니다.
 
 PointCloud2는 상대 위치의 `map` 좌표를 각 차량의 `base_footprint` 좌표로 변환해
 발행합니다. 따라서 clearing ray의 센서 원점이 rolling local costmap 내부의 자기
@@ -50,7 +51,6 @@ PointCloud2는 상대 위치의 `map` 좌표를 각 차량의 `base_footprint` �
 
 - AMCL의 `scan` 입력
 - static map/map server
-- global costmap
 
 AMCL은 정지 상태에서 `amcl_pose`를 연속 발행하지 않으므로,
 `amcl_pose_heartbeat`가 마지막 위치를 `shared_amcl_pose`로 주기적으로

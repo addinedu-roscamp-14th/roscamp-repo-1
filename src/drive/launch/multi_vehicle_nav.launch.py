@@ -59,12 +59,13 @@ def _rewrite_keepout_topics(params, vehicle_id):
 
 def _rewrite_other_robot_topics(params, vehicle_id):
     """Keep peer-obstacle topics at the vehicle namespace root."""
-    local_costmap = params['local_costmap']['local_costmap']['ros__parameters']
-    layer = local_costmap['other_robot_layer']
-    layer['other_robot']['topic'] = f'/{vehicle_id}/other_robot_obstacle'
-    layer['other_robot_clear']['topic'] = (
-        f'/{vehicle_id}/other_robot_obstacle_clear'
-    )
+    for costmap_name in ('local_costmap', 'global_costmap'):
+        costmap = params[costmap_name][costmap_name]['ros__parameters']
+        layer = costmap['other_robot_layer']
+        layer['other_robot']['topic'] = f'/{vehicle_id}/other_robot_obstacle'
+        layer['other_robot_clear']['topic'] = (
+            f'/{vehicle_id}/other_robot_obstacle_clear'
+        )
 
 
 def _launch_nav2(context):
