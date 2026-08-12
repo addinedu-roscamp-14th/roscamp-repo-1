@@ -63,6 +63,14 @@ def test_only_final_vehicle_cargo_operations_gate_departure():
     assert not ArmDispatcher._gates_vehicle(make_goal(), 'transfer_by_id')
 
 
+def test_amr2_uses_the_same_arm_completion_departure_gate():
+    goal = make_goal(vehicle_id='agv2')
+
+    assert ArmDispatcher._gates_vehicle(goal, 'pick_place')
+    assert ArmDispatcher._gates_vehicle(goal, 'transfer_to_slot')
+    assert ArmDispatcher._gates_vehicle(goal, 'load_to_trailer')
+
+
 def test_gate_needs_both_a_vehicle_and_the_final_flag():
     assert not ArmDispatcher._gates_vehicle(
         make_goal(vehicle_id=''), 'transfer_to_slot'
@@ -101,6 +109,24 @@ def test_held_vehicle_waits_until_the_arm_releases_it():
     assert allowed
     assert state == ''
     assert time.monotonic() - started >= 0.2
+
+
+def test_held_amr2_waits_until_the_arm_releases_it():
+    dispatcher = make_gated_dispatcher(held=('agv2',), timeout_sec=5.0)
+
+    def release_later():
+        time.sleep(0.2)
+        dispatcher._on_vehicle_holds(hold_message([]))
+
+    releaser = threading.Thread(target=release_later)
+    releaser.start()
+    allowed, state = dispatcher._wait_for_cargo_release(
+        StubGoalHandle(), 'agv2'
+    )
+    releaser.join()
+
+    assert allowed
+    assert state == ''
 
 
 def test_other_vehicles_are_not_blocked_by_a_held_one():
@@ -249,9 +275,13 @@ def make_per_arm_arrival_dispatcher(max_age_sec=5.0):
     return dispatcher
 
 
-def vehicle_state(state=VehicleState.READY, locked_zone='A'):
+def vehicle_state(
+    state=VehicleState.READY,
+    locked_zone='A',
+    vehicle_id='agv1',
+):
     message = VehicleState()
-    message.vehicle_id = 'agv1'
+    message.vehicle_id = vehicle_id
     message.state = state
     message.locked_zone = locked_zone
     return message
@@ -298,6 +328,23 @@ def test_arm2_recognizes_a_arrival_but_arm1_does_not():
 
     assert dispatcher._vehicle_has_arrived('agv1', 'arm2')
     assert not dispatcher._vehicle_has_arrived('agv1', 'arm1')
+
+
+def test_amr2_arrival_is_recognized_at_both_arm_work_zones():
+    dispatcher = make_per_arm_arrival_dispatcher()
+    dispatcher._on_vehicle_state(
+        'agv2', vehicle_state(locked_zone='B-1', vehicle_id='agv2')
+    )
+
+    assert dispatcher._vehicle_has_arrived('agv2', 'arm1')
+    assert not dispatcher._vehicle_has_arrived('agv2', 'arm2')
+
+    dispatcher._on_vehicle_state(
+        'agv2', vehicle_state(locked_zone='A', vehicle_id='agv2')
+    )
+
+    assert dispatcher._vehicle_has_arrived('agv2', 'arm2')
+    assert not dispatcher._vehicle_has_arrived('agv2', 'arm1')
 
 
 def test_unknown_vehicle_has_not_arrived():
