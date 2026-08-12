@@ -254,7 +254,11 @@ class OtherRobotObstacle(Node):
 
     def _cloud(self, center, offsets, transform):
         header = Header()
-        header.stamp = self.get_clock().now().to_msg()
+        # Points were calculated with this exact map->base transform. Stamp
+        # the cloud with the transform time as well; using node 'now' can fall
+        # just outside the odom->base TF cache and makes the costmap message
+        # filter discard an otherwise valid observation.
+        header.stamp = transform.header.stamp
         header.frame_id = self.cloud_frame_id
 
         if center is None:
