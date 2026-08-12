@@ -44,7 +44,12 @@ ACCENT_ON_BLUE = "#003351"
 ALERT_RED = "#ff6b6b"
 
 # Bottom-right vessel berth in the shared top-down camera image.
-DEFAULT_ARRIVAL_ROI = [0.78, 0.55, 0.99, 0.98]
+DEFAULT_ARRIVAL_ROI = [
+    0.8424657534246576,
+    0.6316695352839932,
+    0.9575342465753425,
+    0.8399311531841652,
+]
 
 # 기상청(KMA) / 해양조사원(KHOA) API 키 - 팀원이 쓰던 것을 그대로 재사용합니다.
 _WEATHER_API_KEY = "7d6c81a1615ce0a0dccd7e35568f7c3714d3f37ae515ce17e25a065005419ae3"

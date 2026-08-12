@@ -223,6 +223,11 @@ class RealtimeLLMAgent:
         self.location_loader = location_loader or _load_registered_locations
         self.cycle_store = cycle_store or CycleStore()
         self._cycle = self.cycle_store.load()
+        # A parked vehicle normally reports READY with no zone lock, which is
+        # indistinguishable from an idle unparked vehicle in fleet telemetry.
+        # Remember successful/requested parking locally so the waiting loop
+        # cannot enqueue a new park command on every heartbeat.
+        self._autonomy_park_requests = set()
 
     def start(self):
         """Start the background evaluation loop once."""
@@ -668,6 +673,7 @@ class RealtimeLLMAgent:
                     last_error='사용 가능한 READY 차량이 없음',
                 )
                 return plan
+            self._autonomy_park_requests.discard(vehicle_id)
             mission_id = f'auto-{uuid.uuid4().hex[:12]}'
             execution = dict(move)
             execution['_steps'] = compile_move(move, vehicle_id)
@@ -769,6 +775,10 @@ class RealtimeLLMAgent:
                 locked.startswith('PARK') or not locked
             ):
                 return 'waiting', ''
+            elif step['type'] == 'park_command':
+                self._autonomy_park_requests.add(
+                    str(move.get('_vehicle_id') or '')
+                )
         move['_step_index'] = index + 1
         move['_current_command_id'] = ''
         move['_dispatched_at'] = 0.0
@@ -919,13 +929,18 @@ class RealtimeLLMAgent:
                 return vehicle_id
         return ''
 
-    @staticmethod
-    def _park_idle_vehicles(client, fleet_status):
+    def _park_idle_vehicles(self, client, fleet_status):
         vehicles = ((fleet_status.get('telemetry') or {}).get(
             'vehicles', {}
         ))
         for vehicle_id in VEHICLE_IDS:
             vehicle = vehicles.get(vehicle_id) or {}
+            locked_zone = str(vehicle.get('locked_zone') or '').upper()
+            if locked_zone.startswith('PARK'):
+                self._autonomy_park_requests.add(vehicle_id)
+                continue
+            if vehicle_id in self._autonomy_park_requests:
+                continue
             if (
                 vehicle.get('state') == READY_STATE
                 and not vehicle.get('current_command_id')
@@ -935,6 +950,8 @@ class RealtimeLLMAgent:
                     client.send_park(vehicle_id=vehicle_id)
                 except CentralControlApiError:
                     pass
+                else:
+                    self._autonomy_park_requests.add(vehicle_id)
 
     def _zone_goal(self, zone, summary, width, height):
         compact = compact_detections(summary)

@@ -631,12 +631,16 @@ class HomographyPickPlace(Node):
         return response
 
     def scan_ship_destinations(self, _request, response):
-        """Cache empty ship slot markers 18..23 once for later placement."""
+        """Freshly scan empty ship slot markers 18..23 for later placement.
+
+        An explicit scan command always runs the same two-view observation
+        sequence used by normal ChoE-branch pick/place commands.  In
+        particular, a complete in-memory cache must not turn a new scan
+        command into a no-motion success: central control can restart while
+        ARM1 stays alive, and the operator still expects the initial physical
+        left/right scan to run for the new control session.
+        """
         with self.command_lock:
-            if len(self.saved_marker_poses) == 6:
-                response.success = True
-                response.message = 'ship marker cache already complete'
-                return response
             if self.motion_thread is not None and self.motion_thread.is_alive():
                 response.success = False
                 response.message = 'ARM1 is busy'
@@ -648,7 +652,7 @@ class HomographyPickPlace(Node):
             )
             self.motion_thread.start()
         response.success = True
-        response.message = 'ship marker scan accepted'
+        response.message = 'fresh two-view ship marker scan accepted'
         return response
 
     def _run_ship_destination_scan(self):
@@ -657,16 +661,26 @@ class HomographyPickPlace(Node):
         try:
             self.publish_work_state('WORK_STARTED')
             self.publish_work_state('SEARCHING')
+            self.publish_status(
+                'ARM1 선박 마커 재스캔: ChoE 순차 관찰 자세를 '
+                '좌/우로 이동하며 18..23을 새로 확인합니다.'
+            )
             detections = self.search_stations({
                 str(marker_id): f'arm/marker_{marker_id}'
                 for marker_id in range(18, 24)
-                if marker_id not in self.saved_marker_poses
             })
-            for marker_text, detection in detections.items():
+            # search_stations(require_all=True) guarantees a complete fresh
+            # result.  Replace the cache only after that guarantee so a failed
+            # rescan never destroys the last known-good ship geometry.
+            fresh_cache = {
+                int(marker_text): detection
+                for marker_text, detection in detections.items()
+            }
+            self.saved_marker_poses = fresh_cache
+            for marker_text in detections:
                 marker_id = int(marker_text)
-                self.saved_marker_poses[marker_id] = detection
                 self.publish_status(
-                    f'saved_marker_poses[{marker_id}] cached '
+                    f'saved_marker_poses[{marker_id}] refreshed '
                     f'({len(self.saved_marker_poses)}/6)'
                 )
             self.publish_work_state('WORK_COMPLETED')

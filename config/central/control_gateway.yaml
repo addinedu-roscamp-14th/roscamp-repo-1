@@ -16,4 +16,4 @@ central_control_gateway:
     minimum_heading_distance_px: 10.0
     telemetry_stale_timeout_sec: 2.0
     # Bottom-right vessel berth: x_min, y_min, x_max, y_max.
-    arrival_roi_normalized: [0.78, 0.55, 0.99, 0.98]
+    arrival_roi_normalized: [0.8424657534246576, 0.6316695352839932, 0.9575342465753425, 0.8399311531841652]
