@@ -1,12 +1,13 @@
 """Tests for ARM2 operation-level terminal event handling."""
 
-import types
 import threading
+import types
 
 from central.arm_dispatcher import (
     ArmDispatcher,
     is_terminal_arm1_state,
     is_terminal_event,
+    movement_from_goal,
 )
 from porter_interfaces.msg import ArmState
 from std_msgs.msg import String
@@ -85,6 +86,50 @@ def test_arm1_goal_becomes_dynamic_execute_service_request():
     assert request.pick_id == 6
     assert request.place_id == 9
     assert accepted_field == 'accepted'
+
+
+def test_two_arm_operations_share_vehicle_cargo_identity():
+    load = types.SimpleNamespace(
+        operation='pick_place', arm_id='arm1', vehicle_id='agv1',
+        source_id=6, destination_id=10, destination_slot='',
+        command_id='load', mission_id='mission',
+    )
+    first = movement_from_goal(load, True, 'op-load', {})
+    assert first['container_id'] == '6'
+    assert first['destination_location'] == 'AMR1'
+
+    unload = types.SimpleNamespace(
+        operation='transfer_to_slot', arm_id='arm2', vehicle_id='agv1',
+        source_id=-1, destination_id=-1, destination_slot='A-1-2',
+        command_id='unload', mission_id='mission',
+    )
+    second = movement_from_goal(unload, True, 'op-unload', {'agv1': '6'})
+    assert second['container_id'] == '6'
+    assert second['source_location'] == 'AMR1'
+    assert second['destination_location'] == 'A-1-2'
+
+
+def test_arm1_trailer_to_ship_uses_correct_agv_marker_mapping():
+    goal = types.SimpleNamespace(
+        operation='pick_place', arm_id='arm1', vehicle_id='agv2',
+        source_id=9, destination_id=23, destination_slot='',
+        command_id='ship', mission_id='mission',
+    )
+    event = movement_from_goal(goal, True, 'op-ship', {'agv2': '6'})
+    assert event['container_id'] == '6'
+    assert event['source_location'] == 'AMR2'
+    assert event['destination_location'] == '선박-6'
+
+
+def test_explicit_container_id_survives_dispatcher_restart():
+    goal = types.SimpleNamespace(
+        operation='transfer_to_slot', arm_id='arm2', vehicle_id='agv1',
+        source_id=-1, destination_id=-1, destination_slot='A-1-2',
+        container_id='6', command_id='unload', mission_id='mission',
+    )
+    event = movement_from_goal(goal, True, 'op-unload', {})
+    assert event['container_id'] == '6'
+    assert event['source_location'] == 'AMR1'
 
 
 def test_arm1_work_state_updates_structured_central_state():

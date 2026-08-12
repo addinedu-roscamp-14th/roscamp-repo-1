@@ -179,6 +179,7 @@ class CentralControlClient:
         source_id=-1,
         destination_id=-1,
         vehicle_id='',
+        container_id='',
         final_for_vehicle=False,
     ):
         """Queue one central robot-arm command."""
@@ -194,6 +195,7 @@ class CentralControlClient:
                 'source_id': int(source_id),
                 'destination_id': int(destination_id),
                 'vehicle_id': vehicle_id,
+                'container_id': str(container_id or ''),
                 'final_for_vehicle': bool(final_for_vehicle),
             },
         )
@@ -218,6 +220,12 @@ class CentralControlClient:
                 'x_max': x_max,
                 'y_max': y_max,
             },
+        )
+
+    def send_inventory_movement(self, movement):
+        """Submit an observed transition to the central durable DB outbox."""
+        return self._request_json(
+            'POST', '/api/v1/inventory/movements', dict(movement)
         )
 
     def _request_json(self, method, path, payload):

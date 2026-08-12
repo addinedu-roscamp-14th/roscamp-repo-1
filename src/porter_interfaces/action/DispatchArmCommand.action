@@ -6,6 +6,7 @@ string destination_slot
 int32 source_id
 int32 destination_id
 string vehicle_id
+string container_id
 bool final_for_vehicle
 ---
 bool success

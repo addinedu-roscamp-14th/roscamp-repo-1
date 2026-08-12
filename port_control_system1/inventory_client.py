@@ -11,7 +11,7 @@ from typing import Callable, Tuple
 
 
 SUPPORTED_SCHEMA_VERSION = '1.0'
-DEFAULT_DB_HOST = '10.11.4.249'
+DEFAULT_DB_HOST = '192.168.5.9'
 DEFAULT_DB_PORT = 5432
 DEFAULT_DB_NAME = 'port_db'
 DEFAULT_DB_USER = 'postgres'

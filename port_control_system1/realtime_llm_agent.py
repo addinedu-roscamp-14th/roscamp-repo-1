@@ -23,6 +23,15 @@ from llm_command_parser import (
 )
 from inventory_client import InventoryClientError
 from inventory_decision_planner import InventoryDecisionPlanner
+from autonomous_inventory import (
+    CANONICAL_LOCATIONS,
+    CycleStore,
+    SHIP_LOCATIONS,
+    AutonomousPolicyError,
+    choose_policy,
+    compile_move,
+    validate_first_move,
+)
 from visual_navigation import (
     VisualNavigationError,
     compact_detections,
@@ -71,6 +80,14 @@ class RealtimeAgentSnapshot:
     last_evaluation_at: float = 0.0
     dispatched_actions: int = 0
     mode: str = 'control'
+    cycle_id: str = ''
+    phase: str = ''
+    db_snapshot_id: str = ''
+    next_move: str = ''
+    active_command: str = ''
+    db_sync_state: str = 'UNKNOWN'
+    db_pending_count: int = 0
+    replan_count: int = 0
 
 
 def _rounded(value, quantum):
@@ -171,7 +188,9 @@ class RealtimeLLMAgent:
                 cls._instance = cls()
             return cls._instance
 
-    def __init__(self, inventory_planner=None, location_loader=None):
+    def __init__(
+        self, inventory_planner=None, location_loader=None, cycle_store=None
+    ):
         self.interval_sec = max(
             0.5,
             float(os.environ.get('PORT_CONTROL_REALTIME_LLM_INTERVAL_SEC', '2.0')),
@@ -202,6 +221,8 @@ class RealtimeLLMAgent:
             inventory_planner or InventoryDecisionPlanner()
         )
         self.location_loader = location_loader or _load_registered_locations
+        self.cycle_store = cycle_store or CycleStore()
+        self._cycle = self.cycle_store.load()
 
     def start(self):
         """Start the background evaluation loop once."""
@@ -306,6 +327,44 @@ class RealtimeLLMAgent:
         print(f'[실시간 LLM 재고 판단] 지속 목표 등록: {objective}')
         self._wake_event.set()
 
+    def start_autonomous_policy(self):
+        """Start the fixed autonomous port policy after operator approval."""
+        if self._cycle.phase == 'WAITING_OPERATOR':
+            self._cycle.identical_failures = 0
+            self._cycle.failure_key = ''
+            self._cycle.last_error = ''
+            self._cycle.phase = 'WAITING_FOR_INBOUND'
+            self._save_cycle()
+        with self._lock:
+            self._objective_revision += 1
+            self._last_inventory_snapshot_id = ''
+            self._last_evaluation_monotonic = 0.0
+            self._not_before_monotonic = 0.0
+            self._snapshot = replace(
+                self._snapshot,
+                enabled=True,
+                objective='DB 기반 완전 자율 항만 관제',
+                state='MONITORING',
+                mode='autonomous',
+                cycle_id=self._cycle.cycle_id,
+                phase=self._cycle.phase,
+                last_error='',
+            )
+        self._wake_event.set()
+
+    def stop_autonomous_policy(self):
+        """Stop creating new plans; an already running ARM call may finish."""
+        with self._lock:
+            self._objective_revision += 1
+            self._snapshot = replace(
+                self._snapshot,
+                enabled=False,
+                state='DISABLED',
+                objective='',
+                last_decision='운영자가 자율 관제 신규 계획을 중지함',
+            )
+        self._wake_event.set()
+
     def _update_snapshot(self, **changes):
         with self._lock:
             self._snapshot = replace(self._snapshot, **changes)
@@ -321,7 +380,9 @@ class RealtimeLLMAgent:
                 if time.monotonic() < self._not_before_monotonic:
                     continue
             try:
-                if snapshot.mode == 'inventory':
+                if snapshot.mode == 'autonomous':
+                    self._evaluate_autonomous()
+                elif snapshot.mode == 'inventory':
                     self._evaluate_inventory(snapshot.objective)
                 else:
                     self._evaluate(snapshot.objective)
@@ -381,6 +442,601 @@ class RealtimeLLMAgent:
             f'status={result.get("status")}, moves={len(result.get("moves", []))}'
         )
         return result
+
+    @staticmethod
+    def _sync_status(fleet_status):
+        telemetry = (fleet_status or {}).get('telemetry') or {}
+        value = telemetry.get('inventory_sync') or {}
+        return {
+            'state': str(value.get('state') or 'OFFLINE').upper(),
+            'pending_count': int(value.get('pending_count') or 0),
+            'last_error': str(value.get('last_error') or ''),
+        }
+
+    @staticmethod
+    def _fleet_emergency(fleet_status):
+        vehicles = ((fleet_status or {}).get('telemetry') or {}).get(
+            'vehicles', {}
+        )
+        return any(
+            bool((vehicle or {}).get('emergency_stopped'))
+            for vehicle in vehicles.values()
+        )
+
+    def _save_cycle(self):
+        self.cycle_store.save(self._cycle)
+
+    def _evaluate_autonomous(self):
+        """Run one observe-plan-first-move cycle and wait for DB truth."""
+        client = CentralControlClient(timeout_sec=3.0)
+        try:
+            fleet_status = client.status()
+        except Exception as exc:
+            self._update_snapshot(state='WAITING_FOR_DATA', last_error=str(exc))
+            return None
+        sync = self._sync_status(fleet_status)
+        self._update_snapshot(
+            db_sync_state=sync['state'],
+            db_pending_count=sync['pending_count'],
+        )
+        if self._fleet_emergency(fleet_status):
+            self._update_snapshot(
+                state='EMERGENCY_STOPPED', phase='EMERGENCY_STOPPED',
+                last_error='차량 비상정지가 활성화되어 신규 계획을 차단함',
+            )
+            return None
+        if sync['state'] != 'READY' or sync['pending_count']:
+            self._update_snapshot(
+                state='WAITING_FOR_DB_SYNC', phase='WAITING_FOR_DB_SYNC',
+                last_error=sync['last_error'] or 'DB 미동기화 이벤트가 존재함',
+            )
+            return None
+        try:
+            inventory = self.inventory_planner.inventory_client.fetch_snapshot()
+        except InventoryClientError as exc:
+            self._update_snapshot(state='ERROR', last_error=str(exc))
+            return None
+        snapshot = inventory.to_dict()
+        self._update_snapshot(db_snapshot_id=inventory.snapshot_id)
+
+        if (
+            self._cycle.phase == 'WAITING_OPERATOR'
+            and self._cycle.identical_failures >= 3
+        ):
+            self._update_snapshot(
+                state='WAITING_OPERATOR', phase='WAITING_OPERATOR',
+                last_error=self._cycle.last_error,
+                replan_count=self._cycle.replan_count,
+            )
+            return None
+
+        if self._cycle.active_move:
+            outcome, detail = self._advance_active_move(
+                client, fleet_status, snapshot
+            )
+            if outcome == 'completed':
+                self._cycle.active_move = None
+                self._cycle.active_mission_id = ''
+                self._cycle.identical_failures = 0
+                self._cycle.failure_key = ''
+                self._cycle.replan_count += 1
+                self._save_cycle()
+            elif outcome == 'failed':
+                self._record_autonomous_failure(detail)
+                return None
+            else:
+                self._update_snapshot(
+                    state='EXECUTING', phase='EXECUTING_MOVE',
+                    active_command=str(
+                        self._cycle.active_move.get(
+                            '_current_command_id', ''
+                        )
+                    ),
+                    next_move=json.dumps(
+                        {
+                            key: value
+                            for key, value in self._cycle.active_move.items()
+                            if not str(key).startswith('_')
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                return None
+
+        port_status = ((fleet_status.get('telemetry') or {}).get(
+            'port_status'
+        ) or {})
+        port_present = bool(port_status.get('vessel_present'))
+        phase, objective = choose_policy(
+            self._cycle, snapshot, port_present
+        )
+        previous_phase = self.snapshot().phase
+        self._save_cycle()
+        self._update_snapshot(
+            state='MONITORING', phase=phase,
+            cycle_id=self._cycle.cycle_id,
+            replan_count=self._cycle.replan_count,
+            active_command='', next_move='', last_error='',
+        )
+        if phase != previous_phase:
+            print(
+                f'[자율 항만 관제] cycle={self._cycle.cycle_id}, '
+                f'phase={phase}, snapshot={inventory.snapshot_id}'
+            )
+
+        if phase == 'WAITING_FOR_CLEAR' and not port_present:
+            return self._complete_outbound(client, snapshot)
+        if phase in {'WAITING_FOR_INBOUND', 'SCANNING_INBOUND',
+                     'WAITING_FOR_CLEAR'}:
+            self._park_idle_vehicles(client, fleet_status)
+            return None
+        if not objective:
+            return None
+        autonomy_status = (
+            (fleet_status.get('telemetry') or {}).get('autonomy') or {}
+        )
+        if (
+            phase == 'LOADING_OUTBOUND'
+            and not autonomy_status.get('arm1_ship_cache_ready')
+        ):
+            self._update_snapshot(
+                state='WAITING_FOR_ARM_CACHE',
+                last_error='ARM1 선박 마커 18~23 캐시 완료 대기 중',
+            )
+            return None
+
+        now = time.monotonic()
+        planning_signature = json.dumps({
+            'snapshot_id': inventory.snapshot_id,
+            'phase': phase,
+            'vehicles': {
+                key: {
+                    'state': value.get('state'),
+                    'command': value.get('current_command_id'),
+                    'zone': value.get('locked_zone'),
+                }
+                for key, value in (
+                    (fleet_status.get('telemetry') or {}).get(
+                        'vehicles', {}
+                    )
+                ).items()
+            },
+            'arms': {
+                key: {
+                    'state': value.get('state_text'),
+                    'operation': value.get('current_operation'),
+                }
+                for key, value in (
+                    (fleet_status.get('telemetry') or {}).get('arms', {})
+                ).items()
+            },
+        }, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            heartbeat_due = (
+                now - self._last_evaluation_monotonic >= self.heartbeat_sec
+            )
+            if (
+                planning_signature == self._last_observation
+                and not heartbeat_due
+            ):
+                return None
+            self._last_observation = planning_signature
+            self._last_evaluation_monotonic = now
+
+        try:
+            planning_detections = YoloDetectionClient().get_latest()
+        except YoloDetectionError as exc:
+            self._update_snapshot(
+                state='WAITING_FOR_DATA', last_error=str(exc)
+            )
+            return None
+        telemetry = fleet_status.get('telemetry') or {}
+        operating_context = {
+            'cycle_id': self._cycle.cycle_id,
+            'phase': phase,
+            'port_roi': telemetry.get('port_status'),
+            'yolo': compact_detections(planning_detections),
+            'vehicles': telemetry.get('vehicles'),
+            'arms': telemetry.get('arms'),
+            'arm_scan': telemetry.get('autonomy'),
+            'inventory_sync': sync,
+        }
+        llm_objective = (
+            f'{objective}\n현재 운영 상태 JSON: '
+            f'{json.dumps(operating_context, ensure_ascii=False)}'
+        )
+        self._update_snapshot(state='EVALUATING', last_decision=llm_objective)
+        plan = self.inventory_planner.plan_snapshot(
+            llm_objective, inventory, list(CANONICAL_LOCATIONS)
+        )
+        if plan.get('status') != 'ready' or not plan.get('moves'):
+            error = str(plan.get('error') or plan.get('summary') or '')
+            self._update_snapshot(
+                state='WAITING_OPERATOR' if plan.get('status') == 'error'
+                else 'MONITORING',
+                last_decision=json.dumps(plan, ensure_ascii=False, indent=2),
+                last_error=error if plan.get('status') == 'error' else '',
+            )
+            return plan
+        try:
+            move = validate_first_move(plan['moves'][0], snapshot)
+            self._validate_policy_move(phase, move, snapshot)
+            vehicle_id = self._ready_vehicle(fleet_status)
+            if not vehicle_id:
+                self._update_snapshot(
+                    state='WAITING_FOR_VEHICLE',
+                    last_error='사용 가능한 READY 차량이 없음',
+                )
+                return plan
+            mission_id = f'auto-{uuid.uuid4().hex[:12]}'
+            execution = dict(move)
+            execution['_steps'] = compile_move(move, vehicle_id)
+            execution['_step_index'] = 0
+            execution['_vehicle_id'] = vehicle_id
+            execution['_current_command_id'] = ''
+            execution['_dispatched_at'] = 0.0
+            self._cycle.active_move = execution
+            self._cycle.active_mission_id = mission_id
+            self._save_cycle()
+            self._dispatch_active_step(client)
+        except (AutonomousPolicyError, CentralControlApiError,
+                VisualNavigationError, YoloDetectionError) as exc:
+            self._record_autonomous_failure(str(exc))
+            return plan
+
+        if phase == 'LOADING_OUTBOUND':
+            cargo_id = str(move['container_id'])
+            if cargo_id not in self._cycle.outbound_ids:
+                self._cycle.outbound_ids.append(cargo_id)
+        self._save_cycle()
+        self._update_snapshot(
+            state='EXECUTING', phase='EXECUTING_MOVE',
+            next_move=json.dumps(move, ensure_ascii=False),
+            active_command=str(
+                self._cycle.active_move.get('_current_command_id', '')
+            ),
+            last_decision=json.dumps(plan, ensure_ascii=False, indent=2),
+            last_error='',
+        )
+        return plan
+
+    def _advance_active_move(self, client, fleet_status, snapshot):
+        move = self._cycle.active_move or {}
+        steps = move.get('_steps') or []
+        index = int(move.get('_step_index') or 0)
+        if index >= len(steps):
+            cargo = next((
+                item for item in snapshot.get('cargos', [])
+                if str(item.get('container_id'))
+                == str(move.get('container_id'))
+            ), None)
+            if (
+                cargo and str(cargo.get('location'))
+                == str(move.get('destination_location'))
+            ):
+                return 'completed', ''
+            return 'failed', '물리 시퀀스 완료 후 DB 최종 위치가 일치하지 않음'
+        command_id = str(move.get('_current_command_id') or '')
+        if not command_id:
+            try:
+                self._validate_active_step(
+                    steps[index], move, snapshot, fleet_status
+                )
+                self._dispatch_active_step(client)
+            except Exception as exc:
+                return 'failed', str(exc)
+            return 'waiting', ''
+        step = steps[index]
+        result = ((fleet_status.get('telemetry') or {}).get(
+            'last_arm_result'
+        ) or {})
+        if step['type'].startswith('arm'):
+            if str(result.get('command_id')) != command_id:
+                return 'waiting', ''
+            if result.get('success') is False:
+                return 'failed', str(
+                    result.get('message') or 'ARM operation failed'
+                )
+            if result.get('success') is not True:
+                return 'waiting', ''
+            expected_location = self._arm_step_destination(step)
+            if expected_location:
+                cargo = next((
+                    item for item in snapshot.get('cargos', [])
+                    if str(item.get('container_id'))
+                    == str(move.get('container_id'))
+                ), None)
+                if (
+                    cargo is None
+                    or str(cargo.get('location')) != expected_location
+                ):
+                    return 'waiting', ''
+        else:
+            vehicle = (((fleet_status.get('telemetry') or {}).get(
+                'vehicles', {}
+            )).get(move.get('_vehicle_id')) or {})
+            if str(vehicle.get('state')).upper() in {'ERROR', 'FAILED'}:
+                return 'failed', f'{move.get("_vehicle_id")} 이동 실패'
+            age = time.time() - float(move.get('_dispatched_at') or 0.0)
+            if age < 0.5 or vehicle.get('state') != READY_STATE:
+                return 'waiting', ''
+            locked = str(vehicle.get('locked_zone') or '').upper()
+            if step['type'] == 'zone_navigation':
+                expected = 'A' if step['zone'].startswith('A-') else step['zone']
+                if locked != expected:
+                    return 'waiting', ''
+            elif step['type'] == 'park_command' and not (
+                locked.startswith('PARK') or not locked
+            ):
+                return 'waiting', ''
+        move['_step_index'] = index + 1
+        move['_current_command_id'] = ''
+        move['_dispatched_at'] = 0.0
+        self._save_cycle()
+        if move['_step_index'] >= len(steps):
+            return self._advance_active_move(client, fleet_status, snapshot)
+        try:
+            self._validate_active_step(
+                steps[move['_step_index']], move, snapshot, fleet_status
+            )
+            self._dispatch_active_step(client)
+        except Exception as exc:
+            return 'failed', str(exc)
+        return 'waiting', ''
+
+    @staticmethod
+    def _validate_active_step(step, move, snapshot, fleet_status):
+        """Recheck cargo, stack, cache and emergency immediately per step."""
+        if not str(step.get('type', '')).startswith('arm'):
+            return
+        if RealtimeLLMAgent._fleet_emergency(fleet_status):
+            raise AutonomousPolicyError('비상정지 중 ARM 단계를 시작할 수 없음')
+        container_id = str(move.get('container_id') or '')
+        cargo = next((
+            item for item in snapshot.get('cargos', [])
+            if str(item.get('container_id')) == container_id
+        ), None)
+        if cargo is None:
+            raise AutonomousPolicyError(f'컨테이너 {container_id} DB 상태 없음')
+        location = str(cargo.get('location') or '')
+        stack = [
+            item for item in snapshot.get('cargos', [])
+            if str(item.get('location')) == location
+        ]
+        if location.startswith(('A-', '선박-')) and int(
+            cargo.get('floor') or 1
+        ) != max(int(item.get('floor') or 1) for item in stack):
+            raise AutonomousPolicyError(
+                f'컨테이너 {container_id} 위에 방해 컨테이너가 생김'
+            )
+        expected_destination = RealtimeLLMAgent._arm_step_destination(step)
+        if expected_destination.startswith(('A-', '선박-')):
+            destination_stack = [
+                item for item in snapshot.get('cargos', [])
+                if str(item.get('location')) == expected_destination
+                and str(item.get('container_id')) != container_id
+            ]
+            if len(destination_stack) >= 3:
+                raise AutonomousPolicyError(
+                    f'목적지 {expected_destination} 적재 용량 초과'
+                )
+        if (
+            step.get('type') == 'arm1_pick_place'
+            and 18 <= int(step.get('destination_id', -1)) <= 23
+        ):
+            status = ((fleet_status.get('telemetry') or {}).get(
+                'autonomy'
+            ) or {})
+            if not status.get('arm1_ship_cache_ready'):
+                raise AutonomousPolicyError('ARM1 선박 마커 캐시가 준비되지 않음')
+
+    @staticmethod
+    def _arm_step_destination(step):
+        action_type = step.get('type')
+        if action_type == 'arm_transfer_to_slot':
+            return str(step.get('destination_slot') or '')
+        if action_type == 'arm_load_to_trailer':
+            return {'agv1': 'AMR1', 'agv2': 'AMR2'}.get(
+                str(step.get('vehicle_id') or ''), ''
+            )
+        if action_type == 'arm1_pick_place':
+            destination_id = int(step.get('destination_id', -1))
+            if destination_id == 10:
+                return 'AMR1'
+            if destination_id == 9:
+                return 'AMR2'
+            if 18 <= destination_id <= 23:
+                return f'선박-{destination_id - 17}'
+        if action_type == 'arm_transfer_by_id':
+            locations = {
+                11: 'A-1-1', 12: 'A-1-2', 13: 'A-2-1',
+                14: 'A-2-2', 15: 'A-3-1', 16: 'A-3-2',
+            }
+            return locations.get(int(step.get('destination_id', -1)), '')
+        return ''
+
+    def _record_autonomous_failure(self, reason):
+        move = self._cycle.active_move or {}
+        key = json.dumps({
+            'container_id': move.get('container_id'),
+            'source': move.get('source_location'),
+            'destination': move.get('destination_location'),
+            'reason': str(reason),
+        }, ensure_ascii=False, sort_keys=True)
+        if key == self._cycle.failure_key:
+            self._cycle.identical_failures += 1
+        else:
+            self._cycle.failure_key = key
+            self._cycle.identical_failures = 1
+        self._cycle.active_move = None
+        self._cycle.active_mission_id = ''
+        self._cycle.replan_count += 1
+        self._cycle.last_error = str(reason)
+        waiting = self._cycle.identical_failures >= 3
+        if waiting:
+            self._cycle.phase = 'WAITING_OPERATOR'
+        self._save_cycle()
+        self._update_snapshot(
+            state='WAITING_OPERATOR' if waiting else 'MONITORING',
+            phase=self._cycle.phase,
+            replan_count=self._cycle.replan_count,
+            last_error=str(reason),
+        )
+
+    @staticmethod
+    def _validate_policy_move(phase, move, snapshot):
+        source = str(move['source_location'])
+        destination = str(move['destination_location'])
+        if phase == 'UNLOADING_INBOUND' and not (
+            source in SHIP_LOCATIONS and destination.startswith('A-')
+        ):
+            raise AutonomousPolicyError('입항 단계는 선박→창고 이동만 허용됨')
+        if phase == 'LOADING_OUTBOUND':
+            cargo = next(
+                item for item in snapshot['cargos']
+                if str(item.get('container_id')) == str(move['container_id'])
+            )
+            if not (
+                source.startswith('A-') and destination in SHIP_LOCATIONS
+                and int(cargo.get('floor', 1)) >= 3
+            ):
+                raise AutonomousPolicyError(
+                    '출항 단계는 창고 3층 최상단→선박 이동만 허용됨'
+                )
+
+    @staticmethod
+    def _ready_vehicle(fleet_status):
+        vehicles = ((fleet_status.get('telemetry') or {}).get(
+            'vehicles', {}
+        ))
+        for vehicle_id in VEHICLE_IDS:
+            vehicle = vehicles.get(vehicle_id) or {}
+            if (
+                vehicle.get('state') == READY_STATE
+                and not vehicle.get('emergency_stopped')
+                and not vehicle.get('current_command_id')
+            ):
+                return vehicle_id
+        return ''
+
+    @staticmethod
+    def _park_idle_vehicles(client, fleet_status):
+        vehicles = ((fleet_status.get('telemetry') or {}).get(
+            'vehicles', {}
+        ))
+        for vehicle_id in VEHICLE_IDS:
+            vehicle = vehicles.get(vehicle_id) or {}
+            if (
+                vehicle.get('state') == READY_STATE
+                and not vehicle.get('current_command_id')
+                and not vehicle.get('locked_zone')
+            ):
+                try:
+                    client.send_park(vehicle_id=vehicle_id)
+                except CentralControlApiError:
+                    pass
+
+    def _zone_goal(self, zone, summary, width, height):
+        compact = compact_detections(summary)
+        normalized = str(zone).upper()
+        selected = next((
+            item for item in compact
+            if str(item.get('label', '')).upper() == normalized
+        ), None)
+        if selected is None:
+            raise AutonomousPolicyError(f'YOLO에서 작업 구역 {zone}를 찾지 못함')
+        action = {
+            'detection_index': selected['detection_index'],
+            'approach_side': 'bottom',
+        }
+        target, heading, detected = resolve_detection_approach(
+            action, summary, width, height
+        )
+        return target, heading, zone_mode_for_label(detected['label'])
+
+    def _dispatch_active_step(self, client):
+        move = self._cycle.active_move
+        steps = move.get('_steps') or []
+        index = int(move.get('_step_index') or 0)
+        if index >= len(steps):
+            return ''
+        action = steps[index]
+        action_type = action['type']
+        vehicle_id = str(move.get('_vehicle_id') or '')
+        if action_type == 'zone_navigation':
+            summary = YoloDetectionClient().get_latest()
+            width = int(summary.get('image_width') or 640)
+            height = int(summary.get('image_height') or 480)
+            target, heading, mode = self._zone_goal(
+                action['zone'], summary, width, height
+            )
+            response = client.send_pixel_goal(
+                target, heading, vehicle_id=vehicle_id, mode=mode,
+                zone_visually_empty=True,
+            )
+        elif action_type == 'park_command':
+            response = client.send_park(vehicle_id=vehicle_id)
+        else:
+            operation = {
+                'arm1_pick_place': 'pick_place',
+                'arm_transfer_to_slot': 'transfer_to_slot',
+                'arm_load_to_trailer': 'load_to_trailer',
+                'arm_transfer_by_id': 'transfer_by_id',
+            }[action_type]
+            response = client.send_arm_command(
+                operation=operation,
+                arm_id=action['arm_id'],
+                mission_id=self._cycle.active_mission_id,
+                destination_slot=action.get('destination_slot', ''),
+                source_id=action.get('source_id', -1),
+                destination_id=action.get('destination_id', -1),
+                vehicle_id=action.get('vehicle_id', ''),
+                container_id=str(move.get('container_id') or ''),
+                final_for_vehicle=action.get('final_for_vehicle', False),
+            )
+        move['_current_command_id'] = str(response.get('command_id') or '')
+        if not move['_current_command_id']:
+            raise AutonomousPolicyError('중앙관제가 command_id를 반환하지 않음')
+        move['_dispatched_at'] = time.time()
+        self._save_cycle()
+        print(
+            f'[자율 항만 실행] mission={self._cycle.active_mission_id}, '
+            f'step={index + 1}/{len(steps)}, type={action_type}, '
+            f'command={move["_current_command_id"]}'
+        )
+        return move['_current_command_id']
+
+    def _complete_outbound(self, client, snapshot):
+        by_id = {
+            str(item.get('container_id')): item
+            for item in snapshot.get('cargos', [])
+        }
+        submitted = 0
+        for container_id in list(self._cycle.outbound_ids):
+            cargo = by_id.get(container_id)
+            if not cargo or cargo.get('location') == '출항완료':
+                continue
+            client.send_inventory_movement({
+                'schema_version': '1.0',
+                'operation_id': (
+                    f'{self._cycle.cycle_id}-clear-{container_id}'
+                ),
+                'command_id': '', 'mission_id': self._cycle.cycle_id,
+                'arm_id': 'operator', 'container_id': container_id,
+                'source_location': str(cargo.get('location') or ''),
+                'source_floor': int(cargo.get('floor') or 1),
+                'source_base_aruco_id': str(cargo.get('base_aruco_id') or ''),
+                'destination_location': '출항완료',
+                'destination_floor': 1,
+                'destination_base_aruco_id': '',
+                'success': True,
+                'error': '',
+            })
+            submitted += 1
+        if not submitted:
+            self._cycle = type(self._cycle)()
+            self._save_cycle()
+        return submitted
 
     def _evaluate(self, objective):
         shared_frame = _cctv_monitor_view().SHARED_FRAME

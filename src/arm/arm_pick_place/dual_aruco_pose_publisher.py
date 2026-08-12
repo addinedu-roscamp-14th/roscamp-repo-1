@@ -89,6 +89,9 @@ class DualArucoPosePublisher(Node):
         self.declare_parameter('dictionary', 'DICT_5X5_50')
         self.declare_parameter('max_reprojection_error_px', 3.0)
         self.declare_parameter('use_node_time_for_pose', True)
+        self.declare_parameter(
+            'scan_marker_ids', list(range(9)) + list(range(18, 24))
+        )
 
         self.image_topic = str(self.get_parameter('image_topic').value)
         self.camera_info_topic = str(
@@ -107,6 +110,10 @@ class DualArucoPosePublisher(Node):
         self.marker_frames = {
             pick_id: str(self.get_parameter('pick_marker_frame').value),
             place_id: str(self.get_parameter('place_marker_frame').value),
+        }
+        self.scan_marker_frames = {
+            int(marker_id): f'arm/marker_{int(marker_id)}'
+            for marker_id in self.get_parameter('scan_marker_ids').value
         }
         self.marker_size = float(
             self.get_parameter('marker_size_m').value
@@ -152,16 +159,19 @@ class DualArucoPosePublisher(Node):
         self.distortion = None
         self.camera_info_frame = ''
         self.last_detected_ids = None
-        self.rejection_counts = {marker_id: 0 for marker_id in self.marker_frames}
+        self.rejection_counts = {
+            marker_id: 0
+            for marker_id in set(self.marker_frames) | set(self.scan_marker_frames)
+        }
         self.pose_publishers = {
             str(self.get_parameter('pick_marker_frame').value): (
                 self.create_publisher(
-                PoseStamped, '/arm/gripper_camera/pick_aruco_pose', 10
+                    PoseStamped, '/arm/gripper_camera/pick_aruco_pose', 10
                 )
             ),
             str(self.get_parameter('place_marker_frame').value): (
                 self.create_publisher(
-                PoseStamped, '/arm/gripper_camera/place_aruco_pose', 10
+                    PoseStamped, '/arm/gripper_camera/place_aruco_pose', 10
                 )
             ),
         }
@@ -208,7 +218,12 @@ class DualArucoPosePublisher(Node):
             pick_id: frames[0],
             place_id: frames[1],
         }
-        self.rejection_counts = {pick_id: 0, place_id: 0}
+        self.rejection_counts = {
+            marker_id: 0
+            for marker_id in {pick_id, place_id} | set(
+                getattr(self, 'scan_marker_frames', {})
+            )
+        }
         self.last_detected_ids = None
         response.accepted = True
         response.message = (
@@ -253,7 +268,10 @@ class DualArucoPosePublisher(Node):
         if ids is not None:
             for index, raw_id in enumerate(ids.flatten()):
                 marker_id = int(raw_id)
-                if marker_id not in self.marker_frames:
+                if (
+                    marker_id not in self.marker_frames
+                    and marker_id not in self.scan_marker_frames
+                ):
                     continue
                 image_points = corners[index].reshape(4, 2)
                 pose = self.estimate_pose(marker_id, image_points)
@@ -324,30 +342,37 @@ class DualArucoPosePublisher(Node):
         rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
         quaternion = rotation_matrix_to_quaternion(rotation_matrix)
         translation = translation_vector.reshape(3)
-        transform = TransformStamped()
-        transform.header.stamp = (
+        stamp = (
             self.get_clock().now().to_msg()
             if self.use_node_time_for_pose
             else image_message.header.stamp
         )
-        transform.header.frame_id = camera_frame
-        transform.child_frame_id = self.marker_frames[marker_id]
-        transform.transform.translation.x = float(translation[0])
-        transform.transform.translation.y = float(translation[1])
-        transform.transform.translation.z = float(translation[2])
-        transform.transform.rotation.x = float(quaternion[0])
-        transform.transform.rotation.y = float(quaternion[1])
-        transform.transform.rotation.z = float(quaternion[2])
-        transform.transform.rotation.w = float(quaternion[3])
-        self.tf_broadcaster.sendTransform(transform)
-        pose = PoseStamped()
-        pose.header = transform.header
-        pose.pose.position.x = transform.transform.translation.x
-        pose.pose.position.y = transform.transform.translation.y
-        pose.pose.position.z = transform.transform.translation.z
-        pose.pose.orientation = transform.transform.rotation
-        frame = self.marker_frames[marker_id]
-        self.pose_publishers[frame].publish(pose)
+        frames = []
+        if marker_id in self.marker_frames:
+            frames.append(self.marker_frames[marker_id])
+        if marker_id in self.scan_marker_frames:
+            frames.append(self.scan_marker_frames[marker_id])
+        for frame in dict.fromkeys(frames):
+            transform = TransformStamped()
+            transform.header.stamp = stamp
+            transform.header.frame_id = camera_frame
+            transform.child_frame_id = frame
+            transform.transform.translation.x = float(translation[0])
+            transform.transform.translation.y = float(translation[1])
+            transform.transform.translation.z = float(translation[2])
+            transform.transform.rotation.x = float(quaternion[0])
+            transform.transform.rotation.y = float(quaternion[1])
+            transform.transform.rotation.z = float(quaternion[2])
+            transform.transform.rotation.w = float(quaternion[3])
+            self.tf_broadcaster.sendTransform(transform)
+            if frame in self.pose_publishers:
+                pose = PoseStamped()
+                pose.header = transform.header
+                pose.pose.position.x = transform.transform.translation.x
+                pose.pose.position.y = transform.transform.translation.y
+                pose.pose.position.z = transform.transform.translation.z
+                pose.pose.orientation = transform.transform.rotation
+                self.pose_publishers[frame].publish(pose)
 
     @staticmethod
     def make_image(frame, source):

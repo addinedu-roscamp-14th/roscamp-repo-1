@@ -150,6 +150,14 @@ class CentralControlGateway(Node):
             'vehicles': {},
             'arms': {},
             'last_arm_result': None,
+            'inventory_sync': {
+                'state': 'OFFLINE',
+                'pending_count': 0,
+                'last_error': 'inventory_sync status not received',
+                'last_operation_id': '',
+            },
+            'port_status': None,
+            'autonomy': None,
             'arrival_roi': list(
                 self.get_parameter('arrival_roi_normalized').value
             ),
@@ -184,6 +192,9 @@ class CentralControlGateway(Node):
         )
         self.arrival_roi_publisher = self.create_publisher(
             String, '/central/autonomy/arrival_roi_config', config_qos
+        )
+        self.inventory_movement_publisher = self.create_publisher(
+            String, '/central/inventory/movements', config_qos
         )
         self.park_request_publisher = self.create_publisher(
             String,
@@ -239,6 +250,26 @@ class CentralControlGateway(Node):
             '/central/arms/results',
             self._on_arm_result,
             10,
+        )
+        self.create_subscription(
+            String,
+            '/central/inventory/sync_status',
+            lambda message: self._on_json_telemetry(
+                'inventory_sync', message
+            ),
+            config_qos,
+        )
+        self.create_subscription(
+            String,
+            '/central/autonomy/port_status',
+            lambda message: self._on_json_telemetry('port_status', message),
+            config_qos,
+        )
+        self.create_subscription(
+            String,
+            '/central/autonomy/mission_state',
+            lambda message: self._on_json_telemetry('autonomy', message),
+            config_qos,
         )
         self._arm_dispatch_client = ActionClient(
             self,
@@ -386,6 +417,14 @@ class CentralControlGateway(Node):
         with self._lock:
             self._telemetry['last_arm_result'] = result
 
+    def _on_json_telemetry(self, key, message):
+        try:
+            value = json.loads(message.data)
+        except json.JSONDecodeError:
+            value = {'state': 'INVALID', 'raw': message.data}
+        with self._lock:
+            self._telemetry[key] = value
+
     def publish_arrival_roi(self, values):
         if len(values) != 4:
             raise CommandValidationError('ROI requires four normalized values')
@@ -410,6 +449,22 @@ class CentralControlGateway(Node):
         with self._lock:
             self._telemetry['arrival_roi'] = roi
         return {'accepted': True, 'roi_normalized': roi}
+
+    def publish_inventory_movement(self, payload):
+        """Publish an observed non-ARM transition through the same sync path."""
+        if not isinstance(payload, dict):
+            raise CommandValidationError('movement must be an object')
+        operation_id = str(payload.get('operation_id') or '').strip()
+        container_id = str(payload.get('container_id') or '').strip()
+        destination = str(payload.get('destination_location') or '').strip()
+        if not operation_id or not container_id or not destination:
+            raise CommandValidationError(
+                'operation_id, container_id and destination_location are required'
+            )
+        message = String()
+        message.data = json.dumps(payload, ensure_ascii=False)
+        self.inventory_movement_publisher.publish(message)
+        return {'accepted': True, 'operation_id': operation_id}
 
     def dispatch_arm_command(self, payload, timeout_sec=3.0):
         """Queue an ARM action and return after the action server accepts it."""
@@ -440,6 +495,7 @@ class CentralControlGateway(Node):
             goal.source_id = int(payload.get('source_id', -1))
             goal.destination_id = int(payload.get('destination_id', -1))
             goal.vehicle_id = str(payload.get('vehicle_id') or '')
+            goal.container_id = str(payload.get('container_id') or '')
             goal.final_for_vehicle = bool(
                 payload.get('final_for_vehicle', False)
             )
@@ -812,6 +868,17 @@ def create_app(
                 status_code=503,
                 detail=str(exc),
             ) from exc
+
+    @app.post('/api/v1/inventory/movements')
+    async def inventory_movement(
+        payload: dict,
+        x_control_token: str | None = header_factory(default=None),
+    ):
+        authorize(x_control_token)
+        try:
+            return node.publish_inventory_movement(payload)
+        except CommandValidationError as exc:
+            raise http_exception_class(status_code=422, detail=str(exc)) from exc
 
     @app.post('/api/v1/arms/commands')
     async def arm_command(

@@ -258,7 +258,7 @@ export PORT_INVENTORY_DB_TIMEOUT_SEC=3
 같은 DB를 터미널에서 확인하는 명령은 다음과 같습니다.
 
 ```bash
-psql -h 10.11.4.249 -U postgres -d port_db
+psql -h 192.168.5.9 -U postgres -d port_db
 ```
 
 클라이언트는 `name, location, container_id, cargo_type, note, base_aruco_id, floor`만
@@ -267,6 +267,36 @@ psql -h 10.11.4.249 -U postgres -d port_db
 오류가 발생하면 이전 데이터를 재사용하지 않고 `status=error`, `moves=[]`로
 종료합니다. 정상 계획도 LLM 응답을 그대로 사용하지 않고 컨테이너 ID, 현재 출발
 위치, 적층 순서와 목적지 기반 관계를 메모리에서 순서대로 검증합니다.
+
+## DB 기반 완전 자율 관제
+
+중앙관제와 대시보드를 실행하기 전에 동일한 DB 접속 환경을 설정합니다.
+
+```bash
+export PORT_INVENTORY_DB_HOST=192.168.5.9
+export PORT_INVENTORY_DB_PORT=5432
+export PORT_INVENTORY_DB_NAME=port_db
+export PORT_INVENTORY_DB_USER=postgres
+export PORT_INVENTORY_DB_PASSWORD=1234
+```
+
+중앙관제의 `inventory_sync` 노드만 PostgreSQL을 갱신합니다. ARM1/ARM2의 완료
+결과는 `/central/inventory/movements` 표준 이벤트가 되고, 먼저 로컬 SQLite
+보류 큐(`PORT_INVENTORY_OUTBOX_PATH`)에 저장된 뒤 `cargo_movements` 이력과
+`cargos` 최신 위치에 트랜잭션으로 반영됩니다. `operation_id`가 같으면 한 번만
+적용됩니다. DB가 끊기면 물리 작업은 안전하게 끝내지만 보류 건이 0이 될 때까지
+새 LLM 계획은 차단됩니다.
+
+대시보드의 **자율 관제모드 시작**은 실제 자동 실행 승인입니다. 시작 후에는
+`WAITING_FOR_INBOUND → SCANNING_INBOUND → UNLOADING_INBOUND →
+LOADING_OUTBOUND → WAITING_FOR_CLEAR` 정책으로 한 컨테이너씩 실행하고 DB 반영을
+확인한 뒤 다시 계획합니다. **중지**하면 진행 중인 ARM 원자 작업만 끝나며 다음
+단계는 전송하지 않습니다. 수동 자연어 명령과 자율 실행은 동시에 허용되지 않습니다.
+
+ARM1은 중앙관제 연결 후 빈 선박 슬롯 마커 18~23을 캐시합니다. 실패하거나 ARM1이
+재시작해 캐시가 사라지면 유휴 상태에서 10초 간격으로 다시 스캔합니다. ROI 입항
+이벤트가 발생하면 노출된 컨테이너 마커 0~8을 선박 슬롯과 대응시켜 DB 동기화
+이벤트로 보냅니다.
 
 판단 결과는 화면 로그와 실시간 에이전트 상태에 다음 형태로만 노출됩니다.
 

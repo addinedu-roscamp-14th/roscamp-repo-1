@@ -38,6 +38,7 @@ setup(
             'fleet_collision_supervisor = '
             'central.fleet_collision_supervisor:main',
             'fleet_dispatcher = central.fleet_dispatcher:main',
+            'inventory_sync = central.inventory_sync:main',
             'map_relay = central.map_relay:main',
             'port_event_detector = central.port_event_detector:main',
             'rqt_click_to_target = central.rqt_click_to_target:main',

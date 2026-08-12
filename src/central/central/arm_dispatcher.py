@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime, timezone
 import json
 import threading
 import time
@@ -44,10 +45,18 @@ ARM1_PROGRESS = {
     'STOPPED': 0.0,
     'FAILED': 0.0,
 }
+MARKER_LOCATIONS = {
+    9: 'AMR2', 10: 'AMR1',
+    11: 'A-1-1', 12: 'A-1-2', 13: 'A-2-1', 14: 'A-2-2',
+    15: 'A-3-1', 16: 'A-3-2',
+    18: '선박-1', 19: '선박-2', 20: '선박-3',
+    21: '선박-4', 22: '선박-5', 23: '선박-6',
+}
 
 
 def is_terminal_event(event):
-    """Return true only for an operation-level terminal phase.
+    """
+    Return true only for an operation-level terminal phase.
 
     ARM2 uses ``state=COMPLETED`` for successful intermediate phases such as
     SOURCE_LOCKED. Therefore state must never terminate the central command.
@@ -58,6 +67,66 @@ def is_terminal_event(event):
 def is_terminal_arm1_state(state):
     """Return whether ARM1's fixed work-state contract has terminated."""
     return str(state or '').strip().upper() in ARM1_TERMINAL_STATES
+
+
+def movement_from_goal(goal, success, operation_id, vehicle_cargo=None):
+    """Normalize one physical transfer into the inventory event contract."""
+    operation = str(goal.operation or '').lower()
+    arm_id = str(goal.arm_id or 'arm2').lower()
+    vehicle_id = str(goal.vehicle_id or '').lower()
+    trailer_location = {'agv1': 'AMR1', 'agv2': 'AMR2'}.get(vehicle_id, '')
+    carried = str((vehicle_cargo or {}).get(vehicle_id, '') or '')
+    source_location = ''
+    destination_location = ''
+    container_id = ''
+
+    if arm_id == 'arm1' and operation == 'pick_place':
+        source_id = int(goal.source_id)
+        destination_id = int(goal.destination_id)
+        if 0 <= source_id <= 8:
+            container_id = str(source_id)
+        else:
+            container_id = carried
+            source_location = MARKER_LOCATIONS.get(source_id, '')
+        destination_location = MARKER_LOCATIONS.get(destination_id, '')
+    elif arm_id == 'arm2' and operation == 'load_to_trailer':
+        container_id = str(int(goal.source_id))
+        destination_location = trailer_location
+    elif arm_id == 'arm2' and operation == 'transfer_to_slot':
+        container_id = carried
+        source_location = trailer_location
+        destination_location = str(goal.destination_slot or '').upper()
+    elif arm_id == 'arm2' and operation == 'transfer_by_id':
+        container_id = str(int(goal.source_id))
+        destination_location = MARKER_LOCATIONS.get(
+            int(goal.destination_id), ''
+        )
+    else:
+        return None
+    explicit_container_id = str(
+        getattr(goal, 'container_id', '') or ''
+    ).strip()
+    if explicit_container_id:
+        container_id = explicit_container_id
+    if not container_id or not destination_location:
+        return None
+    return {
+        'schema_version': '1.0',
+        'operation_id': str(operation_id or f'arm-{goal.command_id}'),
+        'command_id': str(goal.command_id),
+        'mission_id': str(goal.mission_id),
+        'arm_id': arm_id,
+        'container_id': container_id,
+        'source_location': source_location,
+        'source_floor': None,
+        'source_base_aruco_id': '',
+        'destination_location': destination_location,
+        'destination_floor': None,
+        'destination_base_aruco_id': '',
+        'success': bool(success),
+        'completed_at': datetime.now(timezone.utc).isoformat(),
+        'error': '',
+    }
 
 
 class ArmDispatcher(Node):
@@ -129,6 +198,10 @@ class ArmDispatcher(Node):
         self.active_command = None
         self.stop_generations = {'arm1': 0, 'arm2': 0}
         self.failed_missions = set()
+        # Cargo currently known to be on each trailer. This bridges the two
+        # independent ARM operations in one physical movement without asking
+        # either robot controller to write the database directly.
+        self.vehicle_cargo = {}
         self.arm2_last_error = ''
         self.arm2_state = ArmState.OFFLINE
         self.arm2_state_text = 'waiting for ARM2 event or service'
@@ -168,6 +241,9 @@ class ArmDispatcher(Node):
         )
         self.result_publisher = self.create_publisher(
             String, '/central/arms/results', event_qos
+        )
+        self.movement_publisher = self.create_publisher(
+            String, '/central/inventory/movements', event_qos
         )
         # Volatile on purpose: a periodic snapshot must never be replayed to
         # a late joiner, or a restarted fleet dispatcher would hold a vehicle
@@ -233,6 +309,16 @@ class ArmDispatcher(Node):
         self.arm1_stop_client = self.create_client(
             Trigger,
             '/arm/pick_place/stop',
+            callback_group=self.callback_group,
+        )
+        self.arm1_ship_scan_client = self.create_client(
+            Trigger,
+            '/arm/pick_place/scan_ship_destinations',
+            callback_group=self.callback_group,
+        )
+        self.arm1_inbound_scan_client = self.create_client(
+            Trigger,
+            '/arm/pick_place/scan_inbound',
             callback_group=self.callback_group,
         )
 
@@ -454,7 +540,9 @@ class ArmDispatcher(Node):
         if arm_id not in {'arm1', 'arm2'}:
             return None, f'unknown arm_id: {arm_id}'
         if arm_id == 'arm1':
-            if operation not in {'pick_place', 'stop'}:
+            if operation not in {
+                'pick_place', 'scan_ship_destinations', 'scan_inbound', 'stop'
+            }:
                 return None, f'unsupported ARM1 operation: {operation}'
             if operation == 'pick_place' and (
                 not 0 <= goal.source_id <= 49
@@ -495,6 +583,12 @@ class ArmDispatcher(Node):
         if str(goal.arm_id).lower() == 'arm1':
             if operation == 'stop':
                 return self.arm1_stop_client, Trigger.Request(), 'success'
+            if operation == 'scan_ship_destinations':
+                return (
+                    self.arm1_ship_scan_client, Trigger.Request(), 'success'
+                )
+            if operation == 'scan_inbound':
+                return self.arm1_inbound_scan_client, Trigger.Request(), 'success'
             request = ExecutePickPlace.Request()
             request.pick_id = int(goal.source_id)
             request.place_id = int(goal.destination_id)
@@ -716,7 +810,8 @@ class ArmDispatcher(Node):
 
     @staticmethod
     def _gates_vehicle(goal, operation):
-        """Return true when this command must gate the vehicle's departure.
+        """
+        Return true when this command must gate the vehicle's departure.
 
         The same predicate decides both the hold taken while the command is
         pending and the release reported when it finishes, so the two can
@@ -752,10 +847,31 @@ class ArmDispatcher(Node):
             'final_for_vehicle': bool(goal.final_for_vehicle),
             'vehicle_release_allowed': bool(release),
             'message': message,
+            'source_id': int(goal.source_id),
+            'destination_id': int(goal.destination_id),
+            'destination_slot': str(goal.destination_slot),
+            'container_id': str(getattr(goal, 'container_id', '') or ''),
         }
         message_out = String()
         message_out.data = json.dumps(payload, ensure_ascii=False)
         self.result_publisher.publish(message_out)
+        movement = movement_from_goal(
+            goal, success, operation_id, self.vehicle_cargo
+        )
+        if movement is not None:
+            if not success:
+                movement['error'] = str(message or 'ARM operation failed')
+            movement_out = String()
+            movement_out.data = json.dumps(movement, ensure_ascii=False)
+            self.movement_publisher.publish(movement_out)
+            if success:
+                destination = movement['destination_location']
+                source = movement['source_location']
+                vehicle_id = str(goal.vehicle_id or '').lower()
+                if destination in {'AMR1', 'AMR2'} and vehicle_id:
+                    self.vehicle_cargo[vehicle_id] = movement['container_id']
+                elif source in {'AMR1', 'AMR2'} and vehicle_id:
+                    self.vehicle_cargo.pop(vehicle_id, None)
 
     def _finish_error(self, goal_handle, goal, code, message, operation_id=''):
         result = DispatchArmCommand.Result()
@@ -863,7 +979,9 @@ class ArmDispatcher(Node):
             client, request, accepted_field = self._service_for_goal(
                 goal, operation
             )
-            if arm_id == 'arm1' and operation == 'pick_place':
+            if arm_id == 'arm1' and operation in {
+                'pick_place', 'scan_ship_destinations', 'scan_inbound'
+            }:
                 # A latched-looking status string from an earlier operation
                 # must never become the failure reason for this command.
                 with self.condition:
@@ -896,7 +1014,9 @@ class ArmDispatcher(Node):
                 )
 
             operation_id = ''
-            if arm_id == 'arm1' and operation == 'pick_place':
+            if arm_id == 'arm1' and operation in {
+                'pick_place', 'scan_ship_destinations', 'scan_inbound'
+            }:
                 terminal_state, operation_id, wait_error = (
                     self._wait_for_arm1_terminal(
                         goal_handle,
