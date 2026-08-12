@@ -108,12 +108,6 @@ Collision Monitor를 켜지 않은 이유는 가상 장애물 검증과 최종 �
 한 번에 적용하지 않기 위해서입니다. 이후 STOP/SLOWDOWN polygon과 remap을 별도
 opt-in launch로 추가할 수 있습니다.
 
-상대 AGV는 local costmap에만 존재하므로 global planner의 경로는 상대 차량을
-우회하지 않습니다. 이때 `BackUp`/`Spin` recovery를 실행하면 동일한 global path로
-복귀하면서 전진·후진을 반복할 수 있습니다. 다중차량용 Behavior Tree는 움직이는
-recovery와 costmap 강제 삭제 대신 1초간 정지 대기 후 원래 목표를 재시도합니다.
-상대 차량이 빠지면 같은 navigation goal을 계속 수행합니다.
-
 ToF 센서는 AMCL에 연결하지 않고 `other_robot_layer`와 별개의 local costmap
 observation source 또는 Collision Monitor source로 추가합니다. 이렇게 하면 ToF가
 없어도 현재 구성이 그대로 동작합니다.

@@ -6,12 +6,9 @@
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <!-- A peer AGV exists only in the local costmap. Moving recoveries such as
-         BackUp and Spin make the robot oscillate around an unchanged global
-         path and can move it toward the peer. Retry with a stationary wait
-         instead. Sixty retries allow a temporary traffic blockage to clear
-         without cancelling the original navigation goal. -->
-    <RecoveryNode number_of_retries="60" name="NavigateRecovery">
+    <!-- Six recovery actions are available. Twelve retries allow one complete
+         second pass when the first action cycle cannot free the vehicle. -->
+    <RecoveryNode number_of_retries="12" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
         <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
@@ -39,7 +36,17 @@
         </Fallback>
         <ReactiveFallback name="RecoveryFallback">
           <GoalUpdated/>
-          <Wait name="WaitForDynamicObstacle" wait_duration="1.0"/>
+          <RoundRobin name="RecoveryActions">
+            <BackUp name="BackUpRecoveryInitial" backup_dist="0.08" backup_speed="0.12" time_allowance="8.0" error_code_id="{backup_code_id}"/>
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <BackUp name="BackUpRecoveryAfterClear" backup_dist="0.05" backup_speed="0.10" time_allowance="8.0" error_code_id="{backup_code_id}"/>
+            <Spin name="SpinLeft45" spin_dist="0.785" time_allowance="15.0" error_code_id="{spin_error_code}"/>
+            <Spin name="SpinRight90" spin_dist="-1.571" time_allowance="15.0" error_code_id="{spin_error_code}"/>
+            <Wait wait_duration="0.5"/>
+          </RoundRobin>
         </ReactiveFallback>
       </Sequence>
     </RecoveryNode>
