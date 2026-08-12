@@ -677,7 +677,7 @@ class HomographyPickPlace(Node):
                 for marker_text, detection in detections.items()
             }
             self.saved_marker_poses = fresh_cache
-            for marker_text, detection in detections.items():
+            for marker_text in detections:
                 marker_id = int(marker_text)
                 self.publish_status(
                     f'saved_marker_poses[{marker_id}] refreshed '
