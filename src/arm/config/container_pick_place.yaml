@@ -5,7 +5,8 @@
     pick_marker_frame: arm/pick_marker
     place_marker_frame: arm/place_marker
     pick_marker_id: 2
-    place_marker_id: 8
+    # Default vessel position 1. Dynamic commands may select 18..23.
+    place_marker_id: 18
 
     # Every pose is visited once in this order. Detections are classified only
     # against the surface assigned to that pose, never from measured joints.

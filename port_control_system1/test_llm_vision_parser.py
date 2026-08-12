@@ -4,9 +4,14 @@ import sys
 import types
 
 from llm_command_parser import (
+    ARM1_SHIP_DESTINATION_MARKERS,
+    ARM1_SHIP_SLOT_MARKERS,
+    VEHICLE_TRAILER_MARKERS,
+    _SYSTEM_PROMPT_TEMPLATE,
+    _cargo_workflow_issues,
     _finalize_navigation_result,
     _mentioned_vehicle_ids,
-    _SYSTEM_PROMPT_TEMPLATE,
+    _repair_arm_before_departure,
     normalize_navigation_result,
     parse_command_with_llm,
     resolve_execution_mode,
@@ -570,6 +575,354 @@ def test_prompt_exposes_arm1_dynamic_pick_place_contract():
     assert '"source_id": <0..49>' in prompt
     assert '"destination_id": <0..49>' in prompt
     assert 'ARM1은 아직 중앙 서비스 계약이 없으므로' not in prompt
+
+
+def test_prompt_registers_all_six_vessel_destination_markers():
+    prompt = _SYSTEM_PROMPT_TEMPLATE
+
+    assert ARM1_SHIP_DESTINATION_MARKERS == (18, 19, 20, 21, 22, 23)
+    assert ARM1_SHIP_SLOT_MARKERS == {
+        1: 18, 2: 19, 3: 20, 4: 21, 5: 22, 6: 23,
+    }
+    assert 'destination_id는 각각 18, 19, 20, 21, 22, 23' in prompt
+    assert '9번이나 컨테이너의 base_aruco_id를 목적지로 사용하지' in prompt
+
+
+def test_prompt_registers_vehicle_specific_trailer_markers():
+    prompt = _SYSTEM_PROMPT_TEMPLATE
+
+    assert VEHICLE_TRAILER_MARKERS == {'agv1': 10, 'agv2': 9}
+    assert 'AMR1(agv1)=10, AMR2(agv2)=9' in prompt
+
+
+def test_arm1_repairs_amr1_trailer_destination_to_ten():
+    result = normalize_navigation_result(
+        '6번 컨테이너를 AMR1 트레일러에 놓아줘',
+        {
+            'actions': [{
+                'type': 'arm1_pick_place',
+                'arm_id': 'arm1',
+                'source_id': 6,
+                'destination_id': 9,
+                'vehicle_id': 'agv1',
+                'final_for_vehicle': True,
+            }],
+        },
+        DETECTIONS,
+    )
+
+    assert result['actions'][0]['vehicle_id'] == 'agv1'
+    assert result['actions'][0]['destination_id'] == 10
+
+
+def test_arm1_repairs_amr2_trailer_destination_to_nine():
+    result = normalize_navigation_result(
+        '6번 컨테이너를 AMR2 트레일러에 놓아줘',
+        {
+            'actions': [{
+                'type': 'arm1_pick_place',
+                'arm_id': 'arm1',
+                'source_id': 6,
+                'destination_id': 10,
+                'vehicle_id': 'agv2',
+                'final_for_vehicle': True,
+            }],
+        },
+        DETECTIONS,
+    )
+
+    assert result['actions'][0]['vehicle_id'] == 'agv2'
+    assert result['actions'][0]['destination_id'] == 9
+
+
+def test_ship_destination_is_not_rewritten_as_a_trailer_marker():
+    result = normalize_navigation_result(
+        'AMR1의 6번 컨테이너를 선박 1번 자리에 놓아줘',
+        {
+            'actions': [{
+                'type': 'arm1_pick_place',
+                'arm_id': 'arm1',
+                'source_id': 6,
+                'destination_id': 18,
+                'vehicle_id': 'agv1',
+                'final_for_vehicle': True,
+            }],
+        },
+        DETECTIONS,
+    )
+
+    assert result['actions'][0]['destination_id'] == 18
+
+
+def test_vehicle_linked_arm1_ship_place_requires_b1_arrival():
+    issues = _cargo_workflow_issues(
+        {
+            'execution_mode': 'sequential',
+            'actions': [{
+                'type': 'arm1_pick_place',
+                'arm_id': 'arm1',
+                'source_id': 6,
+                'destination_id': 18,
+                'vehicle_id': 'agv1',
+                'final_for_vehicle': True,
+            }],
+        },
+        DETECTIONS,
+    )
+
+    assert issues == [
+        'actions[0] agv1 ARM 작업 전에 B-1 visual_navigation이 없음'
+    ]
+
+
+def test_arm1_can_start_without_duplicate_navigation_when_vehicle_owns_b1():
+    issues = _cargo_workflow_issues(
+        {
+            'execution_mode': 'sequential',
+            'actions': [{
+                'type': 'arm1_pick_place',
+                'arm_id': 'arm1',
+                'source_id': 6,
+                'destination_id': 10,
+                'vehicle_id': 'agv1',
+                'final_for_vehicle': True,
+            }],
+        },
+        [],
+        'B-1:agv1;A:FREE;PARK1:FREE;PARK2:agv2',
+    )
+
+    assert issues == []
+
+
+def test_amr2_can_start_arm1_at_b1_with_its_trailer_marker_9():
+    issues = _cargo_workflow_issues(
+        {
+            'execution_mode': 'sequential',
+            'actions': [{
+                'type': 'arm1_pick_place',
+                'arm_id': 'arm1',
+                'source_id': 6,
+                'destination_id': 9,
+                'vehicle_id': 'agv2',
+                'final_for_vehicle': True,
+            }],
+        },
+        [],
+        'B-1:agv2;A:FREE;PARK1:agv1;PARK2:FREE',
+    )
+
+    assert issues == []
+
+
+def test_amr2_can_start_arm2_without_duplicate_navigation_when_it_owns_a():
+    issues = _cargo_workflow_issues(
+        {
+            'execution_mode': 'sequential',
+            'actions': [{
+                'type': 'arm_transfer_to_slot',
+                'arm_id': 'arm2',
+                'destination_slot': 'A-1-2',
+                'vehicle_id': 'agv2',
+                'final_for_vehicle': True,
+            }],
+        },
+        [],
+        'B-1:FREE;A:agv2;PARK1:agv1;PARK2:FREE',
+    )
+
+    assert issues == []
+
+
+def test_arm1_cannot_use_another_vehicles_b1_ownership():
+    issues = _cargo_workflow_issues(
+        {
+            'execution_mode': 'sequential',
+            'actions': [{
+                'type': 'arm1_pick_place',
+                'arm_id': 'arm1',
+                'source_id': 6,
+                'destination_id': 10,
+                'vehicle_id': 'agv1',
+                'final_for_vehicle': True,
+            }],
+        },
+        [],
+        'B-1:agv2;A:FREE',
+    )
+
+    assert issues == [
+        'actions[0] agv1 ARM 작업 전에 B-1 visual_navigation이 없음'
+    ]
+
+
+def test_current_b1_ownership_is_invalid_after_plan_moves_vehicle_away():
+    issues = _cargo_workflow_issues(
+        {
+            'execution_mode': 'sequential',
+            'actions': [
+                {
+                    'type': 'visual_navigation',
+                    'detection_index': 0,
+                    'vehicle_id': 'agv1',
+                },
+                {
+                    'type': 'arm1_pick_place',
+                    'arm_id': 'arm1',
+                    'source_id': 6,
+                    'destination_id': 10,
+                    'vehicle_id': 'agv1',
+                    'final_for_vehicle': True,
+                },
+            ],
+        },
+        [{
+            'detection_index': 0,
+            'label': 'A-1',
+            'bbox_xyxy': [10, 10, 30, 30],
+        }],
+        'B-1:agv1;A:FREE',
+    )
+
+    assert issues == [
+        'actions[1] agv1 ARM 작업 전에 B-1 visual_navigation이 없음'
+    ]
+
+
+def test_arm1_is_reordered_before_departure_when_agv1_already_owns_b1():
+    result = _repair_arm_before_departure(
+        {
+            'execution_mode': 'sequential',
+            'actions': [
+                {
+                    'type': 'visual_navigation',
+                    'detection_index': 1,
+                    'vehicle_id': 'agv1',
+                },
+                {
+                    'type': 'arm1_pick_place',
+                    'arm_id': 'arm1',
+                    'source_id': 6,
+                    'destination_id': 10,
+                    'vehicle_id': 'agv1',
+                    'final_for_vehicle': True,
+                },
+                {
+                    'type': 'visual_navigation',
+                    'detection_index': 1,
+                    'vehicle_id': 'agv1',
+                },
+                {
+                    'type': 'arm_transfer_to_slot',
+                    'arm_id': 'arm2',
+                    'destination_slot': 'A-1-2',
+                    'vehicle_id': 'agv1',
+                    'final_for_vehicle': True,
+                },
+                {'type': 'park_command', 'vehicle_id': 'agv1'},
+            ],
+        },
+        DETECTIONS,
+        'B-1:agv1;A:FREE',
+    )
+
+    assert [action['type'] for action in result['actions']] == [
+        'arm1_pick_place',
+        'visual_navigation',
+        'arm_transfer_to_slot',
+        'park_command',
+    ]
+    assert _cargo_workflow_issues(
+        result, DETECTIONS, 'B-1:agv1;A:FREE'
+    ) == []
+
+
+def test_amr2_arm_work_is_reordered_before_departing_its_current_a_zone():
+    result = _repair_arm_before_departure(
+        {
+            'execution_mode': 'sequential',
+            'actions': [
+                {
+                    'type': 'visual_navigation',
+                    'detection_index': 0,
+                    'vehicle_id': 'agv2',
+                },
+                {
+                    'type': 'arm_load_to_trailer',
+                    'arm_id': 'arm2',
+                    'source_id': 6,
+                    'vehicle_id': 'agv2',
+                    'final_for_vehicle': True,
+                },
+                {'type': 'park_command', 'vehicle_id': 'agv2'},
+            ],
+        },
+        DETECTIONS,
+        'B-1:FREE;A:agv2',
+    )
+
+    assert [action['type'] for action in result['actions']] == [
+        'arm_load_to_trailer',
+        'visual_navigation',
+        'park_command',
+    ]
+
+
+def test_explicit_amr1_repairs_vehicle_id_on_every_arm1_step():
+    result = normalize_navigation_result(
+        'AMR1에 있는 6번 컨테이너를 선박에 놓아줘',
+        {
+            'execution_mode': 'sequential',
+            'actions': [
+                {
+                    'type': 'visual_navigation',
+                    'detection_index': 0,
+                    'approach_side': 'bottom',
+                    'vehicle_id': '',
+                },
+                {
+                    'type': 'arm1_pick_place',
+                    'arm_id': 'arm1',
+                    'source_id': 6,
+                    'destination_id': 18,
+                    'vehicle_id': '',
+                    'final_for_vehicle': True,
+                },
+            ],
+        },
+        DETECTIONS,
+    )
+
+    assert [action['vehicle_id'] for action in result['actions']] == [
+        'agv1', 'agv1',
+    ]
+    assert _cargo_workflow_issues(result, DETECTIONS) == []
+
+
+def test_final_arm1_step_without_numbered_vehicle_fails_before_execution():
+    issues = _cargo_workflow_issues(
+        {
+            'execution_mode': 'sequential',
+            'actions': [
+                {
+                    'type': 'visual_navigation',
+                    'detection_index': 0,
+                    'vehicle_id': '',
+                },
+                {
+                    'type': 'arm1_pick_place',
+                    'arm_id': 'arm1',
+                    'source_id': 6,
+                    'destination_id': 18,
+                    'vehicle_id': '',
+                    'final_for_vehicle': True,
+                },
+            ],
+        },
+        DETECTIONS,
+    )
+
+    assert issues == ['actions[1] ARM 작업에 vehicle_id가 없음']
 
 
 def test_llm_generated_arrival_then_unload_plan_is_preserved():

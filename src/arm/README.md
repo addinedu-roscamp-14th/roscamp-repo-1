@@ -24,7 +24,7 @@ Cartesian 동작은 `send_coords`를 한 번 전송한 뒤 `get_coords`로 직�
 수동 `/start` 호환 경로의 기본값:
 
 - Pick ArUco ID: `2`
-- Place ArUco ID: `8`
+- Place ArUco ID: `18` (선박 1번 자리, 선박 전체는 `18..23`)
 - Station A 관찰 각도:
   `[-86.39, 57.12, -15.46, -88.15, 7.99, -36.82]`
 - Station AGV 관찰 각도:
@@ -133,12 +133,15 @@ ros2 launch arm_pick_place container_pick_place.launch.py \
 ```bash
 ros2 service call /arm/pick_place/execute \
   porter_interfaces/srv/ExecutePickPlace \
-  "{pick_id: 2, place_id: 9}"
+  "{pick_id: 2, place_id: 18}"
 ```
 
 `pick_id`와 `place_id`는 매 요청마다 변경할 수 있으며 coordinator는 검출기가
 같은 ID로 전환됐다는 응답을 받은 뒤에만 로봇 동작을 시작합니다. launch에서는
 두 ID를 지정하지 않습니다.
+
+차량 트레일러 마커는 AMR1(agv1)=10, AMR2(agv2)=9로 고정합니다. 선박 배치
+마커는 18~23이며 트레일러 마커와 혼용하지 않습니다.
 
 현재 기본 ID로 수동 작업 시작:
 

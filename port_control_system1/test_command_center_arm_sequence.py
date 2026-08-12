@@ -81,6 +81,40 @@ def test_arm1_pick_place_uses_central_arm_queue(monkeypatch):
     assert context['predecessor_command_id'] == 'arm1-command-123'
 
 
+def test_arm1_command_execution_repairs_amr1_trailer_to_id_ten(monkeypatch):
+    captured = {}
+    logs = []
+
+    class FakeClient:
+        def send_arm_command(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                'command_id': 'arm1-command-trailer',
+                'mission_id': kwargs['mission_id'],
+            }
+
+    monkeypatch.setattr(command_center, 'CentralControlClient', FakeClient)
+    popup = object.__new__(command_center.CommandPopup)
+    popup._log = logs.append
+    popup.result_label = types.SimpleNamespace(configure=lambda **_kwargs: None)
+
+    handled = popup._execute_arm_action(
+        {
+            'type': 'arm1_pick_place',
+            'arm_id': 'arm1',
+            'source_id': 6,
+            'destination_id': 9,
+            'vehicle_id': 'agv1',
+            'final_for_vehicle': True,
+        },
+        {'mission_id': 'mission-arm1', 'predecessor_command_id': ''},
+    )
+
+    assert handled
+    assert captured['destination_id'] == 10
+    assert any('9 -> 10' in item for item in logs)
+
+
 def test_arm1_stop_uses_arm1_endpoint(monkeypatch):
     captured = []
 

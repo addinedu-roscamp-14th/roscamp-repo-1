@@ -80,6 +80,9 @@ class ArmDispatcher(Node):
         self.declare_parameter(
             'arm1_work_state_topic', '/arm/pick_place/work_state'
         )
+        self.declare_parameter(
+            'arm1_status_topic', '/arm/pick_place/status'
+        )
         self.declare_parameter('state_publish_rate_hz', 2.0)
         self.declare_parameter('service_wait_timeout_sec', 5.0)
         self.declare_parameter('service_retry_count', 3)
@@ -88,7 +91,8 @@ class ArmDispatcher(Node):
         # A transfer only makes sense once the trailer is actually parked in
         # front of the arm. Without this the arm reached for a vehicle that
         # was still driving. Empty zone disables the wait.
-        self.declare_parameter('vehicle_arrival_zone', 'A')
+        self.declare_parameter('arm1_vehicle_arrival_zone', 'B-1')
+        self.declare_parameter('arm2_vehicle_arrival_zone', 'A')
         self.declare_parameter('vehicle_arrival_timeout_sec', 300.0)
         self.declare_parameter('vehicle_state_max_age_sec', 5.0)
 
@@ -99,9 +103,14 @@ class ArmDispatcher(Node):
         # promised to gate a vehicle's departure. Derived from live queue
         # state rather than edge events so a dropped message self-heals.
         self.vehicle_commitments = {}
-        self.vehicle_arrival_zone = str(
-            self.get_parameter('vehicle_arrival_zone').value or ''
-        ).strip('/')
+        self.vehicle_arrival_zones = {
+            arm_id: str(
+                self.get_parameter(
+                    f'{arm_id}_vehicle_arrival_zone'
+                ).value or ''
+            ).strip('/')
+            for arm_id in ('arm1', 'arm2')
+        }
         self.vehicle_arrival_timeout_sec = float(
             self.get_parameter('vehicle_arrival_timeout_sec').value
         )
@@ -124,6 +133,7 @@ class ArmDispatcher(Node):
         self.arm2_state = ArmState.OFFLINE
         self.arm2_state_text = 'waiting for ARM2 event or service'
         self.arm1_last_error = ''
+        self.arm1_status_text = ''
         self.arm1_state = ArmState.OFFLINE
         self.arm1_state_text = 'waiting for ARM1 work_state or service'
         self.arm1_latest_state_at = None
@@ -147,6 +157,13 @@ class ArmDispatcher(Node):
             str(self.get_parameter('arm1_work_state_topic').value),
             self._on_arm1_work_state,
             event_qos,
+            callback_group=self.callback_group,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter('arm1_status_topic').value),
+            self._on_arm1_status,
+            10,
             callback_group=self.callback_group,
         )
         self.result_publisher = self.create_publisher(
@@ -245,7 +262,10 @@ class ArmDispatcher(Node):
         )
         self.create_timer(1.0 / rate, self._publish_states)
         self.get_logger().info(
-            'ARM dispatcher ready: ARM1=/arm/pick_place, ARM2=/arm2 services'
+            'ARM dispatcher ready: ARM1=/arm/pick_place '
+            f'(arrival={self.vehicle_arrival_zones["arm1"]}), '
+            'ARM2=/arm2 services '
+            f'(arrival={self.vehicle_arrival_zones["arm2"]})'
         )
 
     def _accept_goal(self, goal_request):
@@ -304,12 +324,64 @@ class ArmDispatcher(Node):
                 self.arm1_state = ArmState.STOPPED
             elif state == 'FAILED':
                 self.arm1_state = ArmState.ERROR
-                self.arm1_last_error = 'ARM1 pick/place reported FAILED'
+                self.arm1_last_error = (
+                    getattr(self, 'arm1_status_text', '')
+                    or 'ARM1 pick/place reported FAILED'
+                )
             else:
                 self.arm1_state = ArmState.BUSY
             self.condition.notify_all()
 
+    def _on_arm1_status(self, message):
+        """Keep ARM1's human-readable failure detail beside work_state."""
+        status = str(message.data or '').strip()
+        if not status:
+            return
+        with self.condition:
+            self.arm1_status_text = status
+            if self.arm1_state == ArmState.ERROR:
+                self.arm1_last_error = status
+            self.condition.notify_all()
+
+    @staticmethod
+    def _service_is_ready(client):
+        """Read one ROS service graph state without making snapshots fragile."""
+        try:
+            return client is not None and bool(client.service_is_ready())
+        except Exception:
+            return False
+
+    def _arm2_service_is_ready(self):
+        """Return whether at least one persistent ARM2 endpoint is visible."""
+        clients = [
+            self.trigger_clients.get('stop_pick'),
+            self.trigger_clients.get('scan_destinations'),
+            self.transfer_by_id_client,
+        ]
+        return any(self._service_is_ready(client) for client in clients)
+
+    def _refresh_arm2_idle_connectivity(self):
+        """Derive idle ARM2 connectivity from services before any event exists."""
+        if (
+            self.active_command is not None
+            and str(self.active_command.arm_id).lower() == 'arm2'
+        ):
+            return
+        service_ready = self._arm2_service_is_ready()
+        if service_ready and self.arm2_state == ArmState.OFFLINE:
+            self.arm2_state = ArmState.READY
+            self.arm2_state_text = 'SERVICE_CONNECTED'
+            self.arm2_last_error = ''
+        elif (
+            not service_ready
+            and self.arm2_state == ArmState.READY
+            and self.arm2_state_text == 'SERVICE_CONNECTED'
+        ):
+            self.arm2_state = ArmState.OFFLINE
+            self.arm2_state_text = 'waiting for ARM2 event or service'
+
     def _publish_states(self):
+        self._refresh_arm2_idle_connectivity()
         self._publish_vehicle_holds()
         now = self.get_clock().now().to_msg()
         arm1 = ArmState()
@@ -348,7 +420,12 @@ class ArmDispatcher(Node):
         arm2.state_text = self.arm2_state_text
         arm2.ready = self.arm2_state == ArmState.READY
         arm2.last_error = self.arm2_last_error
-        if self.latest_event_at is None:
+        if (
+            self.latest_event_at is None
+            and self.arm2_state_text == 'SERVICE_CONNECTED'
+        ):
+            arm2.telemetry_age_sec = 0.0
+        elif self.latest_event_at is None:
             arm2.telemetry_age_sec = float('inf')
         else:
             arm2.telemetry_age_sec = float(
@@ -549,6 +626,11 @@ class ArmDispatcher(Node):
                     # state, so a transient-local replay from an old run can
                     # never complete a new central command.
                     if work_started and is_terminal_arm1_state(state):
+                        if state == 'FAILED':
+                            # arm_v2 publishes the detailed status immediately
+                            # after FAILED. Briefly release the condition so the
+                            # status callback can replace the generic error.
+                            self.condition.wait(timeout=0.25)
                         return state, operation_id, ''
                 self.condition.wait(
                     timeout=min(0.25, max(0.0, deadline - time.monotonic()))
@@ -573,8 +655,17 @@ class ArmDispatcher(Node):
             self.vehicle_states[vehicle_id] = (message, time.monotonic())
             self.condition.notify_all()
 
-    def _vehicle_has_arrived(self, vehicle_id):
+    def _arrival_zone_for_arm(self, arm_id):
+        """Return the physical vehicle work zone for one robot arm."""
+        zones = getattr(self, 'vehicle_arrival_zones', None)
+        if isinstance(zones, dict):
+            return str(zones.get(str(arm_id).lower(), '')).strip('/')
+        # Compatibility for lightweight test doubles and old serialized state.
+        return str(getattr(self, 'vehicle_arrival_zone', '')).strip('/')
+
+    def _vehicle_has_arrived(self, vehicle_id, arm_id='arm2'):
         """Return true once the vehicle is parked in the arm's work zone."""
+        arrival_zone = self._arrival_zone_for_arm(arm_id)
         with self.condition:
             entry = self.vehicle_states.get(vehicle_id)
             if entry is None:
@@ -586,7 +677,7 @@ class ArmDispatcher(Node):
         if message.state != VehicleState.READY:
             return False
         return (
-            str(message.locked_zone).strip('/') == self.vehicle_arrival_zone
+            str(message.locked_zone).strip('/') == arrival_zone
         )
 
     def _wait_for_vehicle_arrival(
@@ -594,11 +685,12 @@ class ArmDispatcher(Node):
     ):
         """Hold the command until its vehicle is parked in the work zone."""
         vehicle_id = str(goal.vehicle_id)
-        if not self.vehicle_arrival_zone or not vehicle_id:
+        arrival_zone = self._arrival_zone_for_arm(arm_id)
+        if not arrival_zone or not vehicle_id:
             return True, ''
         deadline = time.monotonic() + self.vehicle_arrival_timeout_sec
         announced = False
-        while not self._vehicle_has_arrived(vehicle_id):
+        while not self._vehicle_has_arrived(vehicle_id, arm_id):
             if goal_handle.is_cancel_requested:
                 return False, f'canceled while waiting for {vehicle_id}'
             with self.condition:
@@ -608,14 +700,14 @@ class ArmDispatcher(Node):
             if time.monotonic() >= deadline:
                 return False, (
                     f'{vehicle_id} did not reach '
-                    f'{self.vehicle_arrival_zone} within '
+                    f'{arrival_zone} within '
                     f'{self.vehicle_arrival_timeout_sec:.0f}s'
                 )
             if not announced:
                 announced = True
                 self.get_logger().info(
                     f'Waiting for {vehicle_id} to reach '
-                    f'{self.vehicle_arrival_zone} before starting '
+                    f'{arrival_zone} before starting '
                     f'{goal.operation}'
                 )
             with self.condition:
@@ -734,6 +826,13 @@ class ArmDispatcher(Node):
             )
 
         try:
+            if str(goal.mission_id) in self.failed_missions:
+                return self._finish_error(
+                    goal_handle,
+                    goal,
+                    self.ERROR_OPERATION_FAILED,
+                    f'mission {goal.mission_id} failed while command was queued',
+                )
             if self._gates_vehicle(goal, operation):
                 # Order matters: wait for the vehicle first, claim it second.
                 # Claiming before the wait would hold the vehicle in place
@@ -764,6 +863,12 @@ class ArmDispatcher(Node):
             client, request, accepted_field = self._service_for_goal(
                 goal, operation
             )
+            if arm_id == 'arm1' and operation == 'pick_place':
+                # A latched-looking status string from an earlier operation
+                # must never become the failure reason for this command.
+                with self.condition:
+                    self.arm1_status_text = ''
+                    self.arm1_last_error = ''
             accepted, service_message = self._call_service(
                 client, request, accepted_field
             )
@@ -823,7 +928,11 @@ class ArmDispatcher(Node):
                         operation_id,
                     )
                 success = terminal_state == 'WORK_COMPLETED'
-                terminal_message = f'ARM1 {terminal_state}'
+                terminal_message = (
+                    self.arm1_last_error
+                    if terminal_state == 'FAILED' and self.arm1_last_error
+                    else f'ARM1 {terminal_state}'
+                )
                 if not success:
                     return self._finish_error(
                         goal_handle,

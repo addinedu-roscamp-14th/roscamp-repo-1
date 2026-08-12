@@ -438,7 +438,8 @@ ros2 run tf2_ros tf2_echo arm2/base_link arm2/TCP
 ## A-1/A-2/A-3 세부 목적지 저장 후 개별 이송
 
 터미널 1에서 통합 launch를 계속 실행합니다. 컨테이너 ID는 0~8이고,
-트레일러는 ID 9 또는 ID 10입니다. 세부 목적지는 다음과 같습니다.
+트레일러는 AMR1(agv1)이 ID 10, AMR2(agv2)가 ID 9입니다. 세부 목적지는
+다음과 같습니다.
 
 - A-1-1 = ID 11
 - A-1-2 = ID 12
@@ -502,7 +503,8 @@ ros2 service call /arm2/transfer_to_a3_2 std_srvs/srv/Trigger "{}"
 J1 스캔으로 찾습니다. 선택한 컨테이너와 트레일러 둘 중 하나가 안정적으로
 저장되면 두 좌표를 잠그고, 컨테이너를 집어 선택된 트레일러에 적재한 뒤
 홈으로 복귀합니다. 두 트레일러가 동시에 보이면 ID 9를 우선합니다. 이 스캔은
-기존 ID 11~16 목적지 저장값을 초기화하거나 갱신하지 않습니다.
+기존 ID 11~16 목적지 저장값을 초기화하거나 갱신하지 않습니다. 차량별 고정
+매핑은 AMR1=10, AMR2=9이며, 물리적으로 한 차량만 A 작업 구역에 진입해야 합니다.
 
 ```bash
 ros2 service call /arm2/load_id0_to_trailer std_srvs/srv/Trigger "{}"

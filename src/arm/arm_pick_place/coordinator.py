@@ -235,7 +235,7 @@ class HomographyPickPlace(Node):
         self.declare_parameter('pick_marker_frame', 'arm/pick_marker')
         self.declare_parameter('place_marker_frame', 'arm/place_marker')
         self.declare_parameter('pick_marker_id', 2)
-        self.declare_parameter('place_marker_id', 8)
+        self.declare_parameter('place_marker_id', 18)
         self.declare_parameter(
             'calibration_file',
             str(

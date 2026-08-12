@@ -59,6 +59,7 @@ from cargo_dispatch_tool import (
 )
 from llm_command_parser import (
     LLMParseError,
+    VEHICLE_TRAILER_MARKERS,
     parse_command_with_llm,
     resolve_execution_mode,
 )
@@ -338,7 +339,7 @@ class CommandPopup(ctk.CTkToplevel):
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(5, weight=1)
 
         ctk.CTkLabel(self, text="🗣️ 자연어 명령", font=self.font_title).grid(
             row=0, column=0, sticky="w", padx=15, pady=(15, 5))
@@ -373,12 +374,21 @@ class CommandPopup(ctk.CTkToplevel):
             cmd_row, text="실행", width=90, command=self.run_command
         ).grid(row=0, column=2)
 
+        self.ignore_db_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self,
+            text="DB 없이 테스트 (명령에 컨테이너 ID를 직접 입력)",
+            variable=self.ignore_db_var,
+            font=self.font_body,
+            text_color="#F59E0B",
+        ).grid(row=3, column=0, sticky="w", padx=15, pady=(0, 8))
+
         self.result_label = ctk.CTkLabel(self, text="", font=self.font_body, text_color="#3B82F6",
                                          wraplength=680, justify="left")
-        self.result_label.grid(row=3, column=0, sticky="w", padx=15, pady=(0, 10))
+        self.result_label.grid(row=4, column=0, sticky="w", padx=15, pady=(0, 10))
 
         log_frame = ctk.CTkFrame(self, corner_radius=10)
-        log_frame.grid(row=4, column=0, sticky="nsew", padx=15, pady=(0, 15))
+        log_frame.grid(row=5, column=0, sticky="nsew", padx=15, pady=(0, 15))
         log_frame.grid_columnconfigure(0, weight=1)
         log_frame.grid_rowconfigure(1, weight=1)
 
@@ -451,6 +461,7 @@ class CommandPopup(ctk.CTkToplevel):
         command = self.command_var.get().strip()
         if not command:
             return
+        allow_inventory_bypass = bool(self.ignore_db_var.get())
 
         # 0순위: "화물 A~D" 같은 범위 표현은 LLM에 맡기면 일관성이 떨어져서
         # (위치명으로 착각하는 등) 코드에서 먼저 확실하게 처리하고 끝냅니다.
@@ -481,18 +492,25 @@ class CommandPopup(ctk.CTkToplevel):
             detail.get("화물종류", "") for detail in self.cargo_details.values() if detail.get("화물종류")
         })
         inventory_snapshot = None
-        try:
-            inventory_snapshot = InventoryClient().fetch_snapshot().to_dict()
+        zone_status = RosControlBridge.get_instance().snapshot().b1_zone
+        if allow_inventory_bypass:
             self._log(
-                '[실행용 DB 스냅샷] '
-                f'{inventory_snapshot["snapshot_id"]}, '
-                f'화물={len(inventory_snapshot["cargos"])}건'
+                '[DB 없는 수동 테스트] PostgreSQL 조회를 생략합니다. '
+                '명령에 명시된 컨테이너 ID만 사용합니다.'
             )
-        except InventoryClientError as exc:
-            # Pure vehicle navigation can still run without inventory.  If the
-            # LLM creates an ARM loading action, the parser's deterministic
-            # inventory validator below fails closed instead of guessing an ID.
-            self._log(f'[실행용 DB 조회 실패] {exc}')
+        else:
+            try:
+                inventory_snapshot = InventoryClient().fetch_snapshot().to_dict()
+                self._log(
+                    '[실행용 DB 스냅샷] '
+                    f'{inventory_snapshot["snapshot_id"]}, '
+                    f'화물={len(inventory_snapshot["cargos"])}건'
+                )
+            except InventoryClientError as exc:
+                # Pure vehicle navigation can still run without inventory.  If
+                # the LLM creates an ARM action, deterministic validation fails
+                # closed instead of guessing an ID.
+                self._log(f'[실행용 DB 조회 실패] {exc}')
         try:
             llm_result = parse_command_with_llm(
                 command,
@@ -504,6 +522,8 @@ class CommandPopup(ctk.CTkToplevel):
                 image_height=image_height,
                 yolo_detections=compact_detection_list,
                 inventory_snapshot=inventory_snapshot,
+                allow_inventory_bypass=allow_inventory_bypass,
+                zone_status=zone_status,
             )
         except LLMParseError as exc:
             self._log(f"[LLM 사용 불가 - 규칙 기반으로 대체] {exc}")
@@ -518,10 +538,16 @@ class CommandPopup(ctk.CTkToplevel):
                 image_height,
             )
             if handled:
-                RealtimeLLMAgent.get_instance().set_objective(
-                    command,
-                    llm_result.get('actions'),
-                )
+                if allow_inventory_bypass:
+                    self._log(
+                        '[DB 없는 수동 테스트] 이번 명령은 1회 실행하며 '
+                        '실시간 재판단에는 등록하지 않습니다.'
+                    )
+                else:
+                    RealtimeLLMAgent.get_instance().set_objective(
+                        command,
+                        llm_result.get('actions'),
+                    )
                 return
             if llm_result.get('suppress_rule_fallback'):
                 reason = str(
@@ -1038,6 +1064,18 @@ class CommandPopup(ctk.CTkToplevel):
             )
             plan_context['step_failed'] = True
             return True
+        if (
+            operation == 'pick_place'
+            and destination_id in set(VEHICLE_TRAILER_MARKERS.values())
+            and vehicle_id in VEHICLE_TRAILER_MARKERS
+        ):
+            expected_trailer_id = VEHICLE_TRAILER_MARKERS[vehicle_id]
+            if destination_id != expected_trailer_id:
+                self._log(
+                    f'[ARM1 트레일러 ID 교정] {vehicle_id}: '
+                    f'{destination_id} -> {expected_trailer_id}'
+                )
+                destination_id = expected_trailer_id
         if operation == 'transfer_by_id' and (
             not 0 <= source_id <= 8
             or destination_id not in set(range(9)) | set(range(11, 17))

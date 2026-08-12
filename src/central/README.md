@@ -13,6 +13,8 @@
 `WORK_COMPLETED`, `FAILED`, `STOPPED` 중 하나가 올 때까지 명령을 완료하지 않습니다.
 `execute` 요청의 `pick_id/place_id`는 중앙 action의
 `source_id/destination_id`에서 매 작업마다 전달됩니다.
+차량 연계 작업은 ARM1의 경우 차량 상태가 `READY`이고 `locked_zone=B-1`,
+ARM2의 경우 `READY`이고 `locked_zone=A`가 된 뒤에만 시작합니다.
 ARM2도 직접 서비스 응답을 작업 완료로 간주하지 않습니다. 반드시
 `/arm2/transfer_events`에서 같은 `operation_id`의 최종 `COMPLETED` 또는 `FAILED`
 이벤트를 받은 뒤 중앙 결과를 확정합니다.
@@ -26,8 +28,8 @@ ARM2도 직접 서비스 응답을 작업 완료로 간주하지 않습니다. �
 - `transfer_by_id`: 창고 내부 이동
 - `go_pose`, `reset_stack_level`, `stop`
 
-차량 출발 승인은 `transfer_to_slot` 또는 `load_to_trailer`가 최종 성공하고 요청의
-`final_for_vehicle`가 참일 때만 `/central/autonomy/vehicle_release`에 발행됩니다.
+차량 출발 승인은 `pick_place`, `transfer_to_slot` 또는 `load_to_trailer`가 최종
+성공하고 요청의 `final_for_vehicle`가 참일 때만 허용됩니다.
 `transfer_by_id` 성공은 차량 출발 조건이 아닙니다.
 
 ### 출발 게이트

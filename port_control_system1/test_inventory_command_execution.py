@@ -176,3 +176,124 @@ def test_arm1_explicit_buried_source_is_rejected_from_db_stack():
     )
 
     assert any('최상단 floor=3 아래에 있음' in item for item in issues)
+
+
+def _ship_plan(destination_id):
+    return {
+        'execution_mode': 'sequential',
+        'actions': [{
+            'type': 'arm1_pick_place',
+            'arm_id': 'arm1',
+            'source_id': 6,
+            'destination_id': destination_id,
+            'vehicle_id': 'agv1',
+            'final_for_vehicle': True,
+        }],
+    }
+
+
+def test_generic_ship_place_accepts_registered_marker_range():
+    issues = inventory_workflow_issues(
+        'amr1에 있는 6번 컨테이너를 선박에 놓아줘',
+        _ship_plan(18),
+        SNAPSHOT,
+    )
+
+    assert issues == []
+
+
+def test_generic_ship_place_rejects_old_marker_nine():
+    issues = inventory_workflow_issues(
+        'amr1에 있는 6번 컨테이너를 선박에 놓아줘',
+        _ship_plan(9),
+        SNAPSHOT,
+    )
+
+    assert any('등록된 ArUco 범위 18..23에 없음' in item for item in issues)
+
+
+def test_numbered_ship_slot_maps_to_registered_marker():
+    issues = inventory_workflow_issues(
+        'amr1의 6번 컨테이너를 선박 3번 자리에 놓아줘',
+        _ship_plan(20),
+        SNAPSHOT,
+    )
+    wrong_issues = inventory_workflow_issues(
+        'amr1의 6번 컨테이너를 선박 3번 자리에 놓아줘',
+        _ship_plan(18),
+        SNAPSHOT,
+    )
+
+    assert issues == []
+    assert any('ArUco 20' in item for item in wrong_issues)
+
+
+def test_ship_place_request_requires_arm1_action():
+    issues = inventory_workflow_issues(
+        'amr1의 6번 컨테이너를 선박에 놓아줘',
+        {'actions': [{'type': 'unknown', 'reason': '목적지 불명'}]},
+        SNAPSHOT,
+    )
+
+    assert issues == ['사용자 선박 배치 요청에 arm1_pick_place 단계가 없음']
+
+
+def test_db_bypass_accepts_explicit_container_and_ship_marker():
+    issues = inventory_workflow_issues(
+        'amr1의 6번 컨테이너를 선박에 놓아줘',
+        _ship_plan(18),
+        None,
+        allow_inventory_bypass=True,
+    )
+
+    assert issues == []
+
+
+def test_ship_loading_word_means_vessel_place_not_amr_loading():
+    issues = inventory_workflow_issues(
+        'amr1의 6번컨테이너를 선박에 실어줘',
+        _ship_plan(18),
+        None,
+        allow_inventory_bypass=True,
+    )
+
+    assert issues == []
+
+
+def test_db_bypass_rejects_a_source_id_not_named_by_operator():
+    issues = inventory_workflow_issues(
+        'amr1의 6번 컨테이너를 선박에 놓아줘',
+        {
+            **_ship_plan(18),
+            'actions': [{
+                **_ship_plan(18)['actions'][0],
+                'source_id': 5,
+            }],
+        },
+        None,
+        allow_inventory_bypass=True,
+    )
+
+    assert any('명시한 컨테이너 ID는 6' in item for item in issues)
+
+
+def test_db_bypass_requires_one_explicit_container_id():
+    issues = inventory_workflow_issues(
+        'amr1의 컨테이너를 선박에 놓아줘',
+        _ship_plan(18),
+        None,
+        allow_inventory_bypass=True,
+    )
+
+    assert any('컨테이너 ID를 명령에 하나만 명시' in item for item in issues)
+
+
+def test_db_bypass_still_rejects_unregistered_ship_marker():
+    issues = inventory_workflow_issues(
+        'amr1의 6번 컨테이너를 선박에 놓아줘',
+        _ship_plan(9),
+        None,
+        allow_inventory_bypass=True,
+    )
+
+    assert any('등록된 ArUco 범위 18..23에 없음' in item for item in issues)
