@@ -153,3 +153,52 @@ def test_no_action_has_stable_public_shape():
         'moves', 'summary', 'error',
     }
     assert result['status'] == 'no_action'
+
+
+def test_single_move_planning_repairs_invalid_multi_move_output():
+    snapshot = make_snapshot([cargo('C0', '0', 'A-1-1', 1, '11')])
+    responses = [
+        {
+            'status': 'ready',
+            'moves': [
+                move(1, '0', 'C0', 'A-1-1', 1, 'B-1'),
+                move(2, '0', 'C0', 'B-1', 1, '임시 버퍼'),
+            ],
+            'summary': '잘못된 다중 이동',
+        },
+        {
+            'status': 'ready',
+            'moves': [move(1, '0', 'C0', 'A-1-1', 1, 'B-1')],
+            'summary': '교정된 단일 이동',
+        },
+    ]
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: responses.pop(0))
+
+    result = planner.plan_single_move_snapshot(
+        'C0 한 건 이동', snapshot, LOCATIONS
+    )
+
+    assert result['status'] == 'ready'
+    assert len(result['moves']) == 1
+    assert not responses
+
+
+def test_single_move_planning_retries_spurious_no_action():
+    snapshot = make_snapshot([cargo('C0', '0', 'A-1-1', 1, '11')])
+    responses = [
+        {'status': 'no_action', 'moves': [], 'summary': '잘못된 대기'},
+        {
+            'status': 'ready',
+            'moves': [move(1, '0', 'C0', 'A-1-1', 1, 'B-1')],
+            'summary': '재시도 성공',
+        },
+    ]
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: responses.pop(0))
+
+    result = planner.plan_single_move_snapshot(
+        'C0 한 건 이동', snapshot, LOCATIONS
+    )
+
+    assert result['status'] == 'ready'
+    assert len(result['moves']) == 1
+    assert not responses

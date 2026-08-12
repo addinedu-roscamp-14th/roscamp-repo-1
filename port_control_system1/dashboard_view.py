@@ -650,6 +650,7 @@ class DashboardView(ctk.CTkFrame):
                     'WAITING_FOR_DB_SYNC': ' · DB 동기화 대기',
                     'WAITING_FOR_VEHICLE': ' · 차량 대기',
                     'WAITING_FOR_ARM_CACHE': ' · ARM1 캐시 대기',
+                    'WAITING_FOR_ARM_SCAN': ' · ARM 스캔 대기',
                     'WAITING_OPERATOR': ' · 운영자 확인 필요',
                     'ERROR': ' · 오류',
                 }.get(snapshot.state, '')

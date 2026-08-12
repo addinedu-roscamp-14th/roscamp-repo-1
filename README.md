@@ -123,18 +123,13 @@ ros2 launch porter_bringup agv_vehicle.launch.py \
 
 ```bash
 cd ~/poter_ws
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
 
 export ROS_DOMAIN_ID=15
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
-sudo ip link set lo multicast on
-ros2 daemon stop
-
 zenoh-bridge-ros2dds \
-  -c config/network/zenoh_arm1.json5 \
+  -c "$HOME/snap/zenoh-bridge-ros2dds/common/config.json5" \
   -e tcp/192.168.5.6:7447
 ```
 
@@ -269,6 +264,26 @@ ros2 launch porter_bringup dashboard_laptop.launch.py \
 ``` bash
 cd ~/poter_ws 
 ./scripts/clear_all_holds.sh --cancel-goals
+```
+### DB 비우기
+``` bash
+cd ~/poter_ws
+
+.venv/bin/python -c "
+import psycopg2
+conn = psycopg2.connect(
+    host='192.168.5.9',
+    port=5432,
+    dbname='port_db',
+    user='postgres',
+    password='1234',
+)
+with conn:
+    with conn.cursor() as cur:
+        cur.execute('TRUNCATE TABLE cargo_movements; DELETE FROM cargos;')
+conn.close()
+print('PostgreSQL cargos 및 cargo_movements 초기화 완료')
+"
 ```
 
 ## 개별 노드 실행 참고

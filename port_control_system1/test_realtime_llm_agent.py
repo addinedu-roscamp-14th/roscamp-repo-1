@@ -138,3 +138,39 @@ def test_work_assignment_allows_vehicle_to_be_parked_again_later():
     agent._autonomy_park_requests.discard('agv1')
 
     assert 'agv1' not in agent._autonomy_park_requests
+
+
+def test_inbound_transport_waits_for_all_arm_scans():
+    status = fleet_status()
+    status['telemetry']['autonomy'] = {
+        'arm1_ship_cache_ready': True,
+        'arm2_destination_cache_ready': True,
+        'inbound_scan_pending': True,
+    }
+    status['telemetry']['arms'] = {
+        'arm1': {'current_operation': 'scan_inbound'},
+    }
+
+    blocker = RealtimeLLMAgent._autonomy_scan_blocker(
+        'UNLOADING_INBOUND', status
+    )
+
+    assert blocker == 'ARM1 입항 컨테이너 스캔 완료 대기 중'
+
+
+def test_inbound_transport_starts_only_after_both_caches_are_ready():
+    status = fleet_status()
+    status['telemetry']['autonomy'] = {
+        'arm1_ship_cache_ready': True,
+        'arm2_destination_cache_ready': True,
+        'inbound_scan_pending': False,
+    }
+    status['telemetry']['arms'] = {
+        'arm1': {'current_operation': ''},
+    }
+
+    blocker = RealtimeLLMAgent._autonomy_scan_blocker(
+        'UNLOADING_INBOUND', status
+    )
+
+    assert blocker == ''

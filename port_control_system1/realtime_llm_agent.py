@@ -468,6 +468,33 @@ class RealtimeLLMAgent:
             for vehicle in vehicles.values()
         )
 
+    @staticmethod
+    def _autonomy_scan_blocker(phase, fleet_status):
+        """Return why an ARM cache/scan prevents the next cargo move."""
+        telemetry = (fleet_status or {}).get('telemetry') or {}
+        autonomy = telemetry.get('autonomy') or {}
+        arms = telemetry.get('arms') or {}
+        arm1 = arms.get('arm1') or {}
+        arm1_operation = str(arm1.get('current_operation') or '')
+        if phase == 'UNLOADING_INBOUND':
+            if (
+                autonomy.get('inbound_scan_pending')
+                or arm1_operation in {
+                    'scan_inbound', 'scan_ship_destinations'
+                }
+            ):
+                return 'ARM1 입항 컨테이너 스캔 완료 대기 중'
+            if not autonomy.get('arm1_ship_cache_ready'):
+                return 'ARM1 선박 마커 18~23 캐시 완료 대기 중'
+            if not autonomy.get('arm2_destination_cache_ready'):
+                return 'ARM2 창고 목적지 마커 캐시 완료 대기 중'
+        if (
+            phase == 'LOADING_OUTBOUND'
+            and not autonomy.get('arm1_ship_cache_ready')
+        ):
+            return 'ARM1 선박 마커 18~23 캐시 완료 대기 중'
+        return ''
+
     def _save_cycle(self):
         self.cycle_store.save(self._cycle)
 
@@ -577,16 +604,11 @@ class RealtimeLLMAgent:
             return None
         if not objective:
             return None
-        autonomy_status = (
-            (fleet_status.get('telemetry') or {}).get('autonomy') or {}
-        )
-        if (
-            phase == 'LOADING_OUTBOUND'
-            and not autonomy_status.get('arm1_ship_cache_ready')
-        ):
+        scan_blocker = self._autonomy_scan_blocker(phase, fleet_status)
+        if scan_blocker:
             self._update_snapshot(
-                state='WAITING_FOR_ARM_CACHE',
-                last_error='ARM1 선박 마커 18~23 캐시 완료 대기 중',
+                state='WAITING_FOR_ARM_SCAN',
+                last_error=scan_blocker,
             )
             return None
 
@@ -635,12 +657,35 @@ class RealtimeLLMAgent:
                 state='WAITING_FOR_DATA', last_error=str(exc)
             )
             return None
+        compact_planning_detections = compact_detections(
+            planning_detections
+        )
+        if phase == 'UNLOADING_INBOUND':
+            visible_warehouse_zones = {
+                str(item.get('label') or '').upper()
+                for item in compact_planning_detections
+                if str(item.get('label') or '').upper() in {
+                    'A-1', 'A-2', 'A-3'
+                }
+            }
+            if not visible_warehouse_zones:
+                self._update_snapshot(
+                    state='WAITING_FOR_DATA',
+                    last_error='YOLO에서 실행 가능한 창고 구역을 찾지 못함',
+                )
+                return None
+            phase, objective = choose_policy(
+                self._cycle,
+                snapshot,
+                port_present,
+                visible_warehouse_zones=visible_warehouse_zones,
+            )
         telemetry = fleet_status.get('telemetry') or {}
         operating_context = {
             'cycle_id': self._cycle.cycle_id,
             'phase': phase,
             'port_roi': telemetry.get('port_status'),
-            'yolo': compact_detections(planning_detections),
+            'yolo': compact_planning_detections,
             'vehicles': telemetry.get('vehicles'),
             'arms': telemetry.get('arms'),
             'arm_scan': telemetry.get('autonomy'),
@@ -651,7 +696,7 @@ class RealtimeLLMAgent:
             f'{json.dumps(operating_context, ensure_ascii=False)}'
         )
         self._update_snapshot(state='EVALUATING', last_decision=llm_objective)
-        plan = self.inventory_planner.plan_snapshot(
+        plan = self.inventory_planner.plan_single_move_snapshot(
             llm_objective, inventory, list(CANONICAL_LOCATIONS)
         )
         if plan.get('status') != 'ready' or not plan.get('moves'):

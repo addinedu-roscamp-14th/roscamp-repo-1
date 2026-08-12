@@ -631,7 +631,8 @@ class HomographyPickPlace(Node):
         return response
 
     def scan_ship_destinations(self, _request, response):
-        """Freshly scan empty ship slot markers 18..23 for later placement.
+        """
+        Freshly scan empty ship slot markers 18..23 for later placement.
 
         An explicit scan command always runs the same two-view observation
         sequence used by normal ChoE-branch pick/place commands.  In
@@ -641,7 +642,10 @@ class HomographyPickPlace(Node):
         left/right scan to run for the new control session.
         """
         with self.command_lock:
-            if self.motion_thread is not None and self.motion_thread.is_alive():
+            if (
+                self.motion_thread is not None
+                and self.motion_thread.is_alive()
+            ):
                 response.success = False
                 response.message = 'ARM1 is busy'
                 return response

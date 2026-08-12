@@ -132,6 +132,58 @@ class InventoryDecisionPlanner:
         except Exception as exc:
             return _error_result(objective, snapshot.snapshot_id, exc)
 
+    def plan_single_move_snapshot(
+        self, objective, snapshot, known_locations, attempts=3
+    ):
+        """Generate exactly one move, repairing one invalid LLM response."""
+        objective = str(objective or '').strip()
+        locations = sorted({
+            str(location).strip()
+            for location in (known_locations or [])
+            if str(location).strip()
+        })
+        if not objective or not locations:
+            return self.plan_snapshot(objective, snapshot, locations)
+        prompt = self._build_prompt(objective, snapshot, locations)
+        last_error = None
+        invalid_output = None
+        for _attempt in range(max(1, int(attempts))):
+            repair_context = {
+                'planning_mode': 'single_move',
+                'hard_constraint': (
+                    'status=ready이면 moves 배열에 정확히 1건만 반환한다. '
+                    '목적지 floor와 base_aruco_id는 목표에 제공된 후보 값을 '
+                    '그대로 사용한다.'
+                ),
+                'request': json.loads(prompt),
+            }
+            if last_error is not None:
+                repair_context['previous_validation_error'] = str(last_error)
+                repair_context['previous_invalid_output'] = invalid_output
+            try:
+                raw_plan = self._generate(json.dumps(
+                    repair_context, ensure_ascii=False, separators=(',', ':')
+                ))
+                invalid_output = raw_plan
+                status = str(raw_plan.get('status', '')).strip()
+                if status != 'ready':
+                    raise InventoryPlanValidationError(
+                        'autonomous single-move planning requires status=ready'
+                    )
+                if len(raw_plan.get('moves') or []) != 1:
+                    raise InventoryPlanValidationError(
+                        'single-move planning requires exactly one move'
+                    )
+                return self.validate_plan(
+                    raw_plan,
+                    objective=objective,
+                    snapshot=snapshot,
+                    known_locations=locations,
+                )
+            except Exception as exc:
+                last_error = exc
+        return _error_result(objective, snapshot.snapshot_id, last_error)
+
     @staticmethod
     def _build_prompt(objective, snapshot, known_locations):
         context = {

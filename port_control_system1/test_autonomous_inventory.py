@@ -8,6 +8,7 @@ from autonomous_inventory import (
     CycleStore,
     choose_policy,
     compile_move,
+    destination_candidates,
     validate_first_move,
 )
 
@@ -32,6 +33,45 @@ def test_inbound_is_unloaded_before_outbound():
     phase, objective = choose_policy(cycle, state, True)
     assert phase == 'UNLOADING_INBOUND'
     assert '[1]' in objective
+    assert 'moves 배열에는 이동 1건만' in objective
+    assert '"location": "A-1-2"' in objective
+
+
+def test_destination_candidates_include_exact_stack_support():
+    state = snapshot(
+        cargo(1, 'A-1-1', 1, '11'),
+        cargo(2, 'A-1-1', 2, '1'),
+    )
+
+    candidates = destination_candidates(state, ('A-1-1', 'A-1-2'))
+
+    assert candidates == [
+        {
+            'location': 'A-1-1',
+            'destination_floor': 3,
+            'destination_base_aruco_id': '2',
+        },
+        {
+            'location': 'A-1-2',
+            'destination_floor': 1,
+            'destination_base_aruco_id': '',
+        },
+    ]
+
+
+def test_inbound_candidates_are_limited_to_visible_warehouse_zone():
+    cycle = AutonomousCycle()
+    phase, objective = choose_policy(
+        cycle,
+        snapshot(cargo(1, '선박-1')),
+        True,
+        visible_warehouse_zones={'A-3'},
+    )
+
+    assert phase == 'UNLOADING_INBOUND'
+    assert '"location": "A-3-1"' in objective
+    assert '"location": "A-3-2"' in objective
+    assert '"location": "A-1-1"' not in objective
 
 
 def test_outbound_is_not_reclassified_as_inbound():
