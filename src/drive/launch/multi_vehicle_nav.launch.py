@@ -121,6 +121,7 @@ def _launch_nav2(context):
                 'obstacle_topic': 'other_robot_obstacle',
                 'clearing_topic': 'other_robot_obstacle_clear',
                 'frame_id': 'map',
+                'cloud_frame_id': f'{vehicle_id}/base_footprint',
                 'obstacle_radius': LaunchConfiguration(
                     'other_robot_obstacle_radius'
                 ),

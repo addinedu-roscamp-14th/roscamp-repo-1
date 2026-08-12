@@ -43,6 +43,11 @@ timeout되면 별도의 clearing PointCloud2로 이전 위치를 지웁니다. �
 독립적인 `local_costmap.other_robot_layer`에서만 사용하며 다음 항목에는 연결하지
 않습니다.
 
+PointCloud2는 상대 위치의 `map` 좌표를 각 차량의 `base_footprint` 좌표로 변환해
+발행합니다. 따라서 clearing ray의 센서 원점이 rolling local costmap 내부의 자기
+차량 위치가 되고, 지도 원점이 local costmap 밖에 있을 때 발생하는 raytrace 경고를
+방지합니다.
+
 - AMCL의 `scan` 입력
 - static map/map server
 - global costmap

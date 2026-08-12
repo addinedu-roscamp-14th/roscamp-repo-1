@@ -7,10 +7,13 @@ import time
 
 from geometry_msgs.msg import PoseWithCovarianceStamped
 import rclpy
+from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 class OtherRobotObstacle(Node):
@@ -23,6 +26,7 @@ class OtherRobotObstacle(Node):
             'clearing_topic', 'other_robot_obstacle_clear'
         )
         self.declare_parameter('frame_id', 'map')
+        self.declare_parameter('cloud_frame_id', '')
         self.declare_parameter('obstacle_radius', 0.13)
         self.declare_parameter('point_spacing', 0.02)
         self.declare_parameter('point_height', 0.08)
@@ -41,6 +45,9 @@ class OtherRobotObstacle(Node):
             self.get_parameter('clearing_topic').value
         )
         self.frame_id = str(self.get_parameter('frame_id').value)
+        self.cloud_frame_id = str(
+            self.get_parameter('cloud_frame_id').value
+        )
         self.obstacle_radius = float(
             self.get_parameter('obstacle_radius').value
         )
@@ -66,6 +73,8 @@ class OtherRobotObstacle(Node):
         self._validate_parameters()
         if not self.other_pose_topic:
             raise ValueError('other_pose_topic must not be empty')
+        if not self.cloud_frame_id:
+            raise ValueError('cloud_frame_id must not be empty')
 
         self.obstacle_offsets = self._make_disk_offsets(
             self.obstacle_radius, self.point_spacing
@@ -80,6 +89,10 @@ class OtherRobotObstacle(Node):
         self.last_published_pose = None
         self.was_active = False
         self.remaining_clear_cycles = 0
+        self.last_tf_warning_at = 0.0
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.obstacle_pub = self.create_publisher(
             PointCloud2, self.obstacle_topic, 10
@@ -98,7 +111,8 @@ class OtherRobotObstacle(Node):
         self.get_logger().info(
             f'other_pose={self.other_pose_topic}, '
             f'obstacle={self.obstacle_topic}, clear={self.clearing_topic}, '
-            f'frame={self.frame_id}, radius={self.obstacle_radius:.3f} m, '
+            f'pose_frame={self.frame_id}, cloud_frame={self.cloud_frame_id}, '
+            f'radius={self.obstacle_radius:.3f} m, '
             f'timeout={self.pose_timeout:.3f} s'
         )
 
@@ -161,12 +175,19 @@ class OtherRobotObstacle(Node):
         )
 
         if pose_is_fresh:
+            transform = self._map_to_cloud_transform()
+            if transform is None:
+                return
             if self.last_published_pose is not None:
                 self.clearing_pub.publish(
-                    self._cloud(self.last_published_pose, self.clearing_offsets)
+                    self._cloud(
+                        self.last_published_pose,
+                        self.clearing_offsets,
+                        transform,
+                    )
                 )
             self.obstacle_pub.publish(
-                self._cloud(self.latest_pose, self.obstacle_offsets)
+                self._cloud(self.latest_pose, self.obstacle_offsets, transform)
             )
             self.last_published_pose = self.latest_pose
             self.was_active = True
@@ -180,25 +201,72 @@ class OtherRobotObstacle(Node):
             )
 
         if self.remaining_clear_cycles > 0 and self.last_published_pose is not None:
-            self.obstacle_pub.publish(self._cloud(None, []))
+            transform = self._map_to_cloud_transform()
+            if transform is None:
+                return
+            self.obstacle_pub.publish(self._cloud(None, [], transform))
             self.clearing_pub.publish(
-                self._cloud(self.last_published_pose, self.clearing_offsets)
+                self._cloud(
+                    self.last_published_pose,
+                    self.clearing_offsets,
+                    transform,
+                )
             )
             self.remaining_clear_cycles -= 1
             if self.remaining_clear_cycles == 0:
                 self.last_published_pose = None
 
-    def _cloud(self, center, offsets):
+    def _map_to_cloud_transform(self):
+        try:
+            return self.tf_buffer.lookup_transform(
+                self.cloud_frame_id,
+                self.frame_id,
+                Time(),
+                timeout=Duration(seconds=0.05),
+            )
+        except TransformException as error:
+            now = time.monotonic()
+            if now - self.last_tf_warning_at >= 2.0:
+                self.get_logger().warning(
+                    f'Waiting for transform {self.cloud_frame_id} <- '
+                    f'{self.frame_id}: {error}'
+                )
+                self.last_tf_warning_at = now
+            return None
+
+    @staticmethod
+    def _transform_xy(x, y, transform):
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        # Planar rotation from the full quaternion. Pinky operates on a level
+        # floor, but this formula remains valid when small roll/pitch noise is
+        # present in the transform.
+        sin_yaw = 2.0 * (
+            rotation.w * rotation.z + rotation.x * rotation.y
+        )
+        cos_yaw = 1.0 - 2.0 * (
+            rotation.y * rotation.y + rotation.z * rotation.z
+        )
+        return (
+            translation.x + cos_yaw * x - sin_yaw * y,
+            translation.y + sin_yaw * x + cos_yaw * y,
+        )
+
+    def _cloud(self, center, offsets, transform):
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.frame_id
+        header.frame_id = self.cloud_frame_id
 
         if center is None:
             points = []
         else:
             center_x, center_y = center
             points = [
-                (center_x + offset_x, center_y + offset_y, self.point_height)
+                (*self._transform_xy(
+                    center_x + offset_x,
+                    center_y + offset_y,
+                    transform,
+                ), self.point_height)
                 for offset_x, offset_y in offsets
             ]
 
