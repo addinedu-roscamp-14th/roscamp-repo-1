@@ -1,14 +1,14 @@
 {
-  "Yellow": {
+  "차량 1": {
     "battery_pct": 100,
     "fault": null,
-    "last_job": "'컨테이너_C6' → 'A-2-1' 이동 완료",
-    "last_job_time": "10:07:23"
+    "last_job": "'화물K' → '창고 C' 이동 완료",
+    "last_job_time": "15:45:28"
   },
-  "Blue": {
+  "차량 2": {
     "battery_pct": 100,
     "fault": null,
-    "last_job": "'컨테이너_C7' → 'A-1-2' 이동 완료",
-    "last_job_time": "10:07:40"
+    "last_job": "'화물H' → '창고 C' 이동 완료",
+    "last_job_time": "15:45:28"
   }
 }

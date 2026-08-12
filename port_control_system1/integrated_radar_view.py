@@ -22,7 +22,6 @@ from ros_control_bridge import RosControlBridge
 from cargo_dispatch_tool import (
     load_named_locations,
     load_cargo_registry,
-    load_cargo_details,
     load_vehicle_state,
     load_vehicle_status,
     save_vehicle_status,
@@ -61,7 +60,6 @@ class IntegratedRadarView(ctk.CTkFrame):
 
         self.locations = load_named_locations()
         self.cargo_registry = load_cargo_registry()
-        self.cargo_details = load_cargo_details()
         self.vehicle_positions, _ = load_vehicle_state()
         self.vehicle_status = load_vehicle_status()
         self.map_image_size = _load_map_image_size()
@@ -119,35 +117,6 @@ class IntegratedRadarView(ctk.CTkFrame):
 
         self.after(200, self._render_loop)
         self.after(1000, self._refresh_ros_status)
-        self.after(1000, self._auto_refresh_loop)
-
-    def _auto_refresh_loop(self) -> None:
-        if not self.winfo_exists():
-            return
-        try:
-            from cargo_dispatch_tool import load_cargo_registry, load_cargo_details, load_vehicle_state
-            new_registry = load_cargo_registry()
-            new_details = load_cargo_details()
-            new_vehicle_positions, _ = load_vehicle_state()
-            
-            needs_cargo_rebuild = False
-            if new_registry != self.cargo_registry or new_details != getattr(self, "cargo_details", {}):
-                self.cargo_registry = new_registry
-                self.cargo_details = new_details
-                needs_cargo_rebuild = True
-                
-            needs_vehicle_rebuild = False
-            if new_vehicle_positions != self.vehicle_positions:
-                self.vehicle_positions = new_vehicle_positions
-                needs_vehicle_rebuild = True
-                
-            if needs_cargo_rebuild and self.status_tab_var.get() == "화물":
-                self._rebuild_cargo_cards()
-            if needs_vehicle_rebuild and self.status_tab_var.get() == "차량":
-                self._rebuild_vehicle_cards()
-        except Exception:
-            pass
-        self.after(1000, self._auto_refresh_loop)
 
     # ------------------------------------------------------------------
     def _build_right_panel(self) -> None:
@@ -246,16 +215,7 @@ class IntegratedRadarView(ctk.CTkFrame):
             btn.pack(side="right")
 
             detail = ctk.CTkFrame(container, fg_color="#1f1f20", corner_radius=5)
-            
-            detail_lines = []
-            for cargo in items_here:
-                c_detail = self.cargo_details.get(cargo, {})
-                floor = c_detail.get("층수", "1")
-                base_id = c_detail.get("기반ArUco", "")
-                base_info = f" (Base: {base_id}, {floor}층)" if base_id else f" ({floor}층)"
-                detail_lines.append(f"• {cargo}{base_info}")
-                
-            detail_text = "\n".join(detail_lines) or "(비어 있음)"
+            detail_text = "\n".join(f"• {cargo}" for cargo in items_here) or "(비어 있음)"
             if missing_coord:
                 detail_text += (
                     "\n\n⚠️ 이 위치는 캘리브레이션 좌표가 없어 레이더뷰 지도에 표시되지 않습니다.\n"
@@ -404,7 +364,6 @@ class IntegratedRadarView(ctk.CTkFrame):
         """위치/화물/차량 데이터를 디스크에서 다시 읽어와 지도와 현재 보고 있는 탭을 갱신합니다."""
         self.locations = load_named_locations()
         self.cargo_registry = load_cargo_registry()
-        self.cargo_details = load_cargo_details()
         self.vehicle_positions, _ = load_vehicle_state()
         self.vehicle_status = load_vehicle_status()
         self._on_status_tab_change(self.status_tab_var.get())

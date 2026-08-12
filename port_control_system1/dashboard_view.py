@@ -17,7 +17,6 @@ from datetime import datetime, timedelta
 import customtkinter as ctk
 import cv2
 import requests
-import psycopg2
 from PIL import Image
 
 from cctv_monitor_view import CCTVMonitorView
@@ -97,35 +96,8 @@ class DashboardView(ctk.CTkFrame):
             ctk.CTkLabel(card, text=title, font=self.font_mini, text_color=TEXT_SECONDARY).pack(anchor="w", padx=10, pady=(0, 2))
             ctk.CTkLabel(card, text=val, font=self.font_body_bold if "가동" in val or "완료" in val else self.font_body, text_color=TEXT_PRIMARY).pack(anchor="w", padx=10)
 
-        # ----------------------------------------------------
-        # DB 연동: 대기 중인 작업 (PENDING) 추가 및 현황
-        # ----------------------------------------------------
-        pending_label = ctk.CTkLabel(status_frame, text="📦 실시간 화물 목록 (Cargos)", font=self.font_subtitle, text_color=TEXT_PRIMARY)
-        pending_label.pack(anchor="w", padx=15, pady=(10, 5))
-
-        # 작업 추가(Insert) 영역
-        insert_frame = ctk.CTkFrame(status_frame, fg_color="transparent")
-        insert_frame.pack(fill="x", padx=15, pady=(0, 5))
-        
-        self.name_entry = ctk.CTkEntry(insert_frame, placeholder_text="화물명", font=self.font_mini, height=30, width=80)
-        self.name_entry.pack(side="left", expand=True, fill="x", padx=(0, 5))
-
-        self.loc_entry = ctk.CTkEntry(insert_frame, placeholder_text="위치", font=self.font_mini, height=30, width=80)
-        self.loc_entry.pack(side="left", expand=True, fill="x", padx=(0, 5))
-        
-        self.aruco_entry = ctk.CTkEntry(insert_frame, placeholder_text="ArUco", font=self.font_mini, height=30, width=60)
-        self.aruco_entry.pack(side="left", expand=True, fill="x", padx=(0, 5))
-        
-        self.submit_button = ctk.CTkButton(insert_frame, text="추가", font=self.font_mini, width=50, height=30, fg_color=ACCENT_BLUE, text_color=ACCENT_ON_BLUE, hover_color="#cce5ff", command=self.add_task_to_db)
-        self.submit_button.pack(side="right")
-
-        self.pending_textbox = ctk.CTkTextbox(status_frame, fg_color=BG_CARD_INNER, text_color=TEXT_SECONDARY, font=self.font_mini, border_width=1, border_color=BORDER_COLOR)
-        self.pending_textbox.pack(expand=True, fill="both", padx=15, pady=(0, 5))
-        self.pending_textbox.configure(state="disabled")
-
         # Push buttons to the bottom
-        # (기존의 팽창하는 투명 프레임은 삭제 또는 유지 가능, 여기선 textbox가 expand=True이므로 생략 가능하나 버튼 레이아웃을 위해 아주 작은 여백만 남깁니다)
-        ctk.CTkFrame(status_frame, fg_color="transparent", height=10).pack(fill="both")
+        ctk.CTkFrame(status_frame, fg_color="transparent").pack(expand=True, fill="both")
 
         divider = ctk.CTkFrame(status_frame, height=1, fg_color=BORDER_COLOR)
         divider.pack(fill="x", padx=15, pady=(0, 10))
@@ -177,147 +149,6 @@ class DashboardView(ctk.CTkFrame):
 
         threading.Thread(target=self.fetch_weather_kma, daemon=True).start()
         threading.Thread(target=self.fetch_ocean_khoa, daemon=True).start()
-
-        # DB 업데이트 루프 시작
-        self.fetch_pending_tasks_loop()
-
-    # ------------------------------------------------------------------
-    # DB 연동: PENDING 작업 대기열 조회
-    # ------------------------------------------------------------------
-    def fetch_pending_tasks_loop(self) -> None:
-        if not getattr(self, "_ui_alive", True):
-            return
-            
-        def _db_task():
-            try:
-                # TODO: 실제 DB 접속 정보로 변경하세요
-                conn = psycopg2.connect(
-                    host="localhost",
-                    database="port_db",
-                    user="postgres",
-                    password="1234",
-                    port="5432"
-                )
-                cursor = conn.cursor()
-                cursor.execute("SELECT name, location, container_id, base_aruco_id, floor FROM cargos ORDER BY location, floor")
-                records = cursor.fetchall()
-                cursor.close()
-                conn.close()
-
-                display_text = ""
-                if records:
-                    current_loc = None
-                    for row in records:
-                        name, location, cid, base, floor = row
-                        # 위치가 바뀌면 구분선 추가
-                        if location != current_loc:
-                            if current_loc is not None:
-                                display_text += "\n"
-                            display_text += f"📍 [{location}]\n"
-                            current_loc = location
-                        
-                        aruco = f" [ArUco:{cid}]" if cid else ""
-                        base_info = f" ← Base:{base}" if base else ""
-                        display_text += f"  {'  ' * (floor - 1)}📦 {floor}층: {name}{aruco}{base_info}\n"
-                else:
-                    display_text = "현재 등록된 화물이 없습니다."
-                
-                self.after(0, self._update_pending_ui, display_text)
-            except Exception as e:
-                self.after(0, self._update_pending_ui, f"DB 오류: {e}")
-
-        # 메인 스레드 블로킹을 막기 위해 조회는 백그라운드 스레드에서 실행
-        threading.Thread(target=_db_task, daemon=True).start()
-        
-        # 1초 뒤 재귀 호출 (무한 루프)
-        self.after(1000, self.fetch_pending_tasks_loop)
-
-    def _update_pending_ui(self, text: str) -> None:
-        if not getattr(self, "_ui_alive", True):
-            return
-        try:
-            current_text = self.pending_textbox.get("1.0", "end-1c")
-            if current_text.strip() != text.strip():
-                try:
-                    scroll_pos = self.pending_textbox.yview()
-                except Exception:
-                    scroll_pos = (0.0,)
-                
-                self.pending_textbox.configure(state="normal")
-                self.pending_textbox.delete("1.0", "end")
-                self.pending_textbox.insert("1.0", text)
-                self.pending_textbox.configure(state="disabled")
-                
-                try:
-                    self.pending_textbox.yview_moveto(scroll_pos[0])
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"UI 업데이트 에러: {e}")
-
-    def add_task_to_db(self) -> None:
-        name = self.name_entry.get().strip()
-        location = self.loc_entry.get().strip()
-        aruco = self.aruco_entry.get().strip()
-        
-        if not name:
-            return
-        if not location:
-            location = "대기장소"
-
-        def _insert_task():
-            try:
-                # TODO: 실제 DB 접속 정보로 변경하세요
-                conn = psycopg2.connect(
-                    host="localhost",
-                    database="port_db",
-                    user="postgres",
-                    password="1234",
-                    port="5432"
-                )
-                cursor = conn.cursor()
-                
-                # 같은 위치에 이미 화물이 있으면 자동으로 그 위 층수로 올림
-                cursor.execute("""
-                    SELECT COALESCE(MAX(floor), 0), 
-                           (SELECT container_id FROM cargos WHERE location = %s ORDER BY floor DESC LIMIT 1)
-                    FROM cargos WHERE location = %s
-                """, (location, location))
-                row = cursor.fetchone()
-                auto_floor = (row[0] or 0) + 1
-                auto_base = row[1] or "" if row[0] and row[0] > 0 else ""
-                
-                insert_query = """
-                    INSERT INTO cargos (name, location, container_id, base_aruco_id, floor) VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (name) DO UPDATE SET 
-                    location = EXCLUDED.location,
-                    container_id = CASE WHEN EXCLUDED.container_id = '' THEN cargos.container_id ELSE EXCLUDED.container_id END,
-                    base_aruco_id = EXCLUDED.base_aruco_id,
-                    floor = EXCLUDED.floor
-                """
-                cursor.execute(insert_query, (name, location, aruco, auto_base, auto_floor))
-                conn.commit()
-                cursor.close()
-                conn.close()
-
-                # UI 업데이트 (엔트리 비우기 등)는 메인 스레드에서 수행해야 합니다.
-                self.after(0, self._on_insert_success)
-            except Exception as e:
-                print(f"DB Insert 오류: {e}")
-
-        # 메인 스레드 블로킹 방지를 위해 Insert도 백그라운드 스레드에서 실행
-        threading.Thread(target=_insert_task, daemon=True).start()
-
-    def _on_insert_success(self) -> None:
-        if not getattr(self, "_ui_alive", True):
-            return
-        try:
-            self.name_entry.delete(0, "end")
-            self.loc_entry.delete(0, "end")
-            self.aruco_entry.delete(0, "end")
-            # 새로고침은 fetch_pending_tasks_loop가 1초마다 돌고 있으므로 자연스럽게 반영됩니다.
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------
     def open_command_popup(self) -> None:

@@ -22,7 +22,6 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 from typing import Dict, List, Optional, Tuple
 
-import psycopg2
 import customtkinter as ctk
 from openpyxl import load_workbook
 
@@ -114,7 +113,7 @@ def load_vehicle_status(num_vehicles: int = NUM_VEHICLES) -> Dict[str, Dict]:
             data = {}
     result = {}
     for i in range(num_vehicles):
-        key = "Yellow" if i == 0 else ("Blue" if i == 1 else f"차량 {i + 1}")
+        key = f"차량 {i + 1}"
         result[key] = {**_default_status(), **data.get(key, {})}
     return result
 
@@ -126,7 +125,7 @@ def save_vehicle_status(status: Dict[str, Dict]) -> None:
 def record_vehicle_job(vehicle_idx: int, description: str) -> None:
     """화물 이동이 끝날 때마다 호출해서 그 차량의 "마지막 작업" 기록을 남깁니다."""
     status = load_vehicle_status()
-    key = "Yellow" if vehicle_idx == 0 else ("Blue" if vehicle_idx == 1 else f"차량 {vehicle_idx + 1}")
+    key = f"차량 {vehicle_idx + 1}"
     if key not in status:
         status[key] = _default_status()
     status[key]["last_job"] = description
@@ -219,106 +218,24 @@ CARGO_DETAILS_FILE = str(_APP_DIR / "cargo_details.json")
 EXCEL_DATA_START_ROW = 6  # generate_cargo_template.py의 DATA_START_ROW와 일치해야 함
 
 
-def _get_db_conn():
-    return psycopg2.connect(
-        host="localhost",
-        database="port_db",
-        user="postgres",
-        password="1234",
-        port="5432"
-    )
-
 def load_cargo_registry() -> Dict[str, str]:
-    registry = {}
-    try:
-        conn = _get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT name, location FROM cargos")
-        rows = cur.fetchall()
-        for name, location in rows:
-            registry[name] = location
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB Load Error (Registry): {e}")
-    return registry
+    if Path(CARGO_FILE).exists():
+        return json.loads(Path(CARGO_FILE).read_text(encoding="utf-8"))
+    return {}
 
 
 def save_cargo_registry(registry: Dict[str, str]) -> None:
-    try:
-        conn = _get_db_conn()
-        cur = conn.cursor()
-        
-        cur.execute("SELECT name FROM cargos")
-        db_names = {row[0] for row in cur.fetchall()}
-        
-        to_delete = db_names - set(registry.keys())
-        for name in to_delete:
-            cur.execute("DELETE FROM cargos WHERE name = %s", (name,))
-            
-        for name, location in registry.items():
-            cur.execute("""
-                INSERT INTO cargos (name, location)
-                VALUES (%s, %s)
-                ON CONFLICT (name) DO UPDATE SET
-                location = EXCLUDED.location
-            """, (name, location))
-            
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB Save Error (Registry): {e}")
+    Path(CARGO_FILE).write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_cargo_details() -> Dict[str, Dict[str, str]]:
-    details = {}
-    try:
-        conn = _get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT name, container_id, cargo_type, note, base_aruco_id, floor FROM cargos")
-        rows = cur.fetchall()
-        for name, container_id, cargo_type, note, base_aruco_id, floor in rows:
-            details[name] = {
-                "컨테이너ID": container_id or "",
-                "화물종류": cargo_type or "",
-                "비고": note or "",
-                "기반ArUco": base_aruco_id or "",
-                "층수": str(floor) if floor is not None else "1"
-            }
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB Load Error (Details): {e}")
-    return details
+    if Path(CARGO_DETAILS_FILE).exists():
+        return json.loads(Path(CARGO_DETAILS_FILE).read_text(encoding="utf-8"))
+    return {}
 
 
 def save_cargo_details(details: Dict[str, Dict[str, str]]) -> None:
-    try:
-        conn = _get_db_conn()
-        cur = conn.cursor()
-        for name, detail in details.items():
-            container_id = detail.get("컨테이너ID", "")
-            cargo_type = detail.get("화물종류", "")
-            note = detail.get("비고", "")
-            base_aruco_id = detail.get("기반ArUco", "")
-            floor_str = detail.get("층수", "1")
-            floor = int(floor_str) if floor_str.isdigit() else 1
-            
-            cur.execute("""
-                UPDATE cargos SET 
-                container_id = %s,
-                cargo_type = %s,
-                note = %s,
-                base_aruco_id = %s,
-                floor = %s
-                WHERE name = %s
-            """, (container_id, cargo_type, note, base_aruco_id, floor, name))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB Save Error (Details): {e}")
+    Path(CARGO_DETAILS_FILE).write_text(json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def bulk_import_cargo_from_excel(
@@ -470,7 +387,7 @@ def plan_relocations_from_excel(
             "container_id": "",
             "vehicle_index": vehicle_idx,
             "is_return": True,
-            "label": f"{'Yellow' if vehicle_idx == 0 else ('Blue' if vehicle_idx == 1 else f'차량 {vehicle_idx + 1}')} 복귀",
+            "label": f"차량 {vehicle_idx + 1} 복귀",
         })
         sim_positions[vehicle_idx] = vehicle_home_location(vehicle_idx)
 
@@ -513,29 +430,16 @@ def build_route(
     pickup = cargo_registry[item_name]  # 이 화물이 지금 실제로 놓여있는 위치
 
     if pickup == destination:
-        # 목적지가 같으면(층수 변경, 구역 내 정리 등) 크레인(로봇팔) 전용 이동
-        return [
-            RouteStep(pickup, "크레인 상차"),
-            RouteStep(destination, "크레인 전용 이동")
-        ]
+        # 이미 목적지에 있으면 이동할 필요가 없으니 안내용 1단계짜리 경로만 반환
+        return [RouteStep(pickup, "이미 목적지에 있음")]
 
-    def _is_warehouse(loc: str) -> bool:
-        return loc in ["A-1-1", "A-1-2", "A-2-1", "A-2-2", "A-3-1", "A-3-2"] or ("창고" in loc and "하역장" not in loc)
-
-    is_pickup_warehouse = _is_warehouse(pickup)
+    is_pickup_warehouse = "창고" in pickup and "하역장" not in pickup
     is_pickup_port = "항구" in pickup and "하역장" not in pickup
-    is_dest_warehouse = _is_warehouse(destination)
+    is_dest_warehouse = "창고" in destination and "하역장" not in destination
     is_dest_port = "항구" in destination and "하역장" not in destination
 
     # 1) 창고 -> 창고 (크레인 전용 이동)
     if is_pickup_warehouse and is_dest_warehouse:
-        return [
-            RouteStep(pickup, "크레인 상차"),
-            RouteStep(destination, "크레인 전용 이동")
-        ]
-        
-    # 2) 항구 -> 항구 (배 내부 이동, 크레인 전용 이동)
-    if is_pickup_port and is_dest_port:
         return [
             RouteStep(pickup, "크레인 상차"),
             RouteStep(destination, "크레인 전용 이동")
@@ -661,37 +565,6 @@ class CargoDispatchTool(ctk.CTkFrame):
 
         self._build_ui()
         self._refresh_cargo_list()
-        
-        # UDP 리스너 초기화 (arm2 등의 상태 패킷 수신)
-        try:
-            from udp_listener import RobotStatusListener
-            self.udp_listener = RobotStatusListener(port=15002, callback=self._on_robot_status)
-            self.udp_listener.start()
-            
-            # 툴 종료 시 리스너 스레드 정리를 위해 바인딩
-            def on_destroy(event):
-                if event.widget == self:
-                    self.udp_listener.stop()
-            self.bind("<Destroy>", on_destroy, add="+")
-        except ImportError:
-            self.udp_listener = None
-            print("Warning: udp_listener module not found. Robot status monitoring disabled.")
-
-        self.after(1000, self._auto_refresh_loop)
-
-    def _auto_refresh_loop(self) -> None:
-        if not self.winfo_exists():
-            return
-        try:
-            new_registry = load_cargo_registry()
-            new_details = load_cargo_details()
-            if new_registry != self.cargo_registry or new_details != self.cargo_details:
-                self.cargo_registry = new_registry
-                self.cargo_details = new_details
-                self._refresh_cargo_list()
-        except Exception:
-            pass
-        self.after(1000, self._auto_refresh_loop)
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -728,17 +601,9 @@ class CargoDispatchTool(ctk.CTkFrame):
 
         self.location_option_var = ctk.StringVar()
         location_names = list(self.locations.keys()) or ["대기장소"]
-        
-        loc_row = ctk.CTkFrame(form, fg_color="transparent")
-        loc_row.grid(row=1, column=0, sticky="ew", pady=(0, 16))
-        loc_row.grid_columnconfigure(0, weight=1)
-        
-        self.location_menu = ctk.CTkOptionMenu(loc_row, variable=self.location_option_var, values=location_names,
+        self.location_menu = ctk.CTkOptionMenu(form, variable=self.location_option_var, values=location_names,
                                               fg_color="#343638", button_color="#565b5e", button_hover_color="#2e86c1", corner_radius=6, height=36)
-        self.location_menu.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        
-        self.floor_var = ctk.StringVar(value="1")
-        ctk.CTkEntry(loc_row, textvariable=self.floor_var, placeholder_text="층수", width=60, **entry_kwargs).grid(row=0, column=1)
+        self.location_menu.grid(row=1, column=0, sticky="ew", pady=(0, 16))
 
         btn_kwargs = {"corner_radius": 6, "height": 36, "font": self.font_body}
         
@@ -746,28 +611,22 @@ class CargoDispatchTool(ctk.CTkFrame):
         
         # Detail Banner
         self.detail_banner = ctk.CTkFrame(form, fg_color="#343638", corner_radius=6, border_width=1, border_color="#2e86c1")
-        ctk.CTkLabel(self.detail_banner, text="📋 추가 정보 입력 (선택사항)", font=self.font_subtitle, text_color="#2e86c1").grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=10)
+        ctk.CTkLabel(self.detail_banner, text="📋 추가 정보 입력 (선택사항)", font=self.font_subtitle, text_color="#2e86c1").grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=10)
         
         self.aruco_var = ctk.StringVar()
-        ctk.CTkLabel(self.detail_banner, text="내 ArUco ID:", font=self.font_body).grid(row=1, column=0, sticky="w", padx=10, pady=2)
-        ctk.CTkEntry(self.detail_banner, textvariable=self.aruco_var, placeholder_text="예: ARUCO_42", width=120, **entry_kwargs).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=2)
+        ctk.CTkLabel(self.detail_banner, text="ArUco/컨테이너:", font=self.font_body).grid(row=1, column=0, sticky="w", padx=10, pady=2)
+        ctk.CTkEntry(self.detail_banner, textvariable=self.aruco_var, placeholder_text="예: ARUCO_42", width=160, **entry_kwargs).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=2)
         
-        self.base_aruco_var = ctk.StringVar()
-        ctk.CTkLabel(self.detail_banner, text="바닥(Base) ArUco:", font=self.font_body).grid(row=1, column=2, sticky="w", padx=10, pady=2)
-        ctk.CTkEntry(self.detail_banner, textvariable=self.base_aruco_var, placeholder_text="어느 ArUco 위에?", width=120, **entry_kwargs).grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=2)
-
         self.cargo_type_var = ctk.StringVar()
         ctk.CTkLabel(self.detail_banner, text="화물 종류:", font=self.font_body).grid(row=2, column=0, sticky="w", padx=10, pady=2)
-        ctk.CTkEntry(self.detail_banner, textvariable=self.cargo_type_var, placeholder_text="예: 컨테이너, 벌크", width=120, **entry_kwargs).grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=2)
+        ctk.CTkEntry(self.detail_banner, textvariable=self.cargo_type_var, placeholder_text="예: 컨테이너, 벌크", width=160, **entry_kwargs).grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=2)
         
-        # 층수(floor_var)는 메인 폼으로 이동됨
-
         self.cargo_note_var = ctk.StringVar()
         ctk.CTkLabel(self.detail_banner, text="비고:", font=self.font_body).grid(row=3, column=0, sticky="w", padx=10, pady=2)
-        ctk.CTkEntry(self.detail_banner, textvariable=self.cargo_note_var, placeholder_text="메모", width=120, **entry_kwargs).grid(row=3, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=2)
+        ctk.CTkEntry(self.detail_banner, textvariable=self.cargo_note_var, placeholder_text="메모", width=160, **entry_kwargs).grid(row=3, column=1, sticky="ew", padx=(0, 10), pady=2)
         
         banner_btn_row = ctk.CTkFrame(self.detail_banner, fg_color="transparent")
-        banner_btn_row.grid(row=4, column=0, columnspan=4, sticky="ew", padx=10, pady=10)
+        banner_btn_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
         ctk.CTkButton(banner_btn_row, text="✅ 저장", width=80, fg_color="#27ae60", hover_color="#1e8449", command=self._confirm_register, **btn_kwargs).pack(side="left", padx=(0, 6))
         ctk.CTkButton(banner_btn_row, text="건너뛰기", width=80, fg_color="#565b5e", hover_color="#333333", command=self._skip_details_register, **btn_kwargs).pack(side="left", padx=(0, 6))
         ctk.CTkButton(banner_btn_row, text="취소", width=60, fg_color="#c0392b", hover_color="#922b21", command=self._cancel_register, **btn_kwargs).pack(side="left")
@@ -862,16 +721,6 @@ class CargoDispatchTool(ctk.CTkFrame):
     def register_cargo_location(self) -> None:
         """화물명과 위치를 확인한 뒤, 추가 정보(ArUco, 화물종류, 비고)를 입력할 수 있는
         배너를 폼 아래에 표시합니다. 기존에 세부정보가 있으면 미리 채워줍니다."""
-        # 권한 체크
-        try:
-            app = self.winfo_toplevel()
-            if hasattr(app, "current_user_id") and app.current_user_id:
-                role = app.USERS.get(app.current_user_id, {}).get("role", "")
-                if role not in ["최고 관리자 (Admin)", "현장 관리자 (Manager)"]:
-                    messagebox.showerror("접근 거부", "화물 등록 권한이 없습니다.\n(관리자 전용 기능)")
-                    return
-        except Exception:
-            pass
         name = self.cargo_name_var.get().strip()
         location = self.location_option_var.get().strip()
 
@@ -890,57 +739,9 @@ class CargoDispatchTool(ctk.CTkFrame):
         self.aruco_var.set(existing.get("컨테이너ID", ""))
         self.cargo_type_var.set(existing.get("화물종류", ""))
         self.cargo_note_var.set(existing.get("비고", ""))
-        self.base_aruco_var.set(existing.get("기반ArUco", ""))
-        
-        # 층수는 메인 폼에서 입력된 값을 유지하되, 기존 세부정보가 있고 메인 폼이 1이면 덮어씌움
-        if existing.get("층수") and self.floor_var.get() == "1":
-            self.floor_var.set(existing.get("층수"))
 
         # 배너 표시 (row=3 - 등록 버튼 바로 아래)
         self.detail_banner.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 4))
-
-    def _on_robot_status(self, msg: dict) -> None:
-        """UDP 패킷으로 로봇팔 상태가 수신되었을 때 호출됩니다 (백그라운드 스레드)."""
-        robot = msg.get("로봇", "unknown")
-        status = msg.get("상태", "")
-        text = msg.get("메시지", "")
-        
-        # 로그 출력 (스레드 안전을 위해 after 사용)
-        log_msg = f"[{robot} 상태] {status}: {text}"
-        self.after(0, lambda: self._log(log_msg))
-        
-        # ---------------------------------------------------------
-        # 안전장치 (실패 처리)
-        # ---------------------------------------------------------
-        if status == "실패":
-            # 큐를 즉시 중단(초기화)합니다.
-            self.dispatch_queue = []
-            self.active_job_index = 0
-            self.active_step_index = 0
-            
-            # 메인 스레드(UI)에서 에러 팝업을 띄우고 UI 텍스트 초기화
-            def handle_failure():
-                from tkinter import messagebox
-                self.step_status_label.configure(text=f"[긴급 정지] {robot} 작업 실패", text_color="#EA5455")
-                self.step_button.configure(text="배차 중단됨 (오류)", state="disabled")
-                messagebox.showerror(
-                    "작업 실패 알림",
-                    f"{robot}에서 작업 실패가 감지되었습니다.\n명령어: {msg.get('명령어', '')}\n메시지: {text}\n\n모든 배차 시퀀스가 중지되었습니다."
-                )
-            self.after(0, handle_failure)
-            return  # 이후 성공 체크 로직 타지 않음
-        
-        # ---------------------------------------------------------
-        # 시퀀스 자동 전진 로직
-        # ---------------------------------------------------------
-        # 로봇팔 코드 수정 반영: 하나의 명령 시퀀스가 전부 완료되었을 때만 "상태":"성공" 패킷이 수신됨
-        is_final_success = (status == "성공")
-                
-        # 최종 작업 완료 신호일 때만 큐를 전진시킵니다.
-        if is_final_success:
-            if getattr(self, "dispatch_queue", None) and self.active_job_index < len(self.dispatch_queue):
-                if self.active_step_index <= len(self.dispatch_queue[self.active_job_index]["route"]):
-                    self.after(0, self.advance_queue)
 
     def _confirm_register(self) -> None:
         """배너의 '저장' 버튼 - 추가 정보를 포함해서 화물을 등록합니다."""
@@ -950,29 +751,10 @@ class CargoDispatchTool(ctk.CTkFrame):
             return
 
         self.cargo_registry[name] = location
-        
-        # 층수가 기본값(1)이고 base도 비어있으면, 같은 위치의 최대 층수를 자동 계산
-        input_floor = self.floor_var.get().strip() or "1"
-        input_base = self.base_aruco_var.get().strip()
-        if input_floor == "1" and not input_base:
-            existing_at_loc = [
-                d for n, d in self.cargo_details.items()
-                if self.cargo_registry.get(n) == location and n != name
-            ]
-            if existing_at_loc:
-                max_floor = max(int(d.get("층수", "1")) for d in existing_at_loc)
-                input_floor = str(max_floor + 1)
-                # 가장 높은 층의 ArUco를 base로 자동 설정
-                top_cargo = [d for d in existing_at_loc if d.get("층수") == str(max_floor)]
-                if top_cargo:
-                    input_base = top_cargo[0].get("컨테이너ID", "")
-        
         self.cargo_details[name] = {
             "컨테이너ID": self.aruco_var.get().strip(),
             "화물종류": self.cargo_type_var.get().strip(),
             "비고": self.cargo_note_var.get().strip(),
-            "기반ArUco": input_base,
-            "층수": input_floor
         }
         save_cargo_registry(self.cargo_registry)
         save_cargo_details(self.cargo_details)
@@ -988,33 +770,7 @@ class CargoDispatchTool(ctk.CTkFrame):
             return
 
         self.cargo_registry[name] = location
-        
-        # 건너뛰기 시 메인 폼에서 입력한 층수를 그대로 사용합니다.
-        input_floor = self.floor_var.get().strip() or "1"
-        auto_base = ""
-        
-        # 층수가 1이고 기반 정보가 없으면 기존 위치 화물들을 참조해 자동 계산 (선택적)
-        existing_at_loc = [
-            d for n, d in self.cargo_details.items()
-            if self.cargo_registry.get(n) == location and n != name
-        ]
-        
-        if input_floor == "1" and existing_at_loc:
-            max_floor = max(int(d.get("층수", "1")) for d in existing_at_loc)
-            input_floor = str(max_floor + 1)
-            top_cargo = [d for d in existing_at_loc if d.get("층수") == str(max_floor)]
-            if top_cargo:
-                auto_base = top_cargo[0].get("컨테이너ID", "")
-        
-        self.cargo_details[name] = {
-            "컨테이너ID": "",
-            "화물종류": "",
-            "비고": "",
-            "기반ArUco": auto_base,
-            "층수": input_floor
-        }
         save_cargo_registry(self.cargo_registry)
-        save_cargo_details(self.cargo_details)
 
         self._hide_detail_banner()
         self._refresh_cargo_list()
@@ -1029,8 +785,6 @@ class CargoDispatchTool(ctk.CTkFrame):
         self._pending_cargo_name = None
         self._pending_cargo_location = None
         self.aruco_var.set("")
-        self.base_aruco_var.set("")
-        self.floor_var.set("1")
         self.cargo_type_var.set("")
         self.cargo_note_var.set("")
         self.cargo_name_var.set("")
@@ -1038,17 +792,6 @@ class CargoDispatchTool(ctk.CTkFrame):
     def delete_cargo(self, name: str) -> None:
         """화물 목록의 각 행에 있는 "삭제" 버튼에서 호출됩니다. name이 이미 정해져 있으니
         이름을 따로 입력받지 않고 확인 창만 띄우고 바로 지웁니다."""
-        # 권한 체크
-        try:
-            app = self.winfo_toplevel()
-            if hasattr(app, "current_user_id") and app.current_user_id:
-                role = app.USERS.get(app.current_user_id, {}).get("role", "")
-                if role not in ["최고 관리자 (Admin)", "현장 관리자 (Manager)"]:
-                    messagebox.showerror("접근 거부", "화물 삭제 권한이 없습니다.\n(관리자 전용 기능)")
-                    return
-        except Exception:
-            pass
-
         if name not in self.cargo_registry:
             return
         if not messagebox.askyesno("화물 삭제", f"'{name}' 화물을 삭제할까요?"):
@@ -1138,12 +881,7 @@ class CargoDispatchTool(ctk.CTkFrame):
         for name, location in self.cargo_registry.items():
             detail = self.cargo_details.get(name, {})
             extra_parts = [v for v in (detail.get("컨테이너ID"), detail.get("화물종류")) if v]
-            base_id = detail.get("기반ArUco")
-            floor = detail.get("층수", "1")
-            
-            base_info = f" (Base: {base_id}, {floor}층)" if base_id else f" ({floor}층)"
             extra = f" [{', '.join(extra_parts)}]" if extra_parts else ""
-            extra += base_info
 
             row = ctk.CTkFrame(self.cargo_rows_container, fg_color="#2b2b2b", corner_radius=6, border_width=1, border_color="#565b5e")
             row.pack(fill="x", pady=(0, 8))

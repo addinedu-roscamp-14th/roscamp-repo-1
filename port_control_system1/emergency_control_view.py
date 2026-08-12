@@ -12,9 +12,9 @@ import customtkinter as ctk
 from ros_control_bridge import RosControlBridge
 
 DEVICE_OPTIONS = [
-    "crane_cargo (창고 크레인)",
-    "crane_yard (항구 크레인)",
-    "Pinky_Pro AGV (Yellow)",
+    "JetCobot #01 (크레인)",
+    "JetCobot #02 (크레인)",
+    "Pinky_Pro AGV (Red)",
     "Pinky_Pro AGV (Blue)",
 ]
 
@@ -84,25 +84,12 @@ class EmergencyControlView(ctk.CTkFrame):
                       hover_color="#cce5ff", height=40, width=100, command=self.open_command_popup).pack(side="right", padx=10)
 
     def open_control_panel(self) -> None:
-        try:
-            app = self.winfo_toplevel()
-            if hasattr(app, "current_user_id") and app.current_user_id:
-                role = app.USERS.get(app.current_user_id, {}).get("role", "")
-                if role != "최고 관리자 (Admin)":
-                    from tkinter import messagebox
-                    messagebox.showerror("접근 거부", "장비 제어권 인계 권한이 없습니다.\n(최고 관리자 전용 기능)")
-                    return
-        except Exception:
-            pass
-
         selected = self.device_selector.get()
         for widget in self.control_panel_frame.winfo_children():
             widget.destroy()
 
-        if "crane_cargo" in selected:
-            self._build_warehouse_crane_panel(selected)
-        elif "crane_yard" in selected:
-            self._build_port_crane_panel(selected)
+        if "크레인" in selected:
+            self._build_crane_panel(selected)
         else:
             self._build_agv_panel(selected)
 
@@ -176,9 +163,9 @@ class EmergencyControlView(ctk.CTkFrame):
         return right_panel
 
     # ------------------------------------------------------------------
-    # JetCobot (항구 크레인 - crane_yard) 제어 패널
+    # JetCobot (크레인) 제어 패널
     # ------------------------------------------------------------------
-    def _build_port_crane_panel(self, device_name: str) -> None:
+    def _build_crane_panel(self, device_name: str) -> None:
         right_panel = self._build_control_base(device_name)
         
         # Spatial Movement (X, Y)
@@ -241,52 +228,6 @@ class EmergencyControlView(ctk.CTkFrame):
         load_frame.pack(fill="x", padx=16, pady=(0, 16), ipady=4)
         ctk.CTkLabel(load_frame, text="GRIPPER LOAD", font=self.font_mono, text_color=TEXT_MUTED).pack(side="left", padx=10)
         ctk.CTkLabel(load_frame, text="0.0 kg", font=self.font_mono, text_color=TEXT_MAIN).pack(side="right", padx=10)
-
-    # ------------------------------------------------------------------
-    # JetCobot (창고 크레인 - crane_cargo) 제어 패널
-    # ------------------------------------------------------------------
-    def _build_warehouse_crane_panel(self, device_name: str) -> None:
-        right_panel = self._build_control_base(device_name)
-
-        # Power & Connection
-        pwr_frame = ctk.CTkFrame(right_panel, fg_color=BG_FRAME, corner_radius=8, border_width=1, border_color=BORDER_COLOR)
-        pwr_frame.pack(fill="x", pady=(0, 16))
-        
-        ctk.CTkLabel(pwr_frame, text="Power & Connection", font=self.font_subtitle, text_color=TEXT_MAIN).pack(anchor="w", padx=16, pady=12)
-        ctk.CTkFrame(pwr_frame, height=1, fg_color=BORDER_LIGHT).pack(fill="x", padx=16)
-
-        pwr_btns = ctk.CTkFrame(pwr_frame, fg_color="transparent")
-        pwr_btns.pack(fill="x", padx=16, pady=16)
-        
-        # 추후 명령어를 할당할 제어 연결 버튼
-        ctk.CTkButton(pwr_btns, text="🔌 제어 연결", height=36, font=self.font_mono, fg_color=BTN_BLUE, hover_color=BTN_BLUE_HOVER, command=lambda: print("제어 연결 로직 대기중")).pack(side="left", fill="x", expand=True, padx=(0, 4))
-
-        # Position Commands
-        pos_frame = ctk.CTkFrame(right_panel, fg_color=BG_FRAME, corner_radius=8, border_width=1, border_color=BORDER_COLOR)
-        pos_frame.pack(fill="x", pady=(0, 16))
-        ctk.CTkLabel(pos_frame, text="Position Control", font=self.font_subtitle, text_color=TEXT_MAIN).pack(anchor="w", padx=16, pady=12)
-        ctk.CTkFrame(pos_frame, height=1, fg_color=BORDER_LIGHT).pack(fill="x", padx=16)
-        
-        btn_kwargs = {"font": self.font_subtitle, "height": 40, "fg_color": BORDER_LIGHT, "hover_color": "#555555"}
-
-        pos_grid = ctk.CTkFrame(pos_frame, fg_color="transparent")
-        pos_grid.pack(fill="x", padx=16, pady=16)
-        
-        ctk.CTkButton(pos_grid, text="초기위치 이동", command=lambda: self._call_crane_service(device_name, "go_initial_pose"), **btn_kwargs).grid(row=0, column=0, sticky="ew", padx=4, pady=4)
-        ctk.CTkButton(pos_grid, text="적재층수 초기화", command=lambda: self._call_crane_service(device_name, "reset_stack_level"), **btn_kwargs).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-
-        ctk.CTkButton(pos_grid, text="A-1 위치이동", command=lambda: self._call_crane_service(device_name, "go_a1_pose"), **btn_kwargs).grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
-        ctk.CTkButton(pos_grid, text="A-2 위치이동", command=lambda: self._call_crane_service(device_name, "go_a2_pose"), **btn_kwargs).grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
-        ctk.CTkButton(pos_grid, text="A-3 위치이동", command=lambda: self._call_crane_service(device_name, "go_a3_pose"), **btn_kwargs).grid(row=3, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
-
-        pos_grid.grid_columnconfigure(0, weight=1)
-        pos_grid.grid_columnconfigure(1, weight=1)
-
-        # Emergency Stop for Arm
-        emg_frame = ctk.CTkFrame(right_panel, fg_color=BG_FRAME, corner_radius=8, border_width=1, border_color=BORDER_COLOR)
-        emg_frame.pack(fill="x", side="bottom", pady=(0, 16))
-        
-        ctk.CTkButton(emg_frame, text="🚨 긴급 정지 (Stop Pick)", font=self.font_subtitle, height=50, fg_color=ALERT_RED, hover_color=ALERT_RED_HOVER, command=lambda: self._call_crane_service(device_name, "stop_pick")).pack(fill="x", padx=16, pady=16)
 
     # ------------------------------------------------------------------
     # Pinky_Pro (AGV) 제어 패널
@@ -359,12 +300,15 @@ class EmergencyControlView(ctk.CTkFrame):
         super().destroy()
 
     def _disconnect_pinky(self) -> None:
+        import os
         import subprocess
         try:
-            # 창을 나가거나 종료할 때, 수동 제어(teleop) 세션만 안전하게 닫습니다.
-            # 시동(bringup) 세션은 유지하여 LLM 시동 상태가 꺼지지 않게 합니다.
-            subprocess.run(["/usr/bin/tmux", "kill-session", "-t", "pinky_teleop_yellow"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["/usr/bin/tmux", "kill-session", "-t", "pinky_teleop_blue"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["/usr/bin/tmux", "kill-session", "-t", "pinky_teleop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["/usr/bin/tmux", "kill-session", "-t", "pinky_bringup"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.system("pkill -9 -f 'ssh -tt pinky@192.168.0.102'")
+            os.system("pkill -9 -f 'ssh -tt pinky@192.168.0.96'")
+            os.system("pkill -9 -f 'pinky_teleop'")
+            os.system("pkill -9 -f 'pinky_bringup'")
         except Exception:
             pass
 
@@ -376,14 +320,20 @@ class EmergencyControlView(ctk.CTkFrame):
         # 기존 동일 세션 종료
         subprocess.run(["/usr/bin/tmux", "kill-session", "-t", session_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # 새 터미널 창을 띄우지 않고 백그라운드(숨김) 모드로 SSH 접속 시작
-        subprocess.run(["/usr/bin/tmux", "new-session", "-d", "-s", session_name, f"ssh -tt pinky@{ip_address}"])
+        # 새 터미널에서 SSH 접속 시작
+        subprocess.Popen([
+            "gnome-terminal", 
+            "--title", title, 
+            "--", 
+            "bash", "-c", 
+            f"echo -e '\\e[1;32m[{title}]\\e[0m 자동 연결을 진행합니다...'; /usr/bin/tmux new-session -s {session_name} 'ssh -tt pinky@{ip_address}'"
+        ])
         
         def auto_type():
-            time.sleep(5.0) # SSH 암호 프롬프트 대기
+            time.sleep(2.0) # SSH 암호 프롬프트 대기
             # 비밀번호 '1' 자동 입력
             subprocess.run(["/usr/bin/tmux", "send-keys", "-t", session_name, "1", "Enter"])
-            time.sleep(5.0) # 로그인 대기
+            time.sleep(1.0) # 로그인 대기
             
             if command:
                 subprocess.run(["/usr/bin/tmux", "send-keys", "-t", session_name, command, "Enter"])
@@ -393,11 +343,10 @@ class EmergencyControlView(ctk.CTkFrame):
     def _start_pinky_engine(self, auto: bool = False) -> None:
         from tkinter import messagebox
         selected = self.device_selector.get()
-        robot_color = "blue" if "Blue" in selected else "yellow"
         domain_id = 12 if "Blue" in selected else 13
         ip_address = "192.168.0.102" if "Blue" in selected else "192.168.0.96"
         self._run_automated_ssh(
-            session_name=f"pinky_bringup_{robot_color}",
+            session_name="pinky_bringup",
             command=f"export ROS_DOMAIN_ID={domain_id}; ros2 launch pinky bringup_robot.launch.xml",
             title=f"Pinky Bringup (Domain: {domain_id})",
             ip_address=ip_address
@@ -408,11 +357,10 @@ class EmergencyControlView(ctk.CTkFrame):
     def _connect_pinky_control(self) -> None:
         from tkinter import messagebox
         selected = self.device_selector.get()
-        robot_color = "blue" if "Blue" in selected else "yellow"
         domain_id = 12 if "Blue" in selected else 13
         ip_address = "192.168.0.102" if "Blue" in selected else "192.168.0.96"
         self._run_automated_ssh(
-            session_name=f"pinky_teleop_{robot_color}",
+            session_name="pinky_teleop",
             command=f"export ROS_DOMAIN_ID={domain_id}; ros2 run teleop_twist_keyboard teleop_twist_keyboard",
             title=f"Pinky Teleop (Domain: {domain_id})",
             ip_address=ip_address
@@ -433,30 +381,25 @@ class EmergencyControlView(ctk.CTkFrame):
         }
         if char in velocity_commands and self.ros_bridge.snapshot().ready:
             linear, angular = velocity_commands[char]
-            self.ros_bridge.send_velocity(linear, angular)
+            selected = self.device_selector.get()
+            vehicle_id = "agv1" if "Red" in selected else "agv2"
+            self.ros_bridge.send_velocity(
+                linear, angular, vehicle_id=vehicle_id
+            )
             return
 
         import subprocess
-        selected = self.device_selector.get()
-        robot_color = "blue" if "Blue" in selected else "yellow"
         try:
-            subprocess.Popen(["/usr/bin/tmux", "send-keys", "-t", f"pinky_teleop_{robot_color}", char], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["/usr/bin/tmux", "send-keys", "-t", "pinky_teleop", char], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"Failed to send command: {e}")
 
     def _activate_emergency_stop(self) -> None:
         from tkinter import messagebox
-        try:
-            app = self.winfo_toplevel()
-            if hasattr(app, "current_user_id") and app.current_user_id:
-                role = app.USERS.get(app.current_user_id, {}).get("role", "")
-                if role != "최고 관리자 (Admin)":
-                    messagebox.showerror("접근 거부", "비상 정지 권한이 없습니다.\n(최고 관리자 전용 기능)")
-                    return
-        except Exception:
-            pass
 
-        if self.ros_bridge.emergency_stop():
+        selected = self.device_selector.get()
+        vehicle_id = "agv1" if "Red" in selected else "agv2"
+        if self.ros_bridge.emergency_stop(vehicle_id):
             messagebox.showwarning(
                 "비상 정지",
                 "현재 ROS 도메인의 /cmd_vel 정지 신호를 100Hz로 유지합니다.",
@@ -469,17 +412,10 @@ class EmergencyControlView(ctk.CTkFrame):
 
     def _release_emergency_stop(self) -> None:
         from tkinter import messagebox
-        try:
-            app = self.winfo_toplevel()
-            if hasattr(app, "current_user_id") and app.current_user_id:
-                role = app.USERS.get(app.current_user_id, {}).get("role", "")
-                if role != "최고 관리자 (Admin)":
-                    messagebox.showerror("접근 거부", "비상 정지 해제 권한이 없습니다.\n(최고 관리자 전용 기능)")
-                    return
-        except Exception:
-            pass
 
-        if self.ros_bridge.release_emergency_stop():
+        selected = self.device_selector.get()
+        vehicle_id = "agv1" if "Red" in selected else "agv2"
+        if self.ros_bridge.release_emergency_stop(vehicle_id):
             messagebox.showinfo(
                 "비상 정지 해제",
                 "정지 유지 신호를 해제했습니다. 이동 전에 주변 안전을 확인하세요.",
@@ -497,7 +433,7 @@ class EmergencyControlView(ctk.CTkFrame):
     ) -> None:
         from tkinter import messagebox
 
-        namespace = "/arm2" if "cargo" in device_name.lower() else "/arm"
+        namespace = "/arm2" if "#02" in device_name else "/arm"
         service_name = f"{namespace}/{operation}"
         if self.ros_bridge.call_trigger(service_name):
             messagebox.showinfo(

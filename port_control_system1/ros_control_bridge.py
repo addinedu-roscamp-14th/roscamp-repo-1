@@ -27,6 +27,8 @@ class RosSnapshot:
     arm2_status: Optional[str] = None
     emergency_active: bool = False
     last_command: Optional[str] = None
+    fleet_states: tuple = ()
+    b1_zone: str = "B-1:UNKNOWN"
 
 
 class RosControlBridge:
@@ -52,7 +54,11 @@ class RosControlBridge:
         self._clients = {}
         self._message_types = {}
         self._manual_stop_deadline = 0.0
+        self._manual_vehicle_id = ""
         self._emergency_active = False
+        self._fleet_emergency = False
+        self._emergency_vehicles = set()
+        self._fleet_states = {}
 
         self.cmd_vel_topic = os.environ.get(
             "PORT_CONTROL_CMD_VEL_TOPIC", "/cmd_vel"
@@ -102,6 +108,7 @@ class RosControlBridge:
             from rclpy.signals import SignalHandlerOptions
             from std_msgs.msg import Float32, String
             from std_srvs.srv import Trigger
+            from porter_interfaces.msg import VehicleState
         except Exception as exc:
             self._update_snapshot(
                 ready=False,
@@ -133,6 +140,12 @@ class RosControlBridge:
                     "target_waypoints": self.create_publisher(
                         Path, owner.target_waypoints_topic, 10
                     ),
+                    "agv1_cmd_vel": self.create_publisher(
+                        Twist, "/agv1/cmd_vel_manual", 10
+                    ),
+                    "agv2_cmd_vel": self.create_publisher(
+                        Twist, "/agv2/cmd_vel_manual", 10
+                    ),
                 }
                 owner._clients = {
                     "/arm/pick_container": self.create_client(
@@ -148,6 +161,19 @@ class RosControlBridge:
                         Trigger, "/arm2/stack_container"
                     ),
                 }
+                for vehicle_id in ("agv1", "agv2"):
+                    self.create_subscription(
+                        VehicleState,
+                        f"/central/fleet/{vehicle_id}/state",
+                        owner._on_vehicle_state,
+                        10,
+                    )
+                self.create_subscription(
+                    String,
+                    "/central/fleet/zones",
+                    lambda msg: owner._update_snapshot(b1_zone=msg.data),
+                    10,
+                )
                 self.create_subscription(
                     Float32,
                     "/battery/percent",
@@ -226,6 +252,30 @@ class RosControlBridge:
             odom_yaw_deg=math.degrees(math.atan2(siny, cosy)),
         )
 
+    def _on_vehicle_state(self, message) -> None:
+        if message.emergency_stopped:
+            self._emergency_vehicles.add(message.vehicle_id)
+        else:
+            self._emergency_vehicles.discard(message.vehicle_id)
+        self._emergency_active = (
+            self._fleet_emergency or bool(self._emergency_vehicles)
+        )
+        self._fleet_states[message.vehicle_id] = (
+            message.vehicle_id,
+            message.state_text,
+            float(message.battery_percent),
+            bool(message.emergency_stopped),
+            float(message.pose.pose.position.x),
+            float(message.pose.pose.position.y),
+        )
+        self._update_snapshot(
+            fleet_states=tuple(
+                self._fleet_states[key]
+                for key in sorted(self._fleet_states)
+            ),
+            emergency_active=self._emergency_active,
+        )
+
     def _new_twist(self, linear_x: float = 0.0, angular_z: float = 0.0):
         twist_type = self._message_types.get("Twist")
         if twist_type is None:
@@ -235,39 +285,72 @@ class RosControlBridge:
         message.angular.z = float(angular_z)
         return message
 
-    def _publish_zero(self) -> None:
-        publisher = self._publishers.get("cmd_vel")
+    def _publish_zero(self, vehicle_id: str = "") -> None:
+        publisher = self._publishers.get(
+            f"{vehicle_id}_cmd_vel" if vehicle_id else "cmd_vel"
+        )
         message = self._new_twist()
         if publisher is not None and message is not None:
             publisher.publish(message)
 
     def _safety_tick(self) -> None:
-        if self._emergency_active:
+        if self._fleet_emergency:
             self._publish_zero()
+            self._publish_zero("agv1")
+            self._publish_zero("agv2")
             return
+        for vehicle_id in self._emergency_vehicles:
+            self._publish_zero(vehicle_id)
         if self._manual_stop_deadline and time.monotonic() >= self._manual_stop_deadline:
             self._manual_stop_deadline = 0.0
-            self._publish_zero()
+            self._publish_zero(self._manual_vehicle_id)
+            self._manual_vehicle_id = ""
 
-    def emergency_stop(self) -> bool:
+    def emergency_stop(self, vehicle_id: str = "fleet") -> bool:
         if not self.snapshot().ready:
             return False
-        self._emergency_active = True
+        try:
+            from central_control_client import CentralControlClient
+            CentralControlClient().set_emergency(True, vehicle_id)
+        except Exception:
+            return False
+        if vehicle_id == "fleet":
+            self._fleet_emergency = True
+            self._publish_zero()
+            self._publish_zero("agv1")
+            self._publish_zero("agv2")
+        else:
+            self._emergency_vehicles.add(vehicle_id)
+            self._publish_zero(vehicle_id)
+        self._emergency_active = (
+            self._fleet_emergency or bool(self._emergency_vehicles)
+        )
         self._update_snapshot(
-            emergency_active=True,
+            emergency_active=self._emergency_active,
             last_command="EMERGENCY_STOP",
         )
-        self._publish_zero()
         return True
 
-    def release_emergency_stop(self) -> bool:
+    def release_emergency_stop(self, vehicle_id: str = "fleet") -> bool:
         if not self.snapshot().ready:
             return False
-        self._emergency_active = False
+        try:
+            from central_control_client import CentralControlClient
+            CentralControlClient().set_emergency(False, vehicle_id)
+        except Exception:
+            return False
+        if vehicle_id == "fleet":
+            self._fleet_emergency = False
+            self._emergency_vehicles.clear()
+        else:
+            self._emergency_vehicles.discard(vehicle_id)
+        self._emergency_active = (
+            self._fleet_emergency or bool(self._emergency_vehicles)
+        )
         self._manual_stop_deadline = 0.0
-        self._publish_zero()
+        self._publish_zero(vehicle_id if vehicle_id != "fleet" else "")
         self._update_snapshot(
-            emergency_active=False,
+            emergency_active=self._emergency_active,
             last_command="EMERGENCY_RELEASED",
         )
         return True
@@ -277,15 +360,24 @@ class RosControlBridge:
         linear_x: float,
         angular_z: float,
         timeout_sec: float = 0.3,
+        vehicle_id: str = "",
     ) -> bool:
-        if not self.snapshot().ready or self._emergency_active:
+        stopped = (
+            self._fleet_emergency
+            or vehicle_id in self._emergency_vehicles
+            or (not vehicle_id and self._emergency_active)
+        )
+        if not self.snapshot().ready or stopped:
             return False
-        publisher = self._publishers.get("cmd_vel")
+        publisher = self._publishers.get(
+            f"{vehicle_id}_cmd_vel" if vehicle_id else "cmd_vel"
+        )
         message = self._new_twist(linear_x, angular_z)
         if publisher is None or message is None:
             return False
         publisher.publish(message)
         self._manual_stop_deadline = time.monotonic() + max(timeout_sec, 0.05)
+        self._manual_vehicle_id = vehicle_id
         self._update_snapshot(
             last_command=f"cmd_vel({linear_x:.3f}, {angular_z:.3f})"
         )

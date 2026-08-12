@@ -38,6 +38,8 @@ class CentralControlClient:
         heading,
         command_id=None,
         mode='direct',
+        vehicle_id='',
+        zone_id='',
     ):
         """Send one VLM-selected target and heading pixel pair."""
         target_payload = self._pixel_payload(target, 'target')
@@ -54,6 +56,8 @@ class CentralControlClient:
                 json={
                     'command_id': command_id,
                     'mode': mode,
+                    'vehicle_id': vehicle_id,
+                    'zone_id': zone_id or ('B-1' if mode == 'parking_b1' else ''),
                     'target': target_payload,
                     'heading': heading_payload,
                 },
@@ -76,55 +80,35 @@ class CentralControlClient:
             )
         return body
 
-    def send_cargo_dispatch(
-        self,
-        item: str,
-        destination: str,
-        target_floor: int = 1,
-        target_aruco_id: str = "",
-        command_id: str = None,
-        is_temp_move: bool = False,
-        vehicle_idx: int = None,
-        is_crane_only: bool = False,
-    ):
-        """Send a cargo dispatch command to the central ROS gateway."""
-        command_id = command_id or f'cargo-{uuid.uuid4()}'
+    def status(self):
+        """Return both AGV states and the B-1 lock from the gateway."""
+        headers = {}
+        if self.token:
+            headers['X-Control-Token'] = self.token
+        response = requests.get(
+            f'{self.base_url}/api/v1/status',
+            headers=headers,
+            timeout=self.timeout_sec,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def set_emergency(self, enabled=True, vehicle_id='fleet'):
+        """Latch or release the fleet/per-vehicle emergency gate."""
         headers = {'Content-Type': 'application/json'}
         if self.token:
             headers['X-Control-Token'] = self.token
-
-        try:
-            response = requests.post(
-                f'{self.base_url}/api/v1/navigation/cargo-move',
-                headers=headers,
-                json={
-                    'command_id': command_id,
-                    'item': item,
-                    'destination': destination,
-                    'target_floor': target_floor,
-                    'target_aruco_id': target_aruco_id,
-                    'is_temp_move': is_temp_move,
-                    'vehicle_idx': vehicle_idx,
-                    'is_crane_only': is_crane_only,
-                },
-                timeout=self.timeout_sec,
-            )
-        except requests.RequestException as exc:
-            raise CentralControlApiError(
-                f'중앙제어 API에 화물 이동 명령을 전송할 수 없습니다: {exc}'
-            ) from exc
-
-        try:
-            body = response.json()
-        except ValueError:
-            body = {'detail': response.text.strip() or 'empty response'}
-        if not response.ok:
-            raise CentralControlApiError(
-                '중앙제어 API가 화물 이동 명령을 거부했습니다 '
-                f'(HTTP {response.status_code}): '
-                f'{body.get("detail", body)}'
-            )
-        return body
+        response = requests.post(
+            f'{self.base_url}/api/v1/emergency-stop',
+            headers=headers,
+            json={
+                'vehicle_id': vehicle_id,
+                'enabled': bool(enabled),
+            },
+            timeout=self.timeout_sec,
+        )
+        response.raise_for_status()
+        return response.json()
 
     @staticmethod
     def _pixel_payload(value, field_name):
