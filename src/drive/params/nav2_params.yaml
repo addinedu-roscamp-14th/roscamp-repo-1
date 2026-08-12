@@ -185,7 +185,7 @@ local_costmap:
       resolution: 0.01
       #robot_radius: 0.22
       footprint: '[[0.172, 0.069], [0.172, -0.069], [-0.04, -0.069], [-0.04, 0.069]]'
-      plugins: ["voxel_layer", "inflation_layer"]
+      plugins: ["voxel_layer", "other_robot_layer", "inflation_layer"]
       # Keep the local filter on the exact mask cells. Inflating the filter in
       # the rolling costmap makes a vehicle parked in a carved pocket unable
       # to start its mandatory straight exit (DriveOnHeading reports
@@ -221,6 +221,35 @@ local_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 1.0
           obstacle_min_range: 0.0
+      # The peer AGV pose is converted to PointCloud2 by
+      # other_robot_obstacle. Keeping this in an independent local-only layer
+      # prevents its clearing rays from modifying LiDAR observations and keeps
+      # the virtual obstacle out of AMCL and the global costmap.
+      other_robot_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        combination_method: 1
+        observation_sources: other_robot other_robot_clear
+        other_robot:
+          topic: other_robot_obstacle
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.5
+          obstacle_min_range: 0.0
+          obstacle_max_range: 100.0
+          observation_persistence: 0.0
+        other_robot_clear:
+          topic: other_robot_obstacle_clear
+          data_type: "PointCloud2"
+          marking: False
+          clearing: True
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.5
+          raytrace_min_range: 0.0
+          raytrace_max_range: 100.0
+          observation_persistence: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True

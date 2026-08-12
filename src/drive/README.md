@@ -26,6 +26,87 @@ map -> agv1/odom -> agv1/base_footprint -> agv1/base_link
 Nav2의 최종 속도는 `/<vehicle_id>/cmd_vel_safe_input`으로 전달되어 Pinky 안전
 게이트를 거칩니다.
 
+### 상대 AGV 가상 장애물
+
+다중 차량 launch는 기본적으로 상대 차량의 AMCL 위치를 각 차량의 local
+costmap에만 가상 장애물로 추가합니다.
+
+```text
+AGV1 AMCL -> /agv1/shared_amcl_pose -> AGV2 obstacle node
+AGV2 AMCL -> /agv2/shared_amcl_pose -> AGV1 obstacle node
+```
+
+`amcl_pose_heartbeat` 노드는 자기 AMCL 위치를 주기적으로 공유하고,
+`other_robot_obstacle` 노드는 상대 위치 주변을 원형 PointCloud2로 발행합니다.
+기본 반경은 `0.13m`, pose timeout은 `1.0s`입니다. 상대 위치가 이동하거나
+timeout되면 별도의 clearing PointCloud2로 이전 위치를 지웁니다. 두 토픽은
+독립적인 `local_costmap.other_robot_layer`에서만 사용하며 다음 항목에는 연결하지
+않습니다.
+
+- AMCL의 `scan` 입력
+- static map/map server
+- global costmap
+
+AMCL은 정지 상태에서 `amcl_pose`를 연속 발행하지 않으므로,
+`amcl_pose_heartbeat`가 마지막 위치를 `shared_amcl_pose`로 주기적으로
+relay합니다. AMCL publisher가 사라지면 relay도 중단되고 상대 차량이 timeout 후
+가상 장애물을 제거합니다. 위치 공유 bridge와 costmap 장애물 생성은 서로 독립된
+노드입니다.
+
+실행 시 조정:
+
+```bash
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv1 \
+  other_robot_obstacle_radius:=0.13 \
+  other_robot_pose_timeout:=1.0
+```
+
+기능을 끄고 기존 LiDAR-only local costmap으로 비교할 때:
+
+```bash
+ros2 launch porter_bringup agv_vehicle.launch.py \
+  vehicle_id:=agv1 \
+  start_other_robot_obstacle:=false
+```
+
+상태 확인:
+
+```bash
+ros2 topic hz /agv1/other_robot_obstacle
+ros2 topic hz /agv2/other_robot_obstacle
+```
+
+차량별 DDS domain이 분리된 Zenoh 구성에서는 AGV1 bridge가
+`/agv2/shared_amcl_pose`, AGV2 bridge가 `/agv1/shared_amcl_pose`를
+subscriber로 허용해야 합니다. 저장소의 `config/network/zenoh_agv1.json5`와
+`zenoh_agv2.json5`에 이 설정이 포함되어 있습니다.
+
+### Collision Monitor와 ToF 확장
+
+현재 실차 속도 경로는 다음과 같습니다.
+
+```text
+Nav2 velocity_smoother -> cmd_vel_safe_input -> Pinky safety gate -> cmd_vel
+```
+
+`nav2_collision_monitor`는 설치되어 있지만 아직 이 경로에 넣지 않습니다. 적용할
+때는 safety gate를 우회하지 않도록 반드시 다음 순서로 연결해야 합니다.
+
+```text
+velocity_smoother -> collision_monitor input
+collision_monitor output -> cmd_vel_safe_input
+cmd_vel_safe_input -> 기존 Pinky safety gate -> cmd_vel
+```
+
+Collision Monitor를 켜지 않은 이유는 가상 장애물 검증과 최종 속도 차단 계층 변경을
+한 번에 적용하지 않기 위해서입니다. 이후 STOP/SLOWDOWN polygon과 remap을 별도
+opt-in launch로 추가할 수 있습니다.
+
+ToF 센서는 AMCL에 연결하지 않고 `other_robot_layer`와 별개의 local costmap
+observation source 또는 Collision Monitor source로 추가합니다. 이렇게 하면 ToF가
+없어도 현재 구성이 그대로 동작합니다.
+
 Nav2 localization/navigation launch, 파라미터, Behavior Tree와 RViz 설정을
 제공하는 패키지입니다. 다중 차량 모드에서는 각 차량 컴퓨터에서 namespaced Nav2를
 실행하고 중앙 관제는 차량별 Nav2 action으로 목표만 전달합니다.
