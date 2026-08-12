@@ -214,8 +214,9 @@ class AGVControlCenter(ctk.CTk):
             text = "ROS 연결 중"
             color = "#f0ad4e"
         agent = self.realtime_agent.snapshot()
-        if self.realtime_agent_var.get() != agent.enabled:
-            self.realtime_agent_var.set(agent.enabled)
+        autonomy_running = agent.enabled and agent.mode == 'autonomous'
+        if self.realtime_agent_var.get() != autonomy_running:
+            self.realtime_agent_var.set(autonomy_running)
         agent_text = {
             'DISABLED': 'AI 꺼짐',
             'WAITING_FOR_OBJECTIVE': 'AI 목표 대기',
@@ -224,6 +225,12 @@ class AGVControlCenter(ctk.CTk):
             'EVALUATING': 'AI 판단 중',
             'MONITORING': 'AI 실시간 관제',
             'ERROR': 'AI 오류',
+            'EXECUTING': 'AI 작업 실행 중',
+            'WAITING_FOR_DB_SYNC': 'AI DB 동기화 대기',
+            'WAITING_FOR_VEHICLE': 'AI 차량 대기',
+            'WAITING_FOR_ARM_CACHE': 'AI ARM1 캐시 대기',
+            'WAITING_OPERATOR': 'AI 운영자 확인 필요',
+            'EMERGENCY_STOPPED': 'AI 비상정지',
         }.get(agent.state, f'AI {agent.state}')
         if agent.mode == 'inventory' and agent.state == 'MONITORING':
             agent_text = 'AI DB 계획 관제'
@@ -232,8 +239,11 @@ class AGVControlCenter(ctk.CTk):
         self.after(500, self._update_ros_status)
 
     def _toggle_realtime_agent(self) -> None:
-        """Enable or suspend autonomous VLM reassessment."""
-        self.realtime_agent.set_enabled(self.realtime_agent_var.get())
+        """Start or stop the fixed DB-backed autonomous policy."""
+        if self.realtime_agent_var.get():
+            self.realtime_agent.start_autonomous_policy()
+        else:
+            self.realtime_agent.stop_autonomous_policy()
 
     def activate_emergency_stop(self) -> None:
         """Latch a local ROS cmd_vel stop and show the operator alert."""

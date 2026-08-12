@@ -1,10 +1,12 @@
 """Run homography-corrected Pick/Place through the JetCobot direct API."""
 
+from collections import deque
+import json
 import math
+from pathlib import Path
 import threading
 import time
-from collections import deque
-from pathlib import Path
+import uuid
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -34,12 +36,12 @@ from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from .model import (
-    MarkerObservation,
     build_pick_place_steps,
-    calibration_levels_for_surface,
     calibrate_target,
+    calibration_levels_for_surface,
     destination_level,
     load_floor_calibration,
+    MarkerObservation,
     parse_stations,
     safe_z_candidates,
     select_symmetric_yaw,
@@ -141,6 +143,10 @@ class HomographyPickPlace(Node):
             self.pick_frame: deque(maxlen=history_length),
             self.place_frame: deque(maxlen=history_length),
         }
+        for marker_id in list(range(9)) + list(range(18, 24)):
+            self.histories[f'arm/marker_{marker_id}'] = deque(
+                maxlen=history_length
+            )
         self.history_lock = threading.Lock()
         self.serial_lock = threading.Lock()
         self.operation_lock = threading.Lock()
@@ -152,6 +158,7 @@ class HomographyPickPlace(Node):
         self.detection_enabled = False
         self.detection_started_ns = None
         self.active_station = ''
+        self.saved_marker_poses = {}
 
         control_qos = QoSProfile(
             depth=1,
@@ -170,6 +177,12 @@ class HomographyPickPlace(Node):
             String,
             '/arm/pick_place/work_state',
             control_qos,
+        )
+        self.inventory_movement = self.create_publisher(
+            String, '/central/inventory/movements', control_qos
+        )
+        self.scan_events = self.create_publisher(
+            String, '/arm/pick_place/scan_events', control_qos
         )
         self.current_work_state = ''
         self.configure_targets_client = self.create_client(
@@ -193,6 +206,18 @@ class HomographyPickPlace(Node):
             Trigger,
             '/arm/pick_place/stop',
             self.stop,
+            callback_group=self.callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm/pick_place/scan_ship_destinations',
+            self.scan_ship_destinations,
+            callback_group=self.callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/arm/pick_place/scan_inbound',
+            self.scan_inbound,
             callback_group=self.callback_group,
         )
         self.create_timer(
@@ -605,6 +630,157 @@ class HomographyPickPlace(Node):
         self.publish_work_state('STOPPED')
         return response
 
+    def scan_ship_destinations(self, _request, response):
+        """Cache empty ship slot markers 18..23 once for later placement."""
+        with self.command_lock:
+            if len(self.saved_marker_poses) == 6:
+                response.success = True
+                response.message = 'ship marker cache already complete'
+                return response
+            if self.motion_thread is not None and self.motion_thread.is_alive():
+                response.success = False
+                response.message = 'ARM1 is busy'
+                return response
+            self.stop_event.clear()
+            self.external_stop_requested = False
+            self.motion_thread = threading.Thread(
+                target=self._run_ship_destination_scan, daemon=True
+            )
+            self.motion_thread.start()
+        response.success = True
+        response.message = 'ship marker scan accepted'
+        return response
+
+    def _run_ship_destination_scan(self):
+        if not self.operation_lock.acquire(blocking=False):
+            return
+        try:
+            self.publish_work_state('WORK_STARTED')
+            self.publish_work_state('SEARCHING')
+            detections = self.search_stations({
+                str(marker_id): f'arm/marker_{marker_id}'
+                for marker_id in range(18, 24)
+                if marker_id not in self.saved_marker_poses
+            })
+            for marker_text, detection in detections.items():
+                marker_id = int(marker_text)
+                self.saved_marker_poses[marker_id] = detection
+                self.publish_status(
+                    f'saved_marker_poses[{marker_id}] cached '
+                    f'({len(self.saved_marker_poses)}/6)'
+                )
+            self.publish_work_state('WORK_COMPLETED')
+            self.publish_status('ARM1 ship marker cache complete: 18..23')
+        except Exception as exc:
+            self.stop_event.set()
+            self.publish_work_state(
+                'STOPPED' if self.external_stop_requested else 'FAILED'
+            )
+            self.publish_status(f'ARM1 ship marker scan failed: {exc}')
+        finally:
+            self.set_detection_enabled(False)
+            self.active_station = ''
+            self.operation_lock.release()
+
+    def scan_inbound(self, _request, response):
+        """Scan exposed IDs 0..8 and associate them with cached ship slots."""
+        with self.command_lock:
+            if len(self.saved_marker_poses) != 6:
+                response.success = False
+                response.message = 'ship marker cache 18..23 is incomplete'
+                return response
+            if self.motion_thread is not None and self.motion_thread.is_alive():
+                response.success = False
+                response.message = 'ARM1 is busy'
+                return response
+            self.stop_event.clear()
+            self.external_stop_requested = False
+            self.motion_thread = threading.Thread(
+                target=self._run_inbound_scan, daemon=True
+            )
+            self.motion_thread.start()
+        response.success = True
+        response.message = 'inbound container scan accepted'
+        return response
+
+    def _run_inbound_scan(self):
+        if not self.operation_lock.acquire(blocking=False):
+            return
+        try:
+            self.publish_work_state('WORK_STARTED')
+            self.publish_work_state('SEARCHING')
+            detections = self.search_stations({
+                str(marker_id): f'arm/marker_{marker_id}'
+                for marker_id in range(9)
+            }, require_all=False)
+            if not detections:
+                raise RuntimeError('no exposed inbound container ID 0..8 found')
+            assignments = self._associate_inbound_slots(detections)
+            scan_id = f'inbound-{uuid.uuid4().hex[:12]}'
+            for container_id, slot_id in assignments.items():
+                event = {
+                    'schema_version': '1.0',
+                    'operation_id': f'{scan_id}-{container_id}',
+                    'command_id': scan_id,
+                    'mission_id': scan_id,
+                    'arm_id': 'arm1',
+                    'container_id': str(container_id),
+                    'source_location': '',
+                    'source_floor': None,
+                    'source_base_aruco_id': '',
+                    'destination_location': f'선박-{slot_id - 17}',
+                    'destination_floor': 1,
+                    'destination_base_aruco_id': str(slot_id),
+                    'success': True,
+                    'error': '',
+                }
+                message = String()
+                message.data = json.dumps(event, ensure_ascii=False)
+                self.inventory_movement.publish(message)
+            result = String()
+            result.data = json.dumps({
+                'state': 'COMPLETED', 'scan_id': scan_id,
+                'assignments': assignments,
+            }, ensure_ascii=False)
+            self.scan_events.publish(result)
+            self.publish_work_state('WORK_COMPLETED')
+            self.publish_status(f'ARM1 inbound scan complete: {assignments}')
+        except Exception as exc:
+            self.stop_event.set()
+            self.publish_work_state(
+                'STOPPED' if self.external_stop_requested else 'FAILED'
+            )
+            self.publish_status(f'ARM1 inbound scan failed: {exc}')
+        finally:
+            self.set_detection_enabled(False)
+            self.active_station = ''
+            self.operation_lock.release()
+
+    def _associate_inbound_slots(self, detections):
+        assignments = {}
+        occupied_slots = set()
+        maximum_distance = 0.080
+        for container_text, (_observation, target, _errors) in detections.items():
+            candidates = []
+            for slot_id, (_slot_observation, slot, _slot_errors) in (
+                self.saved_marker_poses.items()
+            ):
+                distance = math.hypot(
+                    target.x_m - slot.x_m, target.y_m - slot.y_m
+                )
+                candidates.append((distance, slot_id))
+            distance, slot_id = min(candidates)
+            if distance > maximum_distance:
+                raise RuntimeError(
+                    f'container {container_text} is not over a ship slot '
+                    f'(nearest={distance:.3f}m)'
+                )
+            if slot_id in occupied_slots:
+                raise RuntimeError(f'multiple inbound IDs mapped to slot {slot_id}')
+            occupied_slots.add(slot_id)
+            assignments[int(container_text)] = int(slot_id)
+        return assignments
+
     def run_operation(self):
         """Search stations once, then execute the frozen Pick/Place plan."""
         if not self.operation_lock.acquire(blocking=False):
@@ -617,7 +793,13 @@ class HomographyPickPlace(Node):
                 f'place_id={self.place_marker_id}'
             )
             self.publish_work_state('SEARCHING')
-            detections = self.search_stations()
+            role_frames = None
+            cached_place = self.saved_marker_poses.get(self.place_marker_id)
+            if cached_place is not None:
+                role_frames = {'pick': self.pick_frame}
+            detections = self.search_stations(role_frames)
+            if cached_place is not None:
+                detections['place'] = cached_place
             calibrated = {}
             for role, (observation, target, errors) in detections.items():
                 calibrated[role] = target
@@ -645,6 +827,10 @@ class HomographyPickPlace(Node):
                         f'destination_floor={destination}, '
                         + common
                     )
+                    if 18 <= self.place_marker_id <= 23:
+                        self.saved_marker_poses[self.place_marker_id] = (
+                            observation, target, errors
+                        )
             steps = self.select_feasible_plan(calibrated)
             self.execute_steps(steps)
             self.publish_work_state('WORK_COMPLETED')
@@ -781,12 +967,11 @@ class HomographyPickPlace(Node):
             self.yaw_offset,
         )
 
-    def search_stations(self):
+    def search_stations(self, role_frames=None, require_all=True):
         """Scan every pose and classify detections only within its surface."""
         found = {}
-        role_frames = {
-            'pick': self.pick_frame,
-            'place': self.place_frame,
+        role_frames = role_frames or {
+            'pick': self.pick_frame, 'place': self.place_frame,
         }
         for station in self.stations:
             remaining = [role for role in role_frames if role not in found]
@@ -873,7 +1058,7 @@ class HomographyPickPlace(Node):
                     f'{station.name} 탐색 종료: missing={missing}'
                 )
         missing = [role for role in role_frames if role not in found]
-        if missing:
+        if missing and require_all:
             raise RuntimeError(
                 f'all station poses exhausted; missing ArUco={missing}'
             )

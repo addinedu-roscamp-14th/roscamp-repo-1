@@ -270,6 +270,15 @@ def generate_launch_description():
         ),
         Node(
             package='central',
+            executable='inventory_sync',
+            name='inventory_sync',
+            output='screen',
+            condition=IfCondition(
+                LaunchConfiguration('start_arm_dispatcher')
+            ),
+        ),
+        Node(
+            package='central',
             executable='port_event_detector',
             name='port_event_detector',
             output='screen',

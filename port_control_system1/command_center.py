@@ -461,6 +461,15 @@ class CommandPopup(ctk.CTkToplevel):
         command = self.command_var.get().strip()
         if not command:
             return
+        supervisor = RealtimeLLMAgent.get_instance().snapshot()
+        if supervisor.enabled and supervisor.mode == 'autonomous':
+            message = (
+                '자율 관제모드가 차량과 로봇팔을 점유 중입니다. '
+                '수동 명령을 실행하려면 먼저 자율 관제모드를 중지하세요.'
+            )
+            self._log(f'[수동 명령 차단] {message}')
+            self.result_label.configure(text=message, text_color='#EA5455')
+            return
         allow_inventory_bypass = bool(self.ignore_db_var.get())
 
         # 0순위: "화물 A~D" 같은 범위 표현은 LLM에 맡기면 일관성이 떨어져서
@@ -1104,6 +1113,7 @@ class CommandPopup(ctk.CTkToplevel):
                 source_id=source_id,
                 destination_id=destination_id,
                 vehicle_id=vehicle_id,
+                container_id=str(action.get('container_id') or ''),
                 final_for_vehicle=(final_for_vehicle if vehicle_operation else False),
             )
         except CentralControlApiError as exc:

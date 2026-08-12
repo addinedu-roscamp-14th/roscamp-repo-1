@@ -225,6 +225,7 @@ class DashboardView(ctk.CTkFrame):
 
         self._build_amr_status_card(cards_area)
         self._build_arm_status_card(cards_area)
+        self._build_autonomy_status_card(cards_area)
 
         cards = [
             ("당일 선박 입항", "총 5척 정박 완료"),
@@ -394,6 +395,23 @@ class DashboardView(ctk.CTkFrame):
             self.arm_error_labels[arm_id] = error_label
 
         self.update_arm_status()
+
+    def _build_autonomy_status_card(self, parent) -> None:
+        """Show the durable DB gate and current autonomous cycle."""
+        card = ctk.CTkFrame(
+            parent, fg_color=BG_CARD, border_width=1,
+            border_color=BORDER_COLOR, corner_radius=8,
+        )
+        card.pack(fill='x', padx=5, pady=5, ipady=8)
+        ctk.CTkLabel(
+            card, text='DB 기반 자율 관제', font=self.font_mini,
+            text_color=TEXT_SECONDARY,
+        ).pack(anchor='w', padx=10)
+        self.lbl_autonomy_detail = ctk.CTkLabel(
+            card, text='중지됨', font=self.font_mini,
+            text_color=TEXT_SECONDARY, justify='left', wraplength=270,
+        )
+        self.lbl_autonomy_detail.pack(anchor='w', padx=10, pady=(3, 0))
 
     def update_arm_status(self) -> None:
         """Render structured central ARM telemetry every 500 ms."""
@@ -584,9 +602,12 @@ class DashboardView(ctk.CTkFrame):
         open_command_popup(self)
 
     def toggle_autonomy_mode(self) -> None:
-        """Start or stop the shared realtime LLM supervisor."""
+        """Grant or revoke autonomous DB-backed operating approval."""
         snapshot = self.realtime_agent.snapshot()
-        self.realtime_agent.set_enabled(not snapshot.enabled)
+        if snapshot.enabled and snapshot.mode == 'autonomous':
+            self.realtime_agent.stop_autonomous_policy()
+        else:
+            self.realtime_agent.start_autonomous_policy()
         self.update_autonomy_button(schedule_next=False)
 
     def update_autonomy_button(self, schedule_next=True) -> None:
@@ -597,10 +618,34 @@ class DashboardView(ctk.CTkFrame):
             if not self.winfo_exists():
                 return
             snapshot = self.realtime_agent.snapshot()
-            if snapshot.enabled:
+            if hasattr(self, 'lbl_autonomy_detail'):
+                detail = (
+                    f'회차: {snapshot.cycle_id or "-"}\n'
+                    f'단계: {snapshot.phase or "-"}\n'
+                    f'DB: {snapshot.db_sync_state} · 보류 '
+                    f'{snapshot.db_pending_count}건\n'
+                    f'스냅샷: {snapshot.db_snapshot_id or "-"}\n'
+                    f'다음 이동: {snapshot.next_move or "없음"}\n'
+                    f'실행: {snapshot.active_command or "없음"}\n'
+                    f'재계획: {snapshot.replan_count}회'
+                )
+                if snapshot.last_error:
+                    detail += f'\n오류: {snapshot.last_error}'
+                self.lbl_autonomy_detail.configure(
+                    text=detail,
+                    text_color=(
+                        ALERT_RED if snapshot.last_error else TEXT_SECONDARY
+                    ),
+                )
+            if snapshot.enabled and snapshot.mode == 'autonomous':
                 state_suffix = {
                     'WAITING_FOR_OBJECTIVE': ' · 목표 대기',
                     'EVALUATING': ' · 판단 중',
+                    'EXECUTING': ' · 작업 실행 중',
+                    'WAITING_FOR_DB_SYNC': ' · DB 동기화 대기',
+                    'WAITING_FOR_VEHICLE': ' · 차량 대기',
+                    'WAITING_FOR_ARM_CACHE': ' · ARM1 캐시 대기',
+                    'WAITING_OPERATOR': ' · 운영자 확인 필요',
                     'ERROR': ' · 오류',
                 }.get(snapshot.state, '')
                 self.btn_autonomy.configure(

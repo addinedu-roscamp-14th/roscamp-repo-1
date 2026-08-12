@@ -160,8 +160,9 @@ def test_arm_command_uses_whitelisted_gateway_payload(monkeypatch):
         'destination_slot': '',
         'source_id': 3,
         'destination_id': -1,
-        'vehicle_id': 'agv1',
-        'final_for_vehicle': True,
+            'vehicle_id': 'agv1',
+            'container_id': '',
+            'final_for_vehicle': True,
     }
 
 

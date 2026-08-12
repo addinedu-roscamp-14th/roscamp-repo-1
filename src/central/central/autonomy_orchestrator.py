@@ -23,6 +23,7 @@ class AutonomyOrchestrator(Node):
     def __init__(self):
         super().__init__('autonomy_orchestrator')
         self.declare_parameter('auto_scan_arm2_on_arrival', True)
+        self.declare_parameter('auto_scan_arm1_ship_on_start', True)
         self.callback_group = ReentrantCallbackGroup()
         qos = QoSProfile(
             depth=20,
@@ -60,8 +61,61 @@ class AutonomyOrchestrator(Node):
         self.arrival_event_id = ''
         self.scan_requested = False
         self.scan_retry_pending = False
+        self.arm1_scan_requested = False
+        self.arm1_cache_ready = False
+        self.inbound_scan_requested = False
+        self.inbound_scan_pending = False
         self.create_timer(1.0, self._retry_scan_if_needed)
+        self.create_timer(10.0, self._retry_arm1_ship_scan)
         self._publish_status('WAITING_FOR_VESSEL')
+
+    def _retry_arm1_ship_scan(self):
+        if not bool(self.get_parameter('auto_scan_arm1_ship_on_start').value):
+            return
+        with self.lock:
+            if self.arm1_cache_ready or self.arm1_scan_requested:
+                return
+        if not self.arm_client.wait_for_server(timeout_sec=1.0):
+            self._publish_status('WAITING_FOR_ARM1_SHIP_SCAN')
+            return
+        goal = DispatchArmCommand.Goal()
+        goal.command_id = f'arm1-ship-scan-{uuid.uuid4().hex[:8]}'
+        goal.mission_id = goal.command_id
+        goal.arm_id = 'arm1'
+        goal.operation = 'scan_ship_destinations'
+        with self.lock:
+            self.arm1_scan_requested = True
+        future = self.arm_client.send_goal_async(goal)
+        future.add_done_callback(self._on_arm1_scan_accepted)
+
+    def _on_arm1_scan_accepted(self, future):
+        try:
+            handle = future.result()
+        except Exception as exc:
+            handle = None
+            self._publish_status('ARM1_SHIP_SCAN_FAILED', error=str(exc))
+        if handle is None or not handle.accepted:
+            with self.lock:
+                self.arm1_scan_requested = False
+            return
+        self._publish_status('ARM1_SHIP_MARKER_SCAN')
+        handle.get_result_async().add_done_callback(self._on_arm1_scan_result)
+
+    def _on_arm1_scan_result(self, future):
+        try:
+            result = future.result().result
+            success = bool(result.success)
+            error = '' if success else str(result.message)
+        except Exception as exc:
+            success = False
+            error = str(exc)
+        with self.lock:
+            self.arm1_scan_requested = False
+            self.arm1_cache_ready = success
+        self._publish_status(
+            'ARM1_SHIP_CACHE_READY' if success else 'ARM1_SHIP_SCAN_RETRY',
+            error=error,
+        )
 
     def _on_port_event(self, message):
         if message.event_type == PortEvent.VESSEL_DEPARTED:
@@ -71,6 +125,8 @@ class AutonomyOrchestrator(Node):
                 self.arrival_event_id = ''
                 self.scan_requested = False
                 self.scan_retry_pending = False
+                self.inbound_scan_requested = False
+                self.inbound_scan_pending = False
             self._publish_status('VESSEL_DEPARTED', mission_id=mission_id)
             return
         if message.event_type != PortEvent.VESSEL_ARRIVED:
@@ -81,9 +137,71 @@ class AutonomyOrchestrator(Node):
             self.arrival_event_id = message.event_id
             self.active_mission_id = f'port-{uuid.uuid4().hex[:10]}'
             mission_id = self.active_mission_id
+            self.inbound_scan_pending = True
         self._publish_status('VESSEL_ARRIVED', mission_id=mission_id)
         if bool(self.get_parameter('auto_scan_arm2_on_arrival').value):
             self._request_arm2_scan(mission_id)
+        self._request_arm1_inbound_scan(mission_id)
+
+    def _request_arm1_inbound_scan(self, mission_id):
+        with self.lock:
+            if (
+                not self.arm1_cache_ready
+                or self.inbound_scan_requested
+                or not self.inbound_scan_pending
+            ):
+                return
+        if not self.arm_client.wait_for_server(timeout_sec=1.0):
+            return
+        goal = DispatchArmCommand.Goal()
+        goal.command_id = f'{mission_id}-inbound-{uuid.uuid4().hex[:6]}'
+        goal.mission_id = goal.command_id
+        goal.arm_id = 'arm1'
+        goal.operation = 'scan_inbound'
+        with self.lock:
+            self.inbound_scan_requested = True
+        future = self.arm_client.send_goal_async(goal)
+        future.add_done_callback(
+            lambda done, mid=mission_id: self._on_inbound_scan_accepted(
+                mid, done
+            )
+        )
+
+    def _on_inbound_scan_accepted(self, mission_id, future):
+        try:
+            handle = future.result()
+        except Exception as exc:
+            handle = None
+            self._publish_status('INBOUND_SCAN_FAILED', mission_id, error=str(exc))
+        if handle is None or not handle.accepted:
+            with self.lock:
+                self.inbound_scan_requested = False
+            return
+        self._publish_status('SCANNING_INBOUND', mission_id)
+        handle.get_result_async().add_done_callback(
+            lambda done, mid=mission_id: self._on_inbound_scan_result(mid, done)
+        )
+
+    def _on_inbound_scan_result(self, mission_id, future):
+        try:
+            result = future.result().result
+            success = bool(result.success)
+            error = '' if success else str(result.message)
+        except Exception as exc:
+            success = False
+            error = str(exc)
+        with self.lock:
+            self.inbound_scan_requested = False
+            self.inbound_scan_pending = not success
+            if not success:
+                # A restarted ARM1 loses its in-memory ship cache. Rebuild it
+                # before retrying the inbound scan; an already complete cache
+                # makes the Trigger idempotent.
+                self.arm1_cache_ready = False
+        self._publish_status(
+            'INBOUND_SCAN_COMPLETE' if success else 'INBOUND_SCAN_RETRY',
+            mission_id, error=error,
+        )
 
     def _request_arm2_scan(self, mission_id):
         if not self.arm_client.wait_for_server(timeout_sec=1.0):
@@ -158,6 +276,13 @@ class AutonomyOrchestrator(Node):
             )
         if should_retry:
             self._request_arm2_scan(mission_id)
+        with self.lock:
+            should_scan_inbound = bool(
+                mission_id and self.inbound_scan_pending
+                and not self.inbound_scan_requested
+            )
+        if should_scan_inbound:
+            self._request_arm1_inbound_scan(mission_id)
 
     def _on_arm_result(self, message):
         try:
@@ -181,7 +306,12 @@ class AutonomyOrchestrator(Node):
 
     def _publish_status(self, state, mission_id='', **extra):
         message = String()
-        payload = {'state': state, 'mission_id': mission_id}
+        payload = {
+            'state': state,
+            'mission_id': mission_id,
+            'arm1_ship_cache_ready': bool(self.arm1_cache_ready),
+            'inbound_scan_pending': bool(self.inbound_scan_pending),
+        }
         payload.update(extra)
         message.data = json.dumps(payload, ensure_ascii=False)
         self.status_publisher.publish(message)
