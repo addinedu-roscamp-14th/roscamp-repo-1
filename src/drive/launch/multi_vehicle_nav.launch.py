@@ -57,6 +57,17 @@ def _rewrite_keepout_topics(params, vehicle_id):
     info_server['mask_topic'] = mask_topic
 
 
+def _rewrite_other_robot_topics(params, vehicle_id):
+    """Keep peer-obstacle topics at the vehicle namespace root."""
+    for costmap_name in ('local_costmap', 'global_costmap'):
+        costmap = params[costmap_name][costmap_name]['ros__parameters']
+        layer = costmap['other_robot_layer']
+        layer['other_robot']['topic'] = f'/{vehicle_id}/other_robot_obstacle'
+        layer['other_robot_clear']['topic'] = (
+            f'/{vehicle_id}/other_robot_obstacle_clear'
+        )
+
+
 def _launch_nav2(context):
     vehicle_id = LaunchConfiguration('vehicle_id').perform(context).strip('/')
     if vehicle_id not in ('agv1', 'agv2'):
@@ -67,6 +78,7 @@ def _launch_nav2(context):
         params = yaml.safe_load(stream)
     params = _rewrite_frames(params, vehicle_id)
     _rewrite_keepout_topics(params, vehicle_id)
+    _rewrite_other_robot_topics(params, vehicle_id)
     # ROS parameter files match fully-qualified node names. Nesting the file
     # under the vehicle namespace makes every Nav2 block apply to /agvX/*.
     params.pop('/**', None)
@@ -75,7 +87,57 @@ def _launch_nav2(context):
     with generated.open('w', encoding='utf-8') as stream:
         yaml.safe_dump(params, stream, sort_keys=False)
 
+    other_vehicle_id = 'agv2' if vehicle_id == 'agv1' else 'agv1'
     return [
+        Node(
+            package='drive',
+            executable='amcl_pose_heartbeat',
+            name='amcl_pose_heartbeat',
+            namespace=vehicle_id,
+            output='screen',
+            condition=IfCondition(
+                LaunchConfiguration('start_other_robot_obstacle')
+            ),
+            parameters=[{
+                'input_topic': f'/{vehicle_id}/amcl_pose',
+                'output_topic': 'shared_amcl_pose',
+                'frame_id': 'map',
+                'publish_rate': LaunchConfiguration(
+                    'shared_pose_publish_rate'
+                ),
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+            }],
+        ),
+        Node(
+            package='drive',
+            executable='other_robot_obstacle',
+            name='other_robot_obstacle',
+            namespace=vehicle_id,
+            output='screen',
+            condition=IfCondition(
+                LaunchConfiguration('start_other_robot_obstacle')
+            ),
+            parameters=[{
+                'other_pose_topic': f'/{other_vehicle_id}/shared_amcl_pose',
+                'obstacle_topic': 'other_robot_obstacle',
+                'clearing_topic': 'other_robot_obstacle_clear',
+                'frame_id': 'map',
+                'cloud_frame_id': f'{vehicle_id}/base_footprint',
+                'obstacle_radius': LaunchConfiguration(
+                    'other_robot_obstacle_radius'
+                ),
+                'point_spacing': LaunchConfiguration(
+                    'other_robot_point_spacing'
+                ),
+                'publish_rate': LaunchConfiguration(
+                    'other_robot_publish_rate'
+                ),
+                'other_robot_pose_timeout': LaunchConfiguration(
+                    'other_robot_pose_timeout'
+                ),
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+            }],
+        ),
         IncludeLaunchDescription(
             AnyLaunchDescriptionSource(
                 PathJoinSubstitution([
@@ -138,6 +200,38 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('use_composition', default_value='True'),
         DeclareLaunchArgument('start_navigation', default_value='True'),
+        DeclareLaunchArgument(
+            'start_other_robot_obstacle',
+            default_value='True',
+            description=(
+                'Publish the peer AGV AMCL pose into this local costmap'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'other_robot_obstacle_radius',
+            default_value='0.13',
+            description='Virtual peer obstacle radius in metres',
+        ),
+        DeclareLaunchArgument(
+            'other_robot_point_spacing',
+            default_value='0.02',
+            description='PointCloud2 grid spacing in metres',
+        ),
+        DeclareLaunchArgument(
+            'shared_pose_publish_rate',
+            default_value='10.0',
+            description='AMCL pose heartbeat publication rate in Hz',
+        ),
+        DeclareLaunchArgument(
+            'other_robot_publish_rate',
+            default_value='10.0',
+            description='Virtual obstacle publication rate in Hz',
+        ),
+        DeclareLaunchArgument(
+            'other_robot_pose_timeout',
+            default_value='1.0',
+            description='Seconds before a missing peer pose is cleared',
+        ),
         DeclareLaunchArgument(
             'start_parking_supervisor',
             default_value='True',

@@ -73,6 +73,26 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('start_nav2', default_value='true'),
         DeclareLaunchArgument(
+            'start_other_robot_obstacle',
+            default_value='true',
+            description='Add the peer AGV pose to this local costmap',
+        ),
+        DeclareLaunchArgument(
+            'other_robot_obstacle_radius', default_value='0.13'
+        ),
+        DeclareLaunchArgument(
+            'other_robot_point_spacing', default_value='0.02'
+        ),
+        DeclareLaunchArgument(
+            'shared_pose_publish_rate', default_value='10.0'
+        ),
+        DeclareLaunchArgument(
+            'other_robot_publish_rate', default_value='10.0'
+        ),
+        DeclareLaunchArgument(
+            'other_robot_pose_timeout', default_value='1.0'
+        ),
+        DeclareLaunchArgument(
             'use_composition',
             default_value='true',
             description='Run Nav2 in a component container',
@@ -135,6 +155,24 @@ def generate_launch_description():
                         'use_sim_time': LaunchConfiguration('use_sim_time'),
                         'use_composition': LaunchConfiguration(
                             'use_composition'
+                        ),
+                        'start_other_robot_obstacle': LaunchConfiguration(
+                            'start_other_robot_obstacle'
+                        ),
+                        'other_robot_obstacle_radius': LaunchConfiguration(
+                            'other_robot_obstacle_radius'
+                        ),
+                        'other_robot_point_spacing': LaunchConfiguration(
+                            'other_robot_point_spacing'
+                        ),
+                        'shared_pose_publish_rate': LaunchConfiguration(
+                            'shared_pose_publish_rate'
+                        ),
+                        'other_robot_publish_rate': LaunchConfiguration(
+                            'other_robot_publish_rate'
+                        ),
+                        'other_robot_pose_timeout': LaunchConfiguration(
+                            'other_robot_pose_timeout'
                         ),
                         # The top-level vehicle launch starts parking_new
                         # after Nav2 has finished loading on the Raspberry Pi.

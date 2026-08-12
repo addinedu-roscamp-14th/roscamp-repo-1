@@ -17,6 +17,7 @@
           "/agv1/map",
           "/agv1/keepout_filter_mask",
           "/agv1/amcl_pose",
+          "/agv1/shared_amcl_pose",
           "/agv1/odom",
           "/agv1/scan",
           "/agv1/plan",
@@ -26,6 +27,7 @@
           "/agv1/battery/voltage"
         ],
         "subscribers": [
+          "/agv2/shared_amcl_pose",
           "/agv1/initialpose",
           "/agv1/goal_pose",
           "/agv1/cmd_vel_manual"
@@ -51,10 +53,12 @@
         "/agv1/scan=5",
         "/agv1/odom=10",
         "/agv1/amcl_pose=10",
+        "/agv1/shared_amcl_pose=10",
         "/agv1/joint_states=5"
       ],
       "pub_priorities": [
         "/agv1/amcl_pose=1:express",
+        "/agv1/shared_amcl_pose=1:express",
         "/agv1/odom=1:express",
         "/tf=2:express",
         "/agv1/scan=4",
