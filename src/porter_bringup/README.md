@@ -55,8 +55,9 @@ zenoh-bridge-ros2dds \
   -e tcp/<중앙_IP>:7447
 ```
 
-ARM1은 도메인 15와 `config/network/zenoh_arm1.json5`를 사용하지만, 현재 파일은
-서비스 계약을 받기 전의 빈 화이트리스트입니다. ARM1 명령은 중앙에서 거부됩니다.
+ARM1은 도메인 15와 `config/network/zenoh_arm1.json5`를 사용합니다. 이 설정은
+Pick/Place뿐 아니라 초기 선박 마커 스캔, 입항 컨테이너 스캔, 스캔 결과와
+인벤토리 이동 이벤트까지 중앙 관제로 전달합니다.
 
 ```bash
 unset ROS_DISCOVERY_SERVER

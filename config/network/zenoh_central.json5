@@ -34,6 +34,8 @@
           "/agv[12]/battery/voltage",
           "/arm/pick_place/status",
           "/arm/pick_place/work_state",
+          "/arm/pick_place/scan_events",
+          "/central/inventory/movements",
           "/arm2/transfer_events",
           "/arm2/container_pick/status",
           "/arm2/joint_states"
@@ -47,6 +49,8 @@
           "/arm/pick_place/execute",
           "/arm/pick_place/start",
           "/arm/pick_place/stop",
+          "/arm/pick_place/scan_ship_destinations",
+          "/arm/pick_place/scan_inbound",
           "/arm2/scan_destinations",
           "/arm2/transfer_to_a[123]_[12]",
           "/arm2/load_id[0-8]_to_trailer",
