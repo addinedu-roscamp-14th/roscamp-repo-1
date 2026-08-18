@@ -237,3 +237,47 @@ def test_single_move_normalizes_db_derived_mechanical_fields():
         'destination_base_aruco_id': '1',
         'reason': 'LLM이 B-1을 선택',
     }]
+
+
+def test_outbound_single_move_fills_omitted_ship_slot_from_db_capacity():
+    snapshot = make_snapshot([
+        cargo('C6', '6', 'A-1-1', 3, '1'),
+        cargo('C0', '0', '선박-1', 1, '18'),
+    ])
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: {
+        'status': 'ready',
+        'moves': [
+            move(1, '6', 'C6', 'A-1-1', 3, '', reason='선박 출항'),
+        ],
+        'summary': '목적 슬롯을 누락한 LLM 응답',
+    })
+
+    result = planner.plan_single_move_snapshot(
+        '선박 목적지 후보 중 하나로 이동하라. phase=LOADING_OUTBOUND',
+        snapshot,
+        ['A-1-1', '선박-1', '선박-2'],
+    )
+
+    assert result['status'] == 'ready'
+    assert result['moves'][0]['destination_location'] == '선박-2'
+    assert result['moves'][0]['destination_floor'] == 1
+
+
+def test_outbound_single_move_preserves_exact_llm_ship_slot_choice():
+    snapshot = make_snapshot([cargo('C6', '6', 'A-1-1', 3, '1')])
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: {
+        'status': 'ready',
+        'moves': [
+            move(1, '6', 'C6', 'A-1-1', 3, '선박-6', reason='LLM 선택'),
+        ],
+        'summary': '정확한 목적 슬롯',
+    })
+
+    result = planner.plan_single_move_snapshot(
+        '선박 목적지 후보 중 하나로 이동하라. phase=LOADING_OUTBOUND',
+        snapshot,
+        ['A-1-1', '선박-1', '선박-6'],
+    )
+
+    assert result['status'] == 'ready'
+    assert result['moves'][0]['destination_location'] == '선박-6'
