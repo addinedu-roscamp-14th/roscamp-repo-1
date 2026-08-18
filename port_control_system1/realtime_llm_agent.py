@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, replace
 from typing import Dict, Optional
 
@@ -24,10 +25,11 @@ from llm_command_parser import (
 from inventory_client import InventoryClientError
 from inventory_decision_planner import InventoryDecisionPlanner
 from autonomous_inventory import (
+    AutonomousCycle,
+    AutonomousPolicyError,
     CANONICAL_LOCATIONS,
     CycleStore,
     SHIP_LOCATIONS,
-    AutonomousPolicyError,
     choose_policy,
     compile_move,
     validate_first_move,
@@ -85,6 +87,10 @@ class RealtimeAgentSnapshot:
     db_snapshot_id: str = ''
     next_move: str = ''
     active_command: str = ''
+    llm_plan_json: str = ''
+    execution_steps_json: str = ''
+    current_step_json: str = ''
+    command_payload_json: str = ''
     db_sync_state: str = 'UNKNOWN'
     db_pending_count: int = 0
     replan_count: int = 0
@@ -203,6 +209,24 @@ class RealtimeLLMAgent:
             0.0,
             float(os.environ.get('PORT_CONTROL_REALTIME_LLM_INITIAL_DELAY_SEC', '5.0')),
         )
+        self.arm_command_orphan_timeout_sec = max(
+            10.0,
+            float(os.environ.get(
+                'PORT_AUTONOMY_ARM_COMMAND_ORPHAN_TIMEOUT_SEC', '120.0'
+            )),
+        )
+        self.nav_command_retry_grace_sec = max(
+            1.0,
+            float(os.environ.get(
+                'PORT_AUTONOMY_NAV_RETRY_GRACE_SEC', '5.0'
+            )),
+        )
+        self.nav_command_max_resends = max(
+            0,
+            int(os.environ.get(
+                'PORT_AUTONOMY_NAV_MAX_RESENDS', '0'
+            )),
+        )
         enabled = os.environ.get(
             'PORT_CONTROL_REALTIME_LLM_ENABLED', 'true'
         ).strip().lower() in {'1', 'true', 'yes', 'on'}
@@ -222,12 +246,22 @@ class RealtimeLLMAgent:
         )
         self.location_loader = location_loader or _load_registered_locations
         self.cycle_store = cycle_store or CycleStore()
-        self._cycle = self.cycle_store.load()
+        # A dashboard process restart is an explicit new operating session.
+        # Do not restore inbound/outbound IDs, an in-flight move, or failure
+        # counters from the previous process. The PostgreSQL inventory remains
+        # the source of truth and will be reassessed when autonomy starts.
+        self._cycle = AutonomousCycle()
         # A parked vehicle normally reports READY with no zone lock, which is
         # indistinguishable from an idle unparked vehicle in fleet telemetry.
         # Remember successful/requested parking locally so the waiting loop
         # cannot enqueue a new park command on every heartbeat.
         self._autonomy_park_requests = set()
+        self._diagnostic_path = os.path.abspath(os.path.expanduser(
+            os.environ.get(
+                'PORT_AUTONOMY_DIAGNOSTIC_PATH',
+                '~/.local/state/port_control/autonomy_status.json',
+            )
+        ))
 
     def start(self):
         """Start the background evaluation loop once."""
@@ -333,15 +367,23 @@ class RealtimeLLMAgent:
         self._wake_event.set()
 
     def start_autonomous_policy(self):
-        """Start the fixed autonomous port policy after operator approval."""
-        if self._cycle.phase == 'WAITING_OPERATOR':
-            self._cycle.identical_failures = 0
-            self._cycle.failure_key = ''
-            self._cycle.last_error = ''
-            self._cycle.phase = 'WAITING_FOR_INBOUND'
-            self._save_cycle()
+        """Resume autonomy by reassessing current persisted and live state."""
+        # Starting again is an explicit operator retry.  Keep the cycle's
+        # inbound/outbound identity and any in-flight physical move, but never
+        # force the phase back to WAITING_FOR_INBOUND: that discarded a vessel,
+        # cargo, or vehicle already present when the button was pressed.
+        self._cycle.identical_failures = 0
+        self._cycle.failure_key = ''
+        self._cycle.last_error = ''
+        self._cycle.phase = (
+            'EXECUTING_MOVE'
+            if self._cycle.active_move
+            else 'REASSESSING_CURRENT_STATE'
+        )
+        self._save_cycle()
         with self._lock:
             self._objective_revision += 1
+            self._last_observation = ''
             self._last_inventory_snapshot_id = ''
             self._last_evaluation_monotonic = 0.0
             self._not_before_monotonic = 0.0
@@ -353,7 +395,15 @@ class RealtimeLLMAgent:
                 mode='autonomous',
                 cycle_id=self._cycle.cycle_id,
                 phase=self._cycle.phase,
+                last_decision=(
+                    '자율 관제 재시작: 최신 DB·ROI·Fleet·ARM 상태를 '
+                    '다시 확인합니다.'
+                ),
                 last_error='',
+                llm_plan_json='',
+                execution_steps_json='',
+                current_step_json='',
+                command_payload_json='',
             )
         self._wake_event.set()
 
@@ -373,6 +423,29 @@ class RealtimeLLMAgent:
     def _update_snapshot(self, **changes):
         with self._lock:
             self._snapshot = replace(self._snapshot, **changes)
+            snapshot = self._snapshot
+        self._write_diagnostic_snapshot(snapshot)
+
+    def _write_diagnostic_snapshot(self, snapshot):
+        """Persist transient planner errors that otherwise disappear in UI."""
+        payload = dict(snapshot.__dict__)
+        payload['updated_at'] = time.time()
+        try:
+            parent = os.path.dirname(self._diagnostic_path)
+            os.makedirs(parent, exist_ok=True)
+            temporary = f'{self._diagnostic_path}.tmp'
+            with open(temporary, 'w', encoding='utf-8') as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+            os.replace(temporary, self._diagnostic_path)
+        except OSError as exc:
+            print(f'[자율 관제 진단 기록 실패] {exc}', flush=True)
+        if changes_error := str(payload.get('last_error') or ''):
+            print(
+                '[DB 기반 자율 관제 오류] '
+                f'state={payload.get("state")}, '
+                f'phase={payload.get("phase")}, error={changes_error}',
+                flush=True,
+            )
 
     def _run(self):
         while not self._stop_event.is_set():
@@ -468,6 +541,33 @@ class RealtimeLLMAgent:
             for vehicle in vehicles.values()
         )
 
+    @staticmethod
+    def _autonomy_scan_blocker(phase, fleet_status):
+        """Return why an ARM cache/scan prevents the next cargo move."""
+        telemetry = (fleet_status or {}).get('telemetry') or {}
+        autonomy = telemetry.get('autonomy') or {}
+        arms = telemetry.get('arms') or {}
+        arm1 = arms.get('arm1') or {}
+        arm1_operation = str(arm1.get('current_operation') or '')
+        if phase == 'UNLOADING_INBOUND':
+            if (
+                autonomy.get('inbound_scan_pending')
+                or arm1_operation in {
+                    'scan_inbound', 'scan_ship_destinations'
+                }
+            ):
+                return 'ARM1 입항 컨테이너 스캔 완료 대기 중'
+            if not autonomy.get('arm1_ship_cache_ready'):
+                return 'ARM1 선박 마커 18~23 캐시 완료 대기 중'
+            if not autonomy.get('arm2_destination_cache_ready'):
+                return 'ARM2 창고 목적지 마커 캐시 완료 대기 중'
+        if (
+            phase == 'LOADING_OUTBOUND'
+            and not autonomy.get('arm1_ship_cache_ready')
+        ):
+            return 'ARM1 선박 마커 18~23 캐시 완료 대기 중'
+        return ''
+
     def _save_cycle(self):
         self.cycle_store.save(self._cycle)
 
@@ -545,6 +645,12 @@ class RealtimeLLMAgent:
                         },
                         ensure_ascii=False,
                     ),
+                    execution_steps_json=self._execution_steps_json(
+                        self._cycle.active_move
+                    ),
+                    current_step_json=self._current_step_json(
+                        self._cycle.active_move
+                    ),
                 )
                 return None
 
@@ -577,16 +683,11 @@ class RealtimeLLMAgent:
             return None
         if not objective:
             return None
-        autonomy_status = (
-            (fleet_status.get('telemetry') or {}).get('autonomy') or {}
-        )
-        if (
-            phase == 'LOADING_OUTBOUND'
-            and not autonomy_status.get('arm1_ship_cache_ready')
-        ):
+        scan_blocker = self._autonomy_scan_blocker(phase, fleet_status)
+        if scan_blocker:
             self._update_snapshot(
-                state='WAITING_FOR_ARM_CACHE',
-                last_error='ARM1 선박 마커 18~23 캐시 완료 대기 중',
+                state='WAITING_FOR_ARM_SCAN',
+                last_error=scan_blocker,
             )
             return None
 
@@ -635,12 +736,35 @@ class RealtimeLLMAgent:
                 state='WAITING_FOR_DATA', last_error=str(exc)
             )
             return None
+        compact_planning_detections = compact_detections(
+            planning_detections
+        )
+        if phase == 'UNLOADING_INBOUND':
+            visible_warehouse_zones = {
+                str(item.get('label') or '').upper()
+                for item in compact_planning_detections
+                if str(item.get('label') or '').upper() in {
+                    'A-1', 'A-2', 'A-3'
+                }
+            }
+            if not visible_warehouse_zones:
+                self._update_snapshot(
+                    state='WAITING_FOR_DATA',
+                    last_error='YOLO에서 실행 가능한 창고 구역을 찾지 못함',
+                )
+                return None
+            phase, objective = choose_policy(
+                self._cycle,
+                snapshot,
+                port_present,
+                visible_warehouse_zones=visible_warehouse_zones,
+            )
         telemetry = fleet_status.get('telemetry') or {}
         operating_context = {
             'cycle_id': self._cycle.cycle_id,
             'phase': phase,
             'port_roi': telemetry.get('port_status'),
-            'yolo': compact_detections(planning_detections),
+            'yolo': compact_planning_detections,
             'vehicles': telemetry.get('vehicles'),
             'arms': telemetry.get('arms'),
             'arm_scan': telemetry.get('autonomy'),
@@ -651,7 +775,7 @@ class RealtimeLLMAgent:
             f'{json.dumps(operating_context, ensure_ascii=False)}'
         )
         self._update_snapshot(state='EVALUATING', last_decision=llm_objective)
-        plan = self.inventory_planner.plan_snapshot(
+        plan = self.inventory_planner.plan_single_move_snapshot(
             llm_objective, inventory, list(CANONICAL_LOCATIONS)
         )
         if plan.get('status') != 'ready' or not plan.get('moves'):
@@ -660,6 +784,9 @@ class RealtimeLLMAgent:
                 state='WAITING_OPERATOR' if plan.get('status') == 'error'
                 else 'MONITORING',
                 last_decision=json.dumps(plan, ensure_ascii=False, indent=2),
+                llm_plan_json=json.dumps(
+                    plan, ensure_ascii=False, indent=2
+                ),
                 last_error=error if plan.get('status') == 'error' else '',
             )
             return plan
@@ -681,10 +808,16 @@ class RealtimeLLMAgent:
             execution['_vehicle_id'] = vehicle_id
             execution['_current_command_id'] = ''
             execution['_dispatched_at'] = 0.0
+            execution['_nav_missing_since'] = 0.0
+            execution['_step_retry_counts'] = {}
             self._cycle.active_move = execution
             self._cycle.active_mission_id = mission_id
             self._save_cycle()
-            self._dispatch_active_step(client)
+            outcome, detail = self._advance_active_move(
+                client, fleet_status, snapshot
+            )
+            if outcome == 'failed':
+                raise AutonomousPolicyError(detail)
         except (AutonomousPolicyError, CentralControlApiError,
                 VisualNavigationError, YoloDetectionError) as exc:
             self._record_autonomous_failure(str(exc))
@@ -702,20 +835,56 @@ class RealtimeLLMAgent:
                 self._cycle.active_move.get('_current_command_id', '')
             ),
             last_decision=json.dumps(plan, ensure_ascii=False, indent=2),
+            llm_plan_json=json.dumps(plan, ensure_ascii=False, indent=2),
+            execution_steps_json=self._execution_steps_json(
+                self._cycle.active_move
+            ),
+            current_step_json=self._current_step_json(
+                self._cycle.active_move
+            ),
             last_error='',
         )
         return plan
 
-    def _advance_active_move(self, client, fleet_status, snapshot):
-        move = self._cycle.active_move or {}
+    @staticmethod
+    def _execution_steps_json(move):
+        """Render the deterministic physical sequence sent after LLM choice."""
+        move = move or {}
+        return json.dumps([
+            {'sequence': index, **dict(step)}
+            for index, step in enumerate(move.get('_steps') or [], 1)
+        ], ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _current_step_json(move):
+        """Render the current deterministic execution step."""
+        move = move or {}
         steps = move.get('_steps') or []
         index = int(move.get('_step_index') or 0)
         if index >= len(steps):
-            cargo = next((
-                item for item in snapshot.get('cargos', [])
-                if str(item.get('container_id'))
-                == str(move.get('container_id'))
-            ), None)
+            return ''
+        return json.dumps({
+            'sequence': index + 1,
+            'total': len(steps),
+            **dict(steps[index]),
+        }, ensure_ascii=False, indent=2)
+
+    def _advance_active_move(self, client, fleet_status, snapshot):
+        move = self._cycle.active_move or {}
+        cargo = next((
+            item for item in snapshot.get('cargos', [])
+            if str(item.get('container_id'))
+            == str(move.get('container_id'))
+        ), None)
+        if cargo is None:
+            return (
+                'failed',
+                f'진행 중 컨테이너 {move.get("container_id")}가 '
+                '최신 DB에 없어 과거 작업을 폐기함',
+            )
+        steps = move.get('_steps') or []
+        index = int(move.get('_step_index') or 0)
+        if index >= len(steps):
             if (
                 cargo and str(cargo.get('location'))
                 == str(move.get('destination_location'))
@@ -724,6 +893,15 @@ class RealtimeLLMAgent:
             return 'failed', '물리 시퀀스 완료 후 DB 최종 위치가 일치하지 않음'
         command_id = str(move.get('_current_command_id') or '')
         if not command_id:
+            if self._navigation_step_already_reached(
+                steps[index], move, fleet_status
+            ):
+                move['_step_index'] = index + 1
+                move['_nav_missing_since'] = 0.0
+                self._save_cycle()
+                return self._advance_active_move(
+                    client, fleet_status, snapshot
+                )
             try:
                 self._validate_active_step(
                     steps[index], move, snapshot, fleet_status
@@ -738,23 +916,42 @@ class RealtimeLLMAgent:
         ) or {})
         if step['type'].startswith('arm'):
             if str(result.get('command_id')) != command_id:
-                return 'waiting', ''
-            if result.get('success') is False:
-                return 'failed', str(
-                    result.get('message') or 'ARM operation failed'
-                )
-            if result.get('success') is not True:
-                return 'waiting', ''
-            expected_location = self._arm_step_destination(step)
-            if expected_location:
-                cargo = next((
-                    item for item in snapshot.get('cargos', [])
-                    if str(item.get('container_id'))
-                    == str(move.get('container_id'))
-                ), None)
-                if (
-                    cargo is None
-                    or str(cargo.get('location')) != expected_location
+                arm = (((fleet_status.get('telemetry') or {}).get(
+                    'arms', {}
+                )).get(str(step.get('arm_id') or '')) or {})
+                if str(arm.get('current_command_id') or '') == command_id:
+                    return 'waiting', ''
+                expected_location = self._arm_step_destination(step)
+                if expected_location and str(cargo.get('location')) == (
+                    expected_location
+                ):
+                    # The physical result reached PostgreSQL before a
+                    # dashboard restart lost the transient central result.
+                    pass
+                else:
+                    age = time.time() - float(
+                        move.get('_dispatched_at') or 0.0
+                    )
+                    timeout = getattr(
+                        self, 'arm_command_orphan_timeout_sec', 120.0
+                    )
+                    if age >= timeout:
+                        return (
+                            'failed',
+                            f'중앙관제 큐와 결과에서 사라진 ARM 명령 '
+                            f'{command_id}을 {age:.0f}초 대기하여 폐기함',
+                        )
+                    return 'waiting', ''
+            else:
+                if result.get('success') is False:
+                    return 'failed', str(
+                        result.get('message') or 'ARM operation failed'
+                    )
+                if result.get('success') is not True:
+                    return 'waiting', ''
+                expected_location = self._arm_step_destination(step)
+                if expected_location and str(cargo.get('location')) != (
+                    expected_location
                 ):
                     return 'waiting', ''
         else:
@@ -765,11 +962,53 @@ class RealtimeLLMAgent:
                 return 'failed', f'{move.get("_vehicle_id")} 이동 실패'
             age = time.time() - float(move.get('_dispatched_at') or 0.0)
             if age < 0.5 or vehicle.get('state') != READY_STATE:
+                move['_nav_missing_since'] = 0.0
                 return 'waiting', ''
             locked = str(vehicle.get('locked_zone') or '').upper()
             if step['type'] == 'zone_navigation':
                 expected = 'A' if step['zone'].startswith('A-') else step['zone']
                 if locked != expected:
+                    current_vehicle_command = str(
+                        vehicle.get('current_command_id') or ''
+                    )
+                    if current_vehicle_command:
+                        move['_nav_missing_since'] = 0.0
+                        return 'waiting', ''
+                    missing_since = float(
+                        move.get('_nav_missing_since') or 0.0
+                    )
+                    now = time.time()
+                    if not missing_since:
+                        move['_nav_missing_since'] = now
+                        self._save_cycle()
+                        return 'waiting', ''
+                    if now - missing_since < getattr(
+                        self, 'nav_command_retry_grace_sec', 5.0
+                    ):
+                        return 'waiting', ''
+                    retry_counts = move.setdefault(
+                        '_step_retry_counts', {}
+                    )
+                    retry_key = str(index)
+                    retries = int(retry_counts.get(retry_key) or 0)
+                    maximum = int(getattr(
+                        self, 'nav_command_max_resends', 2
+                    ))
+                    if retries >= maximum:
+                        return (
+                            'failed',
+                            f'{move.get("_vehicle_id")}가 {step["zone"]}에 '
+                            f'도착하지 못해 이동 명령 {maximum}회 재전송 후 중단',
+                        )
+                    retry_counts[retry_key] = retries + 1
+                    move['_current_command_id'] = ''
+                    move['_dispatched_at'] = 0.0
+                    move['_nav_missing_since'] = 0.0
+                    self._save_cycle()
+                    try:
+                        self._dispatch_active_step(client)
+                    except Exception as exc:
+                        return 'failed', str(exc)
                     return 'waiting', ''
             elif step['type'] == 'park_command' and not (
                 locked.startswith('PARK') or not locked
@@ -782,17 +1021,37 @@ class RealtimeLLMAgent:
         move['_step_index'] = index + 1
         move['_current_command_id'] = ''
         move['_dispatched_at'] = 0.0
+        move['_nav_missing_since'] = 0.0
         self._save_cycle()
         if move['_step_index'] >= len(steps):
             return self._advance_active_move(client, fleet_status, snapshot)
-        try:
-            self._validate_active_step(
-                steps[move['_step_index']], move, snapshot, fleet_status
-            )
-            self._dispatch_active_step(client)
-        except Exception as exc:
-            return 'failed', str(exc)
-        return 'waiting', ''
+        return self._advance_active_move(client, fleet_status, snapshot)
+
+    @staticmethod
+    def _navigation_step_already_reached(step, move, fleet_status):
+        """Accept fresh Fleet arrival state when the zone label is occluded.
+
+        An AGV normally covers the overhead B-1/A label after arriving.  A
+        restarted or replanned mission must therefore use the completed Fleet
+        lock instead of demanding that YOLO see the covered label again.
+        READY plus no active command distinguishes a completed arrival from a
+        zone reservation that is still navigating.
+        """
+        if str(step.get('type') or '') != 'zone_navigation':
+            return False
+        vehicle_id = str(
+            step.get('vehicle_id') or move.get('_vehicle_id') or ''
+        )
+        vehicle = (((fleet_status.get('telemetry') or {}).get(
+            'vehicles', {}
+        )).get(vehicle_id) or {})
+        if str(vehicle.get('state') or '').upper() != READY_STATE:
+            return False
+        if str(vehicle.get('current_command_id') or ''):
+            return False
+        zone = str(step.get('zone') or '').upper()
+        expected = 'A' if zone.startswith('A-') else zone
+        return str(vehicle.get('locked_zone') or '').upper() == expected
 
     @staticmethod
     def _validate_active_step(step, move, snapshot, fleet_status):
@@ -873,7 +1132,11 @@ class RealtimeLLMAgent:
             'destination': move.get('destination_location'),
             'reason': str(reason),
         }, ensure_ascii=False, sort_keys=True)
-        if key == self._cycle.failure_key:
+        terminal_navigation_failure = self._terminal_navigation_failure(reason)
+        if terminal_navigation_failure:
+            self._cycle.failure_key = key
+            self._cycle.identical_failures = 3
+        elif key == self._cycle.failure_key:
             self._cycle.identical_failures += 1
         else:
             self._cycle.failure_key = key
@@ -892,6 +1155,17 @@ class RealtimeLLMAgent:
             replan_count=self._cycle.replan_count,
             last_error=str(reason),
         )
+
+    @staticmethod
+    def _terminal_navigation_failure(reason):
+        """Stop replanning after one complete two-sided physical recovery."""
+        text = str(reason or '').lower()
+        return any(marker in text for marker in (
+            'adaptive recovery failed',
+            'adaptive lidar recovery',
+            '이동 명령 0회 재전송 후 중단',
+            'vehicle did not move after 0 re-send',
+        ))
 
     @staticmethod
     def _validate_policy_move(phase, move, snapshot):
@@ -980,6 +1254,15 @@ class RealtimeLLMAgent:
         action = steps[index]
         action_type = action['type']
         vehicle_id = str(move.get('_vehicle_id') or '')
+        command_payload = {
+            'mission_id': self._cycle.active_mission_id,
+            'sequence': index + 1,
+            'total_steps': len(steps),
+            'action': dict(action),
+            'retry_attempt': int((
+                move.get('_step_retry_counts') or {}
+            ).get(str(index), 0)),
+        }
         if action_type == 'zone_navigation':
             summary = YoloDetectionClient().get_latest()
             width = int(summary.get('image_width') or 640)
@@ -991,8 +1274,17 @@ class RealtimeLLMAgent:
                 target, heading, vehicle_id=vehicle_id, mode=mode,
                 zone_visually_empty=True,
             )
+            command_payload['request'] = {
+                'vehicle_id': vehicle_id,
+                'zone': action['zone'],
+                'mode': mode,
+                'target': target,
+                'heading': heading,
+                'zone_visually_empty': True,
+            }
         elif action_type == 'park_command':
             response = client.send_park(vehicle_id=vehicle_id)
+            command_payload['request'] = {'vehicle_id': vehicle_id}
         else:
             operation = {
                 'arm1_pick_place': 'pick_place',
@@ -1011,11 +1303,34 @@ class RealtimeLLMAgent:
                 container_id=str(move.get('container_id') or ''),
                 final_for_vehicle=action.get('final_for_vehicle', False),
             )
+            command_payload['request'] = {
+                'operation': operation,
+                'arm_id': action['arm_id'],
+                'mission_id': self._cycle.active_mission_id,
+                'destination_slot': action.get('destination_slot', ''),
+                'source_id': action.get('source_id', -1),
+                'destination_id': action.get('destination_id', -1),
+                'vehicle_id': action.get('vehicle_id', ''),
+                'container_id': str(move.get('container_id') or ''),
+                'final_for_vehicle': action.get(
+                    'final_for_vehicle', False
+                ),
+            }
         move['_current_command_id'] = str(response.get('command_id') or '')
         if not move['_current_command_id']:
             raise AutonomousPolicyError('중앙관제가 command_id를 반환하지 않음')
         move['_dispatched_at'] = time.time()
+        command_payload['command_id'] = move['_current_command_id']
+        command_payload['response'] = response
         self._save_cycle()
+        self._update_snapshot(
+            active_command=move['_current_command_id'],
+            execution_steps_json=self._execution_steps_json(move),
+            current_step_json=self._current_step_json(move),
+            command_payload_json=json.dumps(
+                command_payload, ensure_ascii=False, indent=2
+            ),
+        )
         print(
             f'[자율 항만 실행] mission={self._cycle.active_mission_id}, '
             f'step={index + 1}/{len(steps)}, type={action_type}, '

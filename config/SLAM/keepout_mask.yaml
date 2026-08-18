@@ -3,8 +3,9 @@ image: keepout_mask.pgm
 # bookshelf and pillar boundaries instead of using a circular cutout. The
 # +X-facing final approach corridor is clear through PGM x=170 for y=69..78,
 # keeping the vehicle center and footprint away from the inflated mask edge.
-# Remaining boundary: (181,58)->(181,67)->(170,68)->(170,78)->(158,79)
-# ->(158,96)->(148,96).
+# Remaining boundary: (181,58)->(181,67)->(170,68)->(170,96)
+# ->(148,96). The former x=159..170, y=79..96 B-1 protrusion was cut
+# away to match the requested blue-box clearance beside the lower pillar.
 # Keep a 0.22 m radius rotation pocket around the shared A-zone center
 # (0.168, -0.038) m.
 # A-zone access corridor: centerline (0.168, -0.038) -> (0.520, 0.100) m,

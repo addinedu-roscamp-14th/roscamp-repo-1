@@ -11,6 +11,9 @@ port_event_detector:
     minimum_roi_overlap: 0.30
     history_size: 5
     required_hits: 3
+    # An occupied ROI emits another arrival event only when the number of
+    # matching cargo objects increases for this many consecutive frames.
+    cargo_addition_required_hits: 3
     departure_absence_sec: 10.0
 
 autonomy_orchestrator:

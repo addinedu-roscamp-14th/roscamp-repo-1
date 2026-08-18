@@ -44,6 +44,7 @@ class PortEventDetector(Node):
         self.declare_parameter('minimum_roi_overlap', 0.30)
         self.declare_parameter('history_size', 5)
         self.declare_parameter('required_hits', 3)
+        self.declare_parameter('cargo_addition_required_hits', 3)
         self.declare_parameter('departure_absence_sec', 10.0)
 
         self.roi = self._valid_roi(
@@ -63,11 +64,24 @@ class PortEventDetector(Node):
         self.required_hits = max(
             1, min(history_size, int(self.get_parameter('required_hits').value))
         )
+        self.cargo_addition_required_hits = max(
+            1,
+            min(
+                history_size,
+                int(
+                    self.get_parameter(
+                        'cargo_addition_required_hits'
+                    ).value
+                ),
+            ),
+        )
         self.departure_absence_sec = float(
             self.get_parameter('departure_absence_sec').value
         )
         self.history = deque(maxlen=history_size)
+        self.match_count_history = deque(maxlen=history_size)
         self.vessel_present = False
+        self.maximum_stable_match_count = 0
         self.last_positive_at = None
         self.last_confidence = 0.0
 
@@ -118,6 +132,8 @@ class PortEventDetector(Node):
             return
         self.roi = roi
         self.history.clear()
+        self.match_count_history.clear()
+        self.maximum_stable_match_count = 0
         self.get_logger().info(f'Arrival ROI updated: {self.roi}')
         self._publish_status('ROI_UPDATED')
 
@@ -142,13 +158,19 @@ class PortEventDetector(Node):
                 matched.append((confidence, label, overlap))
         positive = bool(matched)
         self.history.append(positive)
+        self.match_count_history.append(len(matched))
         if positive:
             self.last_positive_at = time.monotonic()
             self.last_confidence = max(item[0] for item in matched)
         if not self.vessel_present and sum(self.history) >= self.required_hits:
             self.vessel_present = True
+            # Use the accepted frame as the baseline. A transient earlier
+            # over-count must not suppress a real cargo addition later.
+            self.maximum_stable_match_count = max(1, len(matched))
             details = {
+                'change_type': 'VESSEL_ARRIVED',
                 'roi_normalized': self.roi,
+                'matched_object_count': len(matched),
                 'matches': [
                     {'confidence': conf, 'label': label, 'overlap': overlap}
                     for conf, label, overlap in matched
@@ -156,6 +178,41 @@ class PortEventDetector(Node):
             }
             self._publish_event(PortEvent.VESSEL_ARRIVED, details)
             self._publish_status('VESSEL_PRESENT')
+        elif self.vessel_present:
+            increased_count = self._stable_count_increase(
+                self.match_count_history,
+                self.maximum_stable_match_count,
+                self.cargo_addition_required_hits,
+            )
+            if increased_count is not None:
+                previous_count = self.maximum_stable_match_count
+                self.maximum_stable_match_count = increased_count
+                details = {
+                    'change_type': 'CARGO_ADDED',
+                    'roi_normalized': self.roi,
+                    'previous_object_count': previous_count,
+                    'matched_object_count': increased_count,
+                    'matches': [
+                        {
+                            'confidence': conf,
+                            'label': label,
+                            'overlap': overlap,
+                        }
+                        for conf, label, overlap in matched
+                    ],
+                }
+                self._publish_event(PortEvent.VESSEL_ARRIVED, details)
+                self._publish_status('CARGO_ADDED')
+
+    @staticmethod
+    def _stable_count_increase(counts, baseline, required_hits):
+        """Return a conservative new count after a stable count increase."""
+        recent = list(counts)[-required_hits:]
+        if len(recent) < required_hits:
+            return None
+        if not all(count > baseline for count in recent):
+            return None
+        return min(recent)
 
     @staticmethod
     def _image_size(payload):
@@ -188,6 +245,8 @@ class PortEventDetector(Node):
             return
         self.vessel_present = False
         self.history.clear()
+        self.match_count_history.clear()
+        self.maximum_stable_match_count = 0
         self._publish_event(
             PortEvent.VESSEL_DEPARTED, {'absent_for_sec': absent_for}
         )
@@ -220,6 +279,11 @@ class PortEventDetector(Node):
             'roi_normalized': self.roi,
             'recent_hits': int(sum(self.history)),
             'history_size': len(self.history),
+            'matched_object_count': (
+                self.match_count_history[-1]
+                if self.match_count_history else 0
+            ),
+            'maximum_stable_match_count': self.maximum_stable_match_count,
         })
         self.status_publisher.publish(message)
 

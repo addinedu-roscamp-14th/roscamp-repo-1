@@ -35,6 +35,7 @@ setup(
             'autonomy_orchestrator = central.autonomy_orchestrator:main',
             'camera_to_map_bridge = central.camera_to_map_bridge:main',
             'control_gateway = central.control_gateway:main',
+            'costmap_parameter_proxy = central.costmap_parameter_proxy:main',
             'fleet_collision_supervisor = '
             'central.fleet_collision_supervisor:main',
             'fleet_dispatcher = central.fleet_dispatcher:main',

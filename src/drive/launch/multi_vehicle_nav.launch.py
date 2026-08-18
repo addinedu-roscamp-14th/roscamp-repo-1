@@ -3,8 +3,6 @@
 from pathlib import Path
 import tempfile
 
-import yaml
-
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -17,6 +15,7 @@ from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+import yaml
 
 
 def _rewrite_frames(value, vehicle_id):
@@ -89,6 +88,41 @@ def _launch_nav2(context):
 
     other_vehicle_id = 'agv2' if vehicle_id == 'agv1' else 'agv1'
     return [
+        Node(
+            package='drive',
+            executable='costmap_scan_filter',
+            name='costmap_scan_filter',
+            namespace=vehicle_id,
+            output='screen',
+            parameters=[{
+                'input_topic': 'scan',
+                'output_topic': 'scan_costmap',
+                'other_pose_topic': (
+                    f'/{other_vehicle_id}/shared_amcl_pose'
+                ),
+            }],
+        ),
+        Node(
+            package='drive',
+            executable='adaptive_lidar_recovery',
+            name='adaptive_lidar_recovery',
+            namespace=vehicle_id,
+            output='screen',
+            parameters=[{
+                'scan_topic': 'scan',
+                'odom_topic': 'odom',
+                # Feed the same velocity-smoother input used by Nav2's
+                # controller/behavior servers. Publishing at its output would
+                # race the smoother's zero commands during recovery.
+                'cmd_vel_topic': 'cmd_vel_nav',
+                'clear_local_costmap_service': (
+                    'local_costmap/clear_entirely_local_costmap'
+                ),
+                'clear_global_costmap_service': (
+                    'global_costmap/clear_entirely_global_costmap'
+                ),
+            }],
+        ),
         Node(
             package='drive',
             executable='amcl_pose_heartbeat',

@@ -6,6 +6,7 @@ import struct
 import time
 
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from nav2_msgs.srv import ClearCostmapAroundPose
 import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
@@ -14,6 +15,10 @@ from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 from tf2_ros import Buffer, TransformException, TransformListener
+
+
+def pose_distance(first, second):
+    return math.hypot(first[0] - second[0], first[1] - second[1])
 
 
 class OtherRobotObstacle(Node):
@@ -34,6 +39,8 @@ class OtherRobotObstacle(Node):
         self.declare_parameter('publish_rate', 10.0)
         self.declare_parameter('other_robot_pose_timeout', 1.0)
         self.declare_parameter('timeout_clear_cycles', 5)
+        self.declare_parameter('clear_around_pose_radius', 0.24)
+        self.declare_parameter('clear_around_pose_min_interval', 0.25)
 
         self.other_pose_topic = str(
             self.get_parameter('other_pose_topic').value
@@ -69,6 +76,12 @@ class OtherRobotObstacle(Node):
         self.timeout_clear_cycles = int(
             self.get_parameter('timeout_clear_cycles').value
         )
+        self.clear_around_pose_radius = float(
+            self.get_parameter('clear_around_pose_radius').value
+        )
+        self.clear_around_pose_min_interval = float(
+            self.get_parameter('clear_around_pose_min_interval').value
+        )
 
         self._validate_parameters()
         if not self.other_pose_topic:
@@ -79,9 +92,12 @@ class OtherRobotObstacle(Node):
         self.obstacle_offsets = self._make_disk_offsets(
             self.obstacle_radius, self.point_spacing
         )
-        self.clearing_offsets = self._make_ring_offsets(
-            self.obstacle_radius + self.clearing_margin,
-            self.point_spacing,
+        self.clearing_offsets = (
+            list(self.obstacle_offsets)
+            + self._make_ring_offsets(
+                self.obstacle_radius + self.clearing_margin,
+                self.point_spacing,
+            )
         )
 
         self.latest_pose = None
@@ -90,6 +106,7 @@ class OtherRobotObstacle(Node):
         self.was_active = False
         self.remaining_clear_cycles = 0
         self.last_tf_warning_at = 0.0
+        self.last_service_clear_at = 0.0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -106,6 +123,16 @@ class OtherRobotObstacle(Node):
             self._on_other_pose,
             10,
         )
+        self.clear_clients = [
+            self.create_client(
+                ClearCostmapAroundPose,
+                'global_costmap/clear_around_pose_global_costmap',
+            ),
+            self.create_client(
+                ClearCostmapAroundPose,
+                'local_costmap/clear_around_pose_local_costmap',
+            ),
+        ]
         self.create_timer(1.0 / self.publish_rate, self._on_timer)
 
         self.get_logger().info(
@@ -122,6 +149,10 @@ class OtherRobotObstacle(Node):
             'point_spacing': self.point_spacing,
             'publish_rate': self.publish_rate,
             'other_robot_pose_timeout': self.pose_timeout,
+            'clear_around_pose_radius': self.clear_around_pose_radius,
+            'clear_around_pose_min_interval': (
+                self.clear_around_pose_min_interval
+            ),
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
@@ -175,8 +206,18 @@ class OtherRobotObstacle(Node):
         )
 
         if pose_is_fresh:
+            if (
+                self.last_published_pose is not None
+                and pose_distance(
+                    self.last_published_pose, self.latest_pose
+                ) >= self.point_spacing
+            ):
+                self._clear_old_pose_via_services(self.last_published_pose)
             transform = self._map_to_cloud_transform()
             if transform is None:
+                if self.last_published_pose is not None:
+                    self._clear_old_pose_via_services(
+                        self.last_published_pose)
                 return
             if self.last_published_pose is not None:
                 self.clearing_pub.publish(
@@ -199,6 +240,9 @@ class OtherRobotObstacle(Node):
             self.get_logger().warning(
                 'Other robot pose timed out; clearing virtual obstacle'
             )
+            if self.last_published_pose is not None:
+                self._clear_old_pose_via_services(
+                    self.last_published_pose, force=True)
 
         if self.remaining_clear_cycles > 0 and self.last_published_pose is not None:
             transform = self._map_to_cloud_transform()
@@ -215,6 +259,31 @@ class OtherRobotObstacle(Node):
             self.remaining_clear_cycles -= 1
             if self.remaining_clear_cycles == 0:
                 self.last_published_pose = None
+
+    def _clear_old_pose_via_services(self, pose, force=False):
+        now = time.monotonic()
+        if (
+            not force
+            and now - self.last_service_clear_at
+            < self.clear_around_pose_min_interval
+        ):
+            return False
+        request = ClearCostmapAroundPose.Request()
+        request.pose.header.frame_id = self.frame_id
+        request.pose.header.stamp = self.get_clock().now().to_msg()
+        request.pose.pose.position.x = float(pose[0])
+        request.pose.pose.position.y = float(pose[1])
+        request.pose.pose.orientation.w = 1.0
+        request.reset_distance = self.clear_around_pose_radius
+        called = False
+        for client in self.clear_clients:
+            if not client.service_is_ready():
+                continue
+            client.call_async(request)
+            called = True
+        if called:
+            self.last_service_clear_at = now
+        return called
 
     def _map_to_cloud_transform(self):
         try:

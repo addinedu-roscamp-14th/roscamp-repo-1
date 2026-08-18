@@ -21,10 +21,18 @@
           "/agv2/odom",
           "/agv2/scan",
           "/agv2/plan",
+          "/agv2/received_global_plan",
+          "/agv2/global_costmap/costmap",
+          "/agv2/global_costmap/costmap_updates",
+          "/agv2/global_costmap/published_footprint",
+          "/agv2/local_costmap/costmap",
+          "/agv2/local_costmap/costmap_updates",
+          "/agv2/local_costmap/published_footprint",
           "/agv2/joint_states",
           "/agv2/robot_description",
           "/agv2/battery/percent",
-          "/agv2/battery/voltage"
+          "/agv2/battery/voltage",
+          "/parameter_events"
         ],
         "subscribers": [
           "/agv1/shared_amcl_pose",
@@ -36,7 +44,18 @@
           "/agv2/safety_hold",
           "/agv2/emergency_stop",
           "/agv2/local_costmap/local_costmap/get_parameters",
-          "/agv2/local_costmap/local_costmap/set_parameters"
+          "/agv2/local_costmap/local_costmap/set_parameters",
+          "/agv2/local_costmap/local_costmap/describe_parameters",
+          "/agv2/local_costmap/local_costmap/get_parameter_types",
+          "/agv2/local_costmap/local_costmap/list_parameters",
+          "/agv2/local_costmap/local_costmap/set_parameters_atomically",
+          "/agv2/global_costmap/global_costmap/get_parameters",
+          "/agv2/global_costmap/global_costmap/set_parameters",
+          "/agv2/global_costmap/global_costmap/describe_parameters",
+          "/agv2/global_costmap/global_costmap/get_parameter_types",
+          "/agv2/global_costmap/global_costmap/list_parameters",
+          "/agv2/global_costmap/global_costmap/set_parameters_atomically",
+          "/agv2/local_costmap/clear_entirely_local_costmap"
         ],
         "service_clients": [],
         "action_servers": [
@@ -51,6 +70,10 @@
       "pub_max_frequencies": [
         "/tf=15",
         "/agv2/scan=5",
+        "/agv2/global_costmap/costmap=1",
+        "/agv2/global_costmap/costmap_updates=2",
+        "/agv2/local_costmap/costmap=2",
+        "/agv2/local_costmap/costmap_updates=5",
         "/agv2/odom=10",
         "/agv2/amcl_pose=10",
         "/agv2/shared_amcl_pose=10",

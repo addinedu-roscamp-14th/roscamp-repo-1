@@ -8,7 +8,8 @@
     <arg name="keepout_mask" default="$(var workspace)/config/SLAM/keepout_mask.yaml"/>
     <arg name="use_sim_time" default="False"/>
     <arg name="params_file" default="$(find-pkg-share drive)/params/nav2_params.yaml"/>
-    <arg name="default_nav_to_pose_bt_xml" default="$(find-pkg-share drive)/behavior_trees/navigate_to_pose_w_replanning_and_recovery_45deg.xml"/>
+    <arg name="default_nav_to_pose_bt_xml" default="$(find-pkg-share drive)/behavior_trees/navigate_to_pose_central_recovery.xml"/>
+    <arg name="default_nav_through_poses_bt_xml" default="$(find-pkg-share drive)/behavior_trees/navigate_through_poses_central_recovery.xml"/>
     <arg name="autostart" default="True"/>
     <arg name="start_navigation" default="True"/>
     <arg name="container_name" default="nav2_container"/>
@@ -49,6 +50,7 @@
             <arg name="params_file" value="$(var params_file)"/>
             <arg name="use_sim_time" value="$(var use_sim_time)"/>
             <arg name="default_nav_to_pose_bt_xml" value="$(var default_nav_to_pose_bt_xml)"/>
+            <arg name="default_nav_through_poses_bt_xml" value="$(var default_nav_through_poses_bt_xml)"/>
             <arg name="autostart" value="$(var autostart)"/>
             <arg name="use_composition" value="$(var use_composition)"/>
             <arg name="use_respawn" value="$(var use_respawn)"/>

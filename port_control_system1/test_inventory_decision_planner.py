@@ -153,3 +153,131 @@ def test_no_action_has_stable_public_shape():
         'moves', 'summary', 'error',
     }
     assert result['status'] == 'no_action'
+
+
+def test_single_move_planning_uses_only_first_valid_llm_choice():
+    snapshot = make_snapshot([cargo('C0', '0', 'A-1-1', 1, '11')])
+    responses = [
+        {
+            'status': 'ready',
+            'moves': [
+                move(1, '0', 'C0', 'A-1-1', 1, 'B-1'),
+                move(2, '0', 'C0', 'B-1', 1, '임시 버퍼'),
+            ],
+            'summary': '잘못된 다중 이동',
+        },
+        {
+            'status': 'ready',
+            'moves': [move(1, '0', 'C0', 'A-1-1', 1, 'B-1')],
+            'summary': '교정된 단일 이동',
+        },
+    ]
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: responses.pop(0))
+
+    result = planner.plan_single_move_snapshot(
+        'C0 한 건 이동', snapshot, LOCATIONS
+    )
+
+    assert result['status'] == 'ready'
+    assert len(result['moves']) == 1
+    assert len(responses) == 1
+
+
+def test_single_move_planning_retries_spurious_no_action():
+    snapshot = make_snapshot([cargo('C0', '0', 'A-1-1', 1, '11')])
+    responses = [
+        {'status': 'no_action', 'moves': [], 'summary': '잘못된 대기'},
+        {
+            'status': 'ready',
+            'moves': [move(1, '0', 'C0', 'A-1-1', 1, 'B-1')],
+            'summary': '재시도 성공',
+        },
+    ]
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: responses.pop(0))
+
+    result = planner.plan_single_move_snapshot(
+        'C0 한 건 이동', snapshot, LOCATIONS
+    )
+
+    assert result['status'] == 'ready'
+    assert len(result['moves']) == 1
+    assert not responses
+
+
+def test_single_move_normalizes_db_derived_mechanical_fields():
+    snapshot = make_snapshot([
+        cargo('C0', '0', 'A-1-1', 1, '11'),
+        cargo('C1', '1', 'B-1', 1, ''),
+    ])
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: {
+        'status': 'ready',
+        'moves': [
+            move(
+                7, '0', '잘못된 이름', '잘못된 출발지', 9,
+                'B-1', 9, '잘못된 기반', 'LLM이 B-1을 선택',
+            ),
+            move(8, '1', 'C1', 'B-1', 1, '임시 버퍼'),
+        ],
+        'summary': '선택 자체는 유효함',
+    })
+
+    result = planner.plan_single_move_snapshot(
+        '한 건 이동', snapshot, LOCATIONS
+    )
+
+    assert result['status'] == 'ready'
+    assert result['moves'] == [{
+        'sequence': 1,
+        'container_id': '0',
+        'container_name': 'C0',
+        'source_location': 'A-1-1',
+        'source_floor': 1,
+        'destination_location': 'B-1',
+        'destination_floor': 2,
+        'destination_base_aruco_id': '1',
+        'reason': 'LLM이 B-1을 선택',
+    }]
+
+
+def test_outbound_single_move_fills_omitted_ship_slot_from_db_capacity():
+    snapshot = make_snapshot([
+        cargo('C6', '6', 'A-1-1', 3, '1'),
+        cargo('C0', '0', '선박-1', 1, '18'),
+    ])
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: {
+        'status': 'ready',
+        'moves': [
+            move(1, '6', 'C6', 'A-1-1', 3, '', reason='선박 출항'),
+        ],
+        'summary': '목적 슬롯을 누락한 LLM 응답',
+    })
+
+    result = planner.plan_single_move_snapshot(
+        '선박 목적지 후보 중 하나로 이동하라. phase=LOADING_OUTBOUND',
+        snapshot,
+        ['A-1-1', '선박-1', '선박-2'],
+    )
+
+    assert result['status'] == 'ready'
+    assert result['moves'][0]['destination_location'] == '선박-2'
+    assert result['moves'][0]['destination_floor'] == 1
+
+
+def test_outbound_single_move_preserves_exact_llm_ship_slot_choice():
+    snapshot = make_snapshot([cargo('C6', '6', 'A-1-1', 3, '1')])
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: {
+        'status': 'ready',
+        'moves': [
+            move(1, '6', 'C6', 'A-1-1', 3, '선박-6', reason='LLM 선택'),
+        ],
+        'summary': '정확한 목적 슬롯',
+    })
+
+    result = planner.plan_single_move_snapshot(
+        '선박 목적지 후보 중 하나로 이동하라. phase=LOADING_OUTBOUND',
+        snapshot,
+        ['A-1-1', '선박-1', '선박-6'],
+    )
+
+    assert result['status'] == 'ready'
+    assert result['moves'][0]['destination_location'] == '선박-6'

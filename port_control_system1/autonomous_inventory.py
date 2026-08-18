@@ -68,7 +68,7 @@ class AutonomousCycle:
 
 
 class CycleStore:
-    """Persist cycle identity so outbound cargo is not reclassified on restart."""
+    """Persist current-cycle diagnostics while the dashboard is running."""
 
     def __init__(self, path=None):
         self.path = os.path.abspath(os.path.expanduser(path or os.environ.get(
@@ -120,6 +120,23 @@ def top_cargos(snapshot, location):
         if str(cargo.get('location')) == location
     ]
     return sorted(values, key=lambda item: int(item.get('floor', 1)))
+
+
+def destination_candidates(snapshot, locations, capacity=3):
+    """Describe exact safe next-floor metadata for candidate destinations."""
+    candidates = []
+    for location in locations:
+        stack = top_cargos(snapshot, location)
+        if len(stack) >= capacity:
+            continue
+        candidates.append({
+            'location': location,
+            'destination_floor': len(stack) + 1,
+            'destination_base_aruco_id': (
+                '' if not stack else str(stack[-1].get('container_id') or '')
+            ),
+        })
+    return candidates
 
 
 def validate_first_move(move, snapshot):
@@ -219,7 +236,9 @@ def compile_move(move, vehicle_id):
     )
 
 
-def choose_policy(cycle, snapshot, port_present):
+def choose_policy(
+    cycle, snapshot, port_present, visible_warehouse_zones=None
+):
     """Return the fixed phase and LLM objective for the next policy action."""
     cargos = cargo_rows(snapshot)
     ship = [cargo for cargo in cargos if cargo.get('location') in SHIP_LOCATIONS]
@@ -246,10 +265,23 @@ def choose_policy(cycle, snapshot, port_present):
                 cycle.inbound_ids.append(value)
         cycle.phase = 'UNLOADING_INBOUND'
         ids = ', '.join(cycle.inbound_ids)
+        warehouse_locations = WAREHOUSE_LOCATIONS
+        if visible_warehouse_zones is not None:
+            visible = {
+                str(zone).upper() for zone in visible_warehouse_zones
+            }
+            warehouse_locations = tuple(
+                location for location in warehouse_locations
+                if location[:3].upper() in visible
+            )
+        destinations = destination_candidates(snapshot, warehouse_locations)
         return cycle.phase, (
             f'이번 회차 입항 컨테이너 [{ids}] 중 선박에 남은 화물을 '
-            '빈 공간과 적층 순서를 고려해 A-1-1부터 A-3-2 중 하나로 '
-            '이동하라. 선박 외 컨테이너는 이동하지 마라.'
+            '최상단에서 하나만 선택하여 아래 목적지 후보 중 하나로 이동하라. '
+            'moves 배열에는 이동 1건만 반환하고 선박 외 컨테이너는 이동하지 '
+            '마라. 선택한 후보의 destination_floor와 '
+            'destination_base_aruco_id를 그대로 사용하라. 목적지 후보 JSON: '
+            f'{json.dumps(destinations, ensure_ascii=False)}'
         )
     third_floor = [
         cargo for cargo in cargos
@@ -259,9 +291,20 @@ def choose_policy(cycle, snapshot, port_present):
     if third_floor:
         cycle.phase = 'LOADING_OUTBOUND'
         ids = ', '.join(str(cargo.get('container_id')) for cargo in third_floor)
+        destinations = destination_candidates(snapshot, SHIP_LOCATIONS)
+        ship_marker_mapping = {
+            location: int(marker_id)
+            for location, marker_id in SHIP_MARKERS.items()
+        }
         return cycle.phase, (
-            f'창고 3층 최상단 컨테이너 [{ids}] 중 하나만 빈 선박 슬롯 '
-            '선박-1부터 선박-6으로 이동하라. 목적 슬롯은 최대 3층이다.'
+            f'창고 3층 최상단 컨테이너 [{ids}] 중 하나만 아래 선박 목적지 '
+            '후보 중 하나로 이동하라. moves 배열에는 이동 1건만 반환하고 '
+            '선택한 후보의 destination_floor와 destination_base_aruco_id를 '
+            '그대로 사용하라. destination_location에는 반드시 선박-1부터 '
+            '선박-6 중 하나를 정확히 넣어라. 목적지 후보 JSON: '
+            f'{json.dumps(destinations, ensure_ascii=False)}. '
+            'ARM1 선박 목적지 ArUco 매핑 JSON: '
+            f'{json.dumps(ship_marker_mapping, ensure_ascii=False)}'
         )
     if outbound and ship_ids & outbound:
         cycle.phase = 'WAITING_FOR_CLEAR'

@@ -20,6 +20,7 @@ from nav2_msgs.action import (
     NavigateToPose,
     Spin,
 )
+from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import Odometry
 from porter_interfaces.action import DispatchNavigation
 from porter_interfaces.msg import VehicleState
@@ -37,6 +38,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from rclpy.task import Future
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32, String
 from std_srvs.srv import SetBool, Trigger
 from visualization_msgs.msg import Marker, MarkerArray
@@ -72,10 +74,164 @@ class VehicleRuntime:
     park_exit_origin_xy: tuple[float, float] | None = None
 
 
+class _ParkingRecoveryGoalHandle:
+    """Minimal non-cancelable handle for topic-triggered parking recovery."""
+
+    is_cancel_requested = False
+
+
 STALL_MOVING = 'moving'
 STALL_HELD = 'held'
 STALL_RESEND = 'resend'
 STALL_EXHAUSTED = 'exhausted'
+
+
+def _normalize_radians(angle):
+    """Wrap an angle to [-pi, pi) for LaserScan sector matching."""
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def laser_sector_clearance(
+    ranges,
+    angle_min,
+    angle_increment,
+    range_min,
+    range_max,
+    center_rad,
+    width_rad,
+    percentile=0.2,
+):
+    """Return a robust low-percentile clearance inside one scan sector.
+
+    A single maximum range is easily produced by a gap between two obstacles.
+    The low percentile represents a continuous vehicle-width opening while
+    still ignoring one or two noisy short returns.
+    """
+    values = []
+    half_width = abs(float(width_rad)) * 0.5
+    usable_max = float(range_max) if math.isfinite(range_max) else 10.0
+    for index, raw_range in enumerate(ranges):
+        angle = float(angle_min) + index * float(angle_increment)
+        if abs(_normalize_radians(angle - center_rad)) > half_width:
+            continue
+        value = float(raw_range)
+        if math.isnan(value) or value < float(range_min):
+            continue
+        if math.isinf(value):
+            value = usable_max
+        values.append(min(value, usable_max))
+    if not values:
+        return 0.0
+    values.sort()
+    quantile = min(1.0, max(0.0, float(percentile)))
+    index = int(round(quantile * (len(values) - 1)))
+    return values[index]
+
+
+def choose_lidar_escape_turn(
+    ranges,
+    angle_min,
+    angle_increment,
+    range_min,
+    range_max,
+):
+    """Choose the turn whose swept front/rear corners have more clearance.
+
+    Positive is a left (counter-clockwise) turn and negative is right.  A
+    left turn sweeps the front-left and rear-right corners; a right turn
+    sweeps the opposite pair.  Scoring both corners is safer than selecting
+    the single longest LiDAR ray.
+    """
+    sector_width = math.radians(50.0)
+
+    def clearance(center):
+        return laser_sector_clearance(
+            ranges,
+            angle_min,
+            angle_increment,
+            range_min,
+            range_max,
+            center,
+            sector_width,
+        )
+
+    front_left = clearance(math.radians(45.0))
+    rear_left = clearance(math.radians(135.0))
+    front_right = clearance(math.radians(-45.0))
+    rear_right = clearance(math.radians(-135.0))
+    left_score = min(front_left, rear_right)
+    right_score = min(front_right, rear_left)
+    direction = 1.0 if left_score >= right_score else -1.0
+    return direction, left_score, right_score
+
+
+def lidar_free_space_center(
+    ranges,
+    angle_min,
+    angle_increment,
+    range_min,
+    range_max,
+    side,
+    minimum_clearance_m,
+    minimum_gap_width_rad=math.radians(15.0),
+    maximum_turn_rad=math.radians(90.0),
+    bin_width_rad=math.radians(5.0),
+):
+    """Return the center angle of the widest continuous free-space gap.
+
+    ``side`` is positive for the left half and negative for the right half.
+    The scan is reduced to robust five-degree bins so one noisy ray does not
+    split an otherwise usable opening. The returned heading points halfway
+    between the two angular edges of that opening.
+    """
+    direction = 1.0 if float(side) >= 0.0 else -1.0
+    bin_width = max(math.radians(1.0), abs(float(bin_width_rad)))
+    maximum = min(math.pi, max(bin_width, abs(float(maximum_turn_rad))))
+    minimum_width = max(bin_width, abs(float(minimum_gap_width_rad)))
+    centers = []
+    center = bin_width * 0.5
+    while center <= maximum + 1e-9:
+        signed_center = direction * center
+        clearance = laser_sector_clearance(
+            ranges,
+            angle_min,
+            angle_increment,
+            range_min,
+            range_max,
+            signed_center,
+            bin_width,
+        )
+        centers.append((signed_center, clearance))
+        center += bin_width
+
+    runs = []
+    current = []
+    for signed_center, clearance in centers:
+        if clearance >= float(minimum_clearance_m):
+            current.append((signed_center, clearance))
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    usable = [run for run in runs if len(run) * bin_width >= minimum_width]
+    if not usable:
+        return None
+    best = max(
+        usable,
+        key=lambda run: (
+            len(run),
+            min(value[1] for value in run),
+        ),
+    )
+    lower = min(abs(value[0]) for value in best) - bin_width * 0.5
+    upper = max(abs(value[0]) for value in best) + bin_width * 0.5
+    gap_center = direction * ((max(0.0, lower) + upper) * 0.5)
+    return (
+        gap_center,
+        upper - max(0.0, lower),
+        min(value[1] for value in best),
+    )
 
 
 def classify_motion_stall(
@@ -119,15 +275,19 @@ class FleetDispatcher(Node):
         self.declare_parameter('state_publish_rate_hz', 2.0)
         # A goal Nav2 accepted can still leave the vehicle standing still.
         # Watch odometry and fail safely instead of waiting out the action's
-        # full timeout. Automatic re-send is opt-in: some Nav2 Jazzy versions
-        # abort bt_navigator if a replacement arrives while cancellation is
-        # still being finalized, especially through a remote action bridge.
+        # full timeout. Cancellation is confirmed complete before a new goal
+        # is sent, avoiding the Nav2 replacement-goal race.
         self.declare_parameter('motion_threshold_mps', 0.015)
         self.declare_parameter('motion_yaw_threshold_rps', 0.05)
         self.declare_parameter('motion_stall_timeout_sec', 20.0)
+        # Do not restart an unchanged Nav2 goal before adaptive recovery.
+        # Re-sending makes the controller push forward again and produces an
+        # oscillating forward/backward loop with the central reverse escape.
         self.declare_parameter('max_motion_resends', 0)
         self.declare_parameter('cancel_settle_timeout_sec', 10.0)
-        self.declare_parameter('max_park_retries', 2)
+        # Nav2 owns physical recovery locally. Repeating the entire parking
+        # action here would repeat its reverse/turn cycle and cause jitter.
+        self.declare_parameter('max_park_retries', 0)
         self.declare_parameter('park_retry_backoff_sec', 2.0)
         self.declare_parameter(
             'exclusive_zone_ids', ['B-1', 'A', 'PARK1', 'PARK2']
@@ -138,6 +298,16 @@ class FleetDispatcher(Node):
         self.declare_parameter('b1_exit_forward_distance_m', 0.30)
         self.declare_parameter('b1_exit_forward_speed_mps', 0.05)
         self.declare_parameter('b1_exit_behavior_timeout_sec', 20.0)
+        # Nav2 Spin can reject the turn at the tight B-1 boundary.  Rotate via
+        # the safety-gated manual velocity input and close the loop with AMCL;
+        # translation is forbidden until the measured heading reaches target.
+        self.declare_parameter('b1_exit_manual_turn', True)
+        self.declare_parameter('b1_exit_turn_speed_rps', 0.25)
+        # The B-1 stopping pose is close enough to the table/ship boundary that
+        # DriveOnHeading can report COLLISION_AHEAD before the vehicle moves.
+        # Use the same low-speed, safety-gated crawl as the parking exit for
+        # this short leg.  Emergency and fleet collision holds still stop it.
+        self.declare_parameter('b1_exit_open_loop', True)
         self.declare_parameter('b1_exit_detection_radius_m', 0.35)
         # Spin overshoots the commanded angle, so feeding the measured error
         # straight back oscillated (+21, -11, +9 deg) and ran out of
@@ -193,6 +363,30 @@ class FleetDispatcher(Node):
         self.declare_parameter('sequence_dependency_timeout_sec', 660.0)
         self.declare_parameter('cargo_hold_timeout_sec', 300.0)
         self.declare_parameter('subscribe_odom_fallback', False)
+        # After Nav2 has exhausted its fixed recoveries, back away
+        # a short distance and use the latest LiDAR geometry to choose the
+        # roomier turn direction before retrying the same goal once. ``all``
+        # applies the same recovery policy to both fleet vehicles.
+        self.declare_parameter('adaptive_recovery_vehicle_id', 'all')
+        # Retained as an opt-in compatibility fallback. Normal navigation,
+        # parking and RViz goals recover inside each vehicle's Nav2 tree.
+        self.declare_parameter('adaptive_recovery_enabled', False)
+        self.declare_parameter('adaptive_recovery_max_attempts', 2)
+        self.declare_parameter('adaptive_recovery_scan_max_age_sec', 1.0)
+        self.declare_parameter('adaptive_recovery_reverse_distance_m', 0.05)
+        self.declare_parameter('adaptive_recovery_reverse_speed_mps', 0.04)
+        self.declare_parameter('adaptive_recovery_reverse_clearance_m', 0.05)
+        self.declare_parameter(
+            'adaptive_recovery_reverse_stop_clearance_m', 0.01
+        )
+        self.declare_parameter('adaptive_recovery_turn_angle_deg', 90.0)
+        self.declare_parameter('adaptive_recovery_min_gap_width_deg', 15.0)
+        self.declare_parameter('adaptive_recovery_gap_bin_width_deg', 5.0)
+        self.declare_parameter('adaptive_recovery_turn_speed_rps', 0.22)
+        self.declare_parameter('adaptive_recovery_turn_tolerance_deg', 4.0)
+        self.declare_parameter('adaptive_recovery_turn_clearance_m', 0.18)
+        self.declare_parameter('adaptive_recovery_command_rate_hz', 20.0)
+        self.declare_parameter('adaptive_recovery_timeout_sec', 12.0)
 
         vehicle_ids = [
             str(value).strip('/')
@@ -276,6 +470,17 @@ class FleetDispatcher(Node):
         )
         if self.b1_exit_behavior_timeout_sec <= 0.0:
             raise ValueError('b1_exit_behavior_timeout_sec must be positive')
+        self.b1_exit_manual_turn = bool(
+            self.get_parameter('b1_exit_manual_turn').value
+        )
+        self.b1_exit_turn_speed_rps = float(
+            self.get_parameter('b1_exit_turn_speed_rps').value
+        )
+        if self.b1_exit_turn_speed_rps <= 0.0:
+            raise ValueError('b1_exit_turn_speed_rps must be positive')
+        self.b1_exit_open_loop = bool(
+            self.get_parameter('b1_exit_open_loop').value
+        )
         self.b1_exit_detection_radius_m = float(
             self.get_parameter('b1_exit_detection_radius_m').value
         )
@@ -430,6 +635,89 @@ class FleetDispatcher(Node):
         self.subscribe_odom_fallback = bool(
             self.get_parameter('subscribe_odom_fallback').value
         )
+        self.adaptive_recovery_vehicle_id = str(
+            self.get_parameter('adaptive_recovery_vehicle_id').value
+        ).strip('/')
+        self.adaptive_recovery_enabled = bool(
+            self.get_parameter('adaptive_recovery_enabled').value
+        )
+        self.adaptive_recovery_max_attempts = int(
+            self.get_parameter('adaptive_recovery_max_attempts').value
+        )
+        self.adaptive_recovery_scan_max_age_sec = float(
+            self.get_parameter('adaptive_recovery_scan_max_age_sec').value
+        )
+        self.adaptive_recovery_reverse_distance_m = float(
+            self.get_parameter('adaptive_recovery_reverse_distance_m').value
+        )
+        self.adaptive_recovery_reverse_speed_mps = float(
+            self.get_parameter('adaptive_recovery_reverse_speed_mps').value
+        )
+        self.adaptive_recovery_reverse_clearance_m = float(
+            self.get_parameter('adaptive_recovery_reverse_clearance_m').value
+        )
+        self.adaptive_recovery_reverse_stop_clearance_m = float(
+            self.get_parameter(
+                'adaptive_recovery_reverse_stop_clearance_m'
+            ).value
+        )
+        self.adaptive_recovery_turn_angle_rad = math.radians(float(
+            self.get_parameter('adaptive_recovery_turn_angle_deg').value
+        ))
+        self.adaptive_recovery_min_gap_width_rad = math.radians(float(
+            self.get_parameter('adaptive_recovery_min_gap_width_deg').value
+        ))
+        self.adaptive_recovery_gap_bin_width_rad = math.radians(float(
+            self.get_parameter('adaptive_recovery_gap_bin_width_deg').value
+        ))
+        self.adaptive_recovery_turn_speed_rps = float(
+            self.get_parameter('adaptive_recovery_turn_speed_rps').value
+        )
+        self.adaptive_recovery_turn_tolerance_rad = math.radians(float(
+            self.get_parameter('adaptive_recovery_turn_tolerance_deg').value
+        ))
+        self.adaptive_recovery_turn_clearance_m = float(
+            self.get_parameter('adaptive_recovery_turn_clearance_m').value
+        )
+        self.adaptive_recovery_command_rate_hz = float(
+            self.get_parameter('adaptive_recovery_command_rate_hz').value
+        )
+        self.adaptive_recovery_timeout_sec = float(
+            self.get_parameter('adaptive_recovery_timeout_sec').value
+        )
+        if self.adaptive_recovery_vehicle_id not in (*vehicle_ids, 'all'):
+            raise ValueError(
+                'adaptive_recovery_vehicle_id must be agv1, agv2, or all'
+            )
+        positive_recovery_values = {
+            'adaptive_recovery_scan_max_age_sec': self.adaptive_recovery_scan_max_age_sec,
+            'adaptive_recovery_reverse_distance_m': self.adaptive_recovery_reverse_distance_m,
+            'adaptive_recovery_reverse_speed_mps': self.adaptive_recovery_reverse_speed_mps,
+            'adaptive_recovery_reverse_clearance_m': self.adaptive_recovery_reverse_clearance_m,
+            'adaptive_recovery_reverse_stop_clearance_m': (
+                self.adaptive_recovery_reverse_stop_clearance_m
+            ),
+            'adaptive_recovery_turn_angle_deg': self.adaptive_recovery_turn_angle_rad,
+            'adaptive_recovery_min_gap_width_deg': self.adaptive_recovery_min_gap_width_rad,
+            'adaptive_recovery_gap_bin_width_deg': self.adaptive_recovery_gap_bin_width_rad,
+            'adaptive_recovery_turn_speed_rps': self.adaptive_recovery_turn_speed_rps,
+            'adaptive_recovery_turn_tolerance_deg': self.adaptive_recovery_turn_tolerance_rad,
+            'adaptive_recovery_turn_clearance_m': self.adaptive_recovery_turn_clearance_m,
+            'adaptive_recovery_command_rate_hz': self.adaptive_recovery_command_rate_hz,
+            'adaptive_recovery_timeout_sec': self.adaptive_recovery_timeout_sec,
+        }
+        if any(value <= 0.0 for value in positive_recovery_values.values()):
+            raise ValueError('adaptive recovery numeric parameters must be positive')
+        if (
+            self.adaptive_recovery_reverse_stop_clearance_m
+            >= self.adaptive_recovery_reverse_clearance_m
+        ):
+            raise ValueError(
+                'adaptive_recovery_reverse_stop_clearance_m must be smaller '
+                'than adaptive_recovery_reverse_clearance_m'
+            )
+        if self.adaptive_recovery_max_attempts < 0:
+            raise ValueError('adaptive_recovery_max_attempts must be non-negative')
         self.callback_group = ReentrantCallbackGroup()
         self._lock = threading.RLock()
         # Vehicles the arm dispatcher still owes a cargo operation. Refreshed
@@ -479,6 +767,9 @@ class FleetDispatcher(Node):
             vehicle_id: VehicleRuntime(vehicle_id)
             for vehicle_id in vehicle_ids
         }
+        self.latest_scans = {vehicle_id: None for vehicle_id in vehicle_ids}
+        self.latest_scan_times = {vehicle_id: None for vehicle_id in vehicle_ids}
+        self._adaptive_recovery_states = {}
         self.nav_pose_clients = {}
         self.nav_waypoint_clients = {}
         self.spin_clients = {}
@@ -488,6 +779,7 @@ class FleetDispatcher(Node):
         self.state_publishers = {}
         self.local_costmap_set_param_clients = {}
         self.local_costmap_get_param_clients = {}
+        self.local_costmap_clear_clients = {}
         self.park_exit_cmd_publishers = {}
         for vehicle_id in vehicle_ids:
             # cmd_vel_safety_gate feeds this into the vehicle's cmd_vel, so the
@@ -509,6 +801,11 @@ class FleetDispatcher(Node):
                     f'{costmap_node}/get_parameters',
                     callback_group=self.callback_group,
                 )
+            )
+            self.local_costmap_clear_clients[vehicle_id] = self.create_client(
+                ClearEntireCostmap,
+                f'/{vehicle_id}/local_costmap/clear_entirely_local_costmap',
+                callback_group=self.callback_group,
             )
             self.nav_pose_clients[vehicle_id] = ActionClient(
                 self,
@@ -652,12 +949,18 @@ class FleetDispatcher(Node):
             f'{self.park_zone_map_xy[vehicle_id][1]:.3f})'
             for vehicle_id in ('agv1', 'agv2')
         )
+        adaptive_summary = (
+            self.adaptive_recovery_vehicle_id
+            if self.adaptive_recovery_enabled
+            else 'disabled'
+        )
         self.get_logger().info(
             'Fleet dispatcher ready: vehicles=agv1,agv2, B-1 lock enabled; '
             f'B-1 reference=({self.b1_zone_map_x:.3f}, '
             f'{self.b1_zone_map_y:.3f}); park spots: {park_summary}; '
             f'idle auto-parking='
-            f'{self.auto_park_idle_sec if self.auto_park_idle_sec > 0.0 else "disabled"}'
+            f'{self.auto_park_idle_sec if self.auto_park_idle_sec > 0.0 else "disabled"}; '
+            f'adaptive LiDAR recovery={adaptive_summary}'
         )
 
     def _create_vehicle_subscriptions(self, vehicle_id):
@@ -682,6 +985,13 @@ class FleetDispatcher(Node):
             Odometry,
             f'/{vehicle_id}/odom',
             lambda message, vid=vehicle_id: self._on_odom(vid, message),
+            telemetry_qos,
+            callback_group=self.callback_group,
+        )
+        self.create_subscription(
+            LaserScan,
+            f'/{vehicle_id}/scan',
+            lambda message, vid=vehicle_id: self._on_scan(vid, message),
             telemetry_qos,
             callback_group=self.callback_group,
         )
@@ -737,6 +1047,11 @@ class FleetDispatcher(Node):
             runtime.pose.header = message.header
             runtime.pose.pose = message.pose.pose
             runtime.pose_received_at = time.monotonic()
+
+    def _on_scan(self, vehicle_id, message):
+        with self._lock:
+            self.latest_scans[vehicle_id] = message
+            self.latest_scan_times[vehicle_id] = time.monotonic()
 
     def _on_collision_status(self, message):
         try:
@@ -1763,33 +2078,89 @@ class FleetDispatcher(Node):
                 return result
             with self._lock:
                 runtime.active_nav_goal = nav_handle
-            nav_result, nav_handle, stall_message = (
-                await self._await_nav_result_watching_motion(
-                    vehicle_id,
-                    nav_handle,
-                    send_nav_goal,
+            adaptive_attempts = 0
+            while True:
+                nav_result, nav_handle, stall_message = (
+                    await self._await_nav_result_watching_motion(
+                        vehicle_id,
+                        nav_handle,
+                        send_nav_goal,
+                    )
                 )
-            )
-            if stall_message:
-                goal_handle.abort()
-                result.error_code = self.ERROR_NAV_FAILED
-                result.message = stall_message
-                return result
-            if goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-                result.error_code = self.ERROR_CANCELED
-                result.message = 'navigation canceled'
-                return result
-            if self._command_preempted(command_id):
-                goal_handle.abort()
-                result.error_code = self.ERROR_CANCELED
-                result.message = 'superseded by a newer vehicle command'
-                return result
-            if nav_result.status != GoalStatus.STATUS_SUCCEEDED:
-                goal_handle.abort()
-                result.error_code = self.ERROR_NAV_FAILED
-                result.message = f'Nav2 finished with status {nav_result.status}'
-                return result
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    result.error_code = self.ERROR_CANCELED
+                    result.message = 'navigation canceled'
+                    return result
+                if self._command_preempted(command_id):
+                    goal_handle.abort()
+                    result.error_code = self.ERROR_CANCELED
+                    result.message = 'superseded by a newer vehicle command'
+                    return result
+
+                nav_succeeded = (
+                    not stall_message
+                    and nav_result is not None
+                    and nav_result.status == GoalStatus.STATUS_SUCCEEDED
+                )
+                if nav_succeeded:
+                    break
+
+                failure_detail = stall_message or (
+                    'Nav2 returned no result'
+                    if nav_result is None
+                    else f'Nav2 finished with status {nav_result.status}'
+                )
+                can_adapt = (
+                    self.adaptive_recovery_enabled
+                    and self._adaptive_recovery_applies(vehicle_id)
+                    and adaptive_attempts < self.adaptive_recovery_max_attempts
+                )
+                if not can_adapt:
+                    goal_handle.abort()
+                    result.error_code = self.ERROR_NAV_FAILED
+                    result.message = failure_detail
+                    return result
+
+                adaptive_attempts += 1
+                self._publish_dispatch_feedback(
+                    goal_handle,
+                    vehicle_id,
+                    'ADAPTIVE_LIDAR_RECOVERY',
+                    0,
+                )
+                recovered, recovery_message = (
+                    await self._run_adaptive_lidar_recovery(
+                        goal_handle,
+                        vehicle_id,
+                        command_id,
+                    )
+                )
+                if not recovered:
+                    goal_handle.abort()
+                    result.error_code = self.ERROR_NAV_FAILED
+                    result.message = (
+                        f'{failure_detail}; adaptive recovery failed: '
+                        f'{recovery_message}'
+                    )
+                    return result
+
+                self.get_logger().warning(
+                    f'{vehicle_id} adaptive LiDAR recovery completed; '
+                    f'retrying the original goal '
+                    f'({adaptive_attempts}/'
+                    f'{self.adaptive_recovery_max_attempts})'
+                )
+                nav_handle = await send_nav_goal()
+                if nav_handle is None or not nav_handle.accepted:
+                    goal_handle.abort()
+                    result.error_code = self.ERROR_NAV_REJECTED
+                    result.message = (
+                        'vehicle Nav2 rejected the goal after adaptive recovery'
+                    )
+                    return result
+                with self._lock:
+                    runtime.active_nav_goal = nav_handle
             if request.zone_id in self.exclusive_zone_ids:
                 with self._zone_condition:
                     if self._zone_owner[request.zone_id] == vehicle_id:
@@ -1808,6 +2179,7 @@ class FleetDispatcher(Node):
             # Backstop for the periodic clearance check: whatever ended this
             # command - success, abort, cancel or exception - the vehicle must
             # not be left driving with a shrunken obstacle buffer.
+            self._adaptive_recovery_states.pop(command_id, None)
             await self._restore_park_exit_inflation(vehicle_id, runtime)
             if queued_zone_id:
                 self._discard_zone_request(command_id, queued_zone_id)
@@ -1824,6 +2196,300 @@ class FleetDispatcher(Node):
             if acquired_target_zone and not navigation_succeeded:
                 self._release_zone(vehicle_id, request.zone_id)
             self._record_command_outcome(command_id, navigation_succeeded)
+
+    def _fresh_scan(self, vehicle_id):
+        with self._lock:
+            scan = self.latest_scans.get(vehicle_id)
+            received_at = self.latest_scan_times.get(vehicle_id)
+        if scan is None or received_at is None:
+            return None
+        if time.monotonic() - received_at > (
+            self.adaptive_recovery_scan_max_age_sec
+        ):
+            return None
+        return scan
+
+    def _adaptive_recovery_applies(self, vehicle_id):
+        """Return whether adaptive recovery covers the requested vehicle."""
+        return self.adaptive_recovery_vehicle_id in ('all', vehicle_id)
+
+    def _scan_clearance(self, scan, center_rad, width_deg=50.0):
+        return laser_sector_clearance(
+            scan.ranges,
+            scan.angle_min,
+            scan.angle_increment,
+            scan.range_min,
+            scan.range_max,
+            center_rad,
+            math.radians(width_deg),
+        )
+
+    def _adaptive_turn_choice(self, scan):
+        return choose_lidar_escape_turn(
+            scan.ranges,
+            scan.angle_min,
+            scan.angle_increment,
+            scan.range_min,
+            scan.range_max,
+        )
+
+    def _adaptive_gap_candidates(self, scan):
+        """Return left/right gap centers measured in the vehicle frame."""
+        arguments = (
+            scan.ranges,
+            scan.angle_min,
+            scan.angle_increment,
+            scan.range_min,
+            scan.range_max,
+        )
+        options = {
+            'minimum_clearance_m': self.adaptive_recovery_turn_clearance_m,
+            'minimum_gap_width_rad': self.adaptive_recovery_min_gap_width_rad,
+            'maximum_turn_rad': self.adaptive_recovery_turn_angle_rad,
+            'bin_width_rad': self.adaptive_recovery_gap_bin_width_rad,
+        }
+        return (
+            lidar_free_space_center(*arguments, side=1.0, **options),
+            lidar_free_space_center(*arguments, side=-1.0, **options),
+        )
+
+    async def _run_adaptive_lidar_recovery(
+        self,
+        goal_handle,
+        vehicle_id,
+        command_id,
+    ):
+        """Try the preferred 45-degree escape, then its opposite.
+
+        This low-speed fallback runs only after Nav2 has stopped and exhausted
+        its own collision-checked recoveries. Commands still pass through the
+        vehicle's emergency/collision safety gate. Every motion increment is
+        guarded by a fresh scan; stale or blocked LiDAR stops the maneuver.
+        """
+        if not self._adaptive_recovery_applies(vehicle_id):
+            return False, f'adaptive recovery is not enabled for {vehicle_id}'
+        if self._vehicle_is_deliberately_stopped(vehicle_id):
+            return False, 'vehicle is held by a safety supervisor'
+
+        scan = self._fresh_scan(vehicle_id)
+        if scan is None:
+            return False, 'no fresh LiDAR scan'
+
+        publisher = self.park_exit_cmd_publishers[vehicle_id]
+        period = 1.0 / self.adaptive_recovery_command_rate_hz
+        deadline = time.monotonic() + self.adaptive_recovery_timeout_sec
+        state = self._adaptive_recovery_states.get(command_id)
+        first_candidate = state is None
+
+        if first_candidate:
+            reverse_duration = (
+                self.adaptive_recovery_reverse_distance_m
+                / self.adaptive_recovery_reverse_speed_mps
+            )
+            reverse_deadline = min(
+                deadline, time.monotonic() + reverse_duration
+            )
+            command = Twist()
+            command.linear.x = -self.adaptive_recovery_reverse_speed_mps
+            rear_clearance = self._scan_clearance(scan, math.pi)
+            if rear_clearance < self.adaptive_recovery_reverse_clearance_m:
+                return (
+                    False,
+                    'rear LiDAR clearance is too small: '
+                    f'{rear_clearance:.3f}m < '
+                    f'{self.adaptive_recovery_reverse_clearance_m:.3f}m',
+                )
+            self.get_logger().warning(
+                f'{vehicle_id} adaptive recovery: backing '
+                f'{self.adaptive_recovery_reverse_distance_m:.2f}m at '
+                f'{self.adaptive_recovery_reverse_speed_mps:.2f}m/s; '
+                f'rear clearance={rear_clearance:.3f}m'
+            )
+            try:
+                while time.monotonic() < reverse_deadline:
+                    if goal_handle.is_cancel_requested:
+                        return False, 'canceled during adaptive reverse'
+                    if self._command_preempted(command_id):
+                        return False, 'superseded during adaptive reverse'
+                    if self._vehicle_is_deliberately_stopped(vehicle_id):
+                        return (
+                            False,
+                            'safety hold engaged during adaptive reverse',
+                        )
+                    scan = self._fresh_scan(vehicle_id)
+                    if scan is None:
+                        return False, 'LiDAR became stale during adaptive reverse'
+                    rear_clearance = self._scan_clearance(scan, math.pi)
+                    if rear_clearance <= (
+                        self.adaptive_recovery_reverse_stop_clearance_m
+                    ):
+                        self.get_logger().warning(
+                            f'{vehicle_id} adaptive recovery: rear clearance '
+                            f'reached stop margin {rear_clearance:.3f}m; '
+                            'continuing with LiDAR turn selection'
+                        )
+                        break
+                    publisher.publish(command)
+                    await self._sleep_async(period)
+            finally:
+                publisher.publish(Twist())
+            await self._sleep_async(0.25)
+
+        scan = self._fresh_scan(vehicle_id)
+        if scan is None:
+            return False, 'no fresh LiDAR scan before adaptive turn'
+        _, left_score, right_score = self._adaptive_turn_choice(scan)
+        with self._lock:
+            current_yaw = self._pose_yaw(self.vehicles[vehicle_id].pose)
+        if first_candidate:
+            left_gap, right_gap = self._adaptive_gap_candidates(scan)
+            candidates = [
+                gap
+                for gap, swept_score in (
+                    (left_gap, left_score),
+                    (right_gap, right_score),
+                )
+                if gap
+                and swept_score >= self.adaptive_recovery_turn_clearance_m
+            ]
+            if not candidates:
+                return (
+                    False,
+                    'LiDAR found no continuous free gap wide enough to turn',
+                )
+            preferred_gap = max(
+                candidates,
+                key=lambda gap: (gap[1], gap[2]),
+            )
+            opposite_gap = (
+                right_gap if preferred_gap[0] > 0.0 else left_gap
+            )
+            target_offset = float(preferred_gap[0])
+            base_yaw = current_yaw
+            self._adaptive_recovery_states[command_id] = {
+                'base_yaw': base_yaw,
+                'first_offset': target_offset,
+                'opposite_offset': (
+                    None if opposite_gap is None else float(opposite_gap[0])
+                ),
+                'opposite_gap_width': (
+                    None if opposite_gap is None else float(opposite_gap[1])
+                ),
+            }
+            candidate_name = 'first'
+            gap_width = float(preferred_gap[1])
+        else:
+            base_yaw = float(state['base_yaw'])
+            target_offset = state.get('opposite_offset')
+            if target_offset is None:
+                return False, 'LiDAR found no usable gap on the opposite side'
+            target_offset = float(target_offset)
+            candidate_name = 'opposite'
+            gap_width = state.get('opposite_gap_width')
+            gap_width = math.nan if gap_width is None else float(gap_width)
+
+        target_yaw = self._normalize_angle(
+            base_yaw + target_offset
+        )
+        yaw_error = self._normalize_angle(target_yaw - current_yaw)
+        rotation_direction = 1.0 if yaw_error >= 0.0 else -1.0
+        selected_score = (
+            left_score if rotation_direction > 0.0 else right_score
+        )
+        direction_name = 'left' if target_offset > 0.0 else 'right'
+        target_degrees = abs(math.degrees(target_offset))
+        width_text = (
+            '' if math.isnan(gap_width)
+            else f', gap_width={math.degrees(gap_width):.1f}deg'
+        )
+        self.get_logger().warning(
+            f'{vehicle_id} adaptive recovery {candidate_name} candidate: '
+            f'left={left_score:.3f}m, right={right_score:.3f}m -> '
+            f'{direction_name} {target_degrees:.1f}deg '
+            f'(free-gap center{width_text})'
+        )
+        if selected_score < self.adaptive_recovery_turn_clearance_m:
+            return (
+                False,
+                f'{candidate_name} turn has insufficient swept clearance: '
+                f'{selected_score:.3f}m < '
+                f'{self.adaptive_recovery_turn_clearance_m:.3f}m',
+            )
+        turn = Twist()
+        try:
+            while time.monotonic() < deadline:
+                if goal_handle.is_cancel_requested:
+                    return False, 'canceled during adaptive turn'
+                if self._command_preempted(command_id):
+                    return False, 'superseded during adaptive turn'
+                if self._vehicle_is_deliberately_stopped(vehicle_id):
+                    return False, 'safety hold engaged during adaptive turn'
+                scan = self._fresh_scan(vehicle_id)
+                if scan is None:
+                    return False, 'LiDAR became stale during adaptive turn'
+                _, current_left, current_right = self._adaptive_turn_choice(scan)
+                with self._lock:
+                    current_yaw = self._pose_yaw(
+                        self.vehicles[vehicle_id].pose
+                    )
+                yaw_error = self._normalize_angle(target_yaw - current_yaw)
+                if abs(yaw_error) <= (
+                    self.adaptive_recovery_turn_tolerance_rad
+                ):
+                    if not await self._clear_local_costmap(vehicle_id):
+                        return False, 'local costmap clear service failed'
+                    await self._sleep_async(0.25)
+                    return True, (
+                        f'{candidate_name} {direction_name} '
+                        f'{target_degrees:.1f}deg candidate '
+                        'ready; local costmap cleared'
+                    )
+                rotation_direction = 1.0 if yaw_error > 0.0 else -1.0
+                current_score = (
+                    current_left
+                    if rotation_direction > 0.0
+                    else current_right
+                )
+                if current_score < self.adaptive_recovery_turn_clearance_m:
+                    return (
+                        False,
+                        'selected turn became obstructed: '
+                        f'{current_score:.3f}m',
+                    )
+                # Do not drive through the target heading if AMCL updates
+                # arrive slowly near the end of the maneuver.
+                turn.angular.z = math.copysign(
+                    min(
+                        self.adaptive_recovery_turn_speed_rps,
+                        max(0.08, abs(yaw_error)),
+                    ),
+                    yaw_error,
+                )
+                publisher.publish(turn)
+                await self._sleep_async(period)
+        finally:
+            publisher.publish(Twist())
+        return False, 'adaptive turn timed out'
+
+    async def _clear_local_costmap(self, vehicle_id):
+        """Clear stale local obstacles before replanning an escape route."""
+        client = self.local_costmap_clear_clients[vehicle_id]
+        if not client.service_is_ready():
+            self.get_logger().error(
+                f'{vehicle_id} local costmap clear service unavailable'
+            )
+            return False
+        try:
+            await client.call_async(ClearEntireCostmap.Request())
+        except Exception as exc:  # noqa: BLE001 - ROS future exception
+            self.get_logger().error(
+                f'{vehicle_id} local costmap clear failed: {exc}'
+            )
+            return False
+        self.get_logger().warning(
+            f'{vehicle_id} adaptive recovery: local costmap cleared'
+        )
+        return True
 
     async def _navigate_to_waiting_pose(
         self,
@@ -1903,6 +2569,10 @@ class FleetDispatcher(Node):
         relative_yaw_rad,
     ):
         """Rotate, verify map-frame yaw, and correct before translation."""
+        if self.b1_exit_manual_turn:
+            return await self._rotate_b1_exit_manual(
+                goal_handle, vehicle_id, command_id, relative_yaw_rad
+            )
         if not self.b1_exit_turn_verify:
             success, message = await self._spin_in_place(
                 goal_handle,
@@ -1994,6 +2664,51 @@ class FleetDispatcher(Node):
             'B-1 exit rotation did not reach the required heading: '
             f'error={math.degrees(correction):.1f}deg',
         )
+
+    async def _rotate_b1_exit_manual(
+        self,
+        goal_handle,
+        vehicle_id,
+        command_id,
+        relative_yaw_rad,
+    ):
+        """Turn through cmd_vel_safety_gate until AMCL confirms the heading."""
+        with self._lock:
+            start_yaw = self._pose_yaw(self.vehicles[vehicle_id].pose)
+        target_yaw = self._normalize_angle(start_yaw + relative_yaw_rad)
+        publisher = self.park_exit_cmd_publishers[vehicle_id]
+        period = 1.0 / self.park_exit_open_loop_rate_hz
+        deadline = time.monotonic() + self.b1_exit_behavior_timeout_sec
+        command = Twist()
+        try:
+            while time.monotonic() < deadline:
+                if goal_handle.is_cancel_requested:
+                    return False, 'canceled during B-1 exit rotation'
+                if self._command_preempted(command_id):
+                    return False, 'superseded during B-1 exit rotation'
+                with self._lock:
+                    runtime = self.vehicles[vehicle_id]
+                    if runtime.emergency:
+                        return False, 'B-1 exit rotation stopped by emergency latch'
+                    measured_yaw = self._pose_yaw(runtime.pose)
+                yaw_error = self._normalize_angle(target_yaw - measured_yaw)
+                if abs(yaw_error) <= self.b1_exit_turn_tolerance_rad:
+                    self.get_logger().info(
+                        f'{vehicle_id} B-1 manual turn complete: '
+                        f'target={math.degrees(target_yaw):.1f}deg, '
+                        f'measured={math.degrees(measured_yaw):.1f}deg, '
+                        f'error={math.degrees(yaw_error):.1f}deg'
+                    )
+                    return True, ''
+                command.angular.z = math.copysign(
+                    min(self.b1_exit_turn_speed_rps, max(0.08, abs(yaw_error))),
+                    yaw_error,
+                )
+                publisher.publish(command)
+                await self._sleep_async(period)
+        finally:
+            publisher.publish(Twist())
+        return False, 'B-1 exit rotation timed out before reaching 90 degrees'
 
     async def _await_nav_result_watching_motion(
         self,
@@ -2155,6 +2870,14 @@ class FleetDispatcher(Node):
         distance_m,
     ):
         """Drive straight along the vehicle x-axis after the B-1 turn."""
+        if self.b1_exit_open_loop:
+            return await self._drive_straight_open_loop(
+                goal_handle,
+                vehicle_id,
+                distance_m,
+                self.b1_exit_forward_speed_mps,
+                'B-1 exit forward motion',
+            )
         return await self._drive_straight(
             goal_handle,
             vehicle_id,
@@ -2750,10 +3473,38 @@ class FleetDispatcher(Node):
                     break
                 self.get_logger().warning(
                     f'{vehicle_id} parking attempt {attempt}/{attempts} '
-                    f'failed: {result.message}; retrying'
+                    f'failed: {result.message}; starting adaptive recovery '
+                    'before retrying'
+                )
+                if (
+                    not self.adaptive_recovery_enabled
+                    or not self._adaptive_recovery_applies(vehicle_id)
+                ):
+                    self.get_logger().error(
+                        f'{vehicle_id} parking retry canceled because '
+                        'adaptive recovery is disabled'
+                    )
+                    break
+                recovered, recovery_message = (
+                    await self._run_adaptive_lidar_recovery(
+                        _ParkingRecoveryGoalHandle(),
+                        vehicle_id,
+                        command_id,
+                    )
+                )
+                if not recovered:
+                    self.get_logger().error(
+                        f'{vehicle_id} parking adaptive recovery failed: '
+                        f'{recovery_message}'
+                    )
+                    break
+                self.get_logger().warning(
+                    f'{vehicle_id} parking adaptive recovery completed: '
+                    f'{recovery_message}; retrying ParkInSpot'
                 )
                 await self._sleep_async(self.park_retry_backoff_sec)
         finally:
+            self._adaptive_recovery_states.pop(command_id, None)
             if acquired_zone and not parking_succeeded:
                 self._release_zone(vehicle_id, zone_id)
             with self._lock:

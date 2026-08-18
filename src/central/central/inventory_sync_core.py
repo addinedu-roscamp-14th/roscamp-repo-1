@@ -234,6 +234,14 @@ class PostgresInventoryWriter:
                         cursor, event['container_id']
                     )
                 mismatch = self._mismatch_message(current, event)
+                displaced = self._reconcile_inbound_observation(cursor, event)
+                if displaced:
+                    detail = (
+                        f'robot observed {event["container_id"]} at '
+                        f'{event["destination_location"]}; displaced DB cargo='
+                        f'{",".join(displaced)}'
+                    )
+                    mismatch = '; '.join(filter(None, (mismatch, detail)))
                 self._apply_success(cursor, current, event, mismatch)
             self._insert_audit(cursor, event, mismatch)
             connection.commit()
@@ -296,6 +304,52 @@ class PostgresInventoryWriter:
                 f'{base}, robot={event["source_base_aruco_id"]}'
             )
         return '; '.join(differences)
+
+    @staticmethod
+    def _is_inbound_observation(event):
+        """Return whether an event is an authoritative ARM1 ship scan.
+
+        An inbound scan describes physical state; it is not a stacking move.
+        Ship slots accept one inbound cargo, so stale DB occupants must not
+        make a floor-1 observation fail with "destination floor must be 2".
+        """
+        operation_id = str(event.get('operation_id') or '')
+        command_id = str(event.get('command_id') or '')
+        return bool(
+            event.get('success')
+            and str(event.get('arm_id') or '').lower() == 'arm1'
+            and not str(event.get('source_location') or '')
+            and event.get('destination_location') in SHIP_MARKERS
+            and (
+                operation_id.startswith('inbound-')
+                or '-inbound-' in command_id
+                or command_id.startswith('inbound-')
+            )
+        )
+
+    def _reconcile_inbound_observation(self, cursor, event):
+        """Make one observed ship slot authoritative and return displaced IDs."""
+        if not self._is_inbound_observation(event):
+            return []
+        destination = event['destination_location']
+        cursor.execute(
+            'SELECT name, container_id, note FROM cargos '
+            'WHERE location = %s AND container_id <> %s FOR UPDATE',
+            (destination, event['container_id']),
+        )
+        rows = cursor.fetchall()
+        for name, container_id, note in rows:
+            suffix = (
+                f'[관측우선 {event["operation_id"]}] ARM1이 {destination}에서 '
+                f'{event["container_id"]}을 관측하여 기존 위치를 보정'
+            )
+            updated_note = f'{str(note or "")} | {suffix}'.strip(' |')
+            cursor.execute(
+                "UPDATE cargos SET location = '출항완료', floor = 1, "
+                "base_aruco_id = '', note = %s WHERE name = %s",
+                (updated_note, name),
+            )
+        return [str(row[1]) for row in rows]
 
     def _apply_success(self, cursor, current, event, mismatch):
         name, db_location, _, _, note, _, db_floor = current

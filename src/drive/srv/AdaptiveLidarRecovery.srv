@@ -1,0 +1,5 @@
+bool opposite
+bool reset_direction
+---
+bool success
+string message
