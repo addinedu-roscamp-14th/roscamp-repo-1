@@ -4,8 +4,11 @@ import threading
 import time
 
 from central.fleet_dispatcher import (
+    choose_lidar_escape_turn,
     classify_motion_stall,
     FleetDispatcher,
+    laser_sector_clearance,
+    lidar_free_space_center,
     STALL_EXHAUSTED,
     STALL_HELD,
     STALL_MOVING,
@@ -15,6 +18,7 @@ from central.fleet_dispatcher import (
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
+import pytest
 from std_msgs.msg import String
 
 
@@ -99,6 +103,99 @@ def target_pose(x, y):
     pose.pose.position.x = x
     pose.pose.position.y = y
     return pose
+
+
+def synthetic_scan(default=2.0):
+    """Return a one-degree 360-degree scan tuple for recovery tests."""
+    ranges = [default] * 360
+    return ranges, -math.pi, math.radians(1.0), 0.05, 3.5
+
+
+def test_adaptive_recovery_all_applies_to_both_vehicles():
+    dispatcher = make_dispatcher()
+    dispatcher.adaptive_recovery_vehicle_id = 'all'
+
+    assert dispatcher._adaptive_recovery_applies('agv1')
+    assert dispatcher._adaptive_recovery_applies('agv2')
+
+
+def block_sector(ranges, center_deg, width_deg, distance):
+    for index in range(len(ranges)):
+        angle_deg = -180.0 + index
+        delta = (angle_deg - center_deg + 180.0) % 360.0 - 180.0
+        if abs(delta) <= width_deg * 0.5:
+            ranges[index] = distance
+
+
+def test_lidar_escape_turn_selects_roomier_right_swept_path():
+    scan = synthetic_scan()
+    ranges = scan[0]
+    # A left turn sweeps front-left, so make that side narrow. Right-turn
+    # front-right/rear-left sectors remain open.
+    block_sector(ranges, 45.0, 50.0, 0.22)
+
+    direction, left_score, right_score = choose_lidar_escape_turn(*scan)
+
+    assert direction == -1.0
+    assert right_score > left_score
+
+
+def test_lidar_escape_turn_selects_roomier_left_swept_path():
+    scan = synthetic_scan()
+    ranges = scan[0]
+    block_sector(ranges, -45.0, 50.0, 0.20)
+
+    direction, left_score, right_score = choose_lidar_escape_turn(*scan)
+
+    assert direction == 1.0
+    assert left_score > right_score
+
+
+def test_lidar_sector_clearance_uses_continuous_space_not_longest_ray():
+    scan = synthetic_scan(default=0.30)
+    ranges = scan[0]
+    # One long return in a narrow sector must not make the corridor look open.
+    ranges[180] = 3.0
+
+    clearance = laser_sector_clearance(
+        *scan, center_rad=0.0, width_rad=math.radians(40.0)
+    )
+
+    assert math.isclose(clearance, 0.30)
+
+
+def test_lidar_free_space_turns_to_the_middle_of_the_opening():
+    scan = synthetic_scan(default=0.10)
+    ranges = scan[0]
+    # Left opening spans 20..60 degrees, so its center is 40 degrees.
+    for degree in range(20, 61):
+        ranges[180 + degree] = 2.0
+
+    gap = lidar_free_space_center(
+        *scan,
+        side=1.0,
+        minimum_clearance_m=0.18,
+    )
+
+    assert gap is not None
+    assert math.degrees(gap[0]) == pytest.approx(40.0, abs=2.6)
+    assert math.degrees(gap[1]) == pytest.approx(40.0, abs=5.1)
+
+
+def test_lidar_free_space_rejects_a_gap_that_is_too_narrow():
+    scan = synthetic_scan(default=0.10)
+    ranges = scan[0]
+    for degree in range(-20, -11):
+        ranges[180 + degree] = 2.0
+
+    gap = lidar_free_space_center(
+        *scan,
+        side=-1.0,
+        minimum_clearance_m=0.18,
+        minimum_gap_width_rad=math.radians(15.0),
+    )
+
+    assert gap is None
 
 
 def test_auto_selects_nearest_vehicle_and_reserves_it():
@@ -739,8 +836,36 @@ class NotReadyActionClient:
         return False
 
 
+class ParkingGoalHandle:
+    accepted = True
+
+    def __init__(self, success, message):
+        self._success = success
+        self._message = message
+
+    async def get_result_async(self):
+        result = type('ParkingResult', (), {
+            'success': self._success,
+            'message': self._message,
+        })()
+        return type('WrappedParkingResult', (), {'result': result})()
+
+
+class SequencedParkingClient:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+
+    def wait_for_server(self, timeout_sec=None):
+        return True
+
+    async def send_goal_async(self, _goal):
+        success, message = self.outcomes.pop(0)
+        return ParkingGoalHandle(success, message)
+
+
 def make_park_dispatcher():
     dispatcher = make_dispatcher()
+    dispatcher._adaptive_recovery_states = {}
     dispatcher._zone_owner = {'PARK1': '', 'PARK2': ''}
     dispatcher._zone_unknown = {'PARK1': False, 'PARK2': False}
     dispatcher._zone_queue = {'PARK1': [], 'PARK2': []}
@@ -804,6 +929,34 @@ def test_dispatch_park_uses_each_vehicles_own_dedicated_spot():
     assert dispatcher.vehicles['agv2'].locked_zone == ''
     assert dispatcher._zone_owner['PARK1'] == ''
     assert dispatcher._zone_owner['PARK2'] == ''
+
+
+def test_parking_failure_runs_adaptive_recovery_before_retry():
+    dispatcher = make_park_dispatcher()
+    dispatcher.park_clients['agv1'] = SequencedParkingClient([
+        (False, 'FollowPath PATIENCE_EXCEEDED'),
+        (True, 'parking completed'),
+    ])
+    dispatcher.adaptive_recovery_enabled = True
+    dispatcher.adaptive_recovery_vehicle_id = 'all'
+    dispatcher._adaptive_recovery_states = {}
+    recovery_calls = []
+
+    async def recover(_goal_handle, vehicle_id, command_id):
+        recovery_calls.append((vehicle_id, command_id))
+        return True, 'turned toward free-space center'
+
+    async def no_sleep(_seconds):
+        return
+
+    dispatcher._run_adaptive_lidar_recovery = recover
+    dispatcher._sleep_async = no_sleep
+
+    _run_to_completion(dispatcher._dispatch_park('agv1'))
+
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0][0] == 'agv1'
+    assert dispatcher.vehicles['agv1'].locked_zone == 'PARK1'
 
 
 def test_moving_vehicle_is_left_alone():
@@ -982,9 +1135,11 @@ def test_a_vehicle_without_a_relaxed_costmap_is_never_restored():
 class RecordingPublisher:
     def __init__(self):
         self.commands = []
+        self.angular_commands = []
 
     def publish(self, message):
         self.commands.append(float(message.linear.x))
+        self.angular_commands.append(float(message.angular.z))
 
 
 class FakeGoalHandle:
@@ -1048,3 +1203,66 @@ def test_open_loop_exit_stops_when_the_goal_is_canceled():
     )
 
     assert dispatcher.park_exit_cmd_publishers['agv1'].commands == [0.0]
+
+
+def test_b1_forward_uses_safety_gated_open_loop_when_enabled():
+    """B-1 must escape a false local-costmap collision before Nav2 planning."""
+    dispatcher = make_open_loop_dispatcher()
+    dispatcher.b1_exit_open_loop = True
+    dispatcher.b1_exit_forward_speed_mps = 0.05
+
+    operation = dispatcher._drive_forward(
+        FakeGoalHandle(), 'agv1', 'command-1', 0.30
+    )
+    try:
+        operation.send(None)
+    except StopIteration as completed:
+        success, message = completed.value
+    else:
+        raise AssertionError('B-1 exit coroutine unexpectedly suspended')
+
+    assert success
+    assert message == ''
+    commands = dispatcher.park_exit_cmd_publishers['agv1'].commands
+    assert commands
+    assert all(value == 0.05 for value in commands[:-1])
+    assert commands[-1] == 0.0
+
+
+def test_b1_manual_turn_waits_for_measured_ninety_degrees_before_success():
+    dispatcher = make_open_loop_dispatcher()
+    dispatcher.b1_exit_manual_turn = True
+    dispatcher.b1_exit_turn_speed_rps = 0.25
+    dispatcher.b1_exit_turn_tolerance_rad = math.radians(5.0)
+    dispatcher.b1_exit_behavior_timeout_sec = 1.0
+    runtime = dispatcher.vehicles['agv1']
+    runtime.pose.pose.orientation.w = 1.0
+    updates = 0
+
+    async def _turn_pose_after_command(_seconds):
+        nonlocal updates
+        updates += 1
+        yaw = math.radians(90.0)
+        runtime.pose.pose.orientation.z = math.sin(yaw * 0.5)
+        runtime.pose.pose.orientation.w = math.cos(yaw * 0.5)
+
+    dispatcher._sleep_async = _turn_pose_after_command
+    operation = dispatcher._rotate_b1_exit_verified(
+        FakeGoalHandle(), 'agv1', 'command-1', math.radians(90.0)
+    )
+    try:
+        operation.send(None)
+    except StopIteration as completed:
+        success, message = completed.value
+    else:
+        raise AssertionError('B-1 turn coroutine unexpectedly suspended')
+
+    assert success
+    assert message == ''
+    assert updates == 1
+    angular = dispatcher.park_exit_cmd_publishers['agv1'].angular_commands
+    assert angular[0] > 0.0
+    assert angular[-1] == 0.0
+    assert all(value == 0.0 for value in (
+        dispatcher.park_exit_cmd_publishers['agv1'].commands
+    ))

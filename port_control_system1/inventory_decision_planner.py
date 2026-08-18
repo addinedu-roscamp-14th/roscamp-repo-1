@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import replace
 
@@ -54,7 +55,12 @@ _PLANNER_SYSTEM_PROMPT = """당신은 항만 컨테이너 재배치 계획기입
 이동이 필요 없으면 status=no_action, moves=[]로 반환하세요. sequence는 1부터 끊김 없이
 증가해야 합니다. 같은 컨테이너을 임시로 치운 뒤 복원하는 것은 허용하지만 동일한
 이동을 반복해서는 안 됩니다. 실제 로봇 명령, ROS 서비스명, DB 갱신 명령은 만들지
-마세요."""
+마세요.
+
+선박 목적지는 반드시 "선박-1"부터 "선박-6" 중 정확한 위치 하나를
+destination_location에 넣으세요. "선박", "항구", 빈 문자열처럼 슬롯 번호가 없는
+목적지는 금지합니다. 선박 슬롯의 ARM1 목적지 ArUco 매핑은 선박-1=18,
+선박-2=19, 선박-3=20, 선박-4=21, 선박-5=22, 선박-6=23입니다."""
 
 
 class InventoryPlanValidationError(ValueError):
@@ -170,10 +176,16 @@ class InventoryDecisionPlanner:
                     raise InventoryPlanValidationError(
                         'autonomous single-move planning requires status=ready'
                     )
-                if len(raw_plan.get('moves') or []) != 1:
+                if not raw_plan.get('moves'):
                     raise InventoryPlanValidationError(
-                        'single-move planning requires exactly one move'
+                        'single-move planning requires one move'
                     )
+                raw_plan = self._normalize_single_move_metadata(
+                    raw_plan,
+                    snapshot,
+                    known_locations=locations,
+                    objective=objective,
+                )
                 return self.validate_plan(
                     raw_plan,
                     objective=objective,
@@ -183,6 +195,126 @@ class InventoryDecisionPlanner:
             except Exception as exc:
                 last_error = exc
         return _error_result(objective, snapshot.snapshot_id, last_error)
+
+    @staticmethod
+    def _normalize_single_move_metadata(
+        raw_plan, snapshot, known_locations=None, objective=''
+    ):
+        """Keep the LLM choice but derive mechanical fields from DB truth."""
+        result = dict(raw_plan)
+        move = dict((raw_plan.get('moves') or [])[0])
+        container_id = str(move.get('container_id') or '').strip()
+        cargo = next((
+            item for item in snapshot.cargos
+            if item.container_id == container_id
+        ), None)
+        if cargo is None:
+            raise InventoryPlanValidationError(
+                f'unknown container_id: {container_id}'
+            )
+        destination = InventoryDecisionPlanner._resolve_ship_destination(
+            move,
+            snapshot,
+            known_locations=known_locations,
+            objective=objective,
+        )
+        move['destination_location'] = destination
+        stack = sorted(
+            (
+                item for item in snapshot.cargos
+                if item.location == destination
+                and item.container_id != container_id
+            ),
+            key=lambda item: item.floor,
+        )
+        move.update({
+            'sequence': 1,
+            'container_id': cargo.container_id,
+            'container_name': cargo.name,
+            'source_location': cargo.location,
+            'source_floor': cargo.floor,
+            'destination_floor': len(stack) + 1,
+            'destination_base_aruco_id': (
+                '' if not stack else stack[-1].container_id
+            ),
+        })
+        result['status'] = 'ready'
+        result['moves'] = [move]
+        return result
+
+    @staticmethod
+    def _resolve_ship_destination(
+        move, snapshot, known_locations=None, objective=''
+    ):
+        """Resolve an omitted generic vessel destination from DB capacity.
+
+        A valid exact LLM choice remains authoritative.  This fallback only
+        fills a missing/generic vessel slot during an outbound objective, so
+        the physical compiler always receives 선박-N and can map it to
+        ARM1 marker 18..23.
+        """
+        destination = str(move.get('destination_location') or '').strip()
+        locations = {
+            str(value).strip() for value in (known_locations or [])
+            if str(value).strip()
+        }
+        if destination in locations:
+            return destination
+
+        compact = re.sub(r'[\s_]+', '-', destination).upper().strip('-')
+        numbered = re.fullmatch(
+            r'(?:선박|SHIP|VESSEL)-?([1-6])(?:번)?(?:-?(?:자리|슬롯|SLOT))?',
+            compact,
+        )
+        if numbered:
+            canonical = f'선박-{numbered.group(1)}'
+            if canonical in locations:
+                return canonical
+
+        marker_value = move.get('destination_id')
+        if marker_value is None:
+            marker_value = move.get('destination_marker_id')
+        try:
+            marker_id = int(marker_value)
+        except (TypeError, ValueError):
+            marker_id = -1
+        if 18 <= marker_id <= 23:
+            canonical = f'선박-{marker_id - 17}'
+            if canonical in locations:
+                return canonical
+
+        objective_text = str(objective or '').upper()
+        generic_ship = (
+            not compact
+            or compact in {'선박', 'SHIP', 'VESSEL', '항구'}
+            or any(term in compact for term in ('선박', 'SHIP', 'VESSEL'))
+        )
+        outbound_objective = (
+            '선박 목적지 후보' in str(objective or '')
+            or 'LOADING_OUTBOUND' in objective_text
+        )
+        if not (generic_ship and outbound_objective):
+            if not destination:
+                raise InventoryPlanValidationError('destination is empty')
+            return destination
+
+        counts = {
+            location: 0
+            for location in locations
+            if re.fullmatch(r'선박-[1-6]', location)
+        }
+        for cargo in snapshot.cargos:
+            if cargo.location in counts:
+                counts[cargo.location] += 1
+        available = [
+            location for location, count in counts.items() if count < 3
+        ]
+        if not available:
+            raise InventoryPlanValidationError('all ship destinations are full')
+        return min(
+            available,
+            key=lambda location: (counts[location], int(location.split('-')[1])),
+        )
 
     @staticmethod
     def _build_prompt(objective, snapshot, known_locations):

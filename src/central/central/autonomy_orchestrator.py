@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import threading
 import time
 import uuid
@@ -27,6 +29,10 @@ class AutonomyOrchestrator(Node):
         self.declare_parameter('auto_scan_arm2_on_arrival', True)
         self.declare_parameter('arm2_scan_retry_sec', 10.0)
         self.declare_parameter('auto_scan_arm1_ship_on_start', True)
+        self.declare_parameter(
+            'arm1_ship_cache_state_path',
+            '~/.local/state/port_control/arm1_ship_cache.json',
+        )
         self.callback_group = ReentrantCallbackGroup()
         qos = QoSProfile(
             depth=20,
@@ -72,7 +78,10 @@ class AutonomyOrchestrator(Node):
             self.get_parameter('auto_scan_arm2_on_start').value
         )
         self.arm1_scan_requested = False
-        self.arm1_cache_ready = False
+        self.arm1_cache_state_path = os.path.abspath(os.path.expanduser(str(
+            self.get_parameter('arm1_ship_cache_state_path').value
+        )))
+        self.arm1_cache_ready = self._load_arm1_cache_state()
         self.inbound_scan_requested = False
         self.inbound_scan_pending = False
         self.create_timer(1.0, self._retry_scan_if_needed)
@@ -121,7 +130,13 @@ class AutonomyOrchestrator(Node):
             error = str(exc)
         with self.lock:
             self.arm1_scan_requested = False
-            self.arm1_cache_ready = success
+            # A failed refresh does not erase ARM1's last known-good in-memory
+            # cache: the coordinator replaces saved_marker_poses only after a
+            # complete 18..23 scan.  Keep readiness unless ARM1 explicitly
+            # reports that its cache is incomplete during an inbound request.
+            if success:
+                self.arm1_cache_ready = True
+                self._save_arm1_cache_state(True)
         self._publish_status(
             'ARM1_SHIP_CACHE_READY' if success else 'ARM1_SHIP_SCAN_RETRY',
             error=error,
@@ -228,10 +243,13 @@ class AutonomyOrchestrator(Node):
                 not success or newer_arrival_waiting
             )
             if not success:
-                # A restarted ARM1 loses its in-memory ship cache. Rebuild it
-                # before retrying the inbound scan; an already complete cache
-                # makes the Trigger idempotent.
-                self.arm1_cache_ready = False
+                # Missing container IDs are an ordinary retriable observation
+                # failure and must not destroy the valid 18..23 slot cache.
+                # Only ARM1's explicit cache-incomplete response proves that
+                # its process restarted and the slot scan really is required.
+                if self._failure_means_arm1_cache_missing(error):
+                    self.arm1_cache_ready = False
+                    self._save_arm1_cache_state(False)
         self._publish_status(
             (
                 'INBOUND_RESCAN_PENDING'
@@ -241,6 +259,42 @@ class AutonomyOrchestrator(Node):
             ),
             mission_id, error=error,
         )
+
+    @staticmethod
+    def _failure_means_arm1_cache_missing(error):
+        text = str(error or '').lower()
+        return bool(
+            'ship marker cache' in text
+            and ('incomplete' in text or 'missing' in text or 'lost' in text)
+        )
+
+    def _load_arm1_cache_state(self):
+        path = getattr(self, 'arm1_cache_state_path', '')
+        if not path:
+            return False
+        try:
+            payload = json.loads(Path(path).read_text(encoding='utf-8'))
+            return bool(payload.get('ready'))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
+    def _save_arm1_cache_state(self, ready):
+        path = getattr(self, 'arm1_cache_state_path', '')
+        if not path:
+            return
+        target = Path(path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix(target.suffix + '.tmp')
+            temporary.write_text(
+                json.dumps({'ready': bool(ready)}, ensure_ascii=False),
+                encoding='utf-8',
+            )
+            os.replace(temporary, target)
+        except OSError as exc:
+            self.get_logger().warning(
+                f'ARM1 ship cache state persistence failed: {exc}'
+            )
 
     def _request_arm2_scan(self, mission_id):
         with self.lock:

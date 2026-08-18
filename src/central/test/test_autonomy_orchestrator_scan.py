@@ -30,6 +30,7 @@ def make_orchestrator():
     orchestrator.arm2_cache_ready = False
     orchestrator.arm2_scan_retry_sec = 10.0
     orchestrator.arm2_scan_retry_not_before = 0.0
+    orchestrator.arm1_cache_state_path = ''
     orchestrator.statuses = []
     orchestrator._publish_status = (
         lambda state, mission_id='', **extra:
@@ -145,3 +146,48 @@ def test_cargo_added_event_rescans_without_replacing_port_mission():
     assert orchestrator.inbound_scan_pending
     assert requested == ['port-existing']
     assert orchestrator.statuses[-1][0] == 'CARGO_ADDED'
+
+
+def test_missing_container_scan_keeps_ship_slot_cache_ready():
+    orchestrator = make_orchestrator()
+    orchestrator.inbound_scan_requested = True
+    orchestrator.inbound_scan_pending = True
+    orchestrator.arrival_event_id = 'arrival-1'
+    orchestrator.arm1_cache_ready = True
+
+    orchestrator._on_inbound_scan_result(
+        'port-1',
+        'arrival-1',
+        CompletedFuture(False, 'no exposed inbound container ID 0..8 found'),
+    )
+
+    assert orchestrator.arm1_cache_ready
+    assert orchestrator.inbound_scan_pending
+    assert orchestrator.statuses[-1][0] == 'INBOUND_SCAN_RETRY'
+
+
+def test_explicit_incomplete_cache_failure_requests_ship_rescan():
+    orchestrator = make_orchestrator()
+    orchestrator.inbound_scan_requested = True
+    orchestrator.inbound_scan_pending = True
+    orchestrator.arrival_event_id = 'arrival-1'
+    orchestrator.arm1_cache_ready = True
+
+    orchestrator._on_inbound_scan_result(
+        'port-1',
+        'arrival-1',
+        CompletedFuture(False, 'ship marker cache 18..23 is incomplete'),
+    )
+
+    assert not orchestrator.arm1_cache_ready
+
+
+def test_arm1_cache_state_survives_central_restart(tmp_path):
+    first = make_orchestrator()
+    first.arm1_cache_state_path = str(tmp_path / 'arm1-cache.json')
+    first._save_arm1_cache_state(True)
+
+    restarted = make_orchestrator()
+    restarted.arm1_cache_state_path = first.arm1_cache_state_path
+
+    assert restarted._load_arm1_cache_state()

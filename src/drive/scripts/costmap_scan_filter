@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+
+"""Remove isolated LaserScan returns from costmap input only."""
+
+import copy
+import math
+import time
+
+from geometry_msgs.msg import PoseWithCovarianceStamped
+import rclpy
+from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from sensor_msgs.msg import LaserScan
+from tf2_ros import Buffer, TransformException, TransformListener
+
+
+def valid_range(value, range_min, range_max):
+    return (
+        math.isfinite(value)
+        and float(range_min) <= value <= float(range_max)
+    )
+
+
+def filter_isolated_ranges(
+    ranges,
+    previous_ranges,
+    range_min,
+    range_max,
+    neighbor_window,
+    neighbor_delta_m,
+    temporal_window,
+    temporal_delta_m,
+):
+    filtered = list(ranges)
+    removed = 0
+    count = len(ranges)
+    for index, value in enumerate(ranges):
+        if not valid_range(value, range_min, range_max):
+            continue
+        neighbor_supported = False
+        for offset in range(1, neighbor_window + 1):
+            for candidate_index in (index - offset, index + offset):
+                if not 0 <= candidate_index < count:
+                    continue
+                candidate = ranges[candidate_index]
+                if (
+                    valid_range(candidate, range_min, range_max)
+                    and abs(float(candidate) - float(value))
+                    <= neighbor_delta_m
+                ):
+                    neighbor_supported = True
+                    break
+            if neighbor_supported:
+                break
+        temporal_supported = False
+        if previous_ranges is not None:
+            for offset in range(-temporal_window, temporal_window + 1):
+                candidate_index = index + offset
+                if not 0 <= candidate_index < len(previous_ranges):
+                    continue
+                candidate = previous_ranges[candidate_index]
+                if (
+                    valid_range(candidate, range_min, range_max)
+                    and abs(float(candidate) - float(value))
+                    <= temporal_delta_m
+                ):
+                    temporal_supported = True
+                    break
+        if not neighbor_supported and not temporal_supported:
+            filtered[index] = math.inf
+            removed += 1
+    return filtered, removed
+
+
+def filter_peer_ranges(
+    ranges, angle_min, angle_increment, peer_center, peer_radius_m,
+):
+    if peer_center is None:
+        return list(ranges), 0
+    center_x, center_y = peer_center
+    filtered = list(ranges)
+    removed = 0
+    for index, value in enumerate(ranges):
+        if not math.isfinite(value):
+            continue
+        angle = float(angle_min) + index * float(angle_increment)
+        endpoint_x = float(value) * math.cos(angle)
+        endpoint_y = float(value) * math.sin(angle)
+        if math.hypot(
+            endpoint_x - center_x,
+            endpoint_y - center_y,
+        ) <= peer_radius_m:
+            filtered[index] = math.inf
+            removed += 1
+    return filtered, removed
+
+
+def transform_xy(x, y, transform):
+    translation = transform.transform.translation
+    rotation = transform.transform.rotation
+    sin_yaw = 2.0 * (
+        rotation.w * rotation.z + rotation.x * rotation.y
+    )
+    cos_yaw = 1.0 - 2.0 * (
+        rotation.y * rotation.y + rotation.z * rotation.z
+    )
+    return (
+        translation.x + cos_yaw * x - sin_yaw * y,
+        translation.y + sin_yaw * x + cos_yaw * y,
+    )
+
+
+class CostmapScanFilter(Node):
+    def __init__(self):
+        super().__init__('costmap_scan_filter')
+        defaults = {
+            'input_topic': 'scan',
+            'output_topic': 'scan_costmap',
+            'other_pose_topic': '',
+            'peer_filter_radius_m': 0.22,
+            'peer_pose_timeout_sec': 1.0,
+            'neighbor_window': 2,
+            'neighbor_delta_m': 0.08,
+            'temporal_window': 1,
+            'temporal_delta_m': 0.10,
+            'status_period_sec': 5.0,
+        }
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
+        self.neighbor_window = max(
+            1, int(self.get_parameter('neighbor_window').value))
+        self.neighbor_delta = max(
+            0.0, float(self.get_parameter('neighbor_delta_m').value))
+        self.temporal_window = max(
+            0, int(self.get_parameter('temporal_window').value))
+        self.temporal_delta = max(
+            0.0, float(self.get_parameter('temporal_delta_m').value))
+        self.peer_filter_radius = max(
+            0.0, float(self.get_parameter('peer_filter_radius_m').value))
+        self.peer_pose_timeout = max(
+            0.0, float(self.get_parameter('peer_pose_timeout_sec').value))
+        self._previous_ranges = None
+        self._peer_pose = None
+        self._peer_pose_received_at = None
+        self._scan_count = 0
+        self._removed_count = 0
+        self._peer_removed_count = 0
+        self._last_report_at = time.monotonic()
+        self._tf_buffer = Buffer(cache_time=Duration(seconds=2.0))
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._publisher = self.create_publisher(
+            LaserScan,
+            str(self.get_parameter('output_topic').value),
+            qos_profile_sensor_data,
+        )
+        self._subscription = self.create_subscription(
+            LaserScan,
+            str(self.get_parameter('input_topic').value),
+            self._on_scan,
+            qos_profile_sensor_data,
+        )
+        other_pose_topic = str(
+            self.get_parameter('other_pose_topic').value)
+        self._peer_subscription = None
+        if other_pose_topic:
+            self._peer_subscription = self.create_subscription(
+                PoseWithCovarianceStamped,
+                other_pose_topic,
+                self._on_peer_pose,
+                10,
+            )
+        self.get_logger().info(
+            'Costmap-only scan isolation filter ready: scan -> scan_costmap; '
+            f'neighbor_window={self.neighbor_window}, '
+            f'neighbor_delta={self.neighbor_delta:.3f}m, '
+            f'temporal_delta={self.temporal_delta:.3f}m, '
+            f'peer_filter_radius={self.peer_filter_radius:.3f}m')
+
+    def _on_peer_pose(self, message):
+        self._peer_pose = message
+        self._peer_pose_received_at = time.monotonic()
+
+    def _peer_center_in_scan(self, scan):
+        if (
+            self._peer_pose is None
+            or self._peer_pose_received_at is None
+            or time.monotonic() - self._peer_pose_received_at
+            > self.peer_pose_timeout
+        ):
+            return None
+        pose = self._peer_pose
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                scan.header.frame_id,
+                pose.header.frame_id,
+                Time.from_msg(scan.header.stamp),
+                timeout=Duration(seconds=0.02),
+            )
+        except TransformException:
+            return None
+        return transform_xy(
+            pose.pose.pose.position.x,
+            pose.pose.pose.position.y,
+            transform,
+        )
+
+    def _on_scan(self, message):
+        filtered_ranges, removed = filter_isolated_ranges(
+            message.ranges,
+            self._previous_ranges,
+            message.range_min,
+            message.range_max,
+            self.neighbor_window,
+            self.neighbor_delta,
+            self.temporal_window,
+            self.temporal_delta,
+        )
+        filtered_ranges, peer_removed = filter_peer_ranges(
+            filtered_ranges,
+            message.angle_min,
+            message.angle_increment,
+            self._peer_center_in_scan(message),
+            self.peer_filter_radius,
+        )
+        self._previous_ranges = list(message.ranges)
+        output = copy.deepcopy(message)
+        output.ranges = filtered_ranges
+        self._publisher.publish(output)
+        self._scan_count += 1
+        self._removed_count += removed
+        self._peer_removed_count += peer_removed
+        now = time.monotonic()
+        status_period = float(
+            self.get_parameter('status_period_sec').value)
+        if now - self._last_report_at >= status_period:
+            average = self._removed_count / max(self._scan_count, 1)
+            peer_average = (
+                self._peer_removed_count / max(self._scan_count, 1)
+            )
+            self.get_logger().info(
+                f'Costmap scan filter: scans={self._scan_count}, '
+                f'isolated_removed_per_scan={average:.1f}, '
+                f'peer_returns_removed_per_scan={peer_average:.1f}')
+            self._scan_count = 0
+            self._removed_count = 0
+            self._peer_removed_count = 0
+            self._last_report_at = now
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = CostmapScanFilter()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

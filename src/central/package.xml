@@ -14,6 +14,7 @@
   <exec_depend>arm2_interfaces</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>drive</exec_depend>
   <exec_depend>map_msgs</exec_depend>
   <exec_depend>porter_interfaces</exec_depend>

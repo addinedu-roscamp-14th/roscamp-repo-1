@@ -68,7 +68,7 @@ class AutonomousCycle:
 
 
 class CycleStore:
-    """Persist cycle identity so outbound cargo is not reclassified on restart."""
+    """Persist current-cycle diagnostics while the dashboard is running."""
 
     def __init__(self, path=None):
         self.path = os.path.abspath(os.path.expanduser(path or os.environ.get(
@@ -292,12 +292,19 @@ def choose_policy(
         cycle.phase = 'LOADING_OUTBOUND'
         ids = ', '.join(str(cargo.get('container_id')) for cargo in third_floor)
         destinations = destination_candidates(snapshot, SHIP_LOCATIONS)
+        ship_marker_mapping = {
+            location: int(marker_id)
+            for location, marker_id in SHIP_MARKERS.items()
+        }
         return cycle.phase, (
             f'창고 3층 최상단 컨테이너 [{ids}] 중 하나만 아래 선박 목적지 '
             '후보 중 하나로 이동하라. moves 배열에는 이동 1건만 반환하고 '
             '선택한 후보의 destination_floor와 destination_base_aruco_id를 '
-            '그대로 사용하라. 목적지 후보 JSON: '
-            f'{json.dumps(destinations, ensure_ascii=False)}'
+            '그대로 사용하라. destination_location에는 반드시 선박-1부터 '
+            '선박-6 중 하나를 정확히 넣어라. 목적지 후보 JSON: '
+            f'{json.dumps(destinations, ensure_ascii=False)}. '
+            'ARM1 선박 목적지 ArUco 매핑 JSON: '
+            f'{json.dumps(ship_marker_mapping, ensure_ascii=False)}'
         )
     if outbound and ship_ids & outbound:
         cycle.phase = 'WAITING_FOR_CLEAR'

@@ -131,7 +131,9 @@ class CameraToMapBridge(Node):
         self.declare_parameter('minimum_direction_distance', 0.02)
         self.declare_parameter('validate_calibration_map', True)
         self.declare_parameter('b1_camera_left_offset_m', 0.15)
-        self.declare_parameter('b1_camera_down_offset_m', 0.03)
+        # Signed camera-vertical offset: positive is image-down, negative is
+        # image-up.  The measured B-1 stop is 5cm above the former +3cm pose.
+        self.declare_parameter('b1_camera_down_offset_m', -0.02)
         self.declare_parameter('b1_waiting_distance_m', 0.25)
         # A-1/A-2/A-3 cargo bins share one fixed, pre-measured map-frame stop
         # pose (measured with RViz "2D Pose Estimate") instead of a pixel ->
@@ -190,8 +192,6 @@ class CameraToMapBridge(Node):
         self.b1_camera_down_offset_m = float(
             self.get_parameter('b1_camera_down_offset_m').value
         )
-        if self.b1_camera_down_offset_m < 0.0:
-            raise ValueError('b1_camera_down_offset_m must not be negative')
         self.b1_waiting_distance_m = float(
             self.get_parameter('b1_waiting_distance_m').value
         )

@@ -2,6 +2,7 @@
 
 from central.inventory_sync_core import (
     InventorySynchronizer,
+    PostgresInventoryWriter,
     normalize_movement,
     SQLiteMovementOutbox,
 )
@@ -57,3 +58,54 @@ def test_failed_physical_event_is_still_valid_audit_input():
     normalized = normalize_movement(value)
     assert normalized['success'] is False
     assert normalized['error'] == 'grip failed'
+
+
+def test_inbound_scan_is_authoritative_observation():
+    event = {
+        'operation_id': 'inbound-scan-4',
+        'command_id': 'port-1-inbound-scan',
+        'container_id': '4',
+        'arm_id': 'arm1',
+        'source_location': '',
+        'destination_location': '선박-4',
+        'destination_floor': 1,
+        'success': True,
+    }
+    assert PostgresInventoryWriter._is_inbound_observation(event)
+    event['source_location'] = 'AMR1'
+    assert not PostgresInventoryWriter._is_inbound_observation(event)
+
+
+def test_inbound_observation_displaces_stale_ship_slot_occupant():
+    class Cursor:
+        def __init__(self):
+            self.rows = [('컨테이너_C6', '6', '기존 상태')]
+            self.updated = []
+
+        def execute(self, statement, parameters):
+            if statement.startswith('UPDATE cargos SET location'):
+                self.updated.append(parameters)
+
+        def fetchall(self):
+            return self.rows
+
+    event = normalize_movement({
+        'operation_id': 'inbound-scan-4',
+        'command_id': 'port-1-inbound-scan',
+        'container_id': '4',
+        'arm_id': 'arm1',
+        'source_location': '',
+        'destination_location': '선박-4',
+        'destination_floor': 1,
+        'success': True,
+    })
+    cursor = Cursor()
+    writer = object.__new__(PostgresInventoryWriter)
+
+    displaced = writer._reconcile_inbound_observation(cursor, event)
+
+    assert displaced == ['6']
+    assert len(cursor.updated) == 1
+    note, name = cursor.updated[0]
+    assert name == '컨테이너_C6'
+    assert '관측우선' in note

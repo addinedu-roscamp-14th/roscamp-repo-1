@@ -97,6 +97,23 @@ def generate_launch_description():
             description='Timeout for each B-1 exit behavior action',
         ),
         DeclareLaunchArgument(
+            'b1_exit_manual_turn',
+            default_value='true',
+            description='Use safety-gated AMCL-verified rotation at B-1',
+        ),
+        DeclareLaunchArgument(
+            'b1_exit_turn_speed_rps',
+            default_value='0.25',
+            description='Maximum angular speed for the B-1 left turn',
+        ),
+        DeclareLaunchArgument(
+            'b1_exit_open_loop',
+            default_value='true',
+            description=(
+                'Use a low-speed safety-gated crawl for the short B-1 exit leg'
+            ),
+        ),
+        DeclareLaunchArgument(
             'b1_exit_detection_radius_m',
             default_value='0.35',
             description='Radius used to recognize a vehicle at B-1 before exit',
@@ -220,6 +237,18 @@ def generate_launch_description():
                     LaunchConfiguration('b1_exit_behavior_timeout_sec'),
                     value_type=float,
                 ),
+                'b1_exit_manual_turn': ParameterValue(
+                    LaunchConfiguration('b1_exit_manual_turn'),
+                    value_type=bool,
+                ),
+                'b1_exit_turn_speed_rps': ParameterValue(
+                    LaunchConfiguration('b1_exit_turn_speed_rps'),
+                    value_type=float,
+                ),
+                'b1_exit_open_loop': ParameterValue(
+                    LaunchConfiguration('b1_exit_open_loop'),
+                    value_type=bool,
+                ),
                 'b1_exit_detection_radius_m': ParameterValue(
                     LaunchConfiguration('b1_exit_detection_radius_m'),
                     value_type=float,
@@ -342,6 +371,20 @@ def generate_launch_description():
             name='map_relay',
             output='screen',
         ),
+        *[
+            Node(
+                package='central',
+                executable='costmap_parameter_proxy',
+                name=f'{vehicle_id}_{scope}_costmap_tuning',
+                output='screen',
+                parameters=[{
+                    'vehicle_id': vehicle_id,
+                    'scope': scope,
+                }],
+            )
+            for vehicle_id in ('agv1', 'agv2')
+            for scope in ('global', 'local')
+        ],
         Node(
             package='drive',
             executable='target_map_pose_to_nav_goal',

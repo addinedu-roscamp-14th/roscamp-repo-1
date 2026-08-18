@@ -84,6 +84,19 @@ def test_b1_offset_moves_toward_camera_image_down():
     assert offset_y == pytest.approx(0.03)
 
 
+def test_negative_b1_down_offset_moves_toward_camera_image_up():
+    bridge = object.__new__(CameraToMapBridge)
+    bridge.homography = np.eye(3)
+
+    offset_x, offset_y = bridge.camera_down_map_offset(
+        [320.0, 240.0],
+        -0.02,
+    )
+
+    assert offset_x == pytest.approx(0.0)
+    assert offset_y == pytest.approx(-0.02)
+
+
 def test_waiting_point_is_behind_final_heading():
     waiting_x, waiting_y = waiting_point_behind_target(
         1.0,

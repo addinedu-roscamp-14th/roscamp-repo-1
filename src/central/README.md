@@ -1,5 +1,14 @@
 # Central Package
 
+## 중앙 RQT costmap 조정
+
+`fleet_central_laptop.launch.py`는 Zenoh 너머의 Nav2 파라미터 서비스를 중앙
+ROS graph에 노출하는 프록시 노드 4개를 실행합니다. RQT Parameter Reconfigure
+목록에서 `agv1_global_costmap_tuning`, `agv1_local_costmap_tuning`,
+`agv2_global_costmap_tuning`, `agv2_local_costmap_tuning`을 선택해 inflation
+radius와 cost scaling factor를 실시간으로 변경할 수 있습니다. 변경은 원격
+costmap에 즉시 전달되지만 Nav2 재시작 후에는 YAML 값으로 돌아갑니다.
+
 중앙 관제에서 카메라 픽셀 좌표를 SLAM `/map` 좌표로 변환하고, 차량/브릿지에 전달 가능한 형태로 발행하는 패키지입니다.
 
 현재 핵심 노드는 `rqt_click_to_target`, `camera_to_map_bridge`,
@@ -282,7 +291,9 @@ YAML/PGM을 비교합니다. `config/SLAM/current_map.yaml` 또는 PGM을 교체
 
 `parking_b1` API 명령은 B-1 중심을 map 좌표로 변환한 뒤, 탑다운 카메라 영상의
 왼쪽 방향을 같은 호모그래피로 계산하여 기본 `0.15m`, 화면 아래쪽으로 기본
-`0.03m` 이동합니다. 목표와 헤딩점을 같이 이동하므로 B-1 정렬 방향은 유지됩니다.
+`-0.02m` 이동합니다. 음수는 카메라 영상 위쪽을 뜻하며, 이전 아래쪽 3cm 위치에서
+위로 5cm 올린 값입니다. 목표와 헤딩점을 같이 이동하므로 B-1 정렬 방향은
+유지됩니다.
 거리는 `b1_camera_left_offset_m`, `b1_camera_down_offset_m` 파라미터로 조정합니다.
 
 점유 구역 대기점은 최종 헤딩의 반대 방향으로 계산합니다.
@@ -737,3 +748,18 @@ ros2 topic echo /central/target_pixel
 ```bash
 ros2 topic list | grep central
 ```
+
+# AMR1/AMR2 LiDAR adaptive recovery
+
+`fleet_dispatcher` applies the fallback to both vehicles after Nav2 exhausts
+its normal recovery tree. It checks a fresh vehicle LiDAR scan and reverses when
+the rear sector has at least 5 cm clearance, stops at a 1 cm rear safety
+margin or after 5 cm, and then compares the LiDAR clearance swept by left and
+right turns. Instead of a fixed 45-degree turn, it finds each side's widest
+continuous free angular gap and rotates toward the midpoint of that gap. It
+then clears the local costmap and retries the original goal. If that route
+fails, it rotates toward the midpoint of the opposite-side gap, clears the
+local costmap again, and retries once more. Commands use the vehicle's
+`cmd_vel_manual`. All
+manual recovery velocity still passes through the vehicle emergency and fleet
+collision safety gate.

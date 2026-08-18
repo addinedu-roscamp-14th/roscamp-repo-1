@@ -155,7 +155,7 @@ def test_no_action_has_stable_public_shape():
     assert result['status'] == 'no_action'
 
 
-def test_single_move_planning_repairs_invalid_multi_move_output():
+def test_single_move_planning_uses_only_first_valid_llm_choice():
     snapshot = make_snapshot([cargo('C0', '0', 'A-1-1', 1, '11')])
     responses = [
         {
@@ -180,7 +180,7 @@ def test_single_move_planning_repairs_invalid_multi_move_output():
 
     assert result['status'] == 'ready'
     assert len(result['moves']) == 1
-    assert not responses
+    assert len(responses) == 1
 
 
 def test_single_move_planning_retries_spurious_no_action():
@@ -202,3 +202,38 @@ def test_single_move_planning_retries_spurious_no_action():
     assert result['status'] == 'ready'
     assert len(result['moves']) == 1
     assert not responses
+
+
+def test_single_move_normalizes_db_derived_mechanical_fields():
+    snapshot = make_snapshot([
+        cargo('C0', '0', 'A-1-1', 1, '11'),
+        cargo('C1', '1', 'B-1', 1, ''),
+    ])
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: {
+        'status': 'ready',
+        'moves': [
+            move(
+                7, '0', '잘못된 이름', '잘못된 출발지', 9,
+                'B-1', 9, '잘못된 기반', 'LLM이 B-1을 선택',
+            ),
+            move(8, '1', 'C1', 'B-1', 1, '임시 버퍼'),
+        ],
+        'summary': '선택 자체는 유효함',
+    })
+
+    result = planner.plan_single_move_snapshot(
+        '한 건 이동', snapshot, LOCATIONS
+    )
+
+    assert result['status'] == 'ready'
+    assert result['moves'] == [{
+        'sequence': 1,
+        'container_id': '0',
+        'container_name': 'C0',
+        'source_location': 'A-1-1',
+        'source_floor': 1,
+        'destination_location': 'B-1',
+        'destination_floor': 2,
+        'destination_base_aruco_id': '1',
+        'reason': 'LLM이 B-1을 선택',
+    }]
