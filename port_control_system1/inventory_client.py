@@ -246,3 +246,164 @@ class InventoryClient:
             generated_at=generated_at,
             cargos=tuple(cargos),
         )
+
+
+class InventoryAdminClient:
+    """Explicit write-capable client for operator-approved inventory resets."""
+
+    def __init__(self, inventory_client=None, connect=None):
+        config = inventory_client or InventoryClient(connect=connect)
+        self.host = config.host
+        self.port = config.port
+        self.database = config.database
+        self.user = config.user
+        self.password = config.password
+        self.timeout_sec = config.timeout_sec
+        self._connect = connect or config._connect
+
+    def clear_inventory(self):
+        """Atomically remove movement history and current cargo state."""
+        connection = None
+        cursor = None
+        try:
+            connection = self._connect(
+                host=self.host,
+                port=self.port,
+                dbname=self.database,
+                user=self.user,
+                password=self.password,
+                connect_timeout=max(1, int(self.timeout_sec)),
+            )
+            cursor = connection.cursor()
+            cursor.execute('TRUNCATE TABLE cargo_movements')
+            cursor.execute('DELETE FROM cargos')
+            connection.commit()
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            raise InventoryClientError(
+                f'PostgreSQL inventory reset failed: {exc}'
+            ) from exc
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    def upsert_cargo(
+        self,
+        name,
+        location,
+        container_id='',
+        cargo_type='',
+        note='',
+        base_aruco_id='',
+        floor=1,
+    ):
+        """Insert or update a single cargo row in PostgreSQL.
+
+        Returns True on success, False on failure (with the error logged).
+        """
+        connection = None
+        cursor = None
+        try:
+            connection = self._connect(
+                host=self.host,
+                port=self.port,
+                dbname=self.database,
+                user=self.user,
+                password=self.password,
+                connect_timeout=max(1, int(self.timeout_sec)),
+            )
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO cargos
+                    (name, location, container_id, cargo_type, note,
+                     base_aruco_id, floor)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (name) DO UPDATE SET
+                    location = EXCLUDED.location,
+                    container_id = EXCLUDED.container_id,
+                    cargo_type = EXCLUDED.cargo_type,
+                    note = EXCLUDED.note,
+                    base_aruco_id = EXCLUDED.base_aruco_id,
+                    floor = EXCLUDED.floor
+                """,
+                (
+                    str(name), str(location), str(container_id),
+                    str(cargo_type), str(note), str(base_aruco_id),
+                    int(floor) if floor else 1,
+                ),
+            )
+            connection.commit()
+            return True
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            raise InventoryClientError(
+                f'PostgreSQL cargo upsert failed: {exc}'
+            ) from exc
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    def delete_cargo(self, name):
+        """Delete a single cargo row from PostgreSQL by name."""
+        connection = None
+        cursor = None
+        try:
+            connection = self._connect(
+                host=self.host,
+                port=self.port,
+                dbname=self.database,
+                user=self.user,
+                password=self.password,
+                connect_timeout=max(1, int(self.timeout_sec)),
+            )
+            cursor = connection.cursor()
+            cursor.execute(
+                'DELETE FROM cargos WHERE name = %s', (str(name),)
+            )
+            connection.commit()
+            return True
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            raise InventoryClientError(
+                f'PostgreSQL cargo delete failed: {exc}'
+            ) from exc
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass

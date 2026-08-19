@@ -133,7 +133,11 @@ controller_server:
     bond_heartbeat_period: 0.1                   # [s] 시스템 상태 체크(하트비트) 주기
     costmap_update_timeout: 0.3                  # [s] 코스트맵 업데이트가 이 시간 지연되면 멈춤
     enable_stamped_cmd_vel: false                # TwistStamped 메시지 대신 일반 Twist 메시지 사용
-    failure_tolerance: 0.15                      # [s] 연속 충돌 감지를 즉시 Recovery로 전달
+    # 전역 경로는 BT에서 1 Hz로 갱신된다. 이 값이 1초보다 짧으면 복구 뒤
+    # 새 경로가 표시되어도 컨트롤러가 다음 재계획을 받기 전에 FollowPath를
+    # 중단하고 다시 후진한다. 충돌 중에는 컨트롤러가 정지 명령을 유지하되,
+    # 최소 한 번의 후속 재계획까지 기다린 다음 Recovery로 넘긴다.
+    failure_tolerance: 1.50                      # [s] 연속 충돌 허용 시간
     publish_zero_velocity: true                  # 목표 도달/취소 시 확실하게 정지하도록 0 속도 명령 발행
     speed_limit_topic: "speed_limit"             # 속도 제한 구역 적용 시 구독할 토픽 이름
     odom_topic: "odom"                           # 현재 속도를 읽어올 오도메트리 토픽
@@ -332,7 +336,7 @@ global_costmap:
       keepout_inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 6.0
-        inflation_radius: 0.08
+        inflation_radius: 0.10
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 20.0

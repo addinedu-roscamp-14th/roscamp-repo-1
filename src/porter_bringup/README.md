@@ -503,7 +503,7 @@ YOLO 검출 JSON (/central/yolo/detections → /detections)
 `B-1`은 항구 상차·하차 전용 주차 구역입니다. B-1 명령에서는 구역 중심과
 세그멘테이션 헤딩을 사용하고, map 변환 후 카메라 영상의 왼쪽 방향으로 기본
 `0.15m`, 화면 아래쪽으로 `0.03m` 이동합니다. 실행 시
-`b1_camera_left_offset_m:=0.15`, `b1_camera_down_offset_m:=-0.02`으로 거리를
+`b1_camera_left_offset_m:=0.15`, `b1_camera_down_offset_m:=0.03`으로 거리를
 조정할 수 있습니다.
 
 RViz에서 `2D Pose Estimate`로 초기 위치를 지정한 후 테스트해야 합니다.

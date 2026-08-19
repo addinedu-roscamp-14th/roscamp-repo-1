@@ -59,7 +59,7 @@ def test_valid_pixel_goal_is_normalized():
     assert goal.requested_vehicle_id == ''
     assert goal.zone_id == ''
     assert goal.predecessor_command_id == ''
-    assert goal.queue_if_busy is False
+    assert goal.queue_if_busy is True
     assert goal.target.x == 100.0
     assert goal.heading.x == 130.5
 

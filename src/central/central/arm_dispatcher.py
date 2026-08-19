@@ -130,7 +130,7 @@ def movement_from_goal(goal, success, operation_id, vehicle_cargo=None):
 
 
 class ArmDispatcher(Node):
-    """Expose one central action while keeping physical ARM calls serialized."""
+    """Expose one action endpoint with an independent queue for each ARM."""
 
     ERROR_INVALID_REQUEST = 1
     ERROR_UNCONFIGURED = 2
@@ -167,6 +167,9 @@ class ArmDispatcher(Node):
 
         self.callback_group = ReentrantCallbackGroup()
         self.condition = threading.Condition()
+        self.queues = {'arm1': deque(), 'arm2': deque()}
+        # Legacy aggregate attributes remain for lightweight diagnostics and
+        # old test doubles. Scheduling uses the per-arm dictionaries below.
         self.queue = deque()
         # token -> vehicle_id for every queued or running command that has
         # promised to gate a vehicle's departure. Derived from live queue
@@ -196,6 +199,8 @@ class ArmDispatcher(Node):
         self.latest_event_at = None
         self.active_goal = None
         self.active_command = None
+        self.active_goals = {'arm1': None, 'arm2': None}
+        self.active_commands = {'arm1': None, 'arm2': None}
         self.stop_generations = {'arm1': 0, 'arm2': 0}
         self.failed_missions = set()
         # Cargo currently known to be on each trailer. This bridges the two
@@ -446,12 +451,21 @@ class ArmDispatcher(Node):
         ]
         return any(self._service_is_ready(client) for client in clients)
 
+    def _active_command_for(self, arm_id):
+        active = getattr(self, 'active_commands', None)
+        if isinstance(active, dict):
+            return active.get(str(arm_id).lower())
+        legacy = getattr(self, 'active_command', None)
+        if (
+            legacy is not None
+            and str(legacy.arm_id or 'arm2').lower() == str(arm_id).lower()
+        ):
+            return legacy
+        return None
+
     def _refresh_arm2_idle_connectivity(self):
         """Derive idle ARM2 connectivity from services before any event exists."""
-        if (
-            self.active_command is not None
-            and str(self.active_command.arm_id).lower() == 'arm2'
-        ):
+        if self._active_command_for('arm2') is not None:
             return
         service_ready = self._arm2_service_is_ready()
         if service_ready and self.arm2_state == ArmState.OFFLINE:
@@ -483,11 +497,8 @@ class ArmDispatcher(Node):
             if self.arm1_latest_state_at is None
             else float(time.monotonic() - self.arm1_latest_state_at)
         )
-        if (
-            self.active_command is not None
-            and str(self.active_command.arm_id).lower() == 'arm1'
-        ):
-            command = self.active_command
+        command = self._active_command_for('arm1')
+        if command is not None:
             arm1.current_command_id = str(command.command_id)
             arm1.current_mission_id = str(command.mission_id)
             arm1.current_operation = str(command.operation)
@@ -517,11 +528,8 @@ class ArmDispatcher(Node):
             arm2.telemetry_age_sec = float(
                 time.monotonic() - self.latest_event_at
             )
-        if (
-            self.active_command is not None
-            and str(self.active_command.arm_id).lower() == 'arm2'
-        ):
-            command = self.active_command
+        command = self._active_command_for('arm2')
+        if command is not None:
             arm2.current_command_id = str(command.command_id)
             arm2.current_mission_id = str(command.mission_id)
             arm2.current_operation = str(command.operation)
@@ -909,13 +917,19 @@ class ArmDispatcher(Node):
         token = object()
         with self.condition:
             command_generation = self.stop_generations[arm_id]
-            self.queue.append(token)
-            while self.queue and self.queue[0] is not token:
+            queues = getattr(self, 'queues', None)
+            arm_queue = (
+                queues.setdefault(arm_id, deque())
+                if isinstance(queues, dict)
+                else self.queue
+            )
+            arm_queue.append(token)
+            while arm_queue and arm_queue[0] is not token:
                 if (
                     goal_handle.is_cancel_requested
                     or command_generation != self.stop_generations[arm_id]
                 ):
-                    self.queue.remove(token)
+                    arm_queue.remove(token)
                     message = (
                         'command canceled while queued'
                         if goal_handle.is_cancel_requested
@@ -932,6 +946,12 @@ class ArmDispatcher(Node):
                     self.condition.notify_all()
                     return result
                 self.condition.wait(timeout=0.2)
+            active_goals = getattr(self, 'active_goals', None)
+            active_commands = getattr(self, 'active_commands', None)
+            if isinstance(active_goals, dict):
+                active_goals[arm_id] = goal_handle
+            if isinstance(active_commands, dict):
+                active_commands[arm_id] = goal
             self.active_goal = goal_handle
             self.active_command = goal
             self._set_runtime_state(arm_id, ArmState.BUSY, 'DISPATCHING')
@@ -1144,12 +1164,20 @@ class ArmDispatcher(Node):
             return result
         finally:
             with self.condition:
-                self.active_goal = None
-                self.active_command = None
-                if self.queue and self.queue[0] is token:
-                    self.queue.popleft()
-                elif token in self.queue:
-                    self.queue.remove(token)
+                active_goals = getattr(self, 'active_goals', None)
+                active_commands = getattr(self, 'active_commands', None)
+                if isinstance(active_goals, dict):
+                    active_goals[arm_id] = None
+                if isinstance(active_commands, dict):
+                    active_commands[arm_id] = None
+                if self.active_goal is goal_handle:
+                    self.active_goal = None
+                if self.active_command is goal:
+                    self.active_command = None
+                if arm_queue and arm_queue[0] is token:
+                    arm_queue.popleft()
+                elif token in arm_queue:
+                    arm_queue.remove(token)
                 # Released on failure as well as success: a stuck vehicle is
                 # worse than an early release, and the operation result
                 # already tells the operator the transfer did not finish.

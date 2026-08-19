@@ -210,9 +210,9 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'b1_camera_down_offset_m',
-            default_value='-0.02',
+            default_value='0.03',
             description=(
-                'Signed B-1 camera-vertical offset: down positive, up negative'
+                'B-1 parking goal offset along camera-image down, in meters'
             ),
         ),
         DeclareLaunchArgument(

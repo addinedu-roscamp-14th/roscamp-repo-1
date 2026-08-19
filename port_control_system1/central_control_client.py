@@ -48,7 +48,7 @@ class CentralControlClient:
         vehicle_id='',
         zone_id='',
         zone_visually_empty=False,
-        queue_if_busy=False,
+        queue_if_busy=True,
     ):
         """Send one VLM-selected target and heading pixel pair.
 

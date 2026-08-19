@@ -31,6 +31,7 @@ def make_orchestrator():
     orchestrator.arm2_scan_retry_sec = 10.0
     orchestrator.arm2_scan_retry_not_before = 0.0
     orchestrator.arm1_cache_state_path = ''
+    orchestrator.arm1_startup_scan_done = True
     orchestrator.statuses = []
     orchestrator._publish_status = (
         lambda state, mission_id='', **extra:
@@ -146,6 +147,25 @@ def test_cargo_added_event_rescans_without_replacing_port_mission():
     assert orchestrator.inbound_scan_pending
     assert requested == ['port-existing']
     assert orchestrator.statuses[-1][0] == 'CARGO_ADDED'
+
+
+def test_release_allowed_result_publishes_follow_up_state():
+    """A release gate result must transition the mission state for follow-up."""
+    orchestrator = make_orchestrator()
+    orchestrator.release_publisher = SimpleNamespace(publish=lambda _: None)
+    payload = {
+        'success': True,
+        'vehicle_id': 'agv1',
+        'mission_id': 'mission-42',
+        'command_id': 'cmd-42',
+        'operation_id': 'op-42',
+        'vehicle_release_allowed': True,
+    }
+
+    orchestrator._on_arm_result(SimpleNamespace(data=json.dumps(payload)))
+
+    assert orchestrator.statuses[-1][0] == 'RELEASE_ALLOWED'
+    assert orchestrator.statuses[-1][1] == 'mission-42'
 
 
 def test_missing_container_scan_keeps_ship_slot_cache_ready():

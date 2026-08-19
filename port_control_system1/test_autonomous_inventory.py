@@ -74,6 +74,35 @@ def test_inbound_candidates_are_limited_to_visible_warehouse_zone():
     assert '"location": "A-1-1"' not in objective
 
 
+def test_parallel_policy_excludes_reserved_cargo_and_destination():
+    cycle = AutonomousCycle(
+        active_move={
+            'container_id': '1',
+            'source_location': '선박-1',
+            'destination_location': 'A-1-1',
+        },
+        active_moves={
+            'agv1': {
+                'container_id': '1',
+                'source_location': '선박-1',
+                'destination_location': 'A-1-1',
+            },
+        },
+    )
+
+    phase, objective = choose_policy(
+        cycle,
+        snapshot(cargo(1, '선박-1'), cargo(2, '선박-2')),
+        True,
+        reserved_container_ids={'1'},
+        reserved_destinations={'A-1-1'},
+    )
+
+    assert phase == 'UNLOADING_INBOUND'
+    assert '[2]' in objective
+    assert '"location": "A-1-1"' not in objective
+
+
 def test_outbound_is_not_reclassified_as_inbound():
     cycle = AutonomousCycle(inbound_ids=['1'], outbound_ids=['6'])
     phase, _objective = choose_policy(
@@ -113,6 +142,8 @@ def test_ship_to_warehouse_compiles_for_both_trailers():
     ]
     assert agv1[1]['destination_id'] == 10
     assert agv2[1]['destination_id'] == 9
+    assert agv1[2]['zone'] == 'A'
+    assert agv2[2]['zone'] == 'A'
 
 
 def test_warehouse_to_ship_uses_cached_ship_marker():
@@ -121,15 +152,20 @@ def test_warehouse_to_ship_uses_cached_ship_marker():
         'destination_location': '선박-6', 'destination_floor': 1,
     }, 'agv1')
     assert steps[1]['type'] == 'arm_load_to_trailer'
+    assert steps[0]['zone'] == 'A'
     assert steps[3]['source_id'] == 10
     assert steps[3]['destination_id'] == 23
 
 
 def test_cycle_store_survives_process_restart(tmp_path):
     store = CycleStore(str(tmp_path / 'cycle.json'))
-    cycle = AutonomousCycle(outbound_ids=['6'], phase='WAITING_FOR_CLEAR')
+    cycle = AutonomousCycle(
+        outbound_ids=['6'], phase='WAITING_FOR_CLEAR',
+        last_vehicle_id='agv2',
+    )
     store.save(cycle)
     restored = store.load()
     assert restored.cycle_id == cycle.cycle_id
     assert restored.outbound_ids == ['6']
     assert restored.phase == 'WAITING_FOR_CLEAR'
+    assert restored.last_vehicle_id == 'agv2'

@@ -203,7 +203,7 @@ def validate_pixel_goal(
     zone_visually_empty = payload.get('zone_visually_empty', False)
     if not isinstance(zone_visually_empty, bool):
         raise CommandValidationError('zone_visually_empty must be a boolean')
-    queue_if_busy = payload.get('queue_if_busy', False)
+    queue_if_busy = payload.get('queue_if_busy', True)
     if not isinstance(queue_if_busy, bool):
         raise CommandValidationError('queue_if_busy must be a boolean')
 

@@ -9,8 +9,11 @@ emergency_view.py의 구성(장비 선택 드롭다운 -> 크레인/AGV 각각 �
 
 import shutil
 
+import cv2
+from PIL import Image
 import customtkinter as ctk
 
+from cctv_monitor_view import CCTVMonitorView
 from ros_control_bridge import AMR_DISPLAY_NAMES, RosControlBridge
 
 
@@ -179,15 +182,21 @@ class EmergencyControlView(ctk.CTkFrame):
         # Camera Top Bar
         cam_top = ctk.CTkFrame(cam_panel, fg_color="transparent")
         cam_top.pack(fill="x", padx=16, pady=16)
-        cam_lbl = ctk.CTkLabel(cam_top, text="🟢 CAM_01_FWD", font=self.font_mono, fg_color="#1e1e1e", corner_radius=4)
-        cam_lbl.pack(side="left")
-        sig_lbl = ctk.CTkLabel(cam_top, text="❌ NO SIGNAL", font=self.font_mono, text_color=ALERT_RED, fg_color="#1e1e1e", corner_radius=4)
-        sig_lbl.pack(side="left", padx=8)
+        self._cam_lbl = ctk.CTkLabel(cam_top, text="🟢 CAM_01_FWD", font=self.font_mono, fg_color="#1e1e1e", corner_radius=4)
+        self._cam_lbl.pack(side="left")
+        self._cam_sig_lbl = ctk.CTkLabel(cam_top, text="❌ NO SIGNAL", font=self.font_mono, text_color=ALERT_RED, fg_color="#1e1e1e", corner_radius=4)
+        self._cam_sig_lbl.pack(side="left", padx=8)
 
         # Camera Center
         cam_center = ctk.CTkFrame(cam_panel, fg_color="#1a1a1a", border_width=1, border_color=BORDER_COLOR)
         cam_center.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        ctk.CTkLabel(cam_center, text="[ Waiting for camera link ]\nVisual feed temporarily unavailable.", text_color="#888", font=self.font_mono).place(relx=0.5, rely=0.5, anchor="center")
+        self._cam_video_label = ctk.CTkLabel(
+            cam_center,
+            text="[ Waiting for camera link ]\nVisual feed temporarily unavailable.",
+            text_color="#888",
+            font=self.font_mono,
+        )
+        self._cam_video_label.place(relx=0.5, rely=0.5, anchor="center")
 
         # Telemetry Bar
         tele_bar = ctk.CTkFrame(cam_panel, height=48, fg_color=BG_MAIN, corner_radius=4, border_width=1, border_color=BORDER_COLOR)
@@ -196,8 +205,13 @@ class EmergencyControlView(ctk.CTkFrame):
         ctk.CTkLabel(tele_bar, text="LAT: 34.0522 N   LON: 118.2437 W   ALT: 12.4m", font=self.font_mono, text_color=TEXT_MUTED).pack(side="left", padx=16)
         ctk.CTkLabel(tele_bar, text="❌ LIDAR OFFLINE", font=self.font_mono, text_color=ALERT_RED).pack(side="right", padx=16)
 
+        # CCTV 백그라운드 캡처가 실행 중이 아니면 시작
+        CCTVMonitorView.ensure_capture_running()
+        self._cam_ui_alive = True
+        self._update_camera_loop()
+
         # Controls Panel Container (Right)
-        right_panel = ctk.CTkFrame(content, width=380, fg_color="transparent")
+        right_panel = ctk.CTkFrame(content, width=320, fg_color="transparent")
         right_panel.pack(side="right", fill="y", padx=(8, 0))
         right_panel.pack_propagate(False)
 
@@ -332,11 +346,51 @@ class EmergencyControlView(ctk.CTkFrame):
         ctk.CTkButton(a_spd_btns, text="FAST (+10%)", height=32, fg_color=BORDER_LIGHT, hover_color="#555555", command=lambda: self._send_teleop_cmd('e')).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
     def stop_control(self) -> None:
+        self._cam_ui_alive = False
         self.control_panel_frame.pack_forget()
         self.main_menu_frame.pack(fill="both", expand=True)
         self._disconnect_pinky()
 
+    def _update_camera_loop(self) -> None:
+        """CCTVMonitorView.SHARED_FRAME을 비상제어 카메라 패널에 표시."""
+        if not getattr(self, '_cam_ui_alive', False):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        frame = CCTVMonitorView.SHARED_FRAME
+        if frame is not None:
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb)
+                # 카메라 패널이 최대한 큰 영상을 표시하도록 최소 크기를
+                # 넉넉히 잡고, 사용 가능한 공간 전체를 사용합니다.
+                w = max(self._cam_video_label.winfo_width(), 640)
+                h = max(self._cam_video_label.winfo_height(), 480)
+                # 비율 유지하면서 패널에 맞춤
+                img_w, img_h = img.size
+                scale = min(w / img_w, h / img_h)
+                if scale < 1.0:
+                    img = img.resize(
+                        (int(img_w * scale), int(img_h * scale)),
+                        Image.LANCZOS,
+                    )
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+                self._cam_video_label.configure(image=ctk_img, text="")
+                self._cam_video_label.image = ctk_img
+                self._cam_sig_lbl.configure(text="● LIVE", text_color=GREEN)
+            except Exception:
+                pass
+        else:
+            self._cam_sig_lbl.configure(text="❌ NO SIGNAL", text_color=ALERT_RED)
+
+        self.after(30, self._update_camera_loop)
+
     def destroy(self) -> None:
+        self._cam_ui_alive = False
         self._disconnect_pinky()
         super().destroy()
 

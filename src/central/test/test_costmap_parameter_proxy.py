@@ -13,7 +13,7 @@ def test_global_defaults_match_nav2_configuration():
 
     assert defaults['inflation_layer.inflation_radius'] == 0.20
     assert defaults['inflation_layer.cost_scaling_factor'] == 20.0
-    assert defaults['keepout_inflation_layer.inflation_radius'] == 0.08
+    assert defaults['keepout_inflation_layer.inflation_radius'] == 0.10
     assert defaults['keepout_inflation_layer.cost_scaling_factor'] == 6.0
 
 

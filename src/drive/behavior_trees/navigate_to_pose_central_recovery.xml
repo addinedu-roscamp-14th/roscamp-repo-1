@@ -14,6 +14,8 @@
         </PipelineSequence>
         <Sequence name="RecoverThenRetry">
           <AdaptiveLidarRecovery service_name="adaptive_lidar_recovery" opposite="false" reset_direction="false" server_timeout="20000"/>
+          <!-- Force the outer retry to regenerate a path after every
+               successful reverse + local/global costmap rebuild. -->
           <AlwaysFailure/>
         </Sequence>
       </Fallback>

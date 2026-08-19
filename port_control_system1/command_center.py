@@ -54,6 +54,7 @@ from cargo_dispatch_tool import (
     load_cargo_registry,
     load_cargo_details,
     save_cargo_registry,
+    _sync_cargo_to_db,
     load_named_locations,
     location_coord_text,
 )
@@ -65,6 +66,7 @@ from llm_command_parser import (
 )
 from inventory_decision_planner import InventoryDecisionPlanner
 from inventory_client import InventoryClient, InventoryClientError
+from autonomous_inventory import CANONICAL_LOCATIONS
 from ros_control_bridge import RosControlBridge
 from realtime_llm_agent import RealtimeLLMAgent
 from visual_navigation import (
@@ -80,6 +82,17 @@ from yolo_detection_client import (
     YoloDetectionClient,
     YoloDetectionError,
 )
+
+
+def inventory_plan_locations(configured_locations):
+    """Combine camera-configured names with every DB planning location."""
+    values = {
+        str(value).strip()
+        for value in (configured_locations or [])
+        if str(value).strip()
+    }
+    values.update(CANONICAL_LOCATIONS)
+    return sorted(values)
 
 PointXY = Tuple[float, float]
 
@@ -409,7 +422,7 @@ class CommandPopup(ctk.CTkToplevel):
             text='PostgreSQL 재고를 조회해 이동 계획을 생성하고 있습니다.',
             text_color='#3B82F6',
         )
-        known_locations = list(self.locations.keys())
+        known_locations = inventory_plan_locations(self.locations.keys())
 
         def _plan():
             result = InventoryDecisionPlanner().plan(
@@ -747,6 +760,7 @@ class CommandPopup(ctk.CTkToplevel):
                 self._log(f"[자동 등록] 화물 '{item}'이 등록부에 없어 '{destination}'에 신규 등록합니다.")
                 self.cargo_registry[item] = destination
                 save_cargo_registry(self.cargo_registry)
+                _sync_cargo_to_db(item, destination, self.cargo_details.get(item))
                 if self.on_cargo_updated:
                     self.on_cargo_updated()
                 self.result_label.configure(
@@ -1341,6 +1355,7 @@ class CommandPopup(ctk.CTkToplevel):
             self._run_route_log(item, route)
             self.cargo_registry[item] = route[-1].location
             save_cargo_registry(self.cargo_registry)
+            _sync_cargo_to_db(item, route[-1].location, self.cargo_details.get(item))
             if self.on_cargo_updated:
                 self.on_cargo_updated()
             
@@ -1365,6 +1380,7 @@ class CommandPopup(ctk.CTkToplevel):
         self.cargo_registry[item] = route[-1].location
         self.vehicle_positions[vehicle_idx] = agv_final_loc
         save_cargo_registry(self.cargo_registry)
+        _sync_cargo_to_db(item, route[-1].location, self.cargo_details.get(item))
         save_vehicle_state(self.vehicle_positions, self.next_vehicle_index)
         record_vehicle_job(vehicle_idx, f"'{item}' → '{route[-1].location}' 이동 완료")
         self._log(f"[적용 완료] cargo_locations.json에 '{item}': '{route[-1].location}' 로 저장됨")
@@ -1427,6 +1443,12 @@ class CommandPopup(ctk.CTkToplevel):
             moved.append(item)
 
         save_cargo_registry(self.cargo_registry)
+        for moved_item in moved:
+            _sync_cargo_to_db(
+                moved_item,
+                self.cargo_registry.get(moved_item, ''),
+                self.cargo_details.get(moved_item),
+            )
         save_vehicle_state(self.vehicle_positions, self.next_vehicle_index)
         self._log(f"[적용 완료] {len(moved)}건 갱신됨: {', '.join(moved) or '없음'}")
 
