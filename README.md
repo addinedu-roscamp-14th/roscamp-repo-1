@@ -243,22 +243,6 @@ ros2 launch porter_bringup dashboard_laptop.launch.py \
   llm_model:="${LOCAL_LLM_MODEL}"
 ```
 
-```bash
-cd ~/poter_ws
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-
-export ROS_DOMAIN_ID=12
-export PORT_CONTROL_API_TOKEN='porter1234'
-export OLLAMA_HOST='http://agent.sds.codes'
-export LOCAL_LLM_MODEL='gemma4:31b'
-
-ros2 launch porter_bringup dashboard_laptop.launch.py \
-  central_ip:=192.168.5.6 \
-  ollama_host:=${OLLAMA_HOST} \
-  llm_model:=${LOCAL_LLM_MODEL}
-```
-
 ### 7. 잠금 해제
 
 ``` bash
@@ -324,7 +308,7 @@ ros2 launch porter_bringup agv_vehicle.launch.py \
 
 ```bash
 ros2 run pinky led_server
-```
+````
 
 ```bash
 ros2 service call /set_led pinky/srv/SetLed \

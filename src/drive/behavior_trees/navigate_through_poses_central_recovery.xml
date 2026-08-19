@@ -1,24 +1,20 @@
 <!-- Multi-pose counterpart using the AMR-local adaptive LiDAR recovery. -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RetryUntilSuccessful num_attempts="-1">
-      <Fallback name="NavigateOrRecover">
-        <PipelineSequence name="NavigateWithReplanning">
-          <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
-          <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
-          <RateController hz="0.333">
-            <ReactiveSequence>
-              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
-              <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
-            </ReactiveSequence>
-          </RateController>
-          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
-        </PipelineSequence>
-        <Sequence name="RecoverThenRetry">
-          <AdaptiveLidarRecovery service_name="adaptive_lidar_recovery" opposite="false" reset_direction="false" server_timeout="20000"/>
-          <AlwaysFailure/>
-        </Sequence>
-      </Fallback>
-    </RetryUntilSuccessful>
+    <!-- Match single-pose navigation: four physical recovery cycles max. -->
+    <RecoveryNode number_of_retries="4" name="NavigateWithAdaptiveRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <RateController hz="0.333">
+          <ReactiveSequence>
+            <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+            <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+          </ReactiveSequence>
+        </RateController>
+        <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+      </PipelineSequence>
+      <AdaptiveLidarRecovery service_name="adaptive_lidar_recovery" opposite="false" reset_direction="false" server_timeout="20000"/>
+    </RecoveryNode>
   </BehaviorTree>
 </root>

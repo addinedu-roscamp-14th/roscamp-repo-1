@@ -137,17 +137,20 @@ def test_heading_alignment_rate_reduces_path_heading_error(
     'navigate_to_pose_central_recovery.xml',
     'navigate_through_poses_central_recovery.xml',
 ])
-def test_nav2_tree_retries_simple_reverse_recovery_until_success(filename):
+def test_nav2_tree_bounds_recovery_for_an_impossible_goal(filename):
     tree_path = Path(__file__).parents[1] / 'behavior_trees' / filename
     root = ET.parse(tree_path).getroot()
-    retry_node = root.find('.//RetryUntilSuccessful')
+    recovery_node = root.find('.//RecoveryNode')
 
-    assert retry_node is not None
-    assert retry_node.attrib['num_attempts'] == '-1'
+    assert recovery_node is not None
+    assert recovery_node.attrib['number_of_retries'] == '4'
     recovery_steps = root.findall('.//AdaptiveLidarRecovery')
     assert len(recovery_steps) == 1
-    assert root.find('.//Sequence[@name="RecoverThenRetry"]/AlwaysFailure') \
-        is not None
+    assert len(list(recovery_node)) == 2
+    assert list(recovery_node)[0].tag == 'PipelineSequence'
+    assert list(recovery_node)[1].tag == 'AdaptiveLidarRecovery'
+    assert not root.findall('.//RetryUntilSuccessful')
+    assert not root.findall('.//AlwaysFailure')
     assert not root.findall('.//Spin')
     assert not root.findall('.//BackUp')
 
