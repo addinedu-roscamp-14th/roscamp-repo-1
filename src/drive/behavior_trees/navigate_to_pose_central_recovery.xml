@@ -2,19 +2,23 @@
      available to central, parking and direct RViz Nav2 goals alike. -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <!-- A static/keepout collision cannot be removed by clearing costmaps.
-         RecoveryNode retries navigation after every successful physical
-         recovery, then returns an impossible goal after four cycles. -->
-    <RecoveryNode number_of_retries="4" name="NavigateWithAdaptiveRecovery">
-      <PipelineSequence name="NavigateWithReplanning">
-        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
-        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
-        <RateController hz="1.0">
-          <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
-        </RateController>
-        <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
-      </PipelineSequence>
-      <AdaptiveLidarRecovery service_name="adaptive_lidar_recovery" opposite="false" reset_direction="false" server_timeout="20000"/>
-    </RecoveryNode>
+    <RetryUntilSuccessful num_attempts="-1">
+      <Fallback name="NavigateOrRecover">
+        <PipelineSequence name="NavigateWithReplanning">
+          <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+          <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+          <RateController hz="1.0">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+          </RateController>
+          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+        </PipelineSequence>
+        <Sequence name="RecoverThenRetry">
+          <AdaptiveLidarRecovery service_name="adaptive_lidar_recovery" opposite="false" reset_direction="false" server_timeout="20000"/>
+          <!-- Force the outer retry to regenerate a path after every
+               successful reverse + local/global costmap rebuild. -->
+          <AlwaysFailure/>
+        </Sequence>
+      </Fallback>
+    </RetryUntilSuccessful>
   </BehaviorTree>
 </root>

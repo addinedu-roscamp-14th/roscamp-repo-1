@@ -38,6 +38,8 @@ class AutonomousCycle:
     outbound_ids: list[str] = field(default_factory=list)
     active_move: dict | None = None
     active_mission_id: str = ''
+    active_moves: dict[str, dict] = field(default_factory=dict)
+    last_vehicle_id: str = ''
     replan_count: int = 0
     failure_key: str = ''
     identical_failures: int = 0
@@ -51,6 +53,8 @@ class AutonomousCycle:
             'outbound_ids': list(self.outbound_ids),
             'active_move': self.active_move,
             'active_mission_id': self.active_mission_id,
+            'active_moves': dict(self.active_moves),
+            'last_vehicle_id': self.last_vehicle_id,
             'replan_count': self.replan_count,
             'failure_key': self.failure_key,
             'identical_failures': self.identical_failures,
@@ -122,10 +126,15 @@ def top_cargos(snapshot, location):
     return sorted(values, key=lambda item: int(item.get('floor', 1)))
 
 
-def destination_candidates(snapshot, locations, capacity=3):
+def destination_candidates(
+    snapshot, locations, capacity=3, excluded_locations=None
+):
     """Describe exact safe next-floor metadata for candidate destinations."""
+    excluded = {str(value) for value in (excluded_locations or [])}
     candidates = []
     for location in locations:
+        if location in excluded:
+            continue
         stack = top_cargos(snapshot, location)
         if len(stack) >= capacity:
             continue
@@ -192,7 +201,9 @@ def compile_move(move, vehicle_id):
                 'source_id': container_id, 'destination_id': trailer_id,
                 'vehicle_id': vehicle_id, 'final_for_vehicle': True,
             },
-            {'type': 'zone_navigation', 'zone': destination[:3], 'vehicle_id': vehicle_id},
+            # Every warehouse slot is served from the shared ARM2 stop A.
+            # The exact A-x-y slot belongs only to the following ARM command.
+            {'type': 'zone_navigation', 'zone': 'A', 'vehicle_id': vehicle_id},
             {
                 'type': 'arm_transfer_to_slot', 'arm_id': 'arm2',
                 'destination_slot': destination, 'vehicle_id': vehicle_id,
@@ -202,7 +213,7 @@ def compile_move(move, vehicle_id):
         ]
     if source.startswith('A-') and destination.startswith('선박-'):
         return [
-            {'type': 'zone_navigation', 'zone': source[:3], 'vehicle_id': vehicle_id},
+            {'type': 'zone_navigation', 'zone': 'A', 'vehicle_id': vehicle_id},
             {
                 'type': 'arm_load_to_trailer', 'arm_id': 'arm2',
                 'source_id': container_id, 'vehicle_id': vehicle_id,
@@ -237,16 +248,34 @@ def compile_move(move, vehicle_id):
 
 
 def choose_policy(
-    cycle, snapshot, port_present, visible_warehouse_zones=None
+    cycle, snapshot, port_present, visible_warehouse_zones=None,
+    reserved_container_ids=None, reserved_destinations=None,
 ):
     """Return the fixed phase and LLM objective for the next policy action."""
     cargos = cargo_rows(snapshot)
     ship = [cargo for cargo in cargos if cargo.get('location') in SHIP_LOCATIONS]
     ship_ids = {str(cargo.get('container_id')) for cargo in ship}
     outbound = set(str(value) for value in cycle.outbound_ids)
-    inbound = [cargo for cargo in ship if str(cargo.get('container_id')) not in outbound]
+    reserved_ids = {str(value) for value in (reserved_container_ids or [])}
+    reserved_destinations = {
+        str(value) for value in (reserved_destinations or [])
+    }
+    all_inbound = [
+        cargo for cargo in ship
+        if str(cargo.get('container_id')) not in outbound
+    ]
+    inbound = [
+        cargo for cargo in all_inbound
+        if str(cargo.get('container_id')) not in reserved_ids
+    ]
 
-    if cycle.active_move:
+    active_values = list((cycle.active_moves or {}).values())
+    if cycle.active_move and cycle.active_move not in active_values:
+        active_values.append(cycle.active_move)
+    if active_values and not inbound and any(
+        str(value.get('source_location') or '').startswith('선박-')
+        for value in active_values
+    ):
         cycle.phase = 'EXECUTING_MOVE'
         return cycle.phase, ''
     if not port_present and outbound:
@@ -264,7 +293,9 @@ def choose_policy(
             if value not in cycle.inbound_ids:
                 cycle.inbound_ids.append(value)
         cycle.phase = 'UNLOADING_INBOUND'
-        ids = ', '.join(cycle.inbound_ids)
+        ids = ', '.join(
+            str(cargo.get('container_id')) for cargo in inbound
+        )
         warehouse_locations = WAREHOUSE_LOCATIONS
         if visible_warehouse_zones is not None:
             visible = {
@@ -274,7 +305,11 @@ def choose_policy(
                 location for location in warehouse_locations
                 if location[:3].upper() in visible
             )
-        destinations = destination_candidates(snapshot, warehouse_locations)
+        destinations = destination_candidates(
+            snapshot,
+            warehouse_locations,
+            excluded_locations=reserved_destinations,
+        )
         return cycle.phase, (
             f'이번 회차 입항 컨테이너 [{ids}] 중 선박에 남은 화물을 '
             '최상단에서 하나만 선택하여 아래 목적지 후보 중 하나로 이동하라. '
@@ -287,11 +322,16 @@ def choose_policy(
         cargo for cargo in cargos
         if str(cargo.get('location', '')).startswith('A-')
         and int(cargo.get('floor', 1)) >= 3
+        and str(cargo.get('container_id')) not in reserved_ids
     ]
     if third_floor:
         cycle.phase = 'LOADING_OUTBOUND'
         ids = ', '.join(str(cargo.get('container_id')) for cargo in third_floor)
-        destinations = destination_candidates(snapshot, SHIP_LOCATIONS)
+        destinations = destination_candidates(
+            snapshot,
+            SHIP_LOCATIONS,
+            excluded_locations=reserved_destinations,
+        )
         ship_marker_mapping = {
             location: int(marker_id)
             for location, marker_id in SHIP_MARKERS.items()
@@ -306,6 +346,9 @@ def choose_policy(
             'ARM1 선박 목적지 ArUco 매핑 JSON: '
             f'{json.dumps(ship_marker_mapping, ensure_ascii=False)}'
         )
+    if active_values:
+        cycle.phase = 'EXECUTING_MOVE'
+        return cycle.phase, ''
     if outbound and ship_ids & outbound:
         cycle.phase = 'WAITING_FOR_CLEAR'
         return cycle.phase, ''

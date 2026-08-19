@@ -155,6 +155,10 @@ class CentralControlGateway(Node):
             'vehicles': {},
             'arms': {},
             'last_arm_result': None,
+            # Keep results by command ID as well as the legacy last result.
+            # ARM1 and ARM2 may finish concurrently, so one shared slot is not
+            # sufficient for the autonomous executor to acknowledge both.
+            'arm_results': {},
             'inventory_sync': {
                 'state': 'OFFLINE',
                 'pending_count': 0,
@@ -421,6 +425,14 @@ class CentralControlGateway(Node):
             result = {'raw': message.data}
         with self._lock:
             self._telemetry['last_arm_result'] = result
+            command_id = str(result.get('command_id') or '')
+            if command_id:
+                results = self._telemetry.setdefault('arm_results', {})
+                # Refresh insertion order for repeated/idempotent events.
+                results.pop(command_id, None)
+                results[command_id] = result
+                while len(results) > 100:
+                    results.pop(next(iter(results)))
 
     def _on_json_telemetry(self, key, message):
         try:
@@ -532,11 +544,17 @@ class CentralControlGateway(Node):
         try:
             wrapped = future.result()
             result = wrapped.result
-            level = self.get_logger().info if result.success else self.get_logger().error
-            level(
+            message = (
                 f'ARM command {command_id} completed: '
                 f'success={result.success}, message={result.message}'
             )
+            # rclpy caches logging severity by source line. Calling a bound
+            # info/error method from the same line makes alternating results
+            # raise "Logger severity cannot be changed between calls".
+            if result.success:
+                self.get_logger().info(message)
+            else:
+                self.get_logger().error(message)
         except Exception as exc:
             self.get_logger().error(
                 f'ARM command {command_id} result failed: {exc}'

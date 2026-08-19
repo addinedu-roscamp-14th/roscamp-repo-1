@@ -249,6 +249,7 @@ class AdaptiveLidarRecoveryNode(Node):
             'odom_topic': 'odom',
             'path_topic': 'plan',
             'local_costmap_topic': 'local_costmap/costmap',
+            'global_costmap_topic': 'global_costmap/costmap',
             'footprint_topic': 'local_costmap/published_footprint',
             'cmd_vel_topic': 'cmd_vel_nav',
             'clear_local_costmap_service': (
@@ -277,7 +278,8 @@ class AdaptiveLidarRecoveryNode(Node):
             'timeout_sec': 15.0,
             'command_rate_hz': 15.0,
             'clear_service_timeout_sec': 3.0,
-            'costmap_rebuild_wait_sec': 0.4,
+            'costmap_rebuild_wait_sec': 0.20,
+            'costmap_rebuild_timeout_sec': 3.0,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -317,6 +319,8 @@ class AdaptiveLidarRecoveryNode(Node):
             self.get_parameter('clear_service_timeout_sec').value)
         self.costmap_rebuild_wait = float(
             self.get_parameter('costmap_rebuild_wait_sec').value)
+        self.costmap_rebuild_timeout = float(
+            self.get_parameter('costmap_rebuild_timeout_sec').value)
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
         self._latest_scan = None
@@ -329,6 +333,7 @@ class AdaptiveLidarRecoveryNode(Node):
         self._path_received_at = None
         self._latest_costmap = None
         self._costmap_received_at = None
+        self._global_costmap_received_at = None
         self._relative_footprint = None
         self._footprint_received_at = None
         group = ReentrantCallbackGroup()
@@ -350,6 +355,13 @@ class AdaptiveLidarRecoveryNode(Node):
             OccupancyGrid,
             str(self.get_parameter('local_costmap_topic').value),
             self._on_costmap,
+            10,
+            callback_group=group,
+        )
+        self.create_subscription(
+            OccupancyGrid,
+            str(self.get_parameter('global_costmap_topic').value),
+            self._on_global_costmap,
             10,
             callback_group=group,
         )
@@ -401,6 +413,10 @@ class AdaptiveLidarRecoveryNode(Node):
         with self._lock:
             self._latest_costmap = message
             self._costmap_received_at = time.monotonic()
+
+    def _on_global_costmap(self, _message):
+        with self._lock:
+            self._global_costmap_received_at = time.monotonic()
 
     def _on_footprint(self, message):
         with self._lock:
@@ -648,8 +664,33 @@ class AdaptiveLidarRecoveryNode(Node):
     def _clear_rebuild_costmap(self):
         if not self._clear_costmaps():
             return False
-        time.sleep(max(0.0, self.costmap_rebuild_wait))
-        return True
+        cleared_at = time.monotonic()
+        deadline = cleared_at + max(0.1, self.costmap_rebuild_timeout)
+        missing = 'local and global'
+        while time.monotonic() < deadline:
+            with self._lock:
+                local_ready = (
+                    self._costmap_received_at is not None
+                    and self._costmap_received_at > cleared_at
+                )
+                global_ready = (
+                    self._global_costmap_received_at is not None
+                    and self._global_costmap_received_at > cleared_at
+                )
+            if local_ready and global_ready:
+                # Let one more sensor/update cycle settle after both complete
+                # grids have been observed. This avoids planning against the
+                # empty transition between clear and layer reconstruction.
+                time.sleep(max(0.0, self.costmap_rebuild_wait))
+                return True
+            if local_ready:
+                missing = 'global'
+            elif global_ready:
+                missing = 'local'
+            time.sleep(0.02)
+        self.get_logger().error(
+            f'Costmap rebuild timed out waiting for fresh {missing} grid')
+        return False
 
     def _recover(self, request, response):
         if not self._operation_lock.acquire(blocking=False):

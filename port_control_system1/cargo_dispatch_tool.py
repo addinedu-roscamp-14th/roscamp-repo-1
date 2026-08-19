@@ -17,6 +17,9 @@ Nav2 목표 전송 + 적재/하역 확인 신호 대기를 연결하시면 됩�
 """
 
 import json
+import os
+import queue
+import threading
 import time
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
@@ -27,6 +30,7 @@ from openpyxl import load_workbook
 
 from waypoint_rules import expand_leg, load_waypoint_rules
 from generate_cargo_template import build_template as build_cargo_excel_template
+from inventory_client import InventoryAdminClient, InventoryClient
 
 
 # 실행할 때의 현재 폴더(cwd)가 아니라, 이 파일이 실제로 있는 폴더를 기준으로 삼습니다.
@@ -51,6 +55,15 @@ NUM_VEHICLES = 2  # 보유 차량 대수 - 늘리거나 줄이려면 이 값만 
 VEHICLE_HOME_LOCATIONS = ["대기장소 1", "대기장소 2"]
 
 VEHICLE_STATE_FILE = str(_APP_DIR / "vehicle_positions.json")
+
+
+def _inventory_refresh_interval_ms() -> int:
+    """Return the dashboard DB polling interval with a safe lower bound."""
+    try:
+        seconds = float(os.environ.get("PORT_INVENTORY_UI_REFRESH_SEC", "2"))
+    except (TypeError, ValueError):
+        seconds = 2.0
+    return max(500, int(max(0.5, seconds) * 1000))
 
 
 def vehicle_home_location(vehicle_idx: int) -> str:
@@ -224,8 +237,49 @@ def load_cargo_registry() -> Dict[str, str]:
     return {}
 
 
+def _sync_cargo_to_db(name: str, location: str, details: dict | None = None) -> None:
+    """화물 한 건을 PostgreSQL cargos 테이블에 upsert 합니다.
+
+    DB 연결이 불가능한 환경(개발 머신 등)에서는 조용히 무시하여 JSON
+    파일 기반 동작이 깨지지 않도록 합니다.
+    """
+    try:
+        detail = details or {}
+        admin = InventoryAdminClient()
+        admin.upsert_cargo(
+            name=name,
+            location=location,
+            container_id=detail.get('컨테이너ID', ''),
+            cargo_type=detail.get('화물종류', ''),
+            note=detail.get('비고', ''),
+            base_aruco_id=detail.get('기반ArUco', ''),
+            floor=int(detail.get('층수', '1') or 1),
+        )
+    except Exception as exc:
+        print(f'[DB 동기화 경고] {name} upsert 실패: {exc}')
+
+
+def _delete_cargo_from_db(name: str) -> None:
+    """화물 한 건을 PostgreSQL cargos 테이블에서 삭제합니다."""
+    try:
+        admin = InventoryAdminClient()
+        admin.delete_cargo(name)
+    except Exception as exc:
+        print(f'[DB 동기화 경고] {name} delete 실패: {exc}')
+
+
 def save_cargo_registry(registry: Dict[str, str]) -> None:
     Path(CARGO_FILE).write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_cargo_registry_and_db(
+    registry: Dict[str, str], details: Dict[str, Dict[str, str]] | None = None
+) -> None:
+    """JSON 파일에 저장함과 동시에 PostgreSQL에 upsert 합니다."""
+    Path(CARGO_FILE).write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+    details = details if details is not None else load_cargo_details()
+    for name, location in registry.items():
+        _sync_cargo_to_db(name, location, details.get(name))
 
 
 def load_cargo_details() -> Dict[str, Dict[str, str]]:
@@ -236,6 +290,17 @@ def load_cargo_details() -> Dict[str, Dict[str, str]]:
 
 def save_cargo_details(details: Dict[str, Dict[str, str]]) -> None:
     Path(CARGO_DETAILS_FILE).write_text(json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_cargo_details_and_db(
+    registry: Dict[str, str], details: Dict[str, Dict[str, str]]
+) -> None:
+    """JSON 파일에 저장함과 동시에 PostgreSQL에 upsert 합니다."""
+    Path(CARGO_DETAILS_FILE).write_text(json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8")
+    for name, detail in details.items():
+        location = registry.get(name, '')
+        if location:
+            _sync_cargo_to_db(name, location, detail)
 
 
 def bulk_import_cargo_from_excel(
@@ -546,6 +611,8 @@ def write_cargo_excel(cargo_registry: Dict[str, str], cargo_details: Dict[str, D
 
 class CargoDispatchTool(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
+        inventory_client = kwargs.pop("inventory_client", None)
+        inventory_admin_client = kwargs.pop("inventory_admin_client", None)
         super().__init__(master, fg_color="transparent", **kwargs)
 
         self.font_title = ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold")
@@ -558,6 +625,25 @@ class CargoDispatchTool(ctk.CTkFrame):
         self.rules = load_waypoint_rules()            # 필수 경유지 규칙 (build_route에 전달)
         self.vehicle_positions, self.next_vehicle_index = load_vehicle_state()  # 차량별 현재 위치
 
+        # PostgreSQL is authoritative for the inventory list shown on this page.
+        # Queries run outside the Tk thread so a DB timeout cannot freeze the UI.
+        self.inventory_client = inventory_client or InventoryClient()
+        self.inventory_admin_client = (
+            inventory_admin_client
+            or InventoryAdminClient(self.inventory_client)
+        )
+        self._inventory_records = None
+        self._inventory_snapshot_id = ""
+        self._inventory_last_success = ""
+        self._inventory_error = ""
+        self._inventory_poll_in_flight = False
+        self._inventory_reset_in_flight = False
+        self._inventory_stopped = False
+        self._inventory_after_id = None
+        self._inventory_results = queue.Queue()
+        self._inventory_reset_results = queue.Queue()
+        self._inventory_refresh_ms = _inventory_refresh_interval_ms()
+
         # 배차 실행 큐 상태 - 자연어 단건 명령이든 엑셀 다건 재배치든 이 큐 하나로 통일해서 처리
         self.dispatch_queue: List[Dict] = []  # [{"item": 화물명, "route": [RouteStep, ...]}, ...]
         self.active_job_index: int = 0        # 큐에서 지금 처리 중인 화물(job)의 인덱스
@@ -565,6 +651,7 @@ class CargoDispatchTool(ctk.CTkFrame):
 
         self._build_ui()
         self._refresh_cargo_list()
+        self._request_inventory_refresh()
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -642,18 +729,39 @@ class CargoDispatchTool(ctk.CTkFrame):
         list_card = ctk.CTkFrame(left, fg_color="#2b2b2b", corner_radius=6, border_width=1, border_color="#1a1a1a")
         list_card.grid(row=2, column=0, sticky="nsew")
         list_card.grid_columnconfigure(0, weight=1)
-        list_card.grid_rowconfigure(1, weight=1)
+        list_card.grid_rowconfigure(2, weight=1)
 
         list_header = ctk.CTkFrame(list_card, fg_color="#2b2b2b", height=52, corner_radius=6)
         list_header.grid(row=0, column=0, sticky="ew")
         list_header.pack_propagate(False)
-        ctk.CTkLabel(list_header, text="등록된 화물 목록", font=self.font_subtitle, text_color="#dce4ee").pack(side="left", padx=16, pady=16)
-        ctk.CTkButton(list_header, text="🔄 새로고침", width=80, fg_color="transparent", text_color="#2e86c1", hover_color="#333333", command=self.refresh_from_disk).pack(side="right", padx=16, pady=16)
+        ctk.CTkLabel(list_header, text="DB 실시간 화물 목록", font=self.font_subtitle, text_color="#dce4ee").pack(side="left", padx=16, pady=16)
+        ctk.CTkButton(list_header, text="🔄 DB 조회", width=80, fg_color="transparent", text_color="#2e86c1", hover_color="#333333", command=self._request_inventory_refresh).pack(side="right", padx=16, pady=16)
+        self.inventory_reset_button = ctk.CTkButton(
+            list_header,
+            text="DB 초기화",
+            width=76,
+            fg_color="#c0392b",
+            hover_color="#922b21",
+            text_color="white",
+            command=self._confirm_inventory_reset,
+        )
+        self.inventory_reset_button.pack(side="right", padx=(0, 4), pady=16)
 
         ctk.CTkFrame(list_card, height=1, fg_color="#1a1a1a").grid(row=0, column=0, sticky="sew")
 
+        self.inventory_status_label = ctk.CTkLabel(
+            list_card,
+            text="PostgreSQL 조회 대기 중",
+            font=self.font_body,
+            text_color="#f0ad4e",
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        )
+        self.inventory_status_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(10, 0))
+
         self.cargo_rows_container = ctk.CTkScrollableFrame(list_card, fg_color="#242424", border_width=1, border_color="#1a1a1a", corner_radius=6)
-        self.cargo_rows_container.grid(row=1, column=0, sticky="nsew", padx=16, pady=16)
+        self.cargo_rows_container.grid(row=2, column=0, sticky="nsew", padx=16, pady=16)
         self.cargo_rows_container.grid_columnconfigure(0, weight=1)
 
         # ---- Right Panel: Batch Redispatch & Log ----
@@ -714,6 +822,217 @@ class CargoDispatchTool(ctk.CTkFrame):
         self.cargo_registry = load_cargo_registry()
         self.cargo_details = load_cargo_details()
         self._refresh_cargo_list()
+        self._request_inventory_refresh()
+
+    def _request_inventory_refresh(self) -> None:
+        """Start one non-blocking PostgreSQL inventory query."""
+        if (
+            self._inventory_stopped
+            or self._inventory_poll_in_flight
+            or self._inventory_reset_in_flight
+        ):
+            return
+        pending_after_id = self._inventory_after_id
+        self._inventory_after_id = None
+        if pending_after_id is not None:
+            try:
+                self.after_cancel(pending_after_id)
+            except Exception:
+                pass
+        self._inventory_poll_in_flight = True
+        if hasattr(self, "inventory_status_label"):
+            self.inventory_status_label.configure(
+                text="PostgreSQL 실시간 조회 중…",
+                text_color="#f0ad4e",
+            )
+
+        def fetch() -> None:
+            try:
+                self._inventory_results.put((True, self.inventory_client.fetch_snapshot()))
+            except Exception as exc:
+                self._inventory_results.put((False, exc))
+
+        threading.Thread(
+            target=fetch,
+            name="cargo-inventory-ui",
+            daemon=True,
+        ).start()
+        self._schedule_inventory_result_check(100)
+
+    def _confirm_inventory_reset(self) -> None:
+        """Require operator confirmation before deleting all inventory rows."""
+        if self._inventory_reset_in_flight:
+            return
+        if self._inventory_poll_in_flight:
+            messagebox.showinfo(
+                "DB 조회 중",
+                "현재 DB 조회가 끝난 뒤 초기화 버튼을 다시 눌러주세요.",
+            )
+            return
+        confirmed = messagebox.askyesno(
+            "DB 전체 초기화",
+            "cargos의 현재 화물 정보와 cargo_movements의 전체 이동 이력을 모두 삭제합니다.\n\n"
+            "자율 관제모드를 먼저 중지해야 하며, 삭제된 정보는 되돌릴 수 없습니다.\n"
+            "계속하시겠습니까?",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+
+        pending_after_id = self._inventory_after_id
+        self._inventory_after_id = None
+        if pending_after_id is not None:
+            try:
+                self.after_cancel(pending_after_id)
+            except Exception:
+                pass
+        self._inventory_reset_in_flight = True
+        self.inventory_reset_button.configure(state="disabled", text="초기화 중…")
+        self.inventory_status_label.configure(
+            text="PostgreSQL 화물 정보와 이동 이력을 초기화하는 중…",
+            text_color="#f0ad4e",
+        )
+
+        def reset() -> None:
+            try:
+                self.inventory_admin_client.clear_inventory()
+                self._inventory_reset_results.put((True, None))
+            except Exception as exc:
+                self._inventory_reset_results.put((False, exc))
+
+        threading.Thread(
+            target=reset,
+            name="cargo-inventory-reset-ui",
+            daemon=True,
+        ).start()
+        self._schedule_inventory_reset_check(100)
+
+    def _schedule_inventory_reset_check(self, delay_ms: int) -> None:
+        if self._inventory_stopped:
+            return
+        try:
+            self._inventory_after_id = self.after(
+                delay_ms,
+                self._consume_inventory_reset_result,
+            )
+        except Exception:
+            self._inventory_stopped = True
+
+    def _consume_inventory_reset_result(self) -> None:
+        if self._inventory_stopped:
+            return
+        try:
+            success, result = self._inventory_reset_results.get_nowait()
+        except queue.Empty:
+            self._schedule_inventory_reset_check(100)
+            return
+
+        self._inventory_after_id = None
+        self._inventory_reset_in_flight = False
+        self.inventory_reset_button.configure(state="normal", text="DB 초기화")
+        if success:
+            self._inventory_records = tuple()
+            self._inventory_snapshot_id = ""
+            self._inventory_last_success = time.strftime("%H:%M:%S")
+            self._inventory_error = ""
+            self.inventory_status_label.configure(
+                text="● DB 초기화 완료 · 최신 상태를 다시 조회합니다.",
+                text_color="#61de8a",
+            )
+            self._refresh_cargo_list()
+            self._request_inventory_refresh()
+            return
+
+        self._inventory_error = " ".join(str(result).split())[:220]
+        self.inventory_status_label.configure(
+            text=f"● DB 초기화 실패 · {self._inventory_error}",
+            text_color="#ff6b6b",
+        )
+        messagebox.showerror(
+            "DB 초기화 실패",
+            f"PostgreSQL을 초기화하지 못했습니다.\n\n{self._inventory_error}",
+        )
+        try:
+            self._inventory_after_id = self.after(
+                self._inventory_refresh_ms,
+                self._request_inventory_refresh,
+            )
+        except Exception:
+            self._inventory_stopped = True
+
+    def _schedule_inventory_result_check(self, delay_ms: int) -> None:
+        if self._inventory_stopped:
+            return
+        try:
+            self._inventory_after_id = self.after(delay_ms, self._consume_inventory_result)
+        except Exception:
+            self._inventory_stopped = True
+
+    def _consume_inventory_result(self) -> None:
+        if self._inventory_stopped:
+            return
+        try:
+            success, result = self._inventory_results.get_nowait()
+        except queue.Empty:
+            self._schedule_inventory_result_check(100)
+            return
+
+        self._inventory_poll_in_flight = False
+        self._inventory_after_id = None
+        refresh_rows = False
+        if success:
+            refresh_rows = (
+                result.snapshot_id != self._inventory_snapshot_id
+                or self._inventory_records is None
+                or bool(self._inventory_error)
+            )
+            self._inventory_records = tuple(result.cargos)
+            self._inventory_snapshot_id = result.snapshot_id
+            self._inventory_last_success = time.strftime("%H:%M:%S")
+            self._inventory_error = ""
+            self.inventory_status_label.configure(
+                text=(
+                    f"● DB 실시간 연결 · {len(self._inventory_records)}건 · "
+                    f"{self._inventory_last_success} · 스냅샷 {self._inventory_snapshot_id}"
+                ),
+                text_color="#61de8a",
+            )
+        else:
+            refresh_rows = not self._inventory_error
+            self._inventory_error = " ".join(str(result).split())[:220]
+            if self._inventory_last_success:
+                status = (
+                    f"● DB 갱신 실패 · 아래 정보는 {self._inventory_last_success} 기준이며 최신이 아닙니다 · "
+                    f"{self._inventory_error}"
+                )
+            else:
+                status = f"● DB 연결 실패 · {self._inventory_error}"
+            self.inventory_status_label.configure(text=status, text_color="#ff6b6b")
+
+        # Preserve the operator's scroll position when the DB content is unchanged.
+        if refresh_rows:
+            self._refresh_cargo_list()
+        try:
+            self._inventory_after_id = self.after(
+                self._inventory_refresh_ms,
+                self._request_inventory_refresh,
+            )
+        except Exception:
+            self._inventory_stopped = True
+
+    def stop(self) -> None:
+        """Stop dashboard polling when the user leaves this page."""
+        self._inventory_stopped = True
+        if self._inventory_after_id is not None:
+            try:
+                self.after_cancel(self._inventory_after_id)
+            except Exception:
+                pass
+            self._inventory_after_id = None
+
+    def destroy(self) -> None:
+        self.stop()
+        super().destroy()
 
     # ------------------------------------------------------------------
     # 화물 위치 등록
@@ -758,6 +1077,7 @@ class CargoDispatchTool(ctk.CTkFrame):
         }
         save_cargo_registry(self.cargo_registry)
         save_cargo_details(self.cargo_details)
+        _sync_cargo_to_db(name, location, self.cargo_details[name])
 
         self._hide_detail_banner()
         self._refresh_cargo_list()
@@ -771,6 +1091,7 @@ class CargoDispatchTool(ctk.CTkFrame):
 
         self.cargo_registry[name] = location
         save_cargo_registry(self.cargo_registry)
+        _sync_cargo_to_db(name, location, self.cargo_details.get(name))
 
         self._hide_detail_banner()
         self._refresh_cargo_list()
@@ -801,6 +1122,7 @@ class CargoDispatchTool(ctk.CTkFrame):
         self.cargo_details.pop(name, None)  # 세부정보도 같이 있으면 제거, 없으면 조용히 무시
         save_cargo_registry(self.cargo_registry)
         save_cargo_details(self.cargo_details)
+        _delete_cargo_from_db(name)
         self._refresh_cargo_list()
 
     def generate_template(self) -> None:
@@ -859,6 +1181,8 @@ class CargoDispatchTool(ctk.CTkFrame):
         self.cargo_details.update(new_details)
         save_cargo_registry(self.cargo_registry)
         save_cargo_details(self.cargo_details)
+        for name, location in new_registry.items():
+            _sync_cargo_to_db(name, location, new_details.get(name))
         self._refresh_cargo_list()
 
         summary = f"{len(new_registry)}건의 화물 위치를 등록했습니다."
@@ -869,31 +1193,50 @@ class CargoDispatchTool(ctk.CTkFrame):
         messagebox.showinfo("엑셀 일괄 등록 완료", summary)
 
     def _refresh_cargo_list(self) -> None:
-        """화물 목록을 다시 그립니다. 각 행에 이름/위치/부가정보와 삭제 버튼이 함께 보입니다."""
+        """Render the latest PostgreSQL inventory snapshot."""
         for widget in self.cargo_rows_container.winfo_children():
             widget.destroy()
 
-        if not self.cargo_registry:
-            ctk.CTkLabel(self.cargo_rows_container, text="등록된 화물이 없습니다.",
+        if self._inventory_records is None:
+            message = (
+                "DB 화물 정보를 불러오지 못했습니다."
+                if self._inventory_error
+                else "DB 화물 정보를 불러오는 중입니다…"
+            )
+            ctk.CTkLabel(self.cargo_rows_container, text=message,
                         font=self.font_body, text_color="#9e9e9e").pack(anchor="w", pady=10)
             return
 
-        for name, location in self.cargo_registry.items():
-            detail = self.cargo_details.get(name, {})
-            extra_parts = [v for v in (detail.get("컨테이너ID"), detail.get("화물종류")) if v]
-            extra = f" [{', '.join(extra_parts)}]" if extra_parts else ""
+        if not self._inventory_records:
+            ctk.CTkLabel(self.cargo_rows_container, text="DB에 저장된 화물이 없습니다.",
+                        font=self.font_body, text_color="#9e9e9e").pack(anchor="w", pady=10)
+            return
 
-            row = ctk.CTkFrame(self.cargo_rows_container, fg_color="#2b2b2b", corner_radius=6, border_width=1, border_color="#565b5e")
+        stale = bool(self._inventory_error)
+        for cargo in self._inventory_records:
+            row = ctk.CTkFrame(
+                self.cargo_rows_container,
+                fg_color="#2b2b2b",
+                corner_radius=6,
+                border_width=1,
+                border_color="#c0392b" if stale else "#565b5e",
+            )
             row.pack(fill="x", pady=(0, 8))
             row.grid_columnconfigure(0, weight=1)
 
-            text_lbl = ctk.CTkLabel(row, text=f"{name}: {location}{extra}", font=("Consolas", 13), text_color="#dce4ee", anchor="w")
-            text_lbl.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+            title = f"{cargo.name}  ·  ID {cargo.container_id or '-'}"
+            location = f"위치 {cargo.location}  ·  {cargo.floor}층  ·  기반 ArUco {cargo.base_aruco_id or '-'}"
+            details = f"종류 {cargo.cargo_type or '-'}"
+            if cargo.note:
+                details += f"  ·  비고 {cargo.note}"
+            text_frame = ctk.CTkFrame(row, fg_color="transparent")
+            text_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=8)
+            ctk.CTkLabel(text_frame, text=title, font=("Malgun Gothic", 13, "bold"), text_color="#dce4ee", anchor="w").pack(fill="x", anchor="w")
+            ctk.CTkLabel(text_frame, text=location, font=self.font_body, text_color="#92ccff", anchor="w").pack(fill="x", anchor="w", pady=(2, 0))
+            ctk.CTkLabel(text_frame, text=details, font=self.font_body, text_color="#9e9e9e", anchor="w", wraplength=420, justify="left").pack(fill="x", anchor="w", pady=(2, 0))
             
             ctk.CTkButton(row, text="🗣️ 배차", width=60, fg_color="#343638", border_width=1, border_color="#565b5e", text_color="#2e86c1", hover_color="#404040",
-                         command=lambda n=name: self.send_cargo_to_command_popup(n)).grid(row=0, column=1, padx=(0, 8), pady=10)
-            ctk.CTkButton(row, text="삭제", width=50, fg_color="#c0392b", hover_color="#922b21", text_color="white", font=self.font_body,
-                         command=lambda n=name: self.delete_cargo(n)).grid(row=0, column=2, padx=(0, 10), pady=10)
+                         command=lambda n=cargo.name: self.send_cargo_to_command_popup(n)).grid(row=0, column=1, padx=(0, 10), pady=10)
 
     def send_cargo_to_command_popup(self, name: str) -> None:
         """화물 목록에서 이 버튼을 누르면, 그 화물명이 미리 채워진 채로 명령 팝업이 열립니다.

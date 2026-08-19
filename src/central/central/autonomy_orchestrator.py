@@ -82,6 +82,7 @@ class AutonomyOrchestrator(Node):
             self.get_parameter('arm1_ship_cache_state_path').value
         )))
         self.arm1_cache_ready = self._load_arm1_cache_state()
+        self.arm1_startup_scan_done = False
         self.inbound_scan_requested = False
         self.inbound_scan_pending = False
         self.create_timer(1.0, self._retry_scan_if_needed)
@@ -92,7 +93,13 @@ class AutonomyOrchestrator(Node):
         if not bool(self.get_parameter('auto_scan_arm1_ship_on_start').value):
             return
         with self.lock:
-            if self.arm1_cache_ready or self.arm1_scan_requested:
+            # On first startup, always attempt a scan even if a stale cache
+            # file says ready=true — the ARM1 process may have restarted and
+            # lost its in-memory marker poses.  After the first successful
+            # scan, trust the cache to avoid redundant scans.
+            if self.arm1_scan_requested:
+                return
+            if self.arm1_cache_ready and self.arm1_startup_scan_done:
                 return
         if not self.arm_client.wait_for_server(timeout_sec=1.0):
             self._publish_status('WAITING_FOR_ARM1_SHIP_SCAN')
@@ -136,11 +143,17 @@ class AutonomyOrchestrator(Node):
             # reports that its cache is incomplete during an inbound request.
             if success:
                 self.arm1_cache_ready = True
+                self.arm1_startup_scan_done = True
                 self._save_arm1_cache_state(True)
         self._publish_status(
             'ARM1_SHIP_CACHE_READY' if success else 'ARM1_SHIP_SCAN_RETRY',
             error=error,
         )
+        # Mark the startup scan as done regardless of success/failure so the
+        # 10-second timer stops retrying.  A failed scan will be retried on
+        # the next vessel arrival via _request_arm1_inbound_scan.
+        with self.lock:
+            self.arm1_startup_scan_done = True
 
     def _on_port_event(self, message):
         if message.event_type == PortEvent.VESSEL_DEPARTED:
@@ -420,15 +433,25 @@ class AutonomyOrchestrator(Node):
             return
         if not result.get('success') or not result.get('vehicle_id'):
             return
-        release = String()
-        release.data = json.dumps({
+        mission_id = str(result.get('mission_id', ''))
+        payload = {
             'vehicle_id': result['vehicle_id'],
-            'mission_id': result.get('mission_id', ''),
+            'mission_id': mission_id,
             'command_id': result.get('command_id', ''),
             'operation_id': result.get('operation_id', ''),
             'state': 'RELEASE_ALLOWED',
             'reason': 'all declared cargo operations completed',
-        }, ensure_ascii=False)
+        }
+        self._publish_status(
+            'RELEASE_ALLOWED',
+            mission_id,
+            vehicle_id=result['vehicle_id'],
+            command_id=result.get('command_id', ''),
+            operation_id=result.get('operation_id', ''),
+            reason='all declared cargo operations completed',
+        )
+        release = String()
+        release.data = json.dumps(payload, ensure_ascii=False)
         self.release_publisher.publish(release)
 
     def _publish_status(self, state, mission_id='', **extra):

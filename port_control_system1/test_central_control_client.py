@@ -58,6 +58,35 @@ def test_pixel_goal_contains_token_and_coordinates(monkeypatch):
     assert captured['json']['queue_if_busy'] is True
 
 
+def test_pixel_goal_defaults_to_queueing_for_concurrent_control(monkeypatch):
+    """Parallel control should preserve the earlier command instead of dropping it."""
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        text = ''
+
+        @staticmethod
+        def json():
+            return {'accepted': True, 'duplicate': False, 'command_id': 'vlm-default'}
+
+    def fake_post(url, headers, json, timeout):
+        captured.update({'json': json})
+        return FakeResponse()
+
+    monkeypatch.setattr('central_control_client.requests.post', fake_post)
+    client = CentralControlClient(base_url='http://central:8100', token='porter1234')
+
+    client.send_pixel_goal(
+        {'x': 320, 'y': 300},
+        {'x': 380, 'y': 300},
+        command_id='vlm-default',
+    )
+
+    assert captured['json']['queue_if_busy'] is True
+
+
 def test_send_park_contains_token_and_vehicle_id(monkeypatch):
     """A park request must reach the dedicated parking endpoint with the token."""
     captured = {}

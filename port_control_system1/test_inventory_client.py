@@ -4,7 +4,11 @@ from datetime import datetime, timezone
 
 import pytest
 
-from inventory_client import InventoryClient, InventoryClientError
+from inventory_client import (
+    InventoryAdminClient,
+    InventoryClient,
+    InventoryClientError,
+)
 
 
 NOW = datetime(2026, 8, 11, 3, 0, 0, tzinfo=timezone.utc)
@@ -17,10 +21,12 @@ class FakeCursor:
     def __init__(self, rows):
         self.rows = rows
         self.query = ''
+        self.queries = []
         self.closed = False
 
     def execute(self, query):
         self.query = query
+        self.queries.append(query)
 
     def fetchall(self):
         return self.rows
@@ -34,6 +40,7 @@ class FakeConnection:
         self.cursor_value = FakeCursor(rows)
         self.session = None
         self.rolled_back = False
+        self.committed = False
         self.closed = False
 
     def set_session(self, **kwargs):
@@ -44,6 +51,9 @@ class FakeConnection:
 
     def rollback(self):
         self.rolled_back = True
+
+    def commit(self):
+        self.committed = True
 
     def close(self):
         self.closed = True
@@ -92,6 +102,23 @@ def test_connection_failure_fails_closed():
 
     with pytest.raises(InventoryClientError, match='query failed'):
         client.fetch_snapshot()
+
+
+def test_operator_inventory_reset_clears_history_and_current_state_atomically():
+    connection = FakeConnection([])
+    reader = InventoryClient(connect=lambda **kwargs: connection)
+    admin = InventoryAdminClient(reader)
+
+    admin.clear_inventory()
+
+    assert connection.cursor_value.queries == [
+        'TRUNCATE TABLE cargo_movements',
+        'DELETE FROM cargos',
+    ]
+    assert connection.committed
+    assert not connection.rolled_back
+    assert connection.cursor_value.closed
+    assert connection.closed
 
 
 def test_snapshot_id_changes_only_when_row_content_changes():

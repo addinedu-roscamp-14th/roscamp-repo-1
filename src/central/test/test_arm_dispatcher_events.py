@@ -37,6 +37,17 @@ def test_arm1_fixed_work_state_terminal_contract():
     assert not is_terminal_arm1_state('PLACE_COMPLETED')
 
 
+def test_arm_dispatcher_tracks_both_active_commands_independently():
+    dispatcher = object.__new__(ArmDispatcher)
+    arm1 = types.SimpleNamespace(arm_id='arm1', command_id='one')
+    arm2 = types.SimpleNamespace(arm_id='arm2', command_id='two')
+    dispatcher.active_commands = {'arm1': arm1, 'arm2': arm2}
+    dispatcher.active_command = arm2
+
+    assert dispatcher._active_command_for('arm1') is arm1
+    assert dispatcher._active_command_for('arm2') is arm2
+
+
 def test_arm1_accepts_only_pick_place_and_stop_operations():
     dispatcher = object.__new__(ArmDispatcher)
 

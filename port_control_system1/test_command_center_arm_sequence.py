@@ -5,6 +5,16 @@ import types
 import command_center
 
 
+def test_db_plan_locations_always_include_ship_marker_slots():
+    locations = command_center.inventory_plan_locations(['A-2-2', 'B-1'])
+
+    assert 'A-2-2' in locations
+    assert '선박-1' in locations
+    assert '선박-6' in locations
+    assert 'AMR1' in locations
+    assert 'AMR2' in locations
+
+
 def test_arm_command_becomes_predecessor_for_following_vehicle_step(
     monkeypatch,
 ):

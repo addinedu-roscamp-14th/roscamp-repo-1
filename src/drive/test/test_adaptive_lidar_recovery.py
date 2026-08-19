@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 import pytest
+import yaml
 
 
 SCRIPT = Path(__file__).parents[1] / 'scripts' / 'adaptive_lidar_recovery'
@@ -137,20 +138,21 @@ def test_heading_alignment_rate_reduces_path_heading_error(
     'navigate_to_pose_central_recovery.xml',
     'navigate_through_poses_central_recovery.xml',
 ])
-def test_nav2_tree_bounds_recovery_for_an_impossible_goal(filename):
+def test_nav2_tree_repeats_recovery_until_success_or_cancel(filename):
     tree_path = Path(__file__).parents[1] / 'behavior_trees' / filename
     root = ET.parse(tree_path).getroot()
-    recovery_node = root.find('.//RecoveryNode')
+    retry = root.find('.//RetryUntilSuccessful')
 
-    assert recovery_node is not None
-    assert recovery_node.attrib['number_of_retries'] == '4'
+    assert retry is not None
+    assert retry.attrib['num_attempts'] == '-1'
     recovery_steps = root.findall('.//AdaptiveLidarRecovery')
     assert len(recovery_steps) == 1
-    assert len(list(recovery_node)) == 2
-    assert list(recovery_node)[0].tag == 'PipelineSequence'
-    assert list(recovery_node)[1].tag == 'AdaptiveLidarRecovery'
-    assert not root.findall('.//RetryUntilSuccessful')
-    assert not root.findall('.//AlwaysFailure')
+    recover_sequence = root.find('.//Sequence[@name="RecoverThenRetry"]')
+    assert recover_sequence is not None
+    assert [child.tag for child in recover_sequence] == [
+        'AdaptiveLidarRecovery', 'AlwaysFailure'
+    ]
+    assert not root.findall('.//RecoveryNode')
     assert not root.findall('.//Spin')
     assert not root.findall('.//BackUp')
 
@@ -164,6 +166,20 @@ def test_each_recovery_reverses_then_clears_for_replanning():
     assert reverse_index < clear_index
     assert 'self._turn(' not in source
     assert 'self._select_target(' not in source
+
+
+def test_controller_waits_longer_than_global_replanning_period():
+    """A transient collision must not trigger another reverse before replan."""
+    params_path = Path(__file__).parents[1] / 'params' / 'nav2_params.yaml'
+    with params_path.open(encoding='utf-8') as stream:
+        params = yaml.safe_load(stream)
+    tolerance = params['controller_server']['ros__parameters'][
+        'failure_tolerance'
+    ]
+
+    # The navigation BT replans at 1 Hz, so one complete replan interval plus
+    # scheduling margin must fit inside the controller failure tolerance.
+    assert tolerance >= 1.5
 
 
 def test_reverse_is_not_skipped_by_stale_costmap():
@@ -184,3 +200,12 @@ def test_recovery_clears_both_costmaps():
 
     assert 'self._clear_local_client' in source
     assert 'self._clear_global_client' in source
+
+
+def test_recovery_waits_for_fresh_local_and_global_costmap_grids():
+    source = inspect.getsource(
+        recovery.AdaptiveLidarRecoveryNode._clear_rebuild_costmap)
+
+    assert 'self._costmap_received_at > cleared_at' in source
+    assert 'self._global_costmap_received_at > cleared_at' in source
+    assert 'Costmap rebuild timed out' in source

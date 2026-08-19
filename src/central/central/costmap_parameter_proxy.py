@@ -30,7 +30,7 @@ def tuning_defaults(scope):
         return {
             'inflation_layer.inflation_radius': 0.20,
             'inflation_layer.cost_scaling_factor': 20.0,
-            'keepout_inflation_layer.inflation_radius': 0.08,
+            'keepout_inflation_layer.inflation_radius': 0.10,
             'keepout_inflation_layer.cost_scaling_factor': 6.0,
         }
     if scope == 'local':
