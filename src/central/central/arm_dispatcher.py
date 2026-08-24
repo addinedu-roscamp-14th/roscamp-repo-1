@@ -10,7 +10,7 @@ import json
 import threading
 import time
 
-from arm2_interfaces.srv import TransferById
+from arm2_interfaces.srv import TransferById, TransferToSlot
 from porter_interfaces.action import DispatchArmCommand
 from porter_interfaces.msg import ArmState, VehicleState
 from porter_interfaces.srv import ExecutePickPlace
@@ -89,6 +89,13 @@ def movement_from_goal(goal, success, operation_id, vehicle_cargo=None):
             container_id = carried
             source_location = MARKER_LOCATIONS.get(source_id, '')
         destination_location = MARKER_LOCATIONS.get(destination_id, '')
+        if (
+            trailer_location
+            and destination_location.startswith('선박-')
+        ):
+            # Trailer-to-ship commands pick the exposed container marker
+            # (0..8), not the trailer marker hidden below the cargo.
+            source_location = trailer_location
     elif arm_id == 'arm2' and operation == 'load_to_trailer':
         container_id = str(int(goal.source_id))
         destination_location = trailer_location
@@ -98,8 +105,9 @@ def movement_from_goal(goal, success, operation_id, vehicle_cargo=None):
         destination_location = str(goal.destination_slot or '').upper()
     elif arm_id == 'arm2' and operation == 'transfer_by_id':
         container_id = str(int(goal.source_id))
-        destination_location = MARKER_LOCATIONS.get(
-            int(goal.destination_id), ''
+        destination_location = (
+            str(getattr(goal, 'destination_slot', '') or '').upper()
+            or MARKER_LOCATIONS.get(int(goal.destination_id), '')
         )
     else:
         return None
@@ -121,8 +129,20 @@ def movement_from_goal(goal, success, operation_id, vehicle_cargo=None):
         'source_floor': None,
         'source_base_aruco_id': '',
         'destination_location': destination_location,
-        'destination_floor': None,
-        'destination_base_aruco_id': '',
+        'destination_floor': (
+            int(getattr(goal, 'destination_floor', 0) or 0) or None
+            if arm_id == 'arm2' and operation in {
+                'transfer_to_slot', 'transfer_by_id'
+            } else None
+        ),
+        'destination_base_aruco_id': (
+            str(int(goal.destination_id))
+            if arm_id == 'arm2'
+            and operation == 'transfer_by_id'
+            and int(getattr(goal, 'destination_floor', 0) or 0) > 1
+            and 0 <= int(goal.destination_id) <= 8
+            else ''
+        ),
         'success': bool(success),
         'completed_at': datetime.now(timezone.utc).isoformat(),
         'error': '',
@@ -304,6 +324,11 @@ class ArmDispatcher(Node):
         self.transfer_by_id_client = self.create_client(
             TransferById,
             '/arm2/transfer_by_id',
+            callback_group=self.callback_group,
+        )
+        self.transfer_to_slot_client = self.create_client(
+            TransferToSlot,
+            '/arm2/transfer_to_slot',
             callback_group=self.callback_group,
         )
         self.arm1_execute_client = self.create_client(
@@ -573,6 +598,14 @@ class ArmDispatcher(Node):
                 'A-1-1', 'A-1-2', 'A-2-1', 'A-2-2', 'A-3-1', 'A-3-2'
             }:
                 return None, f'invalid destination_slot: {slot}'
+            destination_floor = int(
+                getattr(goal, 'destination_floor', 0) or 0
+            )
+            if destination_floor not in {0, 1, 2, 3}:
+                return None, (
+                    'destination_floor must be 1..3 '
+                    '(or 0 for legacy automatic stacking)'
+                )
         if operation == 'load_to_trailer' and not 0 <= goal.source_id <= 8:
             return None, 'source_id must be 0..8'
         if operation == 'transfer_by_id' and (
@@ -607,8 +640,12 @@ class ArmDispatcher(Node):
             request.destination_id = int(goal.destination_id)
             return self.transfer_by_id_client, request, 'accepted'
         if operation == 'transfer_to_slot':
-            slot = str(goal.destination_slot).lower().replace('-', '')
-            key = f'transfer_{slot[0:2]}_{slot[2]}'
+            request = TransferToSlot.Request()
+            request.destination_slot = str(goal.destination_slot).upper()
+            request.destination_floor = int(
+                getattr(goal, 'destination_floor', 0) or 0
+            )
+            return self.transfer_to_slot_client, request, 'success'
         elif operation == 'load_to_trailer':
             key = f'load_id{int(goal.source_id)}_to_trailer'
         elif operation == 'go_pose':
@@ -858,6 +895,9 @@ class ArmDispatcher(Node):
             'source_id': int(goal.source_id),
             'destination_id': int(goal.destination_id),
             'destination_slot': str(goal.destination_slot),
+            'destination_floor': int(
+                getattr(goal, 'destination_floor', 0) or 0
+            ),
             'container_id': str(getattr(goal, 'container_id', '') or ''),
         }
         message_out = String()
@@ -1193,18 +1233,31 @@ class ArmDispatcher(Node):
         return self._stop_arm('arm1', self.arm1_stop_client, response)
 
     def _stop_arm(self, arm_id, client, response):
+        # Invalidate running and queued commands before waiting for the remote
+        # controller.  Otherwise a slow/unavailable stop service leaves a
+        # window in which the next queued job can begin.
+        with self.condition:
+            self.stop_generations[arm_id] += 1
+            self.vehicle_commitments.clear()
+            self._set_runtime_state(
+                arm_id, ArmState.STOPPED, 'STOP_REQUESTED', ''
+            )
+            self.condition.notify_all()
         accepted, message = self._call_service(
             client, Trigger.Request(), 'success'
         )
         response.success = accepted
         response.message = message
-        if accepted:
-            with self.condition:
-                self.stop_generations[arm_id] += 1
+        with self.condition:
+            if accepted:
                 self._set_runtime_state(
-                    arm_id, ArmState.STOPPED, 'STOP_REQUESTED'
+                    arm_id, ArmState.STOPPED, 'STOPPED', ''
                 )
-                self.condition.notify_all()
+            else:
+                self._set_runtime_state(
+                    arm_id, ArmState.ERROR, 'STOP_FAILED', message
+                )
+            self.condition.notify_all()
         return response
 
 

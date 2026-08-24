@@ -64,6 +64,22 @@ def test_arm1_accepts_only_pick_place_and_stop_operations():
     assert 'unsupported ARM1 operation' in rejected_error
 
 
+def test_internal_stack_transfer_publishes_exact_db_destination():
+    goal = types.SimpleNamespace(
+        operation='transfer_by_id', arm_id='arm2', vehicle_id='',
+        source_id=1, destination_id=0,
+        destination_slot='A-2-1', destination_floor=2,
+        container_id='1', command_id='internal-1', mission_id='mission-1',
+    )
+
+    event = movement_from_goal(goal, True, 'operation-1', {})
+
+    assert event['container_id'] == '1'
+    assert event['destination_location'] == 'A-2-1'
+    assert event['destination_floor'] == 2
+    assert event['destination_base_aruco_id'] == '0'
+
+
 def test_arm1_rejects_missing_or_equal_dynamic_marker_ids():
     dispatcher = object.__new__(ArmDispatcher)
 
@@ -112,18 +128,20 @@ def test_two_arm_operations_share_vehicle_cargo_identity():
     unload = types.SimpleNamespace(
         operation='transfer_to_slot', arm_id='arm2', vehicle_id='agv1',
         source_id=-1, destination_id=-1, destination_slot='A-1-2',
+        destination_floor=2,
         command_id='unload', mission_id='mission',
     )
     second = movement_from_goal(unload, True, 'op-unload', {'agv1': '6'})
     assert second['container_id'] == '6'
     assert second['source_location'] == 'AMR1'
     assert second['destination_location'] == 'A-1-2'
+    assert second['destination_floor'] == 2
 
 
-def test_arm1_trailer_to_ship_uses_correct_agv_marker_mapping():
+def test_arm1_trailer_to_ship_uses_container_marker_and_vehicle_location():
     goal = types.SimpleNamespace(
         operation='pick_place', arm_id='arm1', vehicle_id='agv2',
-        source_id=9, destination_id=23, destination_slot='',
+        source_id=6, destination_id=23, destination_slot='',
         command_id='ship', mission_id='mission',
     )
     event = movement_from_goal(goal, True, 'op-ship', {'agv2': '6'})
@@ -232,6 +250,28 @@ def test_arm1_wait_requires_fresh_start_then_completion():
     assert goal_handle.feedback == [
         'WORK_STARTED', 'PICK_COMPLETED', 'WORK_COMPLETED'
     ]
+
+
+def test_stop_invalidates_queue_even_when_physical_service_fails():
+    dispatcher = object.__new__(ArmDispatcher)
+    dispatcher.condition = threading.Condition()
+    dispatcher.stop_generations = {'arm1': 4, 'arm2': 7}
+    dispatcher.vehicle_commitments = {object(): 'agv1'}
+    states = []
+    dispatcher._set_runtime_state = (
+        lambda arm_id, state, text, error=None:
+        states.append((arm_id, state, text, error))
+    )
+    dispatcher._call_service = lambda *_args: (False, 'service unavailable')
+    response = types.SimpleNamespace(success=None, message='')
+
+    result = dispatcher._stop_arm('arm1', object(), response)
+
+    assert dispatcher.stop_generations['arm1'] == 5
+    assert dispatcher.vehicle_commitments == {}
+    assert result.success is False
+    assert states[0][2] == 'STOP_REQUESTED'
+    assert states[-1][2] == 'STOP_FAILED'
 
 
 class StubServiceClient:

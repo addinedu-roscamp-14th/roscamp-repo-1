@@ -1,0 +1,5 @@
+string destination_slot
+int32 destination_floor
+---
+bool success
+string message

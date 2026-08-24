@@ -72,6 +72,11 @@ def generate_launch_description():
             description='Distance behind B-1 used by a queued vehicle',
         ),
         DeclareLaunchArgument(
+            'b1_waiting_camera_down_offset_m',
+            default_value='0.06',
+            description='Additional camera-down offset for the B-1 waiting pose',
+        ),
+        DeclareLaunchArgument(
             'a_zone_waiting_distance_m',
             default_value='0.20',
             description='Distance behind the A zone used by a queued vehicle',
@@ -421,6 +426,10 @@ def generate_launch_description():
                 ]),
                 'b1_waiting_distance_m': ParameterValue(
                     LaunchConfiguration('b1_waiting_distance_m'),
+                    value_type=float,
+                ),
+                'b1_waiting_camera_down_offset_m': ParameterValue(
+                    LaunchConfiguration('b1_waiting_camera_down_offset_m'),
                     value_type=float,
                 ),
                 'a_zone_waiting_distance_m': ParameterValue(

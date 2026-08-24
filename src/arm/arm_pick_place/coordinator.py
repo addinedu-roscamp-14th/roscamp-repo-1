@@ -216,6 +216,12 @@ class HomographyPickPlace(Node):
         )
         self.create_service(
             Trigger,
+            '/arm/pick_place/ship_cache_status',
+            self.ship_cache_status,
+            callback_group=self.callback_group,
+        )
+        self.create_service(
+            Trigger,
             '/arm/pick_place/scan_inbound',
             self.scan_inbound,
             callback_group=self.callback_group,
@@ -637,9 +643,9 @@ class HomographyPickPlace(Node):
         An explicit scan command always runs the same two-view observation
         sequence used by normal ChoE-branch pick/place commands.  In
         particular, a complete in-memory cache must not turn a new scan
-        command into a no-motion success: central control can restart while
-        ARM1 stays alive, and the operator still expects the initial physical
-        left/right scan to run for the new control session.
+        command into a no-motion success. Central control normally queries
+        ship_cache_status first and therefore sends this explicit command
+        only when the live ARM1 process has no complete cache.
         """
         with self.command_lock:
             if (
@@ -657,6 +663,19 @@ class HomographyPickPlace(Node):
             self.motion_thread.start()
         response.success = True
         response.message = 'fresh two-view ship marker scan accepted'
+        return response
+
+    def ship_cache_status(self, _request, response):
+        """Report whether this live ARM1 process has every ship slot pose."""
+        expected = set(range(18, 24))
+        present = expected.intersection(self.saved_marker_poses)
+        missing = sorted(expected - present)
+        response.success = not missing
+        response.message = (
+            'ARM1 ship marker cache ready: 18..23'
+            if not missing
+            else f'ARM1 ship marker cache incomplete; missing={missing}'
+        )
         return response
 
     def _run_ship_destination_scan(self):
@@ -851,8 +870,7 @@ class HomographyPickPlace(Node):
                         )
             steps = self.select_feasible_plan(calibrated)
             self.execute_steps(steps)
-            self.publish_work_state('WORK_COMPLETED')
-            self.publish_status('작업 종료: Place 완료')
+            self.complete_work_then_cleanup()
         except Exception as exc:
             self.stop_event.set()
             if self.external_stop_requested:
@@ -869,6 +887,44 @@ class HomographyPickPlace(Node):
             self.set_detection_enabled(False)
             self.active_station = ''
             self.operation_lock.release()
+
+    def complete_work_then_cleanup(self):
+        """Publish completion before best-effort observation-pose cleanup."""
+        self.publish_work_state('WORK_COMPLETED')
+        self.publish_status('작업 종료: Place 완료')
+        try:
+            self.return_to_second_observation_pose()
+        except Exception as exc:
+            self.publish_status(
+                '작업 후 복귀 실패; WORK_COMPLETED 유지: '
+                f'{exc}'
+            )
+            try:
+                with self.serial_lock:
+                    self.robot.stop()
+            except Exception:
+                pass
+
+    def return_to_second_observation_pose(self):
+        """Finish one job at the ChoE home/second observation pose."""
+        if len(self.stations) < 2:
+            raise RuntimeError(
+                'cannot return: second observation station is unavailable'
+            )
+        station = self.stations[1]
+        self.active_station = station.name
+        self.set_detection_enabled(False)
+        self.publish_status(
+            '작업 종료 복귀 시작: '
+            f'station={station.name}, '
+            f'surface={station.calibration_surface}'
+        )
+        self.move_observation(station.joint_angles_deg)
+        self.publish_status(
+            '작업 종료 복귀 도착: '
+            f'station={station.name}, '
+            f'surface={station.calibration_surface}'
+        )
 
     def select_feasible_plan(self, calibrated):
         """Select independent safe heights and start with a direct plan."""
@@ -1151,6 +1207,16 @@ class HomographyPickPlace(Node):
                     if index != 1:
                         raise
                     self.execute_split_pick_approach(step.pose, exc)
+                if index in (1, 5):
+                    context = (
+                        'PICK safe approach'
+                        if index == 1
+                        else 'PLACE safe approach'
+                    )
+                    self.publish_status(
+                        f'{context}: waiting for hardware stop before descent'
+                    )
+                    self.wait_until_robot_stopped(context)
             elif step.action == 'gripper_open':
                 self.command_gripper(True)
             elif step.action == 'gripper_open_after_stop':

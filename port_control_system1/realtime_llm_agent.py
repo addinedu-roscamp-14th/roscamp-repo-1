@@ -215,6 +215,17 @@ class RealtimeLLMAgent:
                 'PORT_AUTONOMY_ARM_COMMAND_ORPHAN_TIMEOUT_SEC', '120.0'
             )),
         )
+        self.arm_command_retry_grace_sec = max(
+            0.5,
+            float(os.environ.get(
+                'PORT_AUTONOMY_ARM_RETRY_GRACE_SEC', '2.0'
+            )),
+        )
+        # Negative means retry the same ARM step until it succeeds or the
+        # operator stops autonomy / triggers the emergency stop.
+        self.arm_command_max_resends = int(os.environ.get(
+            'PORT_AUTONOMY_ARM_MAX_RESENDS', '-1'
+        ))
         self.nav_command_retry_grace_sec = max(
             1.0,
             float(os.environ.get(
@@ -241,16 +252,22 @@ class RealtimeLLMAgent:
         self._last_evaluation_monotonic = 0.0
         self._not_before_monotonic = 0.0
         self._last_inventory_snapshot_id = ''
+        self._inventory_execution_plan = None
         self.inventory_planner = (
             inventory_planner or InventoryDecisionPlanner()
         )
         self.location_loader = location_loader or _load_registered_locations
         self.cycle_store = cycle_store or CycleStore()
-        # A dashboard process restart is an explicit new operating session.
-        # Do not restore inbound/outbound IDs, an in-flight move, or failure
-        # counters from the previous process. The PostgreSQL inventory remains
-        # the source of truth and will be reassessed when autonomy starts.
-        self._cycle = AutonomousCycle()
+        # Never restore commands or failure counters across a process restart,
+        # but preserve outbound cargo identity.  PostgreSQL location AMR1/AMR2
+        # alone cannot tell whether a stranded trailer cargo was inbound or
+        # outbound; this small intent record lets the new process safely resume
+        # the trailer-to-ship leg. choose_policy drops stale/completed IDs
+        # against the fresh DB snapshot before using them.
+        previous_cycle = self.cycle_store.load()
+        self._cycle = AutonomousCycle(
+            outbound_ids=list(previous_cycle.outbound_ids),
+        )
         # A parked vehicle normally reports READY with no zone lock, which is
         # indistinguishable from an idle unparked vehicle in fleet telemetry.
         # Remember successful/requested parking locally so the waiting loop
@@ -366,6 +383,45 @@ class RealtimeLLMAgent:
         print(f'[실시간 LLM 재고 판단] 지속 목표 등록: {objective}')
         self._wake_event.set()
 
+    def start_inventory_plan_execution(self, objective, initial_plan):
+        """Execute a validated DB plan one move at a time with DB replanning."""
+        objective = str(objective or '').strip()
+        plan = initial_plan if isinstance(initial_plan, dict) else None
+        if not objective or not plan or plan.get('status') != 'ready':
+            raise AutonomousPolicyError('실행 가능한 DB 계획이 필요합니다')
+        if self._active_move_entries():
+            raise AutonomousPolicyError(
+                '이미 실행 중인 자율 이동이 있어 DB 계획을 시작할 수 없습니다'
+            )
+        with self._lock:
+            self._objective_revision += 1
+            self._inventory_execution_plan = dict(plan)
+            self._last_observation = ''
+            self._last_inventory_snapshot_id = ''
+            self._last_evaluation_monotonic = 0.0
+            self._not_before_monotonic = 0.0
+            self._cycle.identical_failures = 0
+            self._cycle.failure_key = ''
+            self._cycle.last_error = ''
+            self._cycle.phase = 'DB_PLAN_READY'
+            self._snapshot = replace(
+                self._snapshot,
+                enabled=True,
+                objective=objective,
+                state='EVALUATING',
+                mode='inventory_execute',
+                phase='DB_PLAN_READY',
+                last_decision=json.dumps(plan, ensure_ascii=False, indent=2),
+                last_error='',
+                llm_plan_json=json.dumps(plan, ensure_ascii=False, indent=2),
+                execution_steps_json='',
+                current_step_json='',
+                command_payload_json='',
+            )
+        self._save_cycle()
+        print(f'[DB 기반 계획 실행] 목표 등록: {objective}')
+        self._wake_event.set()
+
     def start_autonomous_policy(self):
         """Resume autonomy by reassessing current persisted and live state."""
         # Starting again is an explicit operator retry.  Keep the cycle's
@@ -411,6 +467,8 @@ class RealtimeLLMAgent:
         """Stop creating new plans; an already running ARM call may finish."""
         with self._lock:
             self._objective_revision += 1
+            if self._snapshot.mode == 'inventory_execute':
+                self._inventory_execution_plan = None
             self._snapshot = replace(
                 self._snapshot,
                 enabled=False,
@@ -418,6 +476,44 @@ class RealtimeLLMAgent:
                 objective='',
                 last_decision='운영자가 자율 관제 신규 계획을 중지함',
             )
+        self._wake_event.set()
+
+    def emergency_stop_reset(self):
+        """Discard every autonomous continuation after a global stop.
+
+        Physical ARM cancellation is handled by the central gateway.  This
+        clears only software plans, retries and ownership so releasing the
+        emergency latch can never resume the interrupted operation.
+        """
+        with self._lock:
+            self._objective_revision += 1
+            self._inventory_execution_plan = None
+            active_moves = getattr(self._cycle, 'active_moves', None)
+            if isinstance(active_moves, dict):
+                active_moves.clear()
+            self._cycle.active_move = None
+            self._cycle.active_mission_id = ''
+            self._cycle.identical_failures = 0
+            self._cycle.failure_key = ''
+            self._cycle.last_error = '운영자 비상정지로 실행 상태 초기화'
+            self._cycle.phase = 'EMERGENCY_STOPPED'
+            self._snapshot = replace(
+                self._snapshot,
+                enabled=False,
+                state='EMERGENCY_STOPPED',
+                phase='EMERGENCY_STOPPED',
+                objective='',
+                active_command='',
+                next_move='',
+                execution_steps_json='',
+                current_step_json='',
+                command_payload_json='',
+                last_decision=(
+                    '비상정지: ARM1/ARM2 정지 및 모든 자율 후속 명령 초기화'
+                ),
+                last_error='운영자 비상정지로 실행 상태 초기화',
+            )
+        self._save_cycle()
         self._wake_event.set()
 
     def _update_snapshot(self, **changes):
@@ -460,6 +556,8 @@ class RealtimeLLMAgent:
             try:
                 if snapshot.mode == 'autonomous':
                     self._evaluate_autonomous()
+                elif snapshot.mode == 'inventory_execute':
+                    self._evaluate_inventory_execution()
                 elif snapshot.mode == 'inventory':
                     self._evaluate_inventory(snapshot.objective)
                 else:
@@ -520,6 +618,212 @@ class RealtimeLLMAgent:
             f'status={result.get("status")}, moves={len(result.get("moves", []))}'
         )
         return result
+
+    def _evaluate_inventory_execution(self):
+        """Execute the first validated DB move, sync it, then replan."""
+        client = CentralControlClient(timeout_sec=3.0)
+        try:
+            fleet_status = client.status()
+        except Exception as exc:
+            self._update_snapshot(state='WAITING_FOR_DATA', last_error=str(exc))
+            return None
+        sync = self._sync_status(fleet_status)
+        self._update_snapshot(
+            db_sync_state=sync['state'],
+            db_pending_count=sync['pending_count'],
+        )
+        if self._fleet_emergency(fleet_status):
+            self._update_snapshot(
+                state='EMERGENCY_STOPPED',
+                phase='EMERGENCY_STOPPED',
+                last_error='차량 비상정지가 활성화되어 DB 계획 실행을 차단함',
+            )
+            return None
+        if sync['state'] != 'READY' or sync['pending_count']:
+            self._update_snapshot(
+                state='WAITING_FOR_DB_SYNC',
+                phase='WAITING_FOR_DB_SYNC',
+                last_error=sync['last_error'] or 'DB 미동기화 이벤트가 존재함',
+            )
+            return None
+        try:
+            inventory = self.inventory_planner.inventory_client.fetch_snapshot()
+        except InventoryClientError as exc:
+            self._update_snapshot(state='ERROR', last_error=str(exc))
+            return None
+        snapshot = inventory.to_dict()
+        self._update_snapshot(db_snapshot_id=inventory.snapshot_id)
+
+        for execution_key, active_move in list(self._active_move_entries()):
+            outcome, detail = self._advance_active_move(
+                client,
+                fleet_status,
+                snapshot,
+                move=active_move,
+                mission_id=str(active_move.get('_mission_id') or ''),
+            )
+            if outcome == 'completed':
+                self._remove_active_move(execution_key)
+                self._cycle.identical_failures = 0
+                self._cycle.failure_key = ''
+                self._cycle.replan_count += 1
+                with self._lock:
+                    self._inventory_execution_plan = None
+                self._save_cycle()
+            elif outcome == 'failed':
+                self._record_autonomous_failure(
+                    detail,
+                    move=active_move,
+                    vehicle_id=execution_key,
+                )
+                return None
+
+        active_entries = self._active_move_entries()
+        if active_entries:
+            _key, move = active_entries[0]
+            self._update_snapshot(
+                state='EXECUTING',
+                phase='DB_PLAN_EXECUTING',
+                active_command=str(move.get('_current_command_id') or ''),
+                next_move=json.dumps(
+                    {key: value for key, value in move.items()
+                     if not str(key).startswith('_')},
+                    ensure_ascii=False,
+                ),
+                execution_steps_json=self._execution_steps_json(move),
+                current_step_json=self._current_step_json(move),
+                last_error='',
+            )
+            return None
+
+        with self._lock:
+            plan = self._inventory_execution_plan
+            self._inventory_execution_plan = None
+        if (
+            not isinstance(plan, dict)
+            or str(plan.get('snapshot_id') or '') != inventory.snapshot_id
+        ):
+            self._update_snapshot(state='EVALUATING', last_error='')
+            plan = self.inventory_planner.plan_snapshot(
+                self.snapshot().objective,
+                inventory,
+                list(CANONICAL_LOCATIONS),
+            )
+        rendered_plan = json.dumps(plan, ensure_ascii=False, indent=2)
+        if plan.get('status') != 'ready' or not plan.get('moves'):
+            error = str(plan.get('error') or '')
+            completed = plan.get('status') == 'no_action'
+            self._update_snapshot(
+                enabled=False,
+                state='COMPLETED' if completed else 'ERROR',
+                phase='DB_PLAN_COMPLETED' if completed else 'WAITING_OPERATOR',
+                last_decision=rendered_plan,
+                llm_plan_json=rendered_plan,
+                last_error=error,
+                active_command='',
+                next_move='',
+            )
+            return plan
+
+        execution = None
+        execution_key = ''
+        try:
+            move = validate_first_move(plan['moves'][0], snapshot)
+            source = str(move.get('source_location') or '')
+            destination = str(move.get('destination_location') or '')
+            internal_move = (
+                source.startswith('A-') and destination.startswith('A-')
+            ) or (
+                source.startswith('선박-') and destination.startswith('선박-')
+            )
+            if internal_move:
+                vehicle_id = ''
+                execution_key = (
+                    'arm2-internal' if source.startswith('A-')
+                    else 'arm1-internal'
+                )
+            else:
+                required_vehicle_id = {
+                    'AMR1': 'agv1', 'AMR2': 'agv2',
+                }.get(source, '')
+                preferred_zone = (
+                    'B-1' if source.startswith('선박-')
+                    or source in {'AMR1', 'AMR2'}
+                    else 'A' if source.startswith('A-') else ''
+                )
+                vehicle_id = self._ready_vehicle(
+                    fleet_status,
+                    preferred_zone=preferred_zone,
+                    inventory_snapshot=snapshot,
+                    require_empty_trailer=not bool(required_vehicle_id),
+                    required_vehicle_id=required_vehicle_id,
+                )
+                if not vehicle_id:
+                    with self._lock:
+                        self._inventory_execution_plan = plan
+                    self._update_snapshot(
+                        state='WAITING_FOR_VEHICLE',
+                        phase='DB_PLAN_WAITING_FOR_VEHICLE',
+                        last_decision=rendered_plan,
+                        llm_plan_json=rendered_plan,
+                        last_error='사용 가능한 READY 차량이 없음',
+                    )
+                    return plan
+                execution_key = vehicle_id
+                self._autonomy_park_requests.discard(vehicle_id)
+            mission_id = f'db-plan-{uuid.uuid4().hex[:12]}'
+            execution = dict(move)
+            execution['_steps'] = compile_move(move, vehicle_id)
+            execution['_step_index'] = 0
+            execution['_vehicle_id'] = vehicle_id
+            execution['_current_command_id'] = ''
+            execution['_dispatched_at'] = 0.0
+            execution['_nav_missing_since'] = 0.0
+            execution['_step_retry_counts'] = {}
+            execution['_mission_id'] = mission_id
+            execution['_root_mission_id'] = mission_id
+            self._cycle.active_moves[execution_key] = execution
+            self._sync_legacy_active_move()
+            self._cycle.phase = 'DB_PLAN_EXECUTING'
+            self._save_cycle()
+            outcome, detail = self._advance_active_move(
+                client,
+                fleet_status,
+                snapshot,
+                move=execution,
+                mission_id=mission_id,
+            )
+            if outcome == 'failed':
+                raise AutonomousPolicyError(detail)
+        except (AutonomousPolicyError, CentralControlApiError,
+                VisualNavigationError, YoloDetectionError) as exc:
+            if execution is not None:
+                self._record_autonomous_failure(
+                    str(exc), move=execution, vehicle_id=execution_key
+                )
+            else:
+                self._update_snapshot(
+                    enabled=False,
+                    state='WAITING_OPERATOR',
+                    phase='WAITING_OPERATOR',
+                    last_error=str(exc),
+                    last_decision=rendered_plan,
+                    llm_plan_json=rendered_plan,
+                )
+            return plan
+
+        self._update_snapshot(
+            state='EXECUTING',
+            phase='DB_PLAN_EXECUTING',
+            next_move=json.dumps(move, ensure_ascii=False),
+            active_command=str(execution.get('_current_command_id') or ''),
+            last_decision=rendered_plan,
+            llm_plan_json=rendered_plan,
+            execution_steps_json=self._execution_steps_json(execution),
+            current_step_json=self._current_step_json(execution),
+            last_error='',
+        )
+        return plan
 
     @staticmethod
     def _sync_status(fleet_status):
@@ -798,7 +1102,26 @@ class RealtimeLLMAgent:
                 f'phase={phase}, snapshot={inventory.snapshot_id}'
             )
 
+        if phase == 'WAITING_FOR_CLEAR' and port_present:
+            ship_ids = {
+                str(cargo.get('container_id') or '')
+                for cargo in snapshot.get('cargos', [])
+                if str(cargo.get('location') or '') in SHIP_LOCATIONS
+            }
+            if ship_ids.intersection(self._cycle.outbound_ids):
+                self._cycle.outbound_seen_in_roi = True
+                self._save_cycle()
         if phase == 'WAITING_FOR_CLEAR' and not port_present:
+            if not self._cycle.outbound_seen_in_roi:
+                self._update_snapshot(
+                    state='MONITORING',
+                    last_error=(
+                        '출항 화물이 선박 DB 위치와 ROI에서 확인되기 전에는 '
+                        '출항완료로 처리하지 않습니다.'
+                    ),
+                )
+                self._park_idle_vehicles(client, fleet_status)
+                return None
             return self._complete_outbound(client, snapshot)
         if phase in {'WAITING_FOR_INBOUND', 'SCANNING_INBOUND',
                      'WAITING_FOR_CLEAR'}:
@@ -813,7 +1136,6 @@ class RealtimeLLMAgent:
                 last_error=scan_blocker,
             )
             return None
-
         now = time.monotonic()
         planning_signature = json.dumps({
             'snapshot_id': inventory.snapshot_id,
@@ -921,8 +1243,12 @@ class RealtimeLLMAgent:
                 )
             self._validate_policy_move(phase, move, snapshot)
             source_location = str(move.get('source_location') or '')
+            required_vehicle_id = {
+                'AMR1': 'agv1', 'AMR2': 'agv2',
+            }.get(source_location, '')
             preferred_zone = (
                 'B-1' if source_location.startswith('선박-')
+                or source_location in {'AMR1', 'AMR2'}
                 else 'A' if source_location.startswith('A-')
                 else ''
             )
@@ -930,7 +1256,8 @@ class RealtimeLLMAgent:
                 fleet_status,
                 preferred_zone=preferred_zone,
                 inventory_snapshot=snapshot,
-                require_empty_trailer=True,
+                require_empty_trailer=not bool(required_vehicle_id),
+                required_vehicle_id=required_vehicle_id,
                 excluded_vehicle_ids={
                     key for key, _value in active_entries
                 },
@@ -952,6 +1279,7 @@ class RealtimeLLMAgent:
             execution['_nav_missing_since'] = 0.0
             execution['_step_retry_counts'] = {}
             execution['_mission_id'] = mission_id
+            execution['_root_mission_id'] = mission_id
             self._cycle.last_vehicle_id = vehicle_id
             self._cycle.active_moves[vehicle_id] = execution
             self._sync_legacy_active_move()
@@ -1029,6 +1357,39 @@ class RealtimeLLMAgent:
             **dict(steps[index]),
         }, ensure_ascii=False, indent=2)
 
+    @staticmethod
+    def _internal_move_sync_event(move, result):
+        """Rebuild a missing internal ARM movement from validated state."""
+        return {
+            'schema_version': '1.0',
+            # Reuse the physical ARM operation ID. If the normal dispatcher
+            # event arrives as well, inventory_sync applies it exactly once.
+            'operation_id': str(
+                result.get('operation_id')
+                or f'arm-{result.get("command_id", "")}'
+            ),
+            'command_id': str(result.get('command_id') or ''),
+            'mission_id': str(result.get('mission_id') or ''),
+            'arm_id': 'arm2',
+            'container_id': str(move.get('container_id') or ''),
+            # Empty source means inventory_sync uses the current DB row. This
+            # also makes a late duplicate harmless after the first event won.
+            'source_location': '',
+            'source_floor': None,
+            'source_base_aruco_id': '',
+            'destination_location': str(
+                move.get('destination_location') or ''
+            ),
+            'destination_floor': int(
+                move.get('destination_floor') or 1
+            ),
+            'destination_base_aruco_id': str(
+                move.get('destination_base_aruco_id') or ''
+            ),
+            'success': True,
+            'error': '',
+        }
+
     def _advance_active_move(
         self, client, fleet_status, snapshot, move=None, mission_id=''
     ):
@@ -1060,7 +1421,7 @@ class RealtimeLLMAgent:
                 return 'completed', ''
             return 'failed', '물리 시퀀스 완료 후 DB 최종 위치가 일치하지 않음'
         step = steps[index]
-        expected_location = self._arm_step_destination(step)
+        expected_location = self._arm_step_destination(step, move)
         if (
             str(step.get('type') or '').startswith('arm')
             and expected_location
@@ -1073,6 +1434,7 @@ class RealtimeLLMAgent:
             move['_current_command_id'] = ''
             move['_dispatched_at'] = 0.0
             move['_nav_missing_since'] = 0.0
+            move.pop('_awaiting_arm_db_sync', None)
             self._save_cycle()
             return self._advance_active_move(
                 client, fleet_status, snapshot, move, mission_id
@@ -1088,6 +1450,20 @@ class RealtimeLLMAgent:
                 return self._advance_active_move(
                     client, fleet_status, snapshot, move, mission_id
                 )
+            step_wait_reason = self._arm_step_wait_reason(
+                steps[index], fleet_status, snapshot
+            )
+            if not step_wait_reason:
+                step_wait_reason = self._other_arm_result_waiting_for_db(
+                    move
+                )
+            if step_wait_reason:
+                self._update_snapshot(
+                    state='EXECUTING',
+                    phase='EXECUTING_MOVE',
+                    last_error=step_wait_reason,
+                )
+                return 'waiting', ''
             try:
                 self._validate_active_step(
                     steps[index], move, snapshot, fleet_status
@@ -1114,7 +1490,7 @@ class RealtimeLLMAgent:
                 )).get(str(step.get('arm_id') or '')) or {})
                 if str(arm.get('current_command_id') or '') == command_id:
                     return 'waiting', ''
-                expected_location = self._arm_step_destination(step)
+                expected_location = self._arm_step_destination(step, move)
                 if expected_location and str(cargo.get('location')) == (
                     expected_location
                 ):
@@ -1137,16 +1513,39 @@ class RealtimeLLMAgent:
                     return 'waiting', ''
             else:
                 if result.get('success') is False:
-                    return 'failed', str(
-                        result.get('message') or 'ARM operation failed'
+                    return self._retry_failed_arm_step(
+                        client,
+                        move,
+                        mission_id,
+                        fleet_status,
+                        index,
+                        str(result.get('message') or 'ARM operation failed'),
                     )
                 if result.get('success') is not True:
                     return 'waiting', ''
-                expected_location = self._arm_step_destination(step)
+                expected_location = self._arm_step_destination(step, move)
                 if expected_location and str(cargo.get('location')) != (
                     expected_location
                 ):
+                    if (
+                        step.get('type') == 'arm_transfer_by_id'
+                        and not move.get('_db_reconcile_sent')
+                    ):
+                        try:
+                            client.send_inventory_movement(
+                                self._internal_move_sync_event(move, result)
+                            )
+                            move['_db_reconcile_sent'] = command_id
+                            self._save_cycle()
+                        except Exception as exc:
+                            return (
+                                'failed',
+                                f'ARM 내부 이송 DB 반영 실패: {exc}',
+                            )
+                    move['_awaiting_arm_db_sync'] = command_id
+                    self._save_cycle()
                     return 'waiting', ''
+                move.pop('_awaiting_arm_db_sync', None)
         else:
             vehicle = (((fleet_status.get('telemetry') or {}).get(
                 'vehicles', {}
@@ -1230,6 +1629,84 @@ class RealtimeLLMAgent:
             client, fleet_status, snapshot, move, mission_id
         )
 
+    def _retry_failed_arm_step(
+        self, client, move, mission_id, fleet_status, index, reason
+    ):
+        """Retry the same physical ARM step without releasing its vehicle.
+
+        A transient marker miss is recoverable by running the ARM's station
+        scan again.  Keeping the active move in place also keeps the current
+        vehicle assigned to A or B-1, so another vehicle cannot be dispatched
+        into the occupied station while the retry is pending.
+        """
+        retry_counts = move.setdefault('_step_retry_counts', {})
+        retry_key = str(index)
+        retries = int(retry_counts.get(retry_key) or 0)
+        maximum = int(getattr(self, 'arm_command_max_resends', -1))
+        if maximum >= 0 and retries >= maximum:
+            move.pop('_arm_retry_not_before', None)
+            return 'failed', (
+                f'{reason}; 동일 ARM 단계 {maximum}회 재전송 후 중단'
+            )
+
+        retry_label = (
+            f'{retries + 1}/{maximum}'
+            if maximum >= 0 else f'{retries + 1}회'
+        )
+
+        now = time.time()
+        retry_not_before = float(move.get('_arm_retry_not_before') or 0.0)
+        if not retry_not_before:
+            retry_not_before = now + float(getattr(
+                self, 'arm_command_retry_grace_sec', 2.0
+            ))
+            move['_arm_retry_not_before'] = retry_not_before
+            self._save_cycle()
+            self._update_snapshot(
+                state='EXECUTING',
+                phase='EXECUTING_MOVE',
+                last_error=(
+                    f'{reason} · 같은 ARM 작업 재시도 '
+                    f'{retry_label} 대기 중'
+                ),
+            )
+            return 'waiting', ''
+        if now < retry_not_before:
+            return 'waiting', ''
+        if not self._active_step_resources_available(move, fleet_status):
+            return 'waiting', ''
+
+        retry_counts[retry_key] = retries + 1
+        root_mission_id = str(
+            move.get('_root_mission_id') or mission_id or 'auto'
+        )
+        retry_mission_id = (
+            f'{root_mission_id}-arm-retry-{retries + 1}-'
+            f'{uuid.uuid4().hex[:6]}'
+        )
+        move['_root_mission_id'] = root_mission_id
+        move['_mission_id'] = retry_mission_id
+        move.pop('_arm_retry_not_before', None)
+        move['_current_command_id'] = ''
+        move['_dispatched_at'] = 0.0
+        move['_nav_missing_since'] = 0.0
+        self._save_cycle()
+        try:
+            self._dispatch_step_for_move(
+                client, move, retry_mission_id
+            )
+        except Exception as exc:
+            return 'failed', str(exc)
+        self._update_snapshot(
+            state='EXECUTING',
+            phase='EXECUTING_MOVE',
+            last_error=(
+                f'{reason} · 같은 ARM 작업 재전송 '
+                f'{retry_label}'
+            ),
+        )
+        return 'waiting', ''
+
     @staticmethod
     def _navigation_step_already_reached(step, move, fleet_status):
         """Accept fresh Fleet arrival state when the zone label is occluded.
@@ -1255,6 +1732,68 @@ class RealtimeLLMAgent:
         zone = str(step.get('zone') or '').upper()
         expected = 'A' if zone.startswith('A-') else zone
         return str(vehicle.get('locked_zone') or '').upper() == expected
+
+    @staticmethod
+    def _arm_step_wait_reason(step, fleet_status, snapshot):
+        """Return a transient resource wait without failing the mission."""
+        action_type = str(step.get('type') or '')
+        if action_type != 'arm1_pick_place':
+            return ''
+        try:
+            source_id = int(step.get('source_id', -1))
+            destination_id = int(step.get('destination_id', -1))
+        except (TypeError, ValueError):
+            return ''
+        if not (0 <= source_id <= 8 and destination_id in {9, 10}):
+            return ''
+        return RealtimeLLMAgent._loaded_vehicle_still_in_b1(
+            fleet_status, snapshot
+        )
+
+    def _other_arm_result_waiting_for_db(self, move):
+        """Serialize new ARM work until prior physical truth reaches DB."""
+        active = getattr(self._cycle, 'active_moves', None)
+        if isinstance(active, dict) and active:
+            others = active.values()
+        else:
+            legacy = getattr(self._cycle, 'active_move', None)
+            others = (legacy,) if legacy else ()
+        for other in others:
+            if other is move:
+                continue
+            command_id = str(other.get('_awaiting_arm_db_sync') or '')
+            if command_id:
+                return (
+                    f'선행 ARM 작업 {command_id}의 DB 반영 대기 중; '
+                    '다음 ARM 명령을 보류함'
+                )
+        return ''
+
+    @staticmethod
+    def _loaded_vehicle_still_in_b1(fleet_status, snapshot):
+        """Block another ship pickup until the loaded trailer clears B-1."""
+        vehicles = ((fleet_status.get('telemetry') or {}).get(
+            'vehicles', {}
+        ))
+        cargos = snapshot.get('cargos', []) if isinstance(snapshot, dict) else []
+        for vehicle_id, trailer_location in (
+            ('agv1', 'AMR1'), ('agv2', 'AMR2')
+        ):
+            carried = [
+                str(item.get('container_id') or '')
+                for item in cargos
+                if str(item.get('location') or '') == trailer_location
+            ]
+            locked_zone = str(
+                (vehicles.get(vehicle_id) or {}).get('locked_zone') or ''
+            ).upper()
+            if carried and locked_zone == 'B-1':
+                return (
+                    f'{vehicle_id}가 B-1에서 컨테이너 '
+                    f'{", ".join(carried)}을 싣고 A 진입을 기다리는 중; '
+                    'B-1 이탈 후 다음 ARM1 상차를 시작함'
+                )
+        return ''
 
     @staticmethod
     def _validate_active_step(step, move, snapshot, fleet_status):
@@ -1316,7 +1855,18 @@ class RealtimeLLMAgent:
             raise AutonomousPolicyError(
                 f'컨테이너 {container_id} 위에 방해 컨테이너가 생김'
             )
-        expected_destination = RealtimeLLMAgent._arm_step_destination(step)
+        expected_destination = RealtimeLLMAgent._arm_step_destination(
+            step, move
+        )
+        if (
+            action_type == 'arm1_pick_place'
+            and expected_destination in {'AMR1', 'AMR2'}
+        ):
+            b1_blocker = RealtimeLLMAgent._loaded_vehicle_still_in_b1(
+                fleet_status, snapshot
+            )
+            if b1_blocker:
+                raise AutonomousPolicyError(b1_blocker)
         if expected_destination in {'AMR1', 'AMR2'}:
             occupants = [
                 str(item.get('container_id') or '')
@@ -1360,7 +1910,7 @@ class RealtimeLLMAgent:
                 raise AutonomousPolicyError('ARM1 선박 마커 캐시가 준비되지 않음')
 
     @staticmethod
-    def _arm_step_destination(step):
+    def _arm_step_destination(step, move=None):
         action_type = step.get('type')
         if action_type == 'arm_transfer_to_slot':
             return str(step.get('destination_slot') or '')
@@ -1377,11 +1927,19 @@ class RealtimeLLMAgent:
             if 18 <= destination_id <= 23:
                 return f'선박-{destination_id - 17}'
         if action_type == 'arm_transfer_by_id':
+            destination_slot = str(
+                step.get('destination_slot') or ''
+            ).upper()
+            if destination_slot:
+                return destination_slot
             locations = {
                 11: 'A-1-1', 12: 'A-1-2', 13: 'A-2-1',
                 14: 'A-2-2', 15: 'A-3-1', 16: 'A-3-2',
             }
-            return locations.get(int(step.get('destination_id', -1)), '')
+            return (
+                locations.get(int(step.get('destination_id', -1)), '')
+                or str((move or {}).get('destination_location') or '')
+            )
         return ''
 
     @staticmethod
@@ -1398,6 +1956,12 @@ class RealtimeLLMAgent:
         if action_type in {'arm_load_to_trailer', 'arm_transfer_by_id'}:
             return str(move.get('source_location') or '')
         if action_type == 'arm1_pick_place':
+            destination = RealtimeLLMAgent._arm_step_destination(step)
+            if destination in SHIP_LOCATIONS and trailer_location:
+                # For warehouse -> ship, ARM2 has already updated PostgreSQL
+                # from A-x-y to AMR1/AMR2.  ARM1 then performs a fresh scan of
+                # the exposed container marker on that trailer before pick.
+                return trailer_location
             try:
                 source_id = int(step.get('source_id', -1))
             except (TypeError, ValueError):
@@ -1519,11 +2083,18 @@ class RealtimeLLMAgent:
                 if str(item.get('container_id')) == str(move['container_id'])
             )
             if not (
-                source.startswith('A-') and destination in SHIP_LOCATIONS
-                and int(cargo.get('floor', 1)) >= 3
+                destination in SHIP_LOCATIONS
+                and (
+                    (
+                        source.startswith('A-')
+                        and int(cargo.get('floor', 1)) >= 3
+                    )
+                    or source in {'AMR1', 'AMR2'}
+                )
             ):
                 raise AutonomousPolicyError(
-                    '출항 단계는 창고 3층 최상단→선박 이동만 허용됨'
+                    '출항 단계는 창고 3층 최상단 또는 출항 중 AMR 화물의 '
+                    '선박 이동만 허용됨'
                 )
 
     def _ready_vehicle(
@@ -1532,6 +2103,7 @@ class RealtimeLLMAgent:
         preferred_zone='',
         inventory_snapshot=None,
         require_empty_trailer=False,
+        required_vehicle_id='',
         excluded_vehicle_ids=None,
     ):
         """Choose a READY vehicle without replacing a station's owner.
@@ -1566,6 +2138,10 @@ class RealtimeLLMAgent:
                 and not vehicle.get('current_command_id')
                 and trailer_location not in occupied_trailers
                 and vehicle_id not in excluded
+                and (
+                    not required_vehicle_id
+                    or vehicle_id == required_vehicle_id
+                )
             ):
                 ready.append(vehicle_id)
         if not ready:
@@ -1733,6 +2309,7 @@ class RealtimeLLMAgent:
                 arm_id=action['arm_id'],
                 mission_id=mission_id,
                 destination_slot=action.get('destination_slot', ''),
+                destination_floor=action.get('destination_floor', 0),
                 source_id=action.get('source_id', -1),
                 destination_id=action.get('destination_id', -1),
                 vehicle_id=action.get('vehicle_id', ''),
@@ -1744,6 +2321,9 @@ class RealtimeLLMAgent:
                 'arm_id': action['arm_id'],
                 'mission_id': mission_id,
                 'destination_slot': action.get('destination_slot', ''),
+                'destination_floor': int(
+                    action.get('destination_floor') or 0
+                ),
                 'source_id': action.get('source_id', -1),
                 'destination_id': action.get('destination_id', -1),
                 'vehicle_id': action.get('vehicle_id', ''),
@@ -1768,7 +2348,7 @@ class RealtimeLLMAgent:
             ),
         )
         print(
-            f'[자율 항만 실행] mission={self._cycle.active_mission_id}, '
+            f'[자율 항만 실행] mission={mission_id}, '
             f'step={index + 1}/{len(steps)}, type={action_type}, '
             f'command={move["_current_command_id"]}'
         )
@@ -1779,11 +2359,28 @@ class RealtimeLLMAgent:
             str(item.get('container_id')): item
             for item in snapshot.get('cargos', [])
         }
-        submitted = 0
+        pending = []
         for container_id in list(self._cycle.outbound_ids):
             cargo = by_id.get(container_id)
             if not cargo or cargo.get('location') == '출항완료':
                 continue
+            pending.append((container_id, cargo))
+        invalid = [
+            f'{container_id}:{cargo.get("location")}'
+            for container_id, cargo in pending
+            if str(cargo.get('location') or '') not in SHIP_LOCATIONS
+        ]
+        if invalid:
+            self._update_snapshot(
+                state='WAITING_FOR_DB_SYNC',
+                last_error=(
+                    '출항완료 보류: 선박에 반영되지 않은 화물 ' +
+                    ', '.join(invalid)
+                ),
+            )
+            return 0
+        submitted = 0
+        for container_id, cargo in pending:
             client.send_inventory_movement({
                 'schema_version': '1.0',
                 'operation_id': (

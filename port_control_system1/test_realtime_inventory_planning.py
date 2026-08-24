@@ -84,3 +84,85 @@ def test_same_snapshot_is_skipped_until_heartbeat(monkeypatch):
     agent._last_evaluation_monotonic = __import__('time').monotonic()
 
     assert agent._evaluate_inventory('목표') is None
+
+
+def test_db_plan_execution_dispatches_first_internal_move(monkeypatch):
+    inventory = snapshot()
+    plan = {
+        'schema_version': '1.0',
+        'plan_id': 'plan-execute',
+        'snapshot_id': inventory.snapshot_id,
+        'objective': 'C0를 A-1-2로 이동',
+        'status': 'ready',
+        'moves': [{
+            'sequence': 1,
+            'container_id': '0',
+            'container_name': 'C0',
+            'source_location': 'A-1-1',
+            'source_floor': 1,
+            'destination_location': 'A-1-2',
+            'destination_floor': 1,
+            'destination_base_aruco_id': '',
+            'reason': '테스트',
+        }],
+        'summary': '한 건 이동',
+        'error': '',
+    }
+    sent = []
+
+    class SnapshotClient:
+        @staticmethod
+        def fetch_snapshot():
+            return inventory
+
+    class Planner:
+        inventory_client = SnapshotClient()
+
+        @staticmethod
+        def plan_snapshot(*_args):
+            raise AssertionError('matching initial plan must be used first')
+
+    class Store:
+        @staticmethod
+        def load():
+            return realtime_llm_agent.AutonomousCycle()
+
+        @staticmethod
+        def save(_cycle):
+            return None
+
+    class Control:
+        @staticmethod
+        def status():
+            return {'telemetry': {
+                'inventory_sync': {'state': 'READY', 'pending_count': 0},
+                'vehicles': {},
+                'arms': {'arm2': {}},
+                'arm_results': {},
+            }}
+
+        @staticmethod
+        def send_arm_command(**payload):
+            sent.append(payload)
+            return {'command_id': 'arm-db-plan-1'}
+
+    monkeypatch.setattr(
+        realtime_llm_agent, 'CentralControlClient',
+        lambda timeout_sec=3.0: Control(),
+    )
+    agent = RealtimeLLMAgent(
+        inventory_planner=Planner(), cycle_store=Store()
+    )
+
+    agent.start_inventory_plan_execution(plan['objective'], plan)
+    result = agent._evaluate_inventory_execution()
+
+    assert result == plan
+    assert sent[0]['operation'] == 'transfer_by_id'
+    assert sent[0]['source_id'] == 0
+    assert sent[0]['destination_id'] == 12
+    assert sent[0]['vehicle_id'] == ''
+    state = agent.snapshot()
+    assert state.mode == 'inventory_execute'
+    assert state.state == 'EXECUTING'
+    assert state.active_command == 'arm-db-plan-1'

@@ -133,6 +133,9 @@ class CameraToMapBridge(Node):
         self.declare_parameter('b1_camera_left_offset_m', 0.15)
         self.declare_parameter('b1_camera_down_offset_m', 0.03)
         self.declare_parameter('b1_waiting_distance_m', 0.25)
+        self.declare_parameter(
+            'b1_waiting_camera_down_offset_m', 0.06
+        )
         # A-1/A-2/A-3 cargo bins share one fixed, pre-measured map-frame stop
         # pose (measured with RViz "2D Pose Estimate") instead of a pixel ->
         # map conversion, since the loading spot in front of the shelf is the
@@ -197,6 +200,15 @@ class CameraToMapBridge(Node):
         )
         if self.b1_waiting_distance_m < 0.0:
             raise ValueError('b1_waiting_distance_m must not be negative')
+        self.b1_waiting_camera_down_offset_m = float(
+            self.get_parameter(
+                'b1_waiting_camera_down_offset_m'
+            ).value
+        )
+        if self.b1_waiting_camera_down_offset_m < 0.0:
+            raise ValueError(
+                'b1_waiting_camera_down_offset_m must not be negative'
+            )
         self.a_zone_map_x = float(self.get_parameter('a_zone_map_x').value)
         self.a_zone_map_y = float(self.get_parameter('a_zone_map_y').value)
         self.a_zone_map_yaw = float(
@@ -384,6 +396,13 @@ class CameraToMapBridge(Node):
                 yaw,
                 waiting_distance,
             )
+            if is_b1 and self.b1_waiting_camera_down_offset_m > 0.0:
+                down_x, down_y = self.camera_down_map_offset(
+                    target_pixel,
+                    self.b1_waiting_camera_down_offset_m,
+                )
+                waiting_x += down_x
+                waiting_y += down_y
             if is_a and self.a_zone_waiting_camera_down_offset_m > 0.0:
                 down_x, down_y = self.camera_down_map_offset(
                     target_pixel,
@@ -409,6 +428,8 @@ class CameraToMapBridge(Node):
             f'zone={goal.zone_id or "-"}, '
             f'map=({target_x:.3f}, {target_y:.3f}), '
             f'waiting_distance={waiting_distance:.2f}m, '
+            f'b1_waiting_camera_down='
+            f'{self.b1_waiting_camera_down_offset_m if is_b1 else 0.0:.2f}m, '
             f'a_waiting_camera_down='
             f'{self.a_zone_waiting_camera_down_offset_m if is_a else 0.0:.2f}m'
         )

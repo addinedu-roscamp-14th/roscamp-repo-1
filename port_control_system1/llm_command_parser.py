@@ -205,6 +205,7 @@ heading은 target에서 차량 앞쪽이 바라볼 방향에 있는 별도의 �
 10) ARM2가 차량의 컨테이너를 창고 슬롯으로 옮기는 경우:
 {{"type": "arm_transfer_to_slot", "arm_id": "arm2",
   "destination_slot": "<A-1-1|A-1-2|A-2-1|A-2-2|A-3-1|A-3-2>",
+  "destination_floor": <1..3 또는 미지정 시 0>,
   "vehicle_id": "<agv1|agv2>", "final_for_vehicle": <true|false>}}
 
 11) ARM2가 창고 ID의 컨테이너를 차량 트레일러에 싣는 경우:

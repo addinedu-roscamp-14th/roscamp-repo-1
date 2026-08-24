@@ -214,7 +214,9 @@ class AGVControlCenter(ctk.CTk):
             text = "ROS 연결 중"
             color = "#f0ad4e"
         agent = self.realtime_agent.snapshot()
-        autonomy_running = agent.enabled and agent.mode == 'autonomous'
+        autonomy_running = agent.enabled and agent.mode in {
+            'autonomous', 'inventory_execute'
+        }
         if self.realtime_agent_var.get() != autonomy_running:
             self.realtime_agent_var.set(autonomy_running)
         agent_text = {
@@ -234,6 +236,8 @@ class AGVControlCenter(ctk.CTk):
         }.get(agent.state, f'AI {agent.state}')
         if agent.mode == 'inventory' and agent.state == 'MONITORING':
             agent_text = 'AI DB 계획 관제'
+        elif agent.mode == 'inventory_execute':
+            agent_text = 'AI DB 계획 실행'
         text = f'{text} | {agent_text}'
         self.ros_status_label.configure(text=text, text_color=color)
         self.after(500, self._update_ros_status)
@@ -250,7 +254,7 @@ class AGVControlCenter(ctk.CTk):
         if self.ros_bridge.emergency_stop():
             self.show_emergency_popup(
                 "EMERGENCY_STOP",
-                "중앙관제에서 /cmd_vel 비상 정지를 활성화했습니다.",
+                "전체 AMR과 ARM1·ARM2를 정지하고 작업 큐를 초기화했습니다.",
             )
             return
         self.show_emergency_popup(

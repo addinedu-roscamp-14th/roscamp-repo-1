@@ -14,11 +14,11 @@ import time
 from nav_msgs.msg import Odometry, Path as NavPath
 import numpy as np
 from porter_interfaces.msg import VehicleState
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -198,11 +198,16 @@ class FleetCollisionSupervisor(Node):
         # by design, so the guard steps aside and the local costmap keeps
         # doing the avoidance. Empty coordinates leave the guard untouched.
         self.declare_parameter('park_exempt_radius_m', 0.30)
-        xy_descriptor = ParameterDescriptor(
-            type=ParameterType.PARAMETER_DOUBLE_ARRAY
+        # An empty Python list is inferred by rclpy as BYTE_ARRAY. Declaring
+        # the static type explicitly lets YAML provide [x, y] doubles while
+        # still allowing the parameter to be unset when no park exemption is
+        # configured.
+        self.declare_parameter(
+            'agv1_park_xy', Parameter.Type.DOUBLE_ARRAY
         )
-        self.declare_parameter('agv1_park_xy', [], xy_descriptor)
-        self.declare_parameter('agv2_park_xy', [], xy_descriptor)
+        self.declare_parameter(
+            'agv2_park_xy', Parameter.Type.DOUBLE_ARRAY
+        )
         self.declare_parameter('release_stable_sec', 0.8)
         self.declare_parameter('minimum_hold_sec', 0.5)
         self.declare_parameter('max_hold_sec', 10.0)

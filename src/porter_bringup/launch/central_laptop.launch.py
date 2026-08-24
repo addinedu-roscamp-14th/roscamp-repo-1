@@ -37,6 +37,9 @@ def generate_launch_description():
     b1_waiting_distance_m = LaunchConfiguration(
         'b1_waiting_distance_m'
     )
+    b1_waiting_camera_down_offset_m = LaunchConfiguration(
+        'b1_waiting_camera_down_offset_m'
+    )
     a_zone_waiting_distance_m = LaunchConfiguration(
         'a_zone_waiting_distance_m'
     )
@@ -221,6 +224,11 @@ def generate_launch_description():
             description='Distance behind the B-1 final pose used while occupied',
         ),
         DeclareLaunchArgument(
+            'b1_waiting_camera_down_offset_m',
+            default_value='0.06',
+            description='Additional camera-down offset for the B-1 waiting pose',
+        ),
+        DeclareLaunchArgument(
             'a_zone_waiting_distance_m',
             default_value='0.20',
             description='Distance behind the A-zone final pose used while occupied',
@@ -376,6 +384,10 @@ def generate_launch_description():
                 ),
                 'b1_waiting_distance_m': ParameterValue(
                     b1_waiting_distance_m,
+                    value_type=float,
+                ),
+                'b1_waiting_camera_down_offset_m': ParameterValue(
+                    b1_waiting_camera_down_offset_m,
                     value_type=float,
                 ),
                 'a_zone_waiting_distance_m': ParameterValue(

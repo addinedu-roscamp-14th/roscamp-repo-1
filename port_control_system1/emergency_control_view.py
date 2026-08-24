@@ -552,7 +552,8 @@ class EmergencyControlView(ctk.CTkFrame):
         if self.ros_bridge.emergency_stop("fleet"):
             messagebox.showwarning(
                 "비상 정지",
-                "전체 AMR의 정지 신호를 100Hz로 유지합니다.",
+                "전체 AMR 정지 신호를 유지하고 ARM1·ARM2 작업 큐를 초기화합니다.\n"
+                "해제 후 이전 작업은 자동으로 재개되지 않습니다.",
             )
         else:
             messagebox.showerror(

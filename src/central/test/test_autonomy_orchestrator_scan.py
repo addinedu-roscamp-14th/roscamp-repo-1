@@ -21,6 +21,16 @@ class CompletedFuture:
         return self._value
 
 
+class CompletedServiceFuture:
+    """Return a completed Trigger response."""
+
+    def __init__(self, success, message=''):
+        self._value = SimpleNamespace(success=success, message=message)
+
+    def result(self):
+        return self._value
+
+
 def make_orchestrator():
     """Construct the scan-state subset without starting a ROS node."""
     orchestrator = object.__new__(AutonomyOrchestrator)
@@ -28,10 +38,14 @@ def make_orchestrator():
     orchestrator.scan_requested = True
     orchestrator.scan_retry_pending = False
     orchestrator.arm2_cache_ready = False
+    orchestrator.arm2_cache_probe_pending = False
+    orchestrator.arm2_cache_probe_complete = True
     orchestrator.arm2_scan_retry_sec = 10.0
     orchestrator.arm2_scan_retry_not_before = 0.0
     orchestrator.arm1_cache_state_path = ''
     orchestrator.arm1_startup_scan_done = True
+    orchestrator.arm1_cache_probe_pending = False
+    orchestrator.arm1_cache_probe_complete = True
     orchestrator.statuses = []
     orchestrator._publish_status = (
         lambda state, mission_id='', **extra:
@@ -211,3 +225,48 @@ def test_arm1_cache_state_survives_central_restart(tmp_path):
     restarted.arm1_cache_state_path = first.arm1_cache_state_path
 
     assert restarted._load_arm1_cache_state()
+
+
+def test_live_arm1_cache_probe_skips_startup_rescan():
+    orchestrator = make_orchestrator()
+    orchestrator.arm1_cache_probe_complete = False
+    orchestrator.arm1_cache_probe_pending = True
+
+    orchestrator._on_arm1_cache_probe(CompletedServiceFuture(
+        True, 'ARM1 ship marker cache ready: 18..23'
+    ))
+
+    assert orchestrator.arm1_cache_probe_complete
+    assert orchestrator.arm1_cache_ready
+    assert orchestrator.arm1_startup_scan_done
+
+
+def test_live_arm2_cache_probe_skips_startup_rescan():
+    orchestrator = make_orchestrator()
+    orchestrator.arm2_cache_probe_complete = False
+    orchestrator.arm2_cache_probe_pending = True
+    orchestrator.get_parameter = lambda _name: SimpleNamespace(value=True)
+
+    orchestrator._on_arm2_cache_probe(CompletedServiceFuture(
+        True, 'ARM2 destination cache ready: IDs 11..16'
+    ))
+
+    assert orchestrator.arm2_cache_probe_complete
+    assert orchestrator.arm2_cache_ready
+    assert not orchestrator.scan_retry_pending
+
+
+def test_empty_live_arm_caches_schedule_fresh_scans():
+    orchestrator = make_orchestrator()
+    orchestrator.arm1_cache_probe_complete = False
+    orchestrator.arm1_cache_probe_pending = True
+    orchestrator.arm2_cache_probe_complete = False
+    orchestrator.arm2_cache_probe_pending = True
+    orchestrator.get_parameter = lambda _name: SimpleNamespace(value=True)
+
+    orchestrator._on_arm1_cache_probe(CompletedServiceFuture(False, 'missing'))
+    orchestrator._on_arm2_cache_probe(CompletedServiceFuture(False, 'missing'))
+
+    assert not orchestrator.arm1_cache_ready
+    assert not orchestrator.arm2_cache_ready
+    assert orchestrator.scan_retry_pending

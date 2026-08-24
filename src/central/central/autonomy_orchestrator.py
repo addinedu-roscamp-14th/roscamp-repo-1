@@ -20,6 +20,7 @@ from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 
 class AutonomyOrchestrator(Node):
@@ -65,26 +66,44 @@ class AutonomyOrchestrator(Node):
             '/central/arms/dispatch',
             callback_group=self.callback_group,
         )
+        self.arm1_cache_status_client = self.create_client(
+            Trigger,
+            '/arm/pick_place/ship_cache_status',
+            callback_group=self.callback_group,
+        )
+        self.arm2_cache_status_client = self.create_client(
+            Trigger,
+            '/arm2/destination_cache_status',
+            callback_group=self.callback_group,
+        )
         self.lock = threading.Lock()
         self.active_mission_id = ''
         self.arrival_event_id = ''
         self.scan_requested = False
         self.arm2_cache_ready = False
+        self.arm2_cache_probe_pending = False
+        self.arm2_cache_probe_complete = False
         self.arm2_scan_retry_sec = max(
             1.0, float(self.get_parameter('arm2_scan_retry_sec').value)
         )
         self.arm2_scan_retry_not_before = 0.0
-        self.scan_retry_pending = bool(
-            self.get_parameter('auto_scan_arm2_on_start').value
-        )
+        # Never issue a startup scan until the live ARM process has answered
+        # whether its in-memory cache already exists.
+        self.scan_retry_pending = False
         self.arm1_scan_requested = False
         self.arm1_cache_state_path = os.path.abspath(os.path.expanduser(str(
             self.get_parameter('arm1_ship_cache_state_path').value
         )))
-        self.arm1_cache_ready = self._load_arm1_cache_state()
+        # The state file is diagnostic only. The live ARM process is the
+        # authority because its cache intentionally lasts exactly as long as
+        # that process does.
+        self.arm1_cache_ready = False
+        self.arm1_cache_probe_pending = False
+        self.arm1_cache_probe_complete = False
         self.arm1_startup_scan_done = False
         self.inbound_scan_requested = False
         self.inbound_scan_pending = False
+        self.create_timer(1.0, self._probe_arm_caches)
         self.create_timer(1.0, self._retry_scan_if_needed)
         self.create_timer(10.0, self._retry_arm1_ship_scan)
         self._publish_status('WAITING_FOR_VESSEL')
@@ -93,13 +112,11 @@ class AutonomyOrchestrator(Node):
         if not bool(self.get_parameter('auto_scan_arm1_ship_on_start').value):
             return
         with self.lock:
-            # On first startup, always attempt a scan even if a stale cache
-            # file says ready=true — the ARM1 process may have restarted and
-            # lost its in-memory marker poses.  After the first successful
-            # scan, trust the cache to avoid redundant scans.
+            if not self.arm1_cache_probe_complete:
+                return
             if self.arm1_scan_requested:
                 return
-            if self.arm1_cache_ready and self.arm1_startup_scan_done:
+            if self.arm1_cache_ready:
                 return
         if not self.arm_client.wait_for_server(timeout_sec=1.0):
             self._publish_status('WAITING_FOR_ARM1_SHIP_SCAN')
@@ -143,17 +160,83 @@ class AutonomyOrchestrator(Node):
             # reports that its cache is incomplete during an inbound request.
             if success:
                 self.arm1_cache_ready = True
+                self.arm1_cache_probe_complete = True
                 self.arm1_startup_scan_done = True
                 self._save_arm1_cache_state(True)
         self._publish_status(
             'ARM1_SHIP_CACHE_READY' if success else 'ARM1_SHIP_SCAN_RETRY',
             error=error,
         )
-        # Mark the startup scan as done regardless of success/failure so the
-        # 10-second timer stops retrying.  A failed scan will be retried on
-        # the next vessel arrival via _request_arm1_inbound_scan.
+
+    def _probe_arm_caches(self):
+        """Ask each live ARM process whether its fixed-marker cache exists."""
         with self.lock:
-            self.arm1_startup_scan_done = True
+            probe_arm1 = not (
+                self.arm1_cache_probe_complete
+                or self.arm1_cache_probe_pending
+            )
+            probe_arm2 = not (
+                self.arm2_cache_probe_complete
+                or self.arm2_cache_probe_pending
+            )
+        if probe_arm1 and self.arm1_cache_status_client.wait_for_service(
+            timeout_sec=0.0
+        ):
+            with self.lock:
+                self.arm1_cache_probe_pending = True
+            future = self.arm1_cache_status_client.call_async(Trigger.Request())
+            future.add_done_callback(self._on_arm1_cache_probe)
+        if probe_arm2 and self.arm2_cache_status_client.wait_for_service(
+            timeout_sec=0.0
+        ):
+            with self.lock:
+                self.arm2_cache_probe_pending = True
+            future = self.arm2_cache_status_client.call_async(Trigger.Request())
+            future.add_done_callback(self._on_arm2_cache_probe)
+
+    def _on_arm1_cache_probe(self, future):
+        try:
+            response = future.result()
+        except Exception as exc:
+            with self.lock:
+                self.arm1_cache_probe_pending = False
+            self._publish_status('WAITING_FOR_ARM1_CACHE_STATUS', error=str(exc))
+            return
+        ready = bool(response.success)
+        with self.lock:
+            self.arm1_cache_probe_pending = False
+            self.arm1_cache_probe_complete = True
+            self.arm1_cache_ready = ready
+            self.arm1_startup_scan_done = ready
+            self._save_arm1_cache_state(ready)
+        self._publish_status(
+            'ARM1_SHIP_CACHE_READY' if ready else 'ARM1_SHIP_SCAN_REQUIRED',
+            note=str(response.message),
+        )
+
+    def _on_arm2_cache_probe(self, future):
+        try:
+            response = future.result()
+        except Exception as exc:
+            with self.lock:
+                self.arm2_cache_probe_pending = False
+            self._publish_status('WAITING_FOR_ARM2_CACHE_STATUS', error=str(exc))
+            return
+        ready = bool(response.success)
+        with self.lock:
+            self.arm2_cache_probe_pending = False
+            self.arm2_cache_probe_complete = True
+            self.arm2_cache_ready = ready
+            self.scan_retry_pending = bool(
+                not ready
+                and self.get_parameter('auto_scan_arm2_on_start').value
+            )
+            self.arm2_scan_retry_not_before = 0.0
+        self._publish_status(
+            'ARM2_DESTINATION_CACHE_READY'
+            if ready else 'ARM2_DESTINATION_SCAN_REQUIRED',
+            note=str(response.message),
+        )
 
     def _on_port_event(self, message):
         if message.event_type == PortEvent.VESSEL_DEPARTED:
@@ -262,6 +345,8 @@ class AutonomyOrchestrator(Node):
                 # its process restarted and the slot scan really is required.
                 if self._failure_means_arm1_cache_missing(error):
                     self.arm1_cache_ready = False
+                    self.arm1_cache_probe_complete = True
+                    self.arm1_startup_scan_done = False
                     self._save_arm1_cache_state(False)
         self._publish_status(
             (
@@ -389,6 +474,7 @@ class AutonomyOrchestrator(Node):
         with self.lock:
             self.scan_requested = False
             self.arm2_cache_ready = success
+            self.arm2_cache_probe_complete = True
             self.scan_retry_pending = not success
             self.arm2_scan_retry_not_before = (
                 0.0 if success
@@ -409,7 +495,8 @@ class AutonomyOrchestrator(Node):
         with self.lock:
             mission_id = self.active_mission_id
             should_retry = (
-                self.scan_retry_pending
+                self.arm2_cache_probe_complete
+                and self.scan_retry_pending
                 and not self.scan_requested
                 and time.monotonic() >= self.arm2_scan_retry_not_before
             )
@@ -429,6 +516,22 @@ class AutonomyOrchestrator(Node):
             result = json.loads(message.data)
         except json.JSONDecodeError:
             return
+        if (
+            str(result.get('arm_id', '')).lower() == 'arm2'
+            and not result.get('success')
+            and 'scan_destinations first'
+            in str(result.get('message', '')).lower()
+        ):
+            with self.lock:
+                self.arm2_cache_ready = False
+                self.arm2_cache_probe_complete = True
+                self.scan_retry_pending = True
+                self.arm2_scan_retry_not_before = 0.0
+            self._publish_status(
+                'ARM2_DESTINATION_SCAN_REQUIRED',
+                str(result.get('mission_id', '')),
+                error=str(result.get('message', '')),
+            )
         if not result.get('vehicle_release_allowed'):
             return
         if not result.get('success') or not result.get('vehicle_id'):

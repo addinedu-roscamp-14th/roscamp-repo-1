@@ -3,6 +3,7 @@ string mission_id
 string arm_id
 string operation
 string destination_slot
+int32 destination_floor
 int32 source_id
 int32 destination_id
 string vehicle_id
