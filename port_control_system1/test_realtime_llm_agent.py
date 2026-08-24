@@ -1,6 +1,7 @@
 """Tests for event-driven realtime VLM supervision helpers."""
 
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -33,15 +34,15 @@ class PreviousProcessCycleStore:
         pass
 
 
-def test_process_restart_starts_with_a_fresh_autonomous_cycle():
+def test_process_restart_preserves_only_outbound_intent():
     store = PreviousProcessCycleStore()
 
     agent = RealtimeLLMAgent(cycle_store=store)
 
-    assert store.load_calls == 0
+    assert store.load_calls == 1
     assert agent._cycle.phase == 'WAITING_FOR_INBOUND'
     assert agent._cycle.inbound_ids == []
-    assert agent._cycle.outbound_ids == []
+    assert agent._cycle.outbound_ids == ['8']
     assert agent._cycle.active_move is None
     assert agent._cycle.identical_failures == 0
 
@@ -155,6 +156,41 @@ def test_autonomous_vehicle_selection_uses_only_available_vehicle():
 
     selected = agent._ready_vehicle(
         fleet_status(agv1_state='BUSY', agv2_state='READY')
+    )
+
+    assert selected == 'agv2'
+
+
+def test_autonomous_selection_accepts_idle_vehicle_outside_parking_zone():
+    agent = object.__new__(RealtimeLLMAgent)
+    agent._cycle = realtime_llm_agent.AutonomousCycle(
+        last_vehicle_id='agv2'
+    )
+    status = fleet_status(agv2_state='BUSY')
+    status['telemetry']['vehicles']['agv1'].update({
+        'state': 'READY',
+        'current_command_id': '',
+        'locked_zone': '',
+    })
+
+    selected = agent._ready_vehicle(status)
+
+    assert selected == 'agv1'
+
+
+def test_loaded_amr_recovery_selects_the_same_vehicle():
+    agent = object.__new__(RealtimeLLMAgent)
+    agent._cycle = realtime_llm_agent.AutonomousCycle()
+    status = fleet_status()
+    inventory = {'cargos': [{
+        'container_id': '6', 'location': 'AMR2', 'floor': 1,
+    }]}
+
+    selected = agent._ready_vehicle(
+        status,
+        inventory_snapshot=inventory,
+        require_empty_trailer=False,
+        required_vehicle_id='agv2',
     )
 
     assert selected == 'agv2'
@@ -498,6 +534,97 @@ def test_arm_load_rejects_a_different_db_cargo_already_on_trailer():
         )
 
 
+def test_second_ship_pickup_waits_until_loaded_vehicle_clears_b1():
+    step = {
+        'type': 'arm1_pick_place', 'arm_id': 'arm1',
+        'source_id': 7, 'destination_id': 9,
+    }
+    move = {'container_id': '7'}
+    inventory = {'cargos': [
+        {'container_id': '7', 'location': '선박-2', 'floor': 1},
+        {'container_id': '6', 'location': 'AMR1', 'floor': 1},
+    ]}
+    status = fleet_status()
+    status['telemetry']['vehicles']['agv1']['locked_zone'] = 'B-1'
+
+    with pytest.raises(
+        realtime_llm_agent.AutonomousPolicyError,
+        match='B-1 이탈 후 다음 ARM1 상차',
+    ):
+        RealtimeLLMAgent._validate_active_step(
+            step, move, inventory, status
+        )
+
+
+def test_next_ship_pickup_allowed_after_loaded_vehicle_clears_b1():
+    step = {
+        'type': 'arm1_pick_place', 'arm_id': 'arm1',
+        'source_id': 7, 'destination_id': 9,
+    }
+    move = {'container_id': '7'}
+    inventory = {'cargos': [
+        {'container_id': '7', 'location': '선박-2', 'floor': 1},
+        {'container_id': '6', 'location': 'AMR1', 'floor': 1},
+    ]}
+    status = fleet_status()
+    status['telemetry']['vehicles']['agv1']['locked_zone'] = ''
+
+    RealtimeLLMAgent._validate_active_step(
+        step, move, inventory, status
+    )
+
+
+def test_second_ship_arm_step_waits_without_failing_while_b1_is_loaded():
+    step = {
+        'type': 'arm1_pick_place', 'arm_id': 'arm1',
+        'source_id': 7, 'destination_id': 9,
+    }
+    inventory = {'cargos': [
+        {'container_id': '7', 'location': '선박-2', 'floor': 1},
+        {'container_id': '6', 'location': 'AMR1', 'floor': 1},
+    ]}
+    status = fleet_status()
+    status['telemetry']['vehicles']['agv1']['locked_zone'] = 'B-1'
+
+    reason = RealtimeLLMAgent._arm_step_wait_reason(
+        step, status, inventory
+    )
+
+    assert 'B-1 이탈 후 다음 ARM1 상차' in reason
+
+
+def test_navigation_to_b1_is_not_blocked_by_loaded_vehicle_wait():
+    step = {
+        'type': 'zone_navigation', 'zone': 'B-1', 'vehicle_id': 'agv2',
+    }
+    inventory = {'cargos': [
+        {'container_id': '6', 'location': 'AMR1', 'floor': 1},
+    ]}
+    status = fleet_status()
+    status['telemetry']['vehicles']['agv1']['locked_zone'] = 'B-1'
+
+    assert RealtimeLLMAgent._arm_step_wait_reason(
+        step, status, inventory
+    ) == ''
+
+
+def test_next_arm_command_waits_for_other_physical_result_to_reach_db():
+    agent = object.__new__(RealtimeLLMAgent)
+    first = {
+        '_vehicle_id': 'agv1',
+        '_awaiting_arm_db_sync': 'arm-first',
+    }
+    second = {'_vehicle_id': 'agv2'}
+    agent._cycle = realtime_llm_agent.AutonomousCycle(
+        active_move=first,
+        active_moves={'agv1': first, 'agv2': second},
+    )
+
+    reason = agent._other_arm_result_waiting_for_db(second)
+
+    assert 'arm-first의 DB 반영 대기' in reason
+
+
 def test_arm2_unload_requires_planned_container_on_selected_trailer():
     step = {
         'type': 'arm_transfer_to_slot', 'arm_id': 'arm2',
@@ -537,6 +664,57 @@ def test_arm2_unload_accepts_planned_container_on_selected_trailer():
     RealtimeLLMAgent._validate_active_step(
         step, move, inventory, {'telemetry': {}}
     )
+
+
+@pytest.mark.parametrize(
+    ('vehicle_id', 'trailer_location'),
+    [('agv1', 'AMR1'), ('agv2', 'AMR2')],
+)
+def test_arm1_ship_place_validates_fresh_container_on_selected_trailer(
+    vehicle_id, trailer_location
+):
+    step = {
+        'type': 'arm1_pick_place', 'arm_id': 'arm1',
+        'source_id': 6, 'destination_id': 18,
+        'vehicle_id': vehicle_id,
+    }
+    move = {
+        'container_id': '6', 'source_location': 'A-1-1',
+        'destination_location': '선박-1', '_vehicle_id': vehicle_id,
+    }
+    inventory = {'cargos': [{
+        'container_id': '6', 'location': trailer_location, 'floor': 1,
+    }]}
+    status = fleet_status()
+    status['telemetry']['autonomy'] = {'arm1_ship_cache_ready': True}
+
+    RealtimeLLMAgent._validate_active_step(
+        step, move, inventory, status
+    )
+
+
+def test_arm1_ship_place_rejects_container_not_on_selected_trailer():
+    step = {
+        'type': 'arm1_pick_place', 'arm_id': 'arm1',
+        'source_id': 6, 'destination_id': 18, 'vehicle_id': 'agv1',
+    }
+    move = {
+        'container_id': '6', 'source_location': 'A-1-1',
+        'destination_location': '선박-1', '_vehicle_id': 'agv1',
+    }
+    inventory = {'cargos': [{
+        'container_id': '6', 'location': 'A-1-1', 'floor': 3,
+    }]}
+    status = fleet_status()
+    status['telemetry']['autonomy'] = {'arm1_ship_cache_ready': True}
+
+    with pytest.raises(
+        realtime_llm_agent.AutonomousPolicyError,
+        match='expected AMR1, DB=A-1-1',
+    ):
+        RealtimeLLMAgent._validate_active_step(
+            step, move, inventory, status
+        )
 
 
 def test_orphaned_arm_command_is_failed_after_restart_timeout():
@@ -861,6 +1039,24 @@ def test_autonomy_restart_preserves_inflight_move_for_live_reconciliation():
     assert agent._cycle.active_move is move
 
 
+def test_outbound_clear_rejects_cargo_that_is_still_in_warehouse():
+    agent = RealtimeLLMAgent()
+    agent._cycle.outbound_ids = ['6']
+    agent._cycle.outbound_seen_in_roi = True
+    sent = []
+    client = SimpleNamespace(send_inventory_movement=sent.append)
+
+    submitted = agent._complete_outbound(client, {'cargos': [{
+        'container_id': '6', 'location': 'A-1-1', 'floor': 3,
+        'base_aruco_id': '8',
+    }]})
+
+    assert submitted == 0
+    assert sent == []
+    assert agent.snapshot().state == 'WAITING_FOR_DB_SYNC'
+    assert 'A-1-1' in agent.snapshot().last_error
+
+
 def test_exhausted_navigation_recovery_stops_without_replanning_loop():
     agent = RealtimeLLMAgent()
     agent._cycle.active_move = {
@@ -879,7 +1075,7 @@ def test_exhausted_navigation_recovery_stops_without_replanning_loop():
     assert agent.snapshot().state == 'WAITING_OPERATOR'
 
 
-def test_arm_pick_failure_stops_before_dispatching_another_vehicle():
+def test_arm_pick_failure_stops_after_same_step_resends_are_exhausted():
     agent = RealtimeLLMAgent()
     move = {
         'container_id': '6',
@@ -891,6 +1087,7 @@ def test_arm_pick_failure_stops_before_dispatching_another_vehicle():
             {'type': 'zone_navigation', 'zone': 'B-1'},
             {'type': 'arm1_pick_place', 'arm_id': 'arm1'},
         ],
+        '_step_retry_counts': {'1': 2},
     }
     agent._cycle.active_move = move
     agent._cycle.active_moves = {'agv1': move}
@@ -906,3 +1103,143 @@ def test_arm_pick_failure_stops_before_dispatching_another_vehicle():
     assert agent._cycle.identical_failures == 3
     assert agent._cycle.active_moves == {}
     assert agent.snapshot().state == 'WAITING_OPERATOR'
+
+
+def test_arm_marker_miss_schedules_retry_on_same_move_and_vehicle():
+    agent = object.__new__(RealtimeLLMAgent)
+    agent.arm_command_max_resends = 2
+    agent.arm_command_retry_grace_sec = 2.0
+    agent._cycle = realtime_llm_agent.AutonomousCycle()
+    move = {
+        'container_id': '6',
+        '_vehicle_id': 'agv1',
+        '_step_index': 1,
+        '_current_command_id': 'arm-failed',
+        '_steps': [
+            {'type': 'zone_navigation', 'zone': 'B-1'},
+            {'type': 'arm1_pick_place', 'arm_id': 'arm1'},
+        ],
+        '_step_retry_counts': {},
+    }
+    agent._cycle.active_move = move
+    agent._cycle.active_moves = {'agv1': move}
+    agent._save_cycle = lambda: None
+    updates = []
+    agent._update_snapshot = lambda **kwargs: updates.append(kwargs)
+
+    outcome, detail = agent._retry_failed_arm_step(
+        object(), move, 'auto-test', fleet_status(), 1,
+        "all station poses exhausted; missing ArUco=['pick']",
+    )
+
+    assert (outcome, detail) == ('waiting', '')
+    assert move['_vehicle_id'] == 'agv1'
+    assert move['_current_command_id'] == 'arm-failed'
+    assert move['_arm_retry_not_before'] > time.time()
+    assert '같은 ARM 작업 재시도 1/2' in updates[-1]['last_error']
+
+
+def test_arm_marker_miss_retries_without_limit_by_default():
+    agent = object.__new__(RealtimeLLMAgent)
+    agent.arm_command_max_resends = -1
+    agent.arm_command_retry_grace_sec = 2.0
+    agent._cycle = realtime_llm_agent.AutonomousCycle()
+    move = {
+        'container_id': '6',
+        '_vehicle_id': 'agv1',
+        '_step_index': 1,
+        '_current_command_id': 'arm-failed-100',
+        '_steps': [
+            {'type': 'zone_navigation', 'zone': 'B-1'},
+            {'type': 'arm1_pick_place', 'arm_id': 'arm1'},
+        ],
+        '_step_retry_counts': {'1': 100},
+    }
+    agent._cycle.active_move = move
+    agent._cycle.active_moves = {'agv1': move}
+    agent._save_cycle = lambda: None
+    updates = []
+    agent._update_snapshot = lambda **kwargs: updates.append(kwargs)
+
+    outcome, detail = agent._retry_failed_arm_step(
+        object(), move, 'auto-test', fleet_status(), 1,
+        "all station poses exhausted; missing ArUco=['pick']",
+    )
+
+    assert (outcome, detail) == ('waiting', '')
+    assert move['_current_command_id'] == 'arm-failed-100'
+    assert move['_arm_retry_not_before'] > time.time()
+    assert '같은 ARM 작업 재시도 101회' in updates[-1]['last_error']
+
+
+def test_arm_retry_uses_a_new_mission_after_previous_mission_failed():
+    class Client:
+        def __init__(self):
+            self.requests = []
+
+        def send_arm_command(self, **kwargs):
+            self.requests.append(kwargs)
+            return {'command_id': 'arm-retry-command'}
+
+    agent = object.__new__(RealtimeLLMAgent)
+    agent.arm_command_max_resends = -1
+    agent.arm_command_retry_grace_sec = 2.0
+    agent._cycle = realtime_llm_agent.AutonomousCycle()
+    move = {
+        'container_id': '6',
+        '_vehicle_id': 'agv1',
+        '_step_index': 0,
+        '_current_command_id': 'arm-failed',
+        '_mission_id': 'auto-original',
+        '_root_mission_id': 'auto-original',
+        '_arm_retry_not_before': time.time() - 1.0,
+        '_steps': [{
+            'type': 'arm1_pick_place',
+            'arm_id': 'arm1',
+            'source_id': 6,
+            'destination_id': 10,
+            'vehicle_id': 'agv1',
+            'final_for_vehicle': True,
+        }],
+        '_step_retry_counts': {},
+    }
+    agent._cycle.active_move = move
+    agent._cycle.active_moves = {'agv1': move}
+    agent._save_cycle = lambda: None
+    agent._update_snapshot = lambda **_kwargs: None
+    client = Client()
+
+    outcome, detail = agent._retry_failed_arm_step(
+        client, move, 'auto-original', fleet_status(), 0,
+        "all station poses exhausted; missing ArUco=['pick']",
+    )
+
+    assert (outcome, detail) == ('waiting', '')
+    retry_mission = client.requests[0]['mission_id']
+    assert retry_mission.startswith('auto-original-arm-retry-1-')
+    assert retry_mission != 'auto-original'
+    assert move['_mission_id'] == retry_mission
+    assert move['_current_command_id'] == 'arm-retry-command'
+
+
+def test_internal_move_reconciliation_preserves_slot_floor_and_support():
+    event = RealtimeLLMAgent._internal_move_sync_event(
+        {
+            'container_id': '1',
+            'destination_location': 'A-2-1',
+            'destination_floor': 2,
+            'destination_base_aruco_id': '0',
+        },
+        {
+            'operation_id': 'id-transfer-1-to-0',
+            'command_id': 'arm-command-1',
+            'mission_id': 'mission-1',
+        },
+    )
+
+    assert event['operation_id'] == 'id-transfer-1-to-0'
+    assert event['container_id'] == '1'
+    assert event['source_location'] == ''
+    assert event['destination_location'] == 'A-2-1'
+    assert event['destination_floor'] == 2
+    assert event['destination_base_aruco_id'] == '0'

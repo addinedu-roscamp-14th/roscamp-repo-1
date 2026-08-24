@@ -31,6 +31,11 @@ from openpyxl import load_workbook
 from waypoint_rules import expand_leg, load_waypoint_rules
 from generate_cargo_template import build_template as build_cargo_excel_template
 from inventory_client import InventoryAdminClient, InventoryClient
+from autonomous_inventory import (
+    CANONICAL_LOCATIONS,
+    SHIP_MARKERS,
+    WAREHOUSE_MARKERS,
+)
 
 
 # 실행할 때의 현재 폴더(cwd)가 아니라, 이 파일이 실제로 있는 폴더를 기준으로 삼습니다.
@@ -55,6 +60,69 @@ NUM_VEHICLES = 2  # 보유 차량 대수 - 늘리거나 줄이려면 이 값만 
 VEHICLE_HOME_LOCATIONS = ["대기장소 1", "대기장소 2"]
 
 VEHICLE_STATE_FILE = str(_APP_DIR / "vehicle_positions.json")
+
+MANUAL_INVENTORY_LOCATIONS = tuple(CANONICAL_LOCATIONS)
+MANUAL_CONTAINER_IDS = tuple(str(value) for value in range(9))
+MANUAL_FLOORS = ('1', '2', '3')
+TRAILER_BASE_MARKERS = {'AMR1': '10', 'AMR2': '9'}
+
+
+def validate_manual_inventory_position(
+    container_id: str,
+    location: str,
+    floor: int,
+    cargos,
+) -> str:
+    """Validate a manual DB edit and return its supporting ArUco/ID."""
+    container_id = str(container_id).strip()
+    location = str(location).strip()
+    try:
+        floor = int(floor)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('층수는 1, 2, 3 중 하나여야 합니다.') from exc
+    if container_id not in MANUAL_CONTAINER_IDS:
+        raise ValueError('컨테이너 ID는 0부터 8까지 선택해주세요.')
+    if location not in MANUAL_INVENTORY_LOCATIONS:
+        raise ValueError(f'등록되지 않은 표준 위치입니다: {location}')
+    if floor not in {1, 2, 3}:
+        raise ValueError('층수는 1, 2, 3 중 하나여야 합니다.')
+    if location in {'AMR1', 'AMR2', '출항완료'} and floor != 1:
+        raise ValueError(f'{location} 위치는 1층만 사용할 수 있습니다.')
+
+    records = tuple(cargos or ())
+    for cargo in records:
+        other_id = str(getattr(cargo, 'container_id', '') or '')
+        if other_id == container_id:
+            continue
+        if (
+            str(getattr(cargo, 'location', '') or '') == location
+            and int(getattr(cargo, 'floor', 1) or 1) == floor
+        ):
+            raise ValueError(
+                f'{location} {floor}층에는 이미 컨테이너 '
+                f'{other_id or getattr(cargo, "name", "-")}가 있습니다.'
+            )
+
+    if floor == 1:
+        return str(
+            WAREHOUSE_MARKERS.get(location)
+            or SHIP_MARKERS.get(location)
+            or TRAILER_BASE_MARKERS.get(location)
+            or ''
+        )
+
+    support = next((
+        cargo for cargo in records
+        if str(getattr(cargo, 'container_id', '') or '') != container_id
+        and str(getattr(cargo, 'location', '') or '') == location
+        and int(getattr(cargo, 'floor', 1) or 1) == floor - 1
+    ), None)
+    if support is None:
+        raise ValueError(
+            f'{location} {floor}층을 등록하려면 {floor - 1}층 '
+            '컨테이너가 먼저 DB에 있어야 합니다.'
+        )
+    return str(getattr(support, 'container_id', '') or '')
 
 
 def _inventory_refresh_interval_ms() -> int:
@@ -638,10 +706,12 @@ class CargoDispatchTool(ctk.CTkFrame):
         self._inventory_error = ""
         self._inventory_poll_in_flight = False
         self._inventory_reset_in_flight = False
+        self._inventory_delete_in_flight = False
         self._inventory_stopped = False
         self._inventory_after_id = None
         self._inventory_results = queue.Queue()
         self._inventory_reset_results = queue.Queue()
+        self._inventory_delete_results = queue.Queue()
         self._inventory_refresh_ms = _inventory_refresh_interval_ms()
 
         # 배차 실행 큐 상태 - 자연어 단건 명령이든 엑셀 다건 재배치든 이 큐 하나로 통일해서 처리
@@ -666,11 +736,10 @@ class CargoDispatchTool(ctk.CTkFrame):
         header_frame.pack_propagate(False)
         ctk.CTkLabel(header_frame, text="🚚 화물 위치 추적 및 자연어 배차", font=self.font_title, text_color="#dce4ee").pack(side="left", padx=24, pady=16)
 
-        # ---- Left Panel: Cargo Registration & List ----
+        # ---- Left Panel: Cargo Registration ----
         left = ctk.CTkFrame(self, fg_color="transparent")
         left.grid(row=1, column=0, sticky="nsew", padx=(24, 12), pady=24)
         left.grid_columnconfigure(0, weight=1)
-        left.grid_rowconfigure(2, weight=1)
 
         # 1) Registration Form Card
         reg_card = ctk.CTkFrame(left, fg_color="#2b2b2b", corner_radius=6, border_width=1, border_color="#1a1a1a")
@@ -682,52 +751,92 @@ class CargoDispatchTool(ctk.CTkFrame):
         form.pack(fill="x", padx=20, pady=(0, 20))
         form.grid_columnconfigure(0, weight=1)
 
-        self.cargo_name_var = ctk.StringVar()
         entry_kwargs = {"fg_color": "#343638", "border_color": "#565b5e", "text_color": "#dce4ee", "corner_radius": 6, "height": 36}
-        ctk.CTkEntry(form, textvariable=self.cargo_name_var, placeholder_text="화물 이름 (예: 화물A)", **entry_kwargs).grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        self.container_id_var = ctk.StringVar(value=MANUAL_CONTAINER_IDS[0])
+        ctk.CTkLabel(
+            form, text="컨테이너 ID", font=self.font_body,
+            text_color="#9e9e9e",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.container_id_menu = ctk.CTkOptionMenu(
+            form,
+            variable=self.container_id_var,
+            values=list(MANUAL_CONTAINER_IDS),
+            fg_color="#343638",
+            button_color="#565b5e",
+            button_hover_color="#2e86c1",
+            corner_radius=6,
+            height=36,
+        )
+        self.container_id_menu.grid(row=1, column=0, sticky="ew", pady=(0, 12))
 
         self.location_option_var = ctk.StringVar()
-        location_names = list(self.locations.keys()) or ["대기장소"]
+        ctk.CTkLabel(
+            form, text="표준 위치", font=self.font_body,
+            text_color="#9e9e9e",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 4))
+        location_names = list(MANUAL_INVENTORY_LOCATIONS)
+        self.location_option_var.set(location_names[0])
         self.location_menu = ctk.CTkOptionMenu(form, variable=self.location_option_var, values=location_names,
                                               fg_color="#343638", button_color="#565b5e", button_hover_color="#2e86c1", corner_radius=6, height=36)
-        self.location_menu.grid(row=1, column=0, sticky="ew", pady=(0, 16))
+        self.location_menu.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+
+        self.floor_var = ctk.StringVar(value='1')
+        ctk.CTkLabel(
+            form, text="층수", font=self.font_body,
+            text_color="#9e9e9e",
+        ).grid(row=4, column=0, sticky="w", pady=(0, 4))
+        self.floor_menu = ctk.CTkOptionMenu(
+            form,
+            variable=self.floor_var,
+            values=list(MANUAL_FLOORS),
+            fg_color="#343638",
+            button_color="#565b5e",
+            button_hover_color="#2e86c1",
+            corner_radius=6,
+            height=36,
+        )
+        self.floor_menu.grid(row=5, column=0, sticky="ew", pady=(0, 12))
 
         btn_kwargs = {"corner_radius": 6, "height": 36, "font": self.font_body}
         
-        ctk.CTkButton(form, text="위치 등록 / 갱신", fg_color="#2e86c1", hover_color="#21618c", command=self.register_cargo_location, **btn_kwargs).grid(row=2, column=0, sticky="ew", pady=4)
+        ctk.CTkButton(form, text="DB 위치 등록 / 갱신", fg_color="#2e86c1", hover_color="#21618c", command=self.register_cargo_location, **btn_kwargs).grid(row=6, column=0, sticky="ew", pady=4)
         
         # Detail Banner
         self.detail_banner = ctk.CTkFrame(form, fg_color="#343638", corner_radius=6, border_width=1, border_color="#2e86c1")
         ctk.CTkLabel(self.detail_banner, text="📋 추가 정보 입력 (선택사항)", font=self.font_subtitle, text_color="#2e86c1").grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=10)
         
-        self.aruco_var = ctk.StringVar()
-        ctk.CTkLabel(self.detail_banner, text="ArUco/컨테이너:", font=self.font_body).grid(row=1, column=0, sticky="w", padx=10, pady=2)
-        ctk.CTkEntry(self.detail_banner, textvariable=self.aruco_var, placeholder_text="예: ARUCO_42", width=160, **entry_kwargs).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=2)
-        
         self.cargo_type_var = ctk.StringVar()
-        ctk.CTkLabel(self.detail_banner, text="화물 종류:", font=self.font_body).grid(row=2, column=0, sticky="w", padx=10, pady=2)
-        ctk.CTkEntry(self.detail_banner, textvariable=self.cargo_type_var, placeholder_text="예: 컨테이너, 벌크", width=160, **entry_kwargs).grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=2)
+        ctk.CTkLabel(self.detail_banner, text="화물 종류:", font=self.font_body).grid(row=1, column=0, sticky="w", padx=10, pady=2)
+        ctk.CTkEntry(self.detail_banner, textvariable=self.cargo_type_var, placeholder_text="예: 컨테이너, 팔레트", width=160, **entry_kwargs).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=2)
         
         self.cargo_note_var = ctk.StringVar()
-        ctk.CTkLabel(self.detail_banner, text="비고:", font=self.font_body).grid(row=3, column=0, sticky="w", padx=10, pady=2)
-        ctk.CTkEntry(self.detail_banner, textvariable=self.cargo_note_var, placeholder_text="메모", width=160, **entry_kwargs).grid(row=3, column=1, sticky="ew", padx=(0, 10), pady=2)
+        ctk.CTkLabel(self.detail_banner, text="비고:", font=self.font_body).grid(row=2, column=0, sticky="w", padx=10, pady=2)
+        ctk.CTkEntry(self.detail_banner, textvariable=self.cargo_note_var, placeholder_text="메모", width=160, **entry_kwargs).grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=2)
         
         banner_btn_row = ctk.CTkFrame(self.detail_banner, fg_color="transparent")
-        banner_btn_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+        banner_btn_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
         ctk.CTkButton(banner_btn_row, text="✅ 저장", width=80, fg_color="#27ae60", hover_color="#1e8449", command=self._confirm_register, **btn_kwargs).pack(side="left", padx=(0, 6))
         ctk.CTkButton(banner_btn_row, text="건너뛰기", width=80, fg_color="#565b5e", hover_color="#333333", command=self._skip_details_register, **btn_kwargs).pack(side="left", padx=(0, 6))
         ctk.CTkButton(banner_btn_row, text="취소", width=60, fg_color="#c0392b", hover_color="#922b21", command=self._cancel_register, **btn_kwargs).pack(side="left")
 
         self._pending_cargo_name: Optional[str] = None
+        self._pending_container_id: Optional[str] = None
         self._pending_cargo_location: Optional[str] = None
+        self._pending_cargo_floor: Optional[int] = None
+        self._pending_base_aruco_id: Optional[str] = None
 
-        ctk.CTkButton(form, text="📄 엑셀로 일괄 등록", fg_color="#27ae60", hover_color="#1e8449", command=self.bulk_import_from_excel, **btn_kwargs).grid(row=4, column=0, sticky="ew", pady=4)
-        ctk.CTkButton(form, text="🧾 빈 엑셀 양식 생성", fg_color="#343638", hover_color="#333333", border_width=1, border_color="#565b5e", text_color="#dce4ee", command=self.generate_template, **btn_kwargs).grid(row=5, column=0, sticky="ew", pady=4)
-        ctk.CTkButton(form, text="📤 현재 화물정보 엑셀로 내보내기", fg_color="#f39c12", hover_color="#d68910", command=self.export_cargo_to_excel, **btn_kwargs).grid(row=6, column=0, sticky="ew", pady=4)
+        ctk.CTkButton(form, text="📄 엑셀로 일괄 등록", fg_color="#27ae60", hover_color="#1e8449", command=self.bulk_import_from_excel, **btn_kwargs).grid(row=8, column=0, sticky="ew", pady=4)
+        ctk.CTkButton(form, text="🧾 빈 엑셀 양식 생성", fg_color="#343638", hover_color="#333333", border_width=1, border_color="#565b5e", text_color="#dce4ee", command=self.generate_template, **btn_kwargs).grid(row=9, column=0, sticky="ew", pady=4)
+        ctk.CTkButton(form, text="📤 현재 화물정보 엑셀로 내보내기", fg_color="#f39c12", hover_color="#d68910", command=self.export_cargo_to_excel, **btn_kwargs).grid(row=10, column=0, sticky="ew", pady=4)
 
-        # 2) Registered Cargo List Card
-        list_card = ctk.CTkFrame(left, fg_color="#2b2b2b", corner_radius=6, border_width=1, border_color="#1a1a1a")
-        list_card.grid(row=2, column=0, sticky="nsew")
+        # ---- Right Panel: Live PostgreSQL inventory ----
+        right = ctk.CTkFrame(self, fg_color="transparent")
+        right.grid(row=1, column=1, sticky="nsew", padx=(12, 24), pady=24)
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(0, weight=1)
+
+        list_card = ctk.CTkFrame(right, fg_color="#2b2b2b", corner_radius=6, border_width=1, border_color="#1a1a1a")
+        list_card.grid(row=0, column=0, sticky="nsew")
         list_card.grid_columnconfigure(0, weight=1)
         list_card.grid_rowconfigure(2, weight=1)
 
@@ -736,6 +845,15 @@ class CargoDispatchTool(ctk.CTkFrame):
         list_header.pack_propagate(False)
         ctk.CTkLabel(list_header, text="DB 실시간 화물 목록", font=self.font_subtitle, text_color="#dce4ee").pack(side="left", padx=16, pady=16)
         ctk.CTkButton(list_header, text="🔄 DB 조회", width=80, fg_color="transparent", text_color="#2e86c1", hover_color="#333333", command=self._request_inventory_refresh).pack(side="right", padx=16, pady=16)
+        ctk.CTkButton(
+            list_header,
+            text="🗣️ 명령",
+            width=80,
+            fg_color="#92ccff",
+            text_color="#003351",
+            hover_color="#cce5ff",
+            command=self.open_command_popup,
+        ).pack(side="right", padx=(0, 4), pady=10)
         self.inventory_reset_button = ctk.CTkButton(
             list_header,
             text="DB 초기화",
@@ -764,50 +882,6 @@ class CargoDispatchTool(ctk.CTkFrame):
         self.cargo_rows_container.grid(row=2, column=0, sticky="nsew", padx=16, pady=16)
         self.cargo_rows_container.grid_columnconfigure(0, weight=1)
 
-        # ---- Right Panel: Batch Redispatch & Log ----
-        right = ctk.CTkFrame(self, fg_color="#2b2b2b", corner_radius=6, border_width=1, border_color="#1a1a1a")
-        right.grid(row=1, column=1, sticky="nsew", padx=(12, 24), pady=24)
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=1)
-
-        # Top Section (Controls)
-        top_sec = ctk.CTkFrame(right, fg_color="transparent")
-        top_sec.grid(row=0, column=0, sticky="ew", padx=24, pady=24)
-
-        ctk.CTkLabel(top_sec, text="🔄 엑셀 기반 일괄 재배치", font=self.font_subtitle, text_color="#dce4ee").pack(anchor="w", pady=(0, 8))
-        self.relocation_label = ctk.CTkLabel(top_sec, text="바뀐 위치가 담긴 엑셀을 불러오면, 이전 위치와 다른 화물만 골라 이동 경로를 한번에 계획합니다.", font=self.font_body, text_color="#9e9e9e", wraplength=650, justify="left")
-        self.relocation_label.pack(anchor="w", pady=(0, 20))
-
-        reloc_row = ctk.CTkFrame(top_sec, fg_color="transparent")
-        reloc_row.pack(fill="x", pady=(0, 24))
-        ctk.CTkButton(reloc_row, text="📄 재배치 엑셀 불러오기", fg_color="#343638", border_width=1, border_color="#565b5e", text_color="#dce4ee", hover_color="#333333", command=self.import_relocation_excel, **btn_kwargs).pack(side="left", padx=(0, 16))
-        
-        ctk.CTkFrame(top_sec, height=1, fg_color="#1a1a1a").pack(fill="x", pady=(0, 20))
-
-        action_row = ctk.CTkFrame(top_sec, fg_color="transparent")
-        action_row.pack(fill="x")
-        self.step_button = ctk.CTkButton(action_row, text="▶ 배차 실행 (데모 시작)", command=self.advance_queue, state="disabled", fg_color="#2e86c1", hover_color="#21618c", **btn_kwargs)
-        self.step_button.pack(side="left")
-        self.step_status_label = ctk.CTkLabel(action_row, text="", font=self.font_body, text_color="#9e9e9e")
-        self.step_status_label.pack(side="left", padx=16)
-
-        # Bottom Section (Execution Log)
-        log_sec = ctk.CTkFrame(right, fg_color="transparent")
-        log_sec.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 24))
-        log_sec.grid_columnconfigure(0, weight=1)
-        log_sec.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(log_sec, text="진행 로그 (Execution Log)", font=("Consolas", 12, "bold"), text_color="#9e9e9e").grid(row=0, column=0, sticky="w", pady=(0, 12))
-        self.log_box = ctk.CTkTextbox(log_sec, font=("Consolas", 13), fg_color="#1e1e1e", border_width=1, border_color="#1a1a1a", text_color="#dce4ee")
-        self.log_box.grid(row=1, column=0, sticky="nsew")
-        self.log_box.configure(state="disabled")
-
-        # Command Button at bottom right of the main frame
-        bottom_row = ctk.CTkFrame(self, fg_color="transparent")
-        bottom_row.place(relx=1.0, rely=1.0, anchor="se", x=-24, y=-24)
-        ctk.CTkButton(bottom_row, text="🗣️ 명령", font=self.font_subtitle, fg_color="#92ccff", text_color="#003351",
-                      hover_color="#cce5ff", height=40, width=100, command=self.open_command_popup).pack(side="right")
-
     def open_command_popup(self) -> None:
         from command_center import open_command_popup
         # 팝업에서 화물 위치를 바꾸면, 지금 이 화면(이미 메모리에 옛 데이터를 들고 있음)이
@@ -830,6 +904,7 @@ class CargoDispatchTool(ctk.CTkFrame):
             self._inventory_stopped
             or self._inventory_poll_in_flight
             or self._inventory_reset_in_flight
+            or self._inventory_delete_in_flight
         ):
             return
         pending_after_id = self._inventory_after_id
@@ -861,7 +936,7 @@ class CargoDispatchTool(ctk.CTkFrame):
 
     def _confirm_inventory_reset(self) -> None:
         """Require operator confirmation before deleting all inventory rows."""
-        if self._inventory_reset_in_flight:
+        if self._inventory_reset_in_flight or self._inventory_delete_in_flight:
             return
         if self._inventory_poll_in_flight:
             messagebox.showinfo(
@@ -914,6 +989,121 @@ class CargoDispatchTool(ctk.CTkFrame):
             self._inventory_after_id = self.after(
                 delay_ms,
                 self._consume_inventory_reset_result,
+            )
+        except Exception:
+            self._inventory_stopped = True
+
+    def _confirm_inventory_delete(self, cargo) -> None:
+        """Delete one live PostgreSQL cargo row after operator confirmation."""
+        if self._inventory_delete_in_flight or self._inventory_reset_in_flight:
+            return
+        if self._inventory_poll_in_flight:
+            messagebox.showinfo(
+                "DB 조회 중",
+                "현재 DB 조회가 끝난 뒤 삭제 버튼을 다시 눌러주세요.",
+            )
+            return
+
+        name = str(cargo.name)
+        container_id = str(cargo.container_id or '-')
+        confirmed = messagebox.askyesno(
+            "DB 화물 개별 삭제",
+            f"'{name}' (컨테이너 ID {container_id})을 DB에서 삭제할까요?\n\n"
+            "현재 위치 정보만 삭제하며 기존 이동 이력은 유지됩니다.\n"
+            "자율 관제 중이라면 먼저 자율 관제모드를 중지해주세요.",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+
+        pending_after_id = self._inventory_after_id
+        self._inventory_after_id = None
+        if pending_after_id is not None:
+            try:
+                self.after_cancel(pending_after_id)
+            except Exception:
+                pass
+        self._inventory_delete_in_flight = True
+        self.inventory_reset_button.configure(state="disabled")
+        self.inventory_status_label.configure(
+            text=f"PostgreSQL에서 {name}을 삭제하는 중…",
+            text_color="#f0ad4e",
+        )
+        self._refresh_cargo_list()
+
+        def delete_one() -> None:
+            try:
+                self.inventory_admin_client.delete_cargo(name)
+                self._inventory_delete_results.put((True, name))
+            except Exception as exc:
+                self._inventory_delete_results.put((False, (name, exc)))
+
+        threading.Thread(
+            target=delete_one,
+            name="cargo-inventory-delete-ui",
+            daemon=True,
+        ).start()
+        self._schedule_inventory_delete_check(100)
+
+    def _schedule_inventory_delete_check(self, delay_ms: int) -> None:
+        if self._inventory_stopped:
+            return
+        try:
+            self._inventory_after_id = self.after(
+                delay_ms,
+                self._consume_inventory_delete_result,
+            )
+        except Exception:
+            self._inventory_stopped = True
+
+    def _consume_inventory_delete_result(self) -> None:
+        if self._inventory_stopped:
+            return
+        try:
+            success, result = self._inventory_delete_results.get_nowait()
+        except queue.Empty:
+            self._schedule_inventory_delete_check(100)
+            return
+
+        self._inventory_after_id = None
+        self._inventory_delete_in_flight = False
+        self.inventory_reset_button.configure(state="normal")
+        if success:
+            name = str(result)
+            self._inventory_records = tuple(
+                cargo for cargo in (self._inventory_records or ())
+                if cargo.name != name
+            )
+            self._inventory_snapshot_id = ""
+            self._inventory_last_success = time.strftime("%H:%M:%S")
+            self._inventory_error = ""
+            self.cargo_registry.pop(name, None)
+            self.cargo_details.pop(name, None)
+            save_cargo_registry(self.cargo_registry)
+            save_cargo_details(self.cargo_details)
+            self.inventory_status_label.configure(
+                text=f"● {name} 개별 삭제 완료 · 최신 DB를 다시 조회합니다.",
+                text_color="#61de8a",
+            )
+            self._refresh_cargo_list()
+            self._request_inventory_refresh()
+            return
+
+        name, error = result
+        self._inventory_error = " ".join(str(error).split())[:220]
+        self.inventory_status_label.configure(
+            text=f"● {name} 삭제 실패 · {self._inventory_error}",
+            text_color="#ff6b6b",
+        )
+        messagebox.showerror(
+            "DB 화물 삭제 실패",
+            f"PostgreSQL에서 {name}을 삭제하지 못했습니다.\n\n"
+            f"{self._inventory_error}",
+        )
+        try:
+            self._inventory_after_id = self.after(
+                self._inventory_refresh_ms,
+                self._request_inventory_refresh,
             )
         except Exception:
             self._inventory_stopped = True
@@ -1038,63 +1228,105 @@ class CargoDispatchTool(ctk.CTkFrame):
     # 화물 위치 등록
     # ------------------------------------------------------------------
     def register_cargo_location(self) -> None:
-        """화물명과 위치를 확인한 뒤, 추가 정보(ArUco, 화물종류, 비고)를 입력할 수 있는
-        배너를 폼 아래에 표시합니다. 기존에 세부정보가 있으면 미리 채워줍니다."""
-        name = self.cargo_name_var.get().strip()
+        """Validate ID/location/floor and open the optional detail editor."""
+        container_id = self.container_id_var.get().strip()
         location = self.location_option_var.get().strip()
-
-        if not name:
-            messagebox.showinfo("이름 필요", "화물 이름을 입력해주세요.")
+        try:
+            floor = int(self.floor_var.get().strip())
+            base_aruco_id = validate_manual_inventory_position(
+                container_id,
+                location,
+                floor,
+                self._inventory_records,
+            )
+        except ValueError as exc:
+            messagebox.showerror("DB 위치 입력 오류", str(exc))
             return
-        if not location:
-            messagebox.showinfo("위치 필요", "위치를 선택해주세요.")
-            return
 
-        # 이름/위치를 임시 저장하고, 기존 세부정보가 있으면 배너에 미리 채움
+        existing_cargo = next((
+            cargo for cargo in (self._inventory_records or ())
+            if str(cargo.container_id or '') == container_id
+        ), None)
+        name = (
+            existing_cargo.name
+            if existing_cargo is not None
+            else f'컨테이너_C{container_id}'
+        )
         self._pending_cargo_name = name
+        self._pending_container_id = container_id
         self._pending_cargo_location = location
+        self._pending_cargo_floor = floor
+        self._pending_base_aruco_id = base_aruco_id
 
         existing = self.cargo_details.get(name, {})
-        self.aruco_var.set(existing.get("컨테이너ID", ""))
-        self.cargo_type_var.set(existing.get("화물종류", ""))
-        self.cargo_note_var.set(existing.get("비고", ""))
+        self.cargo_type_var.set(
+            existing_cargo.cargo_type
+            if existing_cargo is not None
+            else existing.get("화물종류", "미분류")
+        )
+        self.cargo_note_var.set(
+            existing_cargo.note
+            if existing_cargo is not None
+            else existing.get("비고", "운영자 수동 위치 등록")
+        )
 
-        # 배너 표시 (row=3 - 등록 버튼 바로 아래)
-        self.detail_banner.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+        self.detail_banner.grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(4, 4)
+        )
 
     def _confirm_register(self) -> None:
         """배너의 '저장' 버튼 - 추가 정보를 포함해서 화물을 등록합니다."""
-        name = self._pending_cargo_name
-        location = self._pending_cargo_location
-        if not name or not location:
-            return
-
-        self.cargo_registry[name] = location
-        self.cargo_details[name] = {
-            "컨테이너ID": self.aruco_var.get().strip(),
+        details = {
+            "컨테이너ID": self._pending_container_id or '',
             "화물종류": self.cargo_type_var.get().strip(),
             "비고": self.cargo_note_var.get().strip(),
+            "기반ArUco": self._pending_base_aruco_id or '',
+            "층수": str(self._pending_cargo_floor or 1),
         }
-        save_cargo_registry(self.cargo_registry)
-        save_cargo_details(self.cargo_details)
-        _sync_cargo_to_db(name, location, self.cargo_details[name])
-
-        self._hide_detail_banner()
-        self._refresh_cargo_list()
+        self._save_pending_cargo(details)
 
     def _skip_details_register(self) -> None:
         """배너의 '건너뛰기' 버튼 - 추가 정보 없이 이름/위치만 저장합니다."""
+        name = self._pending_cargo_name or ''
+        existing = dict(self.cargo_details.get(name, {}))
+        existing.update({
+            "컨테이너ID": self._pending_container_id or '',
+            "기반ArUco": self._pending_base_aruco_id or '',
+            "층수": str(self._pending_cargo_floor or 1),
+        })
+        self._save_pending_cargo(existing)
+
+    def _save_pending_cargo(self, details: dict) -> None:
+        """Commit an operator-approved manual position to PostgreSQL."""
         name = self._pending_cargo_name
         location = self._pending_cargo_location
-        if not name or not location:
+        container_id = self._pending_container_id
+        floor = self._pending_cargo_floor
+        if not name or not location or container_id is None or floor is None:
+            return
+        try:
+            self.inventory_admin_client.upsert_cargo(
+                name=name,
+                location=location,
+                container_id=container_id,
+                cargo_type=details.get('화물종류', '') or '미분류',
+                note=details.get('비고', '') or '운영자 수동 위치 등록',
+                base_aruco_id=details.get('기반ArUco', ''),
+                floor=floor,
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                'DB 위치 저장 실패',
+                f'PostgreSQL에 컨테이너 위치를 저장하지 못했습니다.\n\n{exc}',
+            )
             return
 
         self.cargo_registry[name] = location
+        self.cargo_details[name] = dict(details)
         save_cargo_registry(self.cargo_registry)
-        _sync_cargo_to_db(name, location, self.cargo_details.get(name))
-
+        save_cargo_details(self.cargo_details)
         self._hide_detail_banner()
-        self._refresh_cargo_list()
+        self._request_inventory_refresh()
 
     def _cancel_register(self) -> None:
         """배너의 '취소' 버튼 - 등록을 취소하고 배너를 숨깁니다."""
@@ -1104,11 +1336,12 @@ class CargoDispatchTool(ctk.CTkFrame):
         """배너를 숨기고 입력 필드/임시 변수를 초기화합니다."""
         self.detail_banner.grid_forget()
         self._pending_cargo_name = None
+        self._pending_container_id = None
         self._pending_cargo_location = None
-        self.aruco_var.set("")
+        self._pending_cargo_floor = None
+        self._pending_base_aruco_id = None
         self.cargo_type_var.set("")
         self.cargo_note_var.set("")
-        self.cargo_name_var.set("")
 
     def delete_cargo(self, name: str) -> None:
         """화물 목록의 각 행에 있는 "삭제" 버튼에서 호출됩니다. name이 이미 정해져 있으니
@@ -1235,8 +1468,62 @@ class CargoDispatchTool(ctk.CTkFrame):
             ctk.CTkLabel(text_frame, text=location, font=self.font_body, text_color="#92ccff", anchor="w").pack(fill="x", anchor="w", pady=(2, 0))
             ctk.CTkLabel(text_frame, text=details, font=self.font_body, text_color="#9e9e9e", anchor="w", wraplength=420, justify="left").pack(fill="x", anchor="w", pady=(2, 0))
             
-            ctk.CTkButton(row, text="🗣️ 배차", width=60, fg_color="#343638", border_width=1, border_color="#565b5e", text_color="#2e86c1", hover_color="#404040",
-                         command=lambda n=cargo.name: self.send_cargo_to_command_popup(n)).grid(row=0, column=1, padx=(0, 10), pady=10)
+            button_frame = ctk.CTkFrame(row, fg_color="transparent")
+            button_frame.grid(row=0, column=1, padx=(0, 10), pady=8)
+            ctk.CTkButton(
+                button_frame,
+                text="✏ 수정",
+                width=58,
+                fg_color="#343638",
+                border_width=1,
+                border_color="#565b5e",
+                text_color="#f0ad4e",
+                hover_color="#404040",
+                command=lambda item=cargo: self.load_cargo_for_edit(item),
+            ).pack(pady=(0, 4))
+            action_frame = ctk.CTkFrame(row, fg_color="transparent")
+            action_frame.grid(row=0, column=2, padx=(0, 10), pady=10)
+            ctk.CTkButton(
+                action_frame,
+                text="🗣️ 배차",
+                width=60,
+                fg_color="#343638",
+                border_width=1,
+                border_color="#565b5e",
+                text_color="#2e86c1",
+                hover_color="#404040",
+                command=lambda n=cargo.name: self.send_cargo_to_command_popup(n),
+            ).pack(side="left", padx=(0, 4))
+            ctk.CTkButton(
+                action_frame,
+                text="삭제",
+                width=52,
+                fg_color="#c0392b",
+                hover_color="#922b21",
+                text_color="white",
+                state="disabled" if stale or self._inventory_delete_in_flight else "normal",
+                command=lambda item=cargo: self._confirm_inventory_delete(item),
+            ).pack(side="left")
+
+    def load_cargo_for_edit(self, cargo) -> None:
+        """Load one live DB row into the manual position editor."""
+        container_id = str(cargo.container_id or '')
+        if container_id not in MANUAL_CONTAINER_IDS:
+            messagebox.showerror(
+                '수정할 수 없는 ID',
+                f'현재 시스템에서 지원하지 않는 컨테이너 ID입니다: {container_id or "-"}',
+            )
+            return
+        location = str(cargo.location or '')
+        if location not in MANUAL_INVENTORY_LOCATIONS:
+            messagebox.showerror(
+                '표준 위치 아님',
+                f'현재 위치 {location or "-"}는 표준 운영 위치가 아닙니다.',
+            )
+            return
+        self.container_id_var.set(container_id)
+        self.location_option_var.set(location)
+        self.floor_var.set(str(int(cargo.floor or 1)))
 
     def send_cargo_to_command_popup(self, name: str) -> None:
         """화물 목록에서 이 버튼을 누르면, 그 화물명이 미리 채워진 채로 명령 팝업이 열립니다.

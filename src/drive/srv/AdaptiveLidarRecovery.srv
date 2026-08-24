@@ -3,3 +3,7 @@ bool reset_direction
 ---
 bool success
 string message
+bool recovery_anchor_valid
+string recovery_anchor_frame
+float64 recovery_anchor_x
+float64 recovery_anchor_y

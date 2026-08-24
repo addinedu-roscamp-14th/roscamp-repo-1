@@ -23,6 +23,7 @@
           "/arm/pick_place/start",
           "/arm/pick_place/stop",
           "/arm/pick_place/scan_ship_destinations",
+          "/arm/pick_place/ship_cache_status",
           "/arm/pick_place/scan_inbound"
         ],
         "service_clients": [],

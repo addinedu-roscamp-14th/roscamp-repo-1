@@ -145,6 +145,7 @@ class CentralControlGateway(Node):
 
         self._lock = threading.Lock()
         self._dispatch_lock = threading.Lock()
+        self._emergency_targets = set()
         self._recent_command_ids = deque(maxlen=200)
         self._telemetry = {
             'battery_percent': None,
@@ -492,6 +493,15 @@ class CentralControlGateway(Node):
             raise CommandValidationError('arm_id must be arm1 or arm2')
         if not operation:
             raise CommandValidationError('operation is required')
+        with self._lock:
+            emergency_active = bool(self._emergency_targets) or any(
+                bool(vehicle.get('emergency_stopped'))
+                for vehicle in self._telemetry['vehicles'].values()
+            )
+        if emergency_active:
+            raise CommandValidationError(
+                'emergency stop is active; ARM commands are blocked'
+            )
         with self._dispatch_lock:
             if command_id in self._recent_command_ids:
                 return {
@@ -509,6 +519,9 @@ class CentralControlGateway(Node):
             goal.arm_id = arm_id
             goal.operation = operation
             goal.destination_slot = str(payload.get('destination_slot') or '')
+            goal.destination_floor = int(
+                payload.get('destination_floor') or 0
+            )
             goal.source_id = int(payload.get('source_id', -1))
             goal.destination_id = int(payload.get('destination_id', -1))
             goal.vehicle_id = str(payload.get('vehicle_id') or '')
@@ -704,7 +717,41 @@ class CentralControlGateway(Node):
         response = future.result()
         if not response.success:
             raise RuntimeError(response.message)
-        return {'accepted': True, 'target': target, 'enabled': bool(enabled)}
+        with self._lock:
+            if enabled:
+                self._emergency_targets.add(target)
+            elif target == 'fleet':
+                self._emergency_targets.clear()
+            else:
+                self._emergency_targets.discard(target)
+
+        arm_results = {}
+        if enabled:
+            # Vehicle stop is latched first.  ARM stop failures must not undo
+            # that safety latch, so report each result independently while
+            # still attempting both robot arms.
+            for arm_id in ('arm1', 'arm2'):
+                try:
+                    result = self.stop_arm(arm_id)
+                    arm_results[arm_id] = {
+                        'stopped': True,
+                        'message': str(result.get('message') or ''),
+                    }
+                except Exception as exc:
+                    arm_results[arm_id] = {
+                        'stopped': False,
+                        'message': str(exc),
+                    }
+                    self.get_logger().error(
+                        f'Emergency stop could not reach {arm_id.upper()}: {exc}'
+                    )
+        return {
+            'accepted': True,
+            'target': target,
+            'enabled': bool(enabled),
+            'arms': arm_results,
+            'arm_commands_blocked': bool(self._emergency_targets),
+        }
 
     _ZONE_URL_ALIASES = {'b1': 'B-1', 'a': 'A'}
 

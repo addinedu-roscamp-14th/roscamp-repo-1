@@ -1,5 +1,6 @@
 """Tests for remote-inventory LLM planning and deterministic validation."""
 
+import json
 from datetime import datetime, timezone
 
 from inventory_client import InventoryClient, InventoryClientError
@@ -84,6 +85,49 @@ def test_yard_shuffle_can_move_blocker_then_restore_it():
     assert [item['container_id'] for item in result['moves']] == ['1', '0', '1']
 
 
+def test_upper_floor_marker_is_normalized_to_supporting_container_id():
+    snapshot = make_snapshot([
+        cargo('C0', '0', 'A-1-1', 1, '11'),
+        cargo('C1', '1', 'A-2-1', 1, '13'),
+    ])
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: {
+        'status': 'ready',
+        'moves': [
+            move(
+                1, '0', 'C0', 'A-1-1', 1,
+                'A-2-1', 2, '13', 'C1 위 임시 적재',
+            ),
+        ],
+        'summary': '고정 마커로 표현된 상층 기반을 DB 상태로 정규화',
+    })
+
+    result = planner.plan_snapshot('C0를 C1 위로 이동', snapshot, LOCATIONS)
+
+    assert result['status'] == 'ready'
+    assert result['moves'][0]['destination_base_aruco_id'] == '1'
+
+
+def test_upper_floor_without_unique_support_is_still_rejected():
+    snapshot = make_snapshot([
+        cargo('C0', '0', 'A-1-1', 1, '11'),
+    ])
+    planner = InventoryDecisionPlanner(llm=lambda _prompt: {
+        'status': 'ready',
+        'moves': [
+            move(
+                1, '0', 'C0', 'A-1-1', 1,
+                'A-2-1', 2, '13', '지지 화물 없는 잘못된 적층',
+            ),
+        ],
+        'summary': '불가능한 적층',
+    })
+
+    result = planner.plan_snapshot('불가능한 적층', snapshot, LOCATIONS)
+
+    assert result['status'] == 'error'
+    assert 'destination base is inconsistent' in result['error']
+
+
 def test_moving_blocked_container_is_rejected_as_a_whole_plan():
     snapshot = make_snapshot([
         cargo('C0', '0', 'A-1-1', 1, '11'),
@@ -100,6 +144,43 @@ def test_moving_blocked_container_is_rejected_as_a_whole_plan():
     assert result['status'] == 'error'
     assert result['moves'] == []
     assert 'blocked by' in result['error']
+
+
+def test_prompt_explicitly_describes_stack_blockers():
+    snapshot = make_snapshot([
+        cargo('C4', '4', 'A-1-1', 1, '11'),
+        cargo('C3', '3', 'A-1-1', 2, '4'),
+    ])
+
+    prompt = json.loads(InventoryDecisionPlanner._build_prompt(
+        'C4 출고', snapshot, LOCATIONS
+    ))
+    stack = next(
+        item for item in prompt['inventory_stacks']
+        if item['location'] == 'A-1-1'
+    )
+
+    assert stack['containers'][0]['container_id'] == '4'
+    assert stack['containers'][0]['blocked_by'] == ['3']
+    assert stack['containers'][1]['blocked_by'] == []
+
+
+def test_higher_floor_blocks_even_when_base_relation_is_stale():
+    snapshot = make_snapshot([
+        cargo('C4', '4', 'A-1-1', 1, '11'),
+        cargo('C3', '3', 'A-1-1', 2, 'stale-marker'),
+    ])
+    planner = InventoryDecisionPlanner(llm=lambda prompt: {
+        'status': 'ready',
+        'moves': [move(1, '4', 'C4', 'A-1-1', 1, 'B-1')],
+        'summary': '상단 화물을 누락한 잘못된 계획',
+    })
+
+    result = planner.plan_snapshot('C4 출고', snapshot, LOCATIONS)
+
+    assert result['status'] == 'error'
+    assert result['moves'] == []
+    assert 'blocked by: 3' in result['error']
 
 
 def test_unknown_container_and_bad_source_are_rejected():

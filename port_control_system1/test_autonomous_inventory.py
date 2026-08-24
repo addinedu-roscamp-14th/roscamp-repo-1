@@ -120,6 +120,75 @@ def test_third_floor_outbound_starts_after_inbound_cycle():
     assert '[6]' in objective
 
 
+def test_third_floor_outbound_starts_with_empty_vessel_and_fresh_cycle():
+    cycle = AutonomousCycle()
+
+    phase, objective = choose_policy(
+        cycle, snapshot(cargo(6, 'A-1-1', 3, '8')), False
+    )
+
+    assert phase == 'LOADING_OUTBOUND'
+    assert '[6]' in objective
+    assert '선박-1' in objective
+
+
+def test_outbound_cargo_left_on_amr_resumes_before_waiting_for_clear():
+    cycle = AutonomousCycle(outbound_ids=['6'])
+
+    phase, objective = choose_policy(
+        cycle, snapshot(cargo(6, 'AMR1', 1)), False
+    )
+
+    assert phase == 'LOADING_OUTBOUND'
+    assert 'AMR1' in objective
+    assert '[6]' in objective
+
+
+def test_planned_outbound_still_in_third_floor_is_replanned():
+    cycle = AutonomousCycle(outbound_ids=['6'])
+
+    phase, objective = choose_policy(
+        cycle, snapshot(cargo(6, 'A-1-1', 3, '8')), False
+    )
+
+    assert phase == 'LOADING_OUTBOUND'
+    assert '[6]' in objective
+
+
+def test_stale_completed_outbound_intent_is_removed():
+    cycle = AutonomousCycle(outbound_ids=['6', '99'])
+
+    phase, _objective = choose_policy(
+        cycle, snapshot(cargo(6, '출항완료', 1)), False
+    )
+
+    assert cycle.outbound_ids == []
+    assert phase == 'WAITING_FOR_INBOUND'
+
+
+def test_active_outbound_is_not_misclassified_as_waiting_for_clear():
+    move = {
+        'container_id': '6',
+        'source_location': 'A-1-1',
+        'destination_location': '선박-1',
+    }
+    cycle = AutonomousCycle(
+        outbound_ids=['6'], active_move=move,
+        active_moves={'agv1': move},
+    )
+
+    phase, objective = choose_policy(
+        cycle,
+        snapshot(cargo(6, 'A-1-1', 3, '8')),
+        False,
+        reserved_container_ids={'6'},
+        reserved_destinations={'선박-1'},
+    )
+
+    assert phase == 'EXECUTING_MOVE'
+    assert objective == ''
+
+
 def test_validate_rejects_blocked_lower_container():
     state = snapshot(cargo(1, 'A-1-1', 1), cargo(2, 'A-1-1', 2))
     with pytest.raises(AutonomousPolicyError, match='blocked'):
@@ -144,6 +213,10 @@ def test_ship_to_warehouse_compiles_for_both_trailers():
     assert agv2[1]['destination_id'] == 9
     assert agv1[2]['zone'] == 'A'
     assert agv2[2]['zone'] == 'A'
+    assert agv1[3]['destination_floor'] == 1
+    assert agv2[3]['destination_floor'] == 1
+    assert agv1[-1] == {'type': 'park_command', 'vehicle_id': 'agv1'}
+    assert agv2[-1] == {'type': 'park_command', 'vehicle_id': 'agv2'}
 
 
 def test_warehouse_to_ship_uses_cached_ship_marker():
@@ -153,8 +226,67 @@ def test_warehouse_to_ship_uses_cached_ship_marker():
     }, 'agv1')
     assert steps[1]['type'] == 'arm_load_to_trailer'
     assert steps[0]['zone'] == 'A'
-    assert steps[3]['source_id'] == 10
+    assert steps[3]['source_id'] == 6
     assert steps[3]['destination_id'] == 23
+    assert steps[3]['vehicle_id'] == 'agv1'
+    assert steps[4] == {'type': 'park_command', 'vehicle_id': 'agv1'}
+
+
+def test_warehouse_internal_move_does_not_require_an_idle_vehicle():
+    steps = compile_move({
+        'container_id': '6', 'source_location': 'A-1-2',
+        'destination_location': 'A-1-1', 'destination_floor': 1,
+    }, '')
+
+    assert steps == [{
+        'type': 'arm_transfer_by_id', 'arm_id': 'arm2',
+        'source_id': 6, 'destination_id': 11,
+        'destination_slot': 'A-1-1', 'destination_floor': 1,
+        'vehicle_id': '', 'final_for_vehicle': False,
+    }]
+
+
+def test_warehouse_upper_floor_targets_supporting_container_not_floor_marker():
+    steps = compile_move({
+        'container_id': '1', 'source_location': 'A-1-1',
+        'destination_location': 'A-2-1', 'destination_floor': 2,
+        'destination_base_aruco_id': '0',
+    }, '')
+
+    assert steps == [{
+        'type': 'arm_transfer_by_id', 'arm_id': 'arm2',
+        'source_id': 1, 'destination_id': 0,
+        'destination_slot': 'A-2-1', 'destination_floor': 2,
+        'vehicle_id': '', 'final_for_vehicle': False,
+    }]
+
+
+def test_warehouse_to_ship_picks_container_marker_on_agv2_too():
+    steps = compile_move({
+        'container_id': '6', 'source_location': 'A-2-1',
+        'destination_location': '선박-1', 'destination_floor': 1,
+    }, 'agv2')
+
+    assert steps[3]['source_id'] == 6
+    assert steps[3]['destination_id'] == 18
+    assert steps[3]['vehicle_id'] == 'agv2'
+
+
+def test_amr_to_ship_recovery_uses_same_loaded_vehicle():
+    move = {
+        'container_id': '6', 'source_location': 'AMR2',
+        'destination_location': '선박-1', 'destination_floor': 1,
+    }
+
+    steps = compile_move(move, 'agv2')
+
+    assert [step['type'] for step in steps] == [
+        'zone_navigation', 'arm1_pick_place', 'park_command',
+    ]
+    assert steps[1]['source_id'] == 6
+    assert steps[1]['destination_id'] == 18
+    with pytest.raises(AutonomousPolicyError, match='must use agv2'):
+        compile_move(move, 'agv1')
 
 
 def test_cycle_store_survives_process_restart(tmp_path):

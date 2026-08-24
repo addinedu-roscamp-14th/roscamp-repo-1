@@ -24,9 +24,10 @@ class FakeCursor:
         self.queries = []
         self.closed = False
 
-    def execute(self, query):
+    def execute(self, query, params=None):
         self.query = query
         self.queries.append(query)
+        self.params = params
 
     def fetchall(self):
         return self.rows
@@ -115,6 +116,23 @@ def test_operator_inventory_reset_clears_history_and_current_state_atomically():
         'TRUNCATE TABLE cargo_movements',
         'DELETE FROM cargos',
     ]
+    assert connection.committed
+    assert not connection.rolled_back
+    assert connection.cursor_value.closed
+    assert connection.closed
+
+
+def test_operator_can_delete_one_inventory_row_without_clearing_history():
+    connection = FakeConnection([])
+    reader = InventoryClient(connect=lambda **kwargs: connection)
+    admin = InventoryAdminClient(reader)
+
+    admin.delete_cargo('컨테이너_C6')
+
+    assert connection.cursor_value.queries == [
+        'DELETE FROM cargos WHERE name = %s',
+    ]
+    assert connection.cursor_value.params == ('컨테이너_C6',)
     assert connection.committed
     assert not connection.rolled_back
     assert connection.cursor_value.closed

@@ -206,6 +206,58 @@ def test_successful_combined_pick_does_not_add_split_moves(floors):
     ]
 
 
+def test_safe_approaches_confirm_hardware_stop_before_each_descent(floors):
+    """Pick and Place may descend only after their approach has stopped."""
+    coordinator = make_coordinator(floors)
+    steps = coordinator.select_feasible_plan(make_targets(floors))
+    events = []
+    coordinator.command_gripper = lambda opened: events.append(
+        ('gripper', opened)
+    )
+    coordinator.move_coords = lambda pose: events.append(('move', pose))
+    coordinator.wait_until_robot_stopped = lambda context='PLACE': (
+        events.append(('stopped', context))
+    )
+
+    coordinator.execute_steps(steps)
+
+    pick_approach = events.index(('move', steps[1].pose))
+    pick_stopped = events.index(('stopped', 'PICK safe approach'))
+    pick_descent = events.index(('move', steps[2].pose))
+    place_approach = events.index(('move', steps[5].pose))
+    place_stopped = events.index(('stopped', 'PLACE safe approach'))
+    place_descent = events.index(('move', steps[6].pose))
+    assert pick_approach < pick_stopped < pick_descent
+    assert place_approach < place_stopped < place_descent
+
+
+def test_completion_returns_to_second_observation_pose(floors):
+    """A completed transfer returns to the ChoE home observation pose."""
+    coordinator = make_coordinator(floors)
+    coordinator.stations = [
+        type('Station', (), {
+            'name': 'station_agv',
+            'calibration_surface': 'agv',
+            'joint_angles_deg': (1, 2, 3, 4, 5, 6),
+        })(),
+        type('Station', (), {
+            'name': 'station_a',
+            'calibration_surface': 'station',
+            'joint_angles_deg': (6, 5, 4, 3, 2, 1),
+        })(),
+    ]
+    coordinator.set_detection_enabled = lambda enabled: None
+    moved = []
+    coordinator.move_observation = moved.append
+
+    coordinator.complete_work_then_cleanup()
+
+    assert moved == [(6, 5, 4, 3, 2, 1)]
+    assert coordinator.work_states[-1] == 'WORK_COMPLETED'
+    assert any('작업 종료 복귀 도착' in text
+               for text in coordinator.statuses)
+
+
 def test_search_scopes_agv_then_station_and_keeps_cross_station_targets(
     floors,
 ):

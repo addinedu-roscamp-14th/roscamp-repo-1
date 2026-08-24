@@ -47,7 +47,7 @@ _PLANNER_SYSTEM_PROMPT = """당신은 항만 컨테이너 재배치 계획기입
     "source_floor": 1,
     "destination_location": "등록된 목적지",
     "destination_floor": 1,
-    "destination_base_aruco_id": "바닥이면 빈 문자열 또는 고정 마커 ID",
+    "destination_base_aruco_id": "1층이면 빈 문자열 또는 고정 마커 ID, 2층 이상이면 바로 아래 컨테이너의 container_id",
     "reason": "이 이동이 필요한 이유"
   }],
   "summary": "전체 계획 요약"
@@ -60,7 +60,9 @@ _PLANNER_SYSTEM_PROMPT = """당신은 항만 컨테이너 재배치 계획기입
 선박 목적지는 반드시 "선박-1"부터 "선박-6" 중 정확한 위치 하나를
 destination_location에 넣으세요. "선박", "항구", 빈 문자열처럼 슬롯 번호가 없는
 목적지는 금지합니다. 선박 슬롯의 ARM1 목적지 ArUco 매핑은 선박-1=18,
-선박-2=19, 선박-3=20, 선박-4=21, 선박-5=22, 선박-6=23입니다."""
+선박-2=19, 선박-3=20, 선박-4=21, 선박-5=22, 선박-6=23입니다.
+2층 이상 적재의 destination_base_aruco_id에는 11~23 고정 마커가 아니라
+그 단계 직전 목적지 바로 아래층 컨테이너의 container_id를 넣으세요."""
 
 
 class InventoryPlanValidationError(ValueError):
@@ -318,10 +320,38 @@ class InventoryDecisionPlanner:
 
     @staticmethod
     def _build_prompt(objective, snapshot, known_locations):
+        stacks = {}
+        for cargo in snapshot.cargos:
+            stacks.setdefault(cargo.location, []).append(cargo)
+        stack_context = []
+        for location in sorted(stacks):
+            ordered = sorted(stacks[location], key=lambda item: item.floor)
+            stack_context.append({
+                'location': location,
+                'containers': [
+                    {
+                        'container_id': cargo.container_id,
+                        'container_name': cargo.name,
+                        'floor': cargo.floor,
+                        'base_aruco_id': cargo.base_aruco_id,
+                        'blocked_by': [
+                            upper.container_id
+                            for upper in ordered
+                            if upper.floor > cargo.floor
+                        ],
+                    }
+                    for cargo in ordered
+                ],
+            })
         context = {
             'objective': objective,
             'registered_locations': known_locations,
             'inventory_snapshot': snapshot.to_dict(),
+            'inventory_stacks': stack_context,
+            'stack_safety_rule': (
+                'blocked_by가 비어 있지 않은 컨테이너는 직접 이동하지 말고, '
+                'listed blocker를 높은 층부터 등록된 다른 위치로 먼저 이동한다.'
+            ),
         }
         return json.dumps(context, ensure_ascii=False, separators=(',', ':'))
 
@@ -435,11 +465,22 @@ class InventoryDecisionPlanner:
                 raise InventoryPlanValidationError(
                     f'move {sequence} source does not match the simulated inventory'
                 )
-            blockers = [
+            # A higher floor at the same physical slot always blocks this
+            # cargo.  The base_aruco_id relation is useful additional evidence,
+            # but it can be stale after a manual edit or an older ARM event and
+            # therefore must not be the sole safety check.
+            blockers = sorted({
                 value.container_id or value.name
                 for value in by_name.values()
-                if value.base_aruco_id == cargo.container_id
-            ]
+                if value.name != cargo.name
+                and (
+                    (
+                        value.location == cargo.location
+                        and value.floor > cargo.floor
+                    )
+                    or value.base_aruco_id == cargo.container_id
+                )
+            })
             if blockers:
                 raise InventoryPlanValidationError(
                     f'move {sequence} container is blocked by: {", ".join(blockers)}'
@@ -472,15 +513,25 @@ class InventoryDecisionPlanner:
                     f'move {sequence} reason must not be empty'
                 )
             if destination_floor > 1:
-                base_cargo = by_id.get(destination_base)
-                if (
-                    base_cargo is None
-                    or base_cargo.location != destination_location
-                    or base_cargo.floor != destination_floor - 1
-                ):
+                # LLMs intermittently confuse a stack's floor marker with the
+                # supporting container ID.  The destination and floor still
+                # express the planner's choice, while the unique support is a
+                # mechanical field that can be derived safely from simulated
+                # DB truth.  Fail closed when that support is absent or
+                # ambiguous instead of inventing a stack.
+                supports = [
+                    value for value in by_name.values()
+                    if value.name != cargo.name
+                    and value.location == destination_location
+                    and value.floor == destination_floor - 1
+                ]
+                if len(supports) != 1:
                     raise InventoryPlanValidationError(
                         f'move {sequence} destination base is inconsistent'
                     )
+                destination_base = str(
+                    supports[0].container_id or supports[0].name
+                )
             if destination_base and any(
                 value.name != cargo.name
                 and value.location == destination_location

@@ -14,12 +14,15 @@ from arm2.arm2_container_pick_coordinator import (
     compose_yaw_follow_pose,
     ContainerPickCoordinator,
     grouped_marker_locks_satisfied,
+    id_transfer_scan_specs,
     inverted_l_workspace_contains,
     lift_distance_candidates,
     nearest_symmetric_yaw_degrees,
+    placed_count_for_destination_floor,
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
     stack_layer_z_offset,
+    trailer_placement_layer,
     symmetric_marker_yaw_degrees,
     visual_servo_within_tolerance,
 )
@@ -40,6 +43,25 @@ def test_trailer_scan_requires_source_and_either_trailer():
     assert not grouped_marker_locks_satisfied(
         ['source', None, None], (0,), (1, 2)
     )
+
+
+def test_fixed_id_transfer_scans_source_but_reuses_destination_cache():
+    frames = {1: 'container-1', 13: 'fixed-marker-13'}
+    histories = {1: 'history-1', 13: 'history-13'}
+
+    fixed_specs = id_transfer_scan_specs(
+        1, 13, 'A-2-1', frames, histories
+    )
+    dynamic_specs = id_transfer_scan_specs(
+        1, 3, None,
+        {1: 'container-1', 3: 'container-3'},
+        {1: 'history-1', 3: 'history-3'},
+    )
+
+    assert fixed_specs == [
+        ('source container ID 1', 'container-1', 'history-1')
+    ]
+    assert len(dynamic_specs) == 2
 
 
 def test_place_correction_follows_marker_red_axis():
@@ -214,6 +236,18 @@ def test_stack_layer_offset_increases_by_container_height():
     assert np.isclose(stack_layer_z_offset(0.015, 0.035, 0), 0.015)
     assert np.isclose(stack_layer_z_offset(0.015, 0.035, 1), 0.050)
     assert np.isclose(stack_layer_z_offset(0.015, 0.035, 2), 0.085)
+
+
+def test_each_vehicle_trailer_always_uses_its_single_deck_layer():
+    assert trailer_placement_layer(9) == 0
+    assert trailer_placement_layer(10) == 0
+
+
+def test_explicit_destination_floor_overrides_reset_memory_count():
+    """A DB floor maps directly to the zero-based physical stack layer."""
+    assert placed_count_for_destination_floor(0, 3, 3) == 2
+    assert placed_count_for_destination_floor(2, 1, 3) == 0
+    assert placed_count_for_destination_floor(2, 0, 3) == 2
 
 
 def test_yaw_follow_rotates_grasp_and_xy_offset_only():

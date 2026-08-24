@@ -85,11 +85,16 @@ from yolo_detection_client import (
 
 
 def inventory_plan_locations(configured_locations):
-    """Combine camera-configured names with every DB planning location."""
+    """Return only locations that the inventory executor can physically use.
+
+    Camera navigation also contains vehicle-only waypoints such as ``B-1`` and
+    ``대기장소 1``.  They must not be exposed to the inventory LLM as cargo
+    destinations because the deterministic executor cannot place cargo there.
+    """
     values = {
         str(value).strip()
         for value in (configured_locations or [])
-        if str(value).strip()
+        if str(value).strip() in CANONICAL_LOCATIONS
     }
     values.update(CANONICAL_LOCATIONS)
     return sorted(values)
@@ -378,8 +383,8 @@ class CommandPopup(ctk.CTkToplevel):
         cmd_entry.icursor("end")  # 미리 채운 문구 뒤에 바로 이어 쓸 수 있게 커서를 맨 끝으로
         self.plan_button = ctk.CTkButton(
             cmd_row,
-            text="DB 기반 계획",
-            width=110,
+            text="DB 기반 계획 실행",
+            width=140,
             command=self.generate_inventory_plan,
         )
         self.plan_button.grid(row=0, column=1, padx=(0, 8))
@@ -413,10 +418,26 @@ class CommandPopup(ctk.CTkToplevel):
 
     # ------------------------------------------------------------------
     def generate_inventory_plan(self) -> None:
-        """Generate and display a read-only plan from the remote inventory."""
+        """Generate a validated DB plan and hand it to the safe executor."""
         objective = self.command_var.get().strip()
         if not objective:
             return
+        agent = RealtimeLLMAgent.get_instance()
+        supervisor = agent.snapshot()
+        if supervisor.enabled and supervisor.mode == 'inventory_execute':
+            message = (
+                '이미 DB 계획이 차량과 로봇팔을 점유 중입니다. '
+                '현재 실행을 먼저 중지한 뒤 다시 시도하세요.'
+            )
+            self._log(f'[DB 계획 실행 차단] {message}')
+            self.result_label.configure(text=message, text_color='#EA5455')
+            return
+        if supervisor.enabled and supervisor.mode == 'autonomous':
+            agent.stop_autonomous_policy()
+            self._log(
+                '[DB 계획 실행 전환] 자율 관제의 신규 계획을 중지하고 '
+                'DB 명령 실행으로 점유권을 전환합니다.'
+            )
         self.plan_button.configure(state='disabled', text='판단 중...')
         self.result_label.configure(
             text='PostgreSQL 재고를 조회해 이동 계획을 생성하고 있습니다.',
@@ -445,10 +466,10 @@ class CommandPopup(ctk.CTkToplevel):
         ).start()
 
     def _finish_inventory_plan(self, objective, result) -> None:
-        """Present a plan without entering any existing execution path."""
+        """Present and execute a validated plan through the DB-safe path."""
         if not self.winfo_exists():
             return
-        self.plan_button.configure(state='normal', text='DB 기반 계획')
+        self.plan_button.configure(state='normal', text='DB 기반 계획 실행')
         rendered = json.dumps(result, ensure_ascii=False, indent=2)
         self._log(f'[DB 기반 판단 JSON]\n{rendered}')
         status = result.get('status')
@@ -461,12 +482,32 @@ class CommandPopup(ctk.CTkToplevel):
         move_count = len(result.get('moves') or [])
         summary = result.get('summary') or '추가 이동이 필요하지 않습니다.'
         self.result_label.configure(
-            text=f'[DB 기반 계획: {move_count}건] {summary}',
+            text=f'[DB 기반 계획 실행: {move_count}건] {summary}',
             text_color='#28C76F',
         )
-        RealtimeLLMAgent.get_instance().set_inventory_objective(
-            objective,
-            initial_plan=result,
+        if status != 'ready' or not move_count:
+            return
+        agent = RealtimeLLMAgent.get_instance()
+        supervisor = agent.snapshot()
+        if supervisor.enabled and supervisor.mode == 'inventory_execute':
+            message = (
+                '계획 생성 중 다른 자율 실행이 시작되어 DB 계획 전송을 차단했습니다.'
+            )
+            self._log(f'[DB 계획 실행 차단] {message}')
+            self.result_label.configure(text=message, text_color='#EA5455')
+            return
+        if supervisor.enabled and supervisor.mode == 'autonomous':
+            agent.stop_autonomous_policy()
+        try:
+            agent.start_inventory_plan_execution(objective, result)
+        except Exception as exc:
+            message = f'DB 계획 실행 시작 실패: {exc}'
+            self._log(f'[DB 계획 실행 차단] {message}')
+            self.result_label.configure(text=message, text_color='#EA5455')
+            return
+        self._log(
+            '[DB 계획 실행 시작] 검증된 첫 이동을 실행하고, DB 반영 후 '
+            '최신 스냅샷으로 다음 이동을 재계획합니다.'
         )
 
     # ------------------------------------------------------------------
@@ -475,9 +516,11 @@ class CommandPopup(ctk.CTkToplevel):
         if not command:
             return
         supervisor = RealtimeLLMAgent.get_instance().snapshot()
-        if supervisor.enabled and supervisor.mode == 'autonomous':
+        if supervisor.enabled and supervisor.mode in {
+            'autonomous', 'inventory_execute'
+        }:
             message = (
-                '자율 관제모드가 차량과 로봇팔을 점유 중입니다. '
+                '자율 관제 또는 DB 계획 실행이 차량과 로봇팔을 점유 중입니다. '
                 '수동 명령을 실행하려면 먼저 자율 관제모드를 중지하세요.'
             )
             self._log(f'[수동 명령 차단] {message}')
@@ -1054,6 +1097,7 @@ class CommandPopup(ctk.CTkToplevel):
         }
         operation = operation_by_type[action_type]
         destination_slot = str(action.get('destination_slot') or '').upper()
+        destination_floor = action.get('destination_floor', 0)
         source_id = action.get('source_id', -1)
         destination_id = action.get('destination_id', -1)
         vehicle_id = self._extract_vehicle_id(action)
@@ -1062,14 +1106,26 @@ class CommandPopup(ctk.CTkToplevel):
             'A-2-2', 'A-3-1', 'A-3-2',
         }
         try:
+            destination_floor = int(destination_floor or 0)
             source_id = int(source_id)
             destination_id = int(destination_id)
         except (TypeError, ValueError):
-            self._log(f'[ARM 명령 거부] ID가 정수가 아닙니다: {action}')
+            self._log(
+                f'[ARM 명령 거부] ID/목적 층이 정수가 아닙니다: {action}'
+            )
             plan_context['step_failed'] = True
             return True
         if operation == 'transfer_to_slot' and destination_slot not in valid_slots:
             self._log(f'[ARM 명령 거부] 잘못된 목적 슬롯: {destination_slot}')
+            plan_context['step_failed'] = True
+            return True
+        if operation == 'transfer_to_slot' and destination_floor not in {
+            0, 1, 2, 3
+        }:
+            self._log(
+                '[ARM 명령 거부] 목적 층은 1..3이어야 합니다: '
+                f'{destination_floor}'
+            )
             plan_context['step_failed'] = True
             return True
         if operation == 'load_to_trailer' and not 0 <= source_id <= 8:
@@ -1124,6 +1180,7 @@ class CommandPopup(ctk.CTkToplevel):
                 arm_id=arm_id,
                 mission_id=plan_context['mission_id'],
                 destination_slot=destination_slot,
+                destination_floor=destination_floor,
                 source_id=source_id,
                 destination_id=destination_id,
                 vehicle_id=vehicle_id,

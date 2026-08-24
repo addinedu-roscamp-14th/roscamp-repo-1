@@ -147,6 +147,10 @@ def test_nav2_tree_repeats_recovery_until_success_or_cancel(filename):
     assert retry.attrib['num_attempts'] == '-1'
     recovery_steps = root.findall('.//AdaptiveLidarRecovery')
     assert len(recovery_steps) == 1
+    # A valid replanned path may initially head back toward the pose where
+    # recovery started. Rejecting that path causes another reverse and can
+    # make the vehicle back up repeatedly even when the way ahead is clear.
+    assert not root.findall('.//PathEscapesRecoveryPose')
     recover_sequence = root.find('.//Sequence[@name="RecoverThenRetry"]')
     assert recover_sequence is not None
     assert [child.tag for child in recover_sequence] == [
@@ -166,6 +170,35 @@ def test_each_recovery_reverses_then_clears_for_replanning():
     assert reverse_index < clear_index
     assert 'self._turn(' not in source
     assert 'self._select_target(' not in source
+
+
+def test_recovery_exports_the_pre_reverse_path_frame_anchor():
+    source = inspect.getsource(recovery.AdaptiveLidarRecoveryNode._recover)
+
+    anchor_index = source.index('self._recovery_anchor_in_path_frame()')
+    reverse_index = source.index('self._reverse(deadline)')
+    assert anchor_index < reverse_index
+    assert 'response.recovery_anchor_valid' in source
+    assert 'response.recovery_anchor_frame' in source
+
+
+def test_path_escape_bt_tolerates_uninitialized_blackboard_inputs():
+    source_path = (
+        Path(__file__).parents[1]
+        / 'src' / 'adaptive_lidar_recovery_bt.cpp'
+    )
+    source = source_path.read_text(encoding='utf-8')
+
+    assert 'if (!anchor_valid_input || !anchor_valid_input.value())' in source
+    assert 'if (!path_input || !anchor_frame_input' in source
+    assert 'getInput<bool>("recovery_anchor_valid").value()' not in source
+
+
+def test_recovery_defaults_to_clearance_based_reverse_distance():
+    source = inspect.getsource(recovery.AdaptiveLidarRecoveryNode.__init__)
+
+    assert "'reverse_distance_m': 0.05" in source
+    assert "'reverse_long_distance_m': 0.10" in source
 
 
 def test_controller_waits_longer_than_global_replanning_period():

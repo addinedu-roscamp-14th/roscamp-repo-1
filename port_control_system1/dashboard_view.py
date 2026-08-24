@@ -625,7 +625,9 @@ class DashboardView(ctk.CTkFrame):
     def toggle_autonomy_mode(self) -> None:
         """Grant or revoke autonomous DB-backed operating approval."""
         snapshot = self.realtime_agent.snapshot()
-        if snapshot.enabled and snapshot.mode == 'autonomous':
+        if snapshot.enabled and snapshot.mode in {
+            'autonomous', 'inventory_execute'
+        }:
             self.realtime_agent.stop_autonomous_policy()
         else:
             self.realtime_agent.start_autonomous_policy()
@@ -675,7 +677,9 @@ class DashboardView(ctk.CTkFrame):
                     self.txt_autonomy_commands.insert('1.0', command_detail)
                     self.txt_autonomy_commands.configure(state='disabled')
                     self._last_autonomy_command_text = command_detail
-            if snapshot.enabled and snapshot.mode == 'autonomous':
+            if snapshot.enabled and snapshot.mode in {
+                'autonomous', 'inventory_execute'
+            }:
                 state_suffix = {
                     'WAITING_FOR_OBJECTIVE': ' · 목표 대기',
                     'EVALUATING': ' · 판단 중',
@@ -687,8 +691,13 @@ class DashboardView(ctk.CTkFrame):
                     'WAITING_OPERATOR': ' · 운영자 확인 필요',
                     'ERROR': ' · 오류',
                 }.get(snapshot.state, '')
+                running_label = (
+                    'DB 계획 실행 중지'
+                    if snapshot.mode == 'inventory_execute'
+                    else '자율 관제모드 중지'
+                )
                 self.btn_autonomy.configure(
-                    text=f'⏹ 자율 관제모드 중지{state_suffix}',
+                    text=f'⏹ {running_label}{state_suffix}',
                     fg_color=ALERT_RED if snapshot.state == 'ERROR' else ACCENT_GREEN,
                     hover_color='#c94f4f' if snapshot.state == 'ERROR' else '#45b96f',
                     text_color=BG_SURFACE,

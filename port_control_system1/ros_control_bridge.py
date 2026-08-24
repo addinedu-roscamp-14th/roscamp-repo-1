@@ -484,6 +484,15 @@ class RosControlBridge:
         except Exception:
             return False
         if vehicle_id == "fleet":
+            try:
+                from realtime_llm_agent import RealtimeLLMAgent
+                RealtimeLLMAgent.get_instance().emergency_stop_reset()
+            except Exception as exc:
+                # The central emergency latch and ARM stops already succeeded;
+                # a dashboard bookkeeping error must never report the physical
+                # stop itself as failed.
+                print(f"[비상정지 자율 상태 초기화 경고] {exc}", flush=True)
+        if vehicle_id == "fleet":
             self._fleet_emergency = True
             self._publish_zero()
             self._publish_zero("agv1")

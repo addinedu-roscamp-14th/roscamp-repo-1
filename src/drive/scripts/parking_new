@@ -109,6 +109,17 @@ class ParkingActionServer(Node):
         self.declare_parameter('final_alignment_kp', 1.5)
         self.declare_parameter('final_alignment_rate_hz', 20.0)
         self.declare_parameter('final_alignment_timeout_sec', 8.0)
+        # Used only by parking spots that explicitly opt out of Nav2 for the
+        # final approach leg.  The command is still published through
+        # cmd_vel_safe_input, so emergency and fleet-collision holds remain
+        # effective while local/global costmap checks are bypassed.
+        self.declare_parameter('direct_approach_linear_speed', 0.05)
+        self.declare_parameter('direct_approach_max_angular_speed', 0.30)
+        self.declare_parameter('direct_approach_min_angular_speed', 0.08)
+        self.declare_parameter('direct_approach_heading_kp', 1.5)
+        self.declare_parameter('direct_approach_heading_tolerance', 0.06)
+        self.declare_parameter('direct_approach_xy_tolerance', 0.02)
+        self.declare_parameter('direct_approach_timeout_sec', 20.0)
 
         self.parking_spots_yaml = self.resolve_path(
             str(self.get_parameter('parking_spots_yaml').value)
@@ -201,6 +212,45 @@ class ParkingActionServer(Node):
         self.final_alignment_timeout = max(
             1.0,
             float(self.get_parameter('final_alignment_timeout_sec').value),
+        )
+        self.direct_approach_linear_speed = max(
+            0.01,
+            abs(float(self.get_parameter('direct_approach_linear_speed').value)),
+        )
+        self.direct_approach_max_angular_speed = max(
+            0.01,
+            abs(float(
+                self.get_parameter('direct_approach_max_angular_speed').value
+            )),
+        )
+        self.direct_approach_min_angular_speed = min(
+            self.direct_approach_max_angular_speed,
+            max(
+                0.01,
+                abs(float(
+                    self.get_parameter(
+                        'direct_approach_min_angular_speed'
+                    ).value
+                )),
+            ),
+        )
+        self.direct_approach_heading_kp = max(
+            0.01,
+            float(self.get_parameter('direct_approach_heading_kp').value),
+        )
+        self.direct_approach_heading_tolerance = max(
+            0.01,
+            float(
+                self.get_parameter('direct_approach_heading_tolerance').value
+            ),
+        )
+        self.direct_approach_xy_tolerance = max(
+            0.005,
+            float(self.get_parameter('direct_approach_xy_tolerance').value),
+        )
+        self.direct_approach_timeout = max(
+            1.0,
+            float(self.get_parameter('direct_approach_timeout_sec').value),
         )
         self.goal_checker_yaw_param = (
             f'{self.goal_checker_id}.yaw_goal_tolerance'
@@ -367,9 +417,22 @@ class ParkingActionServer(Node):
             f'Parking sequence parameters: approach_waypoints={len(approach_path)}, '
             f'reverse_distance={reverse_distance:.3f} m'
         )
+        ignore_parking_maneuver_costmap = str(
+            spot.get(
+                'parking_maneuver_ignore_costmap',
+                spot.get('final_approach_ignore_costmap', False),
+            )
+        ).strip().lower() in {'1', 'true', 'yes', 'on'}
+        if ignore_parking_maneuver_costmap:
+            self.get_logger().info(
+                'Parking maneuver costmap bypass enabled: final approach, '
+                'yaw alignment and reverse parking use direct AMCL control; '
+                'cmd_vel safety gate remains active'
+            )
         reached_approach = self.navigate_approach_path(
             goal_handle,
             approach_path,
+            ignore_final_approach_costmap=ignore_parking_maneuver_costmap,
         )
 
         if not reached_approach:
@@ -539,7 +602,12 @@ class ParkingActionServer(Node):
 
         return True
 
-    def navigate_approach_path(self, goal_handle, approach_path):
+    def navigate_approach_path(
+        self,
+        goal_handle,
+        approach_path,
+        ignore_final_approach_costmap=False,
+    ):
         total = len(approach_path)
         for index, pose in enumerate(approach_path, start=1):
             is_final_approach = index == total
@@ -569,6 +637,21 @@ class ParkingActionServer(Node):
                 yaw_tolerance = self.strict_yaw_goal_tolerance
             else:
                 yaw_tolerance = self.intermediate_yaw_goal_tolerance
+
+            if is_final_approach and ignore_final_approach_costmap:
+                self.get_logger().info(
+                    'Final parking approach: using AMCL closed-loop direct '
+                    'motion; Nav2 costmap checks are bypassed for this leg only'
+                )
+                if not self.drive_direct_to_approach(goal_handle, pose):
+                    return False
+                self.publish_feedback(
+                    goal_handle,
+                    f'waypoint_{index}_of_{total}_reached',
+                    0.10 + 0.45 * (index / max(total, 1)),
+                    target_pose=pose,
+                )
+                continue
 
             if not self.set_yaw_goal_tolerance(yaw_tolerance):
                 return False
@@ -627,6 +710,88 @@ class ParkingActionServer(Node):
             target_pose=approach_path[-1],
         )
         return True
+
+    def drive_direct_to_approach(self, goal_handle, target):
+        """Reach the final approach point without consulting Nav2 costmaps.
+
+        The vehicle first turns toward the point, then drives forward with a
+        small AMCL heading correction.  Parking-yaw alignment remains the
+        following, separate step.  Velocity still enters cmd_vel_safe_input.
+        """
+        self.publish_feedback(
+            goal_handle,
+            'direct_final_approach',
+            0.50,
+            target_pose=target,
+        )
+        start_time = time.monotonic()
+        period = 1.0 / max(self.final_alignment_rate, 1.0)
+
+        while rclpy.ok() and time.monotonic() - start_time < (
+            self.direct_approach_timeout
+        ):
+            if goal_handle.is_cancel_requested:
+                self.stop_robot()
+                self.last_error_message = (
+                    'Parking canceled during direct final approach'
+                )
+                return False
+            pose_is_fresh = self.refresh_pose_from_tf()
+            if not pose_is_fresh:
+                pose_is_fresh = (
+                    self.latest_pose is not None
+                    and self.latest_pose_received_at is not None
+                    and time.monotonic() - self.latest_pose_received_at <= 0.5
+                )
+            if not pose_is_fresh:
+                self.stop_robot()
+                self.last_error_message = (
+                    'No fresh pose during direct final approach'
+                )
+                self.get_logger().error(self.last_error_message)
+                return False
+
+            dx = target['x'] - self.latest_pose.position.x
+            dy = target['y'] - self.latest_pose.position.y
+            distance = math.hypot(dx, dy)
+            if distance <= self.direct_approach_xy_tolerance:
+                self.stop_robot()
+                self.get_logger().info(
+                    f'Direct final approach reached: distance={distance:.3f}m'
+                )
+                return True
+
+            target_heading = math.atan2(dy, dx)
+            current_yaw = quaternion_to_yaw(self.latest_pose.orientation)
+            heading_error = normalize_angle(target_heading - current_yaw)
+            angular_speed = min(
+                self.direct_approach_max_angular_speed,
+                max(
+                    self.direct_approach_min_angular_speed,
+                    abs(heading_error) * self.direct_approach_heading_kp,
+                ),
+            )
+            twist = Twist()
+            if abs(heading_error) > self.direct_approach_heading_tolerance:
+                # Rotate in one continuous direction before translating. This
+                # avoids the curved Nav2 maneuver that was repeatedly clipped
+                # by inflated cells beside the AMR1 parking approach.
+                twist.angular.z = math.copysign(
+                    angular_speed, heading_error
+                )
+            else:
+                twist.linear.x = self.direct_approach_linear_speed
+                twist.angular.z = heading_error * self.direct_approach_heading_kp
+            self.cmd_vel_pub.publish(twist)
+            time.sleep(period)
+
+        self.stop_robot()
+        self.last_error_message = (
+            'Direct final parking approach timed out after '
+            f'{self.direct_approach_timeout:.1f}s'
+        )
+        self.get_logger().error(self.last_error_message)
+        return False
 
     def set_yaw_goal_tolerance(self, tolerance):
         if not self.controller_params_client.wait_for_service(timeout_sec=2.0):

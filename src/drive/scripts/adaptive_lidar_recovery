@@ -557,6 +557,45 @@ class AdaptiveLidarRecoveryNode(Node):
             return None, 'original path has no usable forward tangent'
         return heading, ''
 
+    def _recovery_anchor_in_path_frame(self):
+        """Return the pre-reverse pose in the global path frame."""
+        with self._lock:
+            path = self._latest_path
+            received_at = self._path_received_at
+            pose = self._pose
+            odom_frame = self._odom_frame
+        if (
+            path is None
+            or received_at is None
+            or time.monotonic() - received_at > self.path_max_age
+            or pose is None
+            or not odom_frame
+        ):
+            return None
+        path_frame = str(
+            path.header.frame_id
+            or (path.poses[0].header.frame_id if path.poses else '')
+        )
+        if not path_frame:
+            return None
+        if path_frame == odom_frame:
+            return path_frame, float(pose[0]), float(pose[1])
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                path_frame, odom_frame, Time()).transform
+        except TransformException as error:
+            self.get_logger().warning(
+                f'Recovery anchor TF unavailable: {error}')
+            return None
+        yaw = quaternion_to_yaw(transform.rotation)
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        return (
+            path_frame,
+            float(transform.translation.x) + cosine * pose[0] - sine * pose[1],
+            float(transform.translation.y) + sine * pose[0] + cosine * pose[1],
+        )
+
     def _reverse(self, deadline):
         scan, _ = self._fresh_state()
         if scan is None:
@@ -699,6 +738,7 @@ class AdaptiveLidarRecoveryNode(Node):
             return response
         try:
             deadline = time.monotonic() + self.timeout
+            recovery_anchor = self._recovery_anchor_in_path_frame()
             success, message = self._reverse(deadline)
             if not success:
                 response.success = False
@@ -715,6 +755,13 @@ class AdaptiveLidarRecoveryNode(Node):
             response.message = (
                 'reverse completed; local/global costmaps rebuilt for path '
                 'regeneration')
+            response.recovery_anchor_valid = recovery_anchor is not None
+            if recovery_anchor is not None:
+                (
+                    response.recovery_anchor_frame,
+                    response.recovery_anchor_x,
+                    response.recovery_anchor_y,
+                ) = recovery_anchor
             return response
         finally:
             self._publish_stop()

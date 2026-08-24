@@ -13,7 +13,7 @@ import uuid
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped
-from arm2_interfaces.srv import TransferById
+from arm2_interfaces.srv import TransferById, TransferToSlot
 import numpy as np
 from pymycobot.mycobot280 import MyCobot280
 from rcl_interfaces.msg import SetParametersResult
@@ -404,6 +404,30 @@ def stack_layer_z_offset(base_offset, container_height, placed_count):
     return float(base_offset) + float(container_height) * int(placed_count)
 
 
+def trailer_placement_layer(marker_id):
+    """Return the zero-based layer for a single-cargo AMR trailer."""
+    marker_id = int(marker_id)
+    if marker_id not in (9, 10):
+        raise ValueError('trailer marker ID must be 9 or 10')
+    # AMR1 (10) and AMR2 (9) each carry exactly one container.  Their deck
+    # target must never inherit a previous warehouse or vehicle placement.
+    return 0
+
+
+def placed_count_for_destination_floor(
+    current_placed_count, destination_floor, max_stack_levels
+):
+    """Resolve the zero-based placement layer from an explicit DB floor."""
+    floor = int(destination_floor or 0)
+    if floor == 0:
+        return int(current_placed_count)
+    if floor < 1 or floor > int(max_stack_levels):
+        raise ValueError(
+            f'destination floor must be 1..{int(max_stack_levels)}'
+        )
+    return floor - 1
+
+
 def grouped_marker_locks_satisfied(
     locked,
     required_indices,
@@ -414,6 +438,28 @@ def grouped_marker_locks_satisfied(
         all(locked[index] is not None for index in required_indices)
         and any(locked[index] is not None for index in any_of_indices)
     )
+
+
+def id_transfer_scan_specs(
+    source_id,
+    destination_id,
+    destination_zone,
+    source_frames,
+    marker_histories,
+):
+    """Build live observations without rescanning fixed destination markers."""
+    specs = [(
+        f'source container ID {source_id}',
+        source_frames[source_id],
+        marker_histories[source_id],
+    )]
+    if destination_zone is None:
+        specs.append((
+            f'destination container ID {destination_id}',
+            source_frames[destination_id],
+            marker_histories[destination_id],
+        ))
+    return specs
 
 
 def cartesian_path_acceptable(
@@ -1066,7 +1112,6 @@ class ContainerPickCoordinator(Node):
         self.saved_destination_stack_counts = {
             name: 0 for name in self.destination_ids
         }
-        self.saved_destination_stack_counts['TRAILER'] = 0
         self.saved_destination_stack_counts.update({
             f'ID-{marker_id}': 0 for marker_id in range(9)
         })
@@ -1187,9 +1232,19 @@ class ContainerPickCoordinator(Node):
             Trigger, '/arm2/scan_destinations', self.start_destination_scan
         )
         self.create_service(
+            Trigger,
+            '/arm2/destination_cache_status',
+            self.destination_cache_status,
+        )
+        self.create_service(
             TransferById,
             '/arm2/transfer_by_id',
             self.start_id_to_id_transfer,
+        )
+        self.create_service(
+            TransferToSlot,
+            '/arm2/transfer_to_slot',
+            self.start_requested_destination_transfer,
         )
         for destination_name, service_name in (
             ('A-1-1', '/arm2/transfer_to_a1_1'),
@@ -2611,6 +2666,19 @@ class ContainerPickCoordinator(Node):
         )
         return response
 
+    def destination_cache_status(self, _request, response):
+        """Report whether this live ARM2 process has all warehouse poses."""
+        expected = set(self.destination_ids)
+        present = expected.intersection(self.saved_destination_poses)
+        missing = sorted(expected - present)
+        response.success = not missing
+        response.message = (
+            'ARM2 destination cache ready: IDs 11..16'
+            if not missing
+            else f'ARM2 destination cache incomplete; missing={missing}'
+        )
+        return response
+
     def execute_destination_scan(self, operation_id):
         try:
             self.publish_transfer_event(
@@ -2913,6 +2981,16 @@ class ContainerPickCoordinator(Node):
             ),
             None,
         )
+        if (
+            destination_zone is not None
+            and destination_zone not in self.saved_destination_poses
+        ):
+            response.accepted = False
+            response.message = (
+                f'{destination_zone} is not saved; call '
+                '/arm2/scan_destinations first'
+            )
+            return response
         stack_name = (
             destination_zone
             if destination_zone is not None else f'ID-{destination_id}'
@@ -2949,8 +3027,13 @@ class ContainerPickCoordinator(Node):
         self.motion_thread.start()
         response.accepted = True
         response.message = (
-            f'Scanning only requested source ID {source_id} and '
-            f'destination ID {destination_id}, then starting transfer'
+            f'Scanning only requested source ID {source_id}, then using '
+            + (
+                f'cached destination ID {destination_id}'
+                if destination_zone is not None
+                else f'live destination container ID {destination_id}'
+            )
+            + ' to start transfer'
             + (
                 f' ({destination_zone})'
                 if destination_zone is not None else ''
@@ -2969,26 +3052,13 @@ class ContainerPickCoordinator(Node):
             ),
             None,
         )
-        specs = [(
-            f'source container ID {source_id}',
-            self.source_frames[source_id],
-            self.marker_histories[source_id],
-        )]
-        if destination_zone is not None:
-            specs.append((
-                f'destination stack ID {destination_id} '
-                f'({destination_zone})',
-                self.destination_frames[destination_id],
-                self.marker_histories[destination_id],
-            ))
-        else:
-            specs.append((
-                f'destination container ID {destination_id}',
-                self.source_frames[destination_id],
-                self.marker_histories[destination_id],
-            ))
-        if destination_zone is not None:
-            self.destination_scan_active.set()
+        specs = id_transfer_scan_specs(
+            source_id,
+            destination_id,
+            destination_zone,
+            self.source_frames,
+            self.marker_histories,
+        )
         self.publish_transfer_event(
             operation_id=operation_id,
             operation='id_transfer',
@@ -2998,13 +3068,14 @@ class ContainerPickCoordinator(Node):
             destination_zone=destination_zone,
             destination_id=destination_id,
             progress=10,
-            message=f'ID {source_id}와 ID {destination_id} 위치 스캔 중',
+            message=(
+                f'출발 컨테이너 ID {source_id} 위치 스캔 중; '
+                f'목적지 {destination_zone} ID {destination_id}는 초기 캐시 사용'
+                if destination_zone is not None
+                else f'ID {source_id}와 ID {destination_id} 위치 스캔 중'
+            ),
         )
-        try:
-            scan_result, reason = self._scan_id_transfer_route(specs)
-        finally:
-            if destination_zone is not None:
-                self.destination_scan_active.clear()
+        scan_result, reason = self._scan_id_transfer_route(specs)
         if scan_result is None:
             self.publish_status(
                 f'ID {source_id} -> ID {destination_id} FAILED: {reason}'
@@ -3039,7 +3110,10 @@ class ContainerPickCoordinator(Node):
         )
         self.tracking_suspended.set()
         source_pose = copy.deepcopy(locked[0])
-        destination_pose = copy.deepcopy(locked[1])
+        destination_pose = copy.deepcopy(
+            self.saved_destination_poses[destination_zone]
+            if destination_zone is not None else locked[1]
+        )
         if destination_zone is None:
             stack_name = f'ID-{destination_id}'
             destination_correction = self.id_transfer_correction
@@ -3053,9 +3127,6 @@ class ContainerPickCoordinator(Node):
                     f'{self.id_transfer_a2_place_correction.tolist()}'
                 )
         else:
-            self.saved_destination_poses[destination_zone] = copy.deepcopy(
-                destination_pose
-            )
             stack_name = destination_zone
             destination_correction = self.saved_destination_correction
         try:
@@ -3346,8 +3417,7 @@ class ContainerPickCoordinator(Node):
                     error=reason,
                 )
                 return
-            with self.stack_level_lock:
-                placed_count = self.saved_destination_stack_counts['TRAILER']
+            placed_count = trailer_placement_layer(trailer_marker_id)
             if placed_count >= self.max_stack_levels:
                 self.publish_status(
                     f'TRAILER LOAD ID {source_marker_id} FAILED: '
@@ -3405,7 +3475,9 @@ class ContainerPickCoordinator(Node):
                 targets,
                 destination_name='TRAILER',
                 count_stack=False,
-                saved_stack_name='TRAILER',
+                # AMR trailers have one deck layer, so a successful load must
+                # not increment a persistent stacking counter.
+                saved_stack_name=None,
                 source_marker_id=source_marker_id,
                 source_scan_zone=source_scan_zone,
                 operation_id=operation_id,
@@ -3516,8 +3588,24 @@ class ContainerPickCoordinator(Node):
             + ', '.join(missing)
         )
 
+    def start_requested_destination_transfer(self, request, response):
+        """Start a slot transfer at the DB-validated destination floor."""
+        destination_name = str(request.destination_slot or '').upper()
+        if destination_name not in self.destination_ids:
+            response.success = False
+            response.message = (
+                f'Unknown destination slot: {destination_name}'
+            )
+            return response
+        return self.start_saved_destination_transfer(
+            request,
+            response,
+            destination_name,
+            destination_floor=int(request.destination_floor or 0),
+        )
+
     def start_saved_destination_transfer(
-        self, _request, response, destination_name
+        self, _request, response, destination_name, destination_floor=0
     ):
         """Scan one container ID 0-8 and transfer it to a saved destination."""
         if not self.execute_motion or self.motion_backend != 'moveit':
@@ -3536,9 +3624,31 @@ class ContainerPickCoordinator(Node):
             )
             return response
         with self.stack_level_lock:
-            placed_count = self.saved_destination_stack_counts[
+            current_count = self.saved_destination_stack_counts[
                 destination_name
             ]
+            try:
+                placed_count = placed_count_for_destination_floor(
+                    current_count,
+                    destination_floor,
+                    self.max_stack_levels,
+                )
+            except ValueError as exc:
+                response.success = False
+                response.message = str(exc)
+                return response
+            if placed_count != current_count:
+                self.publish_status(
+                    f'TRANSFER: {destination_name} stack count reconciled '
+                    f'{current_count}->{placed_count} from requested floor '
+                    f'{int(destination_floor)}'
+                )
+                # The DB snapshot was deterministically validated immediately
+                # before dispatch.  It is authoritative for already occupied
+                # lower layers, while this in-memory count is reset by scans.
+                self.saved_destination_stack_counts[
+                    destination_name
+                ] = placed_count
         if placed_count >= self.max_stack_levels:
             response.success = False
             response.message = (
@@ -3568,18 +3678,19 @@ class ContainerPickCoordinator(Node):
         )
         self.motion_thread = threading.Thread(
             target=self.execute_saved_destination_transfer,
-            args=(destination_name, operation_id),
+            args=(destination_name, operation_id, placed_count),
             daemon=True,
         )
         self.motion_thread.start()
         response.success = True
         response.message = (
-            f'Scanning container ID 0-8 for transfer to {destination_name}'
+            f'Scanning container ID 0-8 for transfer to {destination_name} '
+            f'floor {placed_count + 1}'
         )
         return response
 
     def execute_saved_destination_transfer(
-        self, destination_name, operation_id
+        self, destination_name, operation_id, requested_placed_count=None
     ):
         destination_marker_id = self.destination_ids[destination_name]
         try:
@@ -3667,9 +3778,11 @@ class ContainerPickCoordinator(Node):
                 return
             destination_pose = self.saved_destination_poses[destination_name]
             with self.stack_level_lock:
-                placed_count = self.saved_destination_stack_counts[
-                    destination_name
-                ]
+                placed_count = (
+                    self.saved_destination_stack_counts[destination_name]
+                    if requested_placed_count is None
+                    else int(requested_placed_count)
+                )
             targets, reason = self.calculate_stack_targets_from_locked_poses(
                 source_targets,
                 destination_pose,

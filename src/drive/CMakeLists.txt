@@ -5,6 +5,7 @@ find_package(ament_cmake REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(behaviortree_cpp REQUIRED)
 find_package(nav2_behavior_tree REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_srvs REQUIRED)
@@ -23,6 +24,7 @@ target_compile_definitions(drive_adaptive_lidar_recovery_bt_node
 ament_target_dependencies(drive_adaptive_lidar_recovery_bt_node
   behaviortree_cpp
   nav2_behavior_tree
+  nav_msgs
   rclcpp
 )
 rosidl_get_typesupport_target(cpp_typesupport_target
