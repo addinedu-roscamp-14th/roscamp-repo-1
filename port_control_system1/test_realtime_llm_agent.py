@@ -502,7 +502,7 @@ def test_arm_source_id_must_match_active_db_container():
     }
     move = {'container_id': '8'}
     inventory = {'cargos': [{
-        'container_id': '8', 'location': '선박-1', 'floor': 1,
+        'container_id': '8', 'location': '선박-2', 'floor': 1,
     }]}
 
     with pytest.raises(
@@ -521,7 +521,7 @@ def test_arm_load_rejects_a_different_db_cargo_already_on_trailer():
     }
     move = {'container_id': '7'}
     inventory = {'cargos': [
-        {'container_id': '7', 'location': '선박-1', 'floor': 1},
+        {'container_id': '7', 'location': '선박-2', 'floor': 1},
         {'container_id': '8', 'location': 'AMR1', 'floor': 1},
     ]}
 
@@ -675,12 +675,12 @@ def test_arm1_ship_place_validates_fresh_container_on_selected_trailer(
 ):
     step = {
         'type': 'arm1_pick_place', 'arm_id': 'arm1',
-        'source_id': 6, 'destination_id': 18,
+        'source_id': 6, 'destination_id': 19,
         'vehicle_id': vehicle_id,
     }
     move = {
         'container_id': '6', 'source_location': 'A-1-1',
-        'destination_location': '선박-1', '_vehicle_id': vehicle_id,
+        'destination_location': '선박-2', '_vehicle_id': vehicle_id,
     }
     inventory = {'cargos': [{
         'container_id': '6', 'location': trailer_location, 'floor': 1,
@@ -696,11 +696,11 @@ def test_arm1_ship_place_validates_fresh_container_on_selected_trailer(
 def test_arm1_ship_place_rejects_container_not_on_selected_trailer():
     step = {
         'type': 'arm1_pick_place', 'arm_id': 'arm1',
-        'source_id': 6, 'destination_id': 18, 'vehicle_id': 'agv1',
+        'source_id': 6, 'destination_id': 19, 'vehicle_id': 'agv1',
     }
     move = {
         'container_id': '6', 'source_location': 'A-1-1',
-        'destination_location': '선박-1', '_vehicle_id': 'agv1',
+        'destination_location': '선박-2', '_vehicle_id': 'agv1',
     }
     inventory = {'cargos': [{
         'container_id': '6', 'location': 'A-1-1', 'floor': 3,
@@ -753,7 +753,7 @@ def test_concurrent_arm_result_is_read_by_command_id_after_last_is_overwritten()
     agent = object.__new__(RealtimeLLMAgent)
     move = {
         'container_id': '2',
-        'destination_location': '선박-1',
+        'destination_location': '선박-2',
         '_steps': [{
             'type': 'arm1_scan_inbound', 'arm_id': 'arm1',
         }],
@@ -782,7 +782,7 @@ def test_concurrent_arm_result_is_read_by_command_id_after_last_is_overwritten()
         },
     }}
     inventory = {'cargos': [{
-        'container_id': '2', 'location': '선박-1', 'floor': 1,
+        'container_id': '2', 'location': '선박-2', 'floor': 1,
     }]}
 
     outcome, detail = agent._advance_active_move(None, status, inventory)
@@ -955,7 +955,7 @@ def test_a_navigation_uses_registered_goal_when_yolo_label_is_missing():
 def test_db_available_a_destination_enables_registered_navigation_fallback():
     move = {
         'container_id': '6',
-        'source_location': '선박-1',
+        'source_location': '선박-2',
         'destination_location': 'A-1-1',
         'destination_floor': 1,
     }
@@ -974,7 +974,7 @@ def test_db_available_a_destination_enables_registered_navigation_fallback():
 def test_db_occupied_a_destination_rejects_wrong_floor_fallback():
     move = {
         'container_id': '6',
-        'source_location': '선박-1',
+        'source_location': '선박-2',
         'destination_location': 'A-1-1',
         'destination_floor': 1,
     }
@@ -1061,7 +1061,7 @@ def test_exhausted_navigation_recovery_stops_without_replanning_loop():
     agent = RealtimeLLMAgent()
     agent._cycle.active_move = {
         'container_id': '6',
-        'source_location': '선박-1',
+        'source_location': '선박-2',
         'destination_location': 'A-1-1',
     }
     agent._save_cycle = lambda: None
@@ -1079,7 +1079,7 @@ def test_arm_pick_failure_stops_after_same_step_resends_are_exhausted():
     agent = RealtimeLLMAgent()
     move = {
         'container_id': '6',
-        'source_location': '선박-1',
+        'source_location': '선박-2',
         'destination_location': 'A-1-1',
         '_vehicle_id': 'agv1',
         '_step_index': 1,

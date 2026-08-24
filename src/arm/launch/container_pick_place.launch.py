@@ -174,7 +174,7 @@ def generate_launch_description():
         parameters=[{
             'camera_frame_id': LaunchConfiguration('camera_frame_id'),
             'pick_marker_id': 2,
-            'place_marker_id': 18,
+            'place_marker_id': 19,
             'pick_marker_frame': 'arm/pick_marker',
             'place_marker_frame': 'arm/place_marker',
             'marker_size_m': ParameterValue(

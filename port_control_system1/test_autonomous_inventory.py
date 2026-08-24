@@ -27,7 +27,7 @@ def cargo(container_id, location, floor=1, base=''):
 def test_inbound_is_unloaded_before_outbound():
     cycle = AutonomousCycle()
     state = snapshot(
-        cargo(1, '선박-1'),
+        cargo(1, '선박-2'),
         cargo(2, 'A-1-1', 3),
     )
     phase, objective = choose_policy(cycle, state, True)
@@ -63,7 +63,7 @@ def test_inbound_candidates_are_limited_to_visible_warehouse_zone():
     cycle = AutonomousCycle()
     phase, objective = choose_policy(
         cycle,
-        snapshot(cargo(1, '선박-1')),
+        snapshot(cargo(1, '선박-2')),
         True,
         visible_warehouse_zones={'A-3'},
     )
@@ -78,13 +78,13 @@ def test_parallel_policy_excludes_reserved_cargo_and_destination():
     cycle = AutonomousCycle(
         active_move={
             'container_id': '1',
-            'source_location': '선박-1',
+            'source_location': '선박-2',
             'destination_location': 'A-1-1',
         },
         active_moves={
             'agv1': {
                 'container_id': '1',
-                'source_location': '선박-1',
+                'source_location': '선박-2',
                 'destination_location': 'A-1-1',
             },
         },
@@ -92,7 +92,7 @@ def test_parallel_policy_excludes_reserved_cargo_and_destination():
 
     phase, objective = choose_policy(
         cycle,
-        snapshot(cargo(1, '선박-1'), cargo(2, '선박-2')),
+        snapshot(cargo(1, '선박-2'), cargo(2, '선박-3')),
         True,
         reserved_container_ids={'1'},
         reserved_destinations={'A-1-1'},
@@ -106,7 +106,7 @@ def test_parallel_policy_excludes_reserved_cargo_and_destination():
 def test_outbound_is_not_reclassified_as_inbound():
     cycle = AutonomousCycle(inbound_ids=['1'], outbound_ids=['6'])
     phase, _objective = choose_policy(
-        cycle, snapshot(cargo(6, '선박-1')), True
+        cycle, snapshot(cargo(6, '선박-2')), True
     )
     assert phase == 'WAITING_FOR_CLEAR'
 
@@ -129,7 +129,7 @@ def test_third_floor_outbound_starts_with_empty_vessel_and_fresh_cycle():
 
     assert phase == 'LOADING_OUTBOUND'
     assert '[6]' in objective
-    assert '선박-1' in objective
+    assert '선박-2' in objective
 
 
 def test_outbound_cargo_left_on_amr_resumes_before_waiting_for_clear():
@@ -170,7 +170,7 @@ def test_active_outbound_is_not_misclassified_as_waiting_for_clear():
     move = {
         'container_id': '6',
         'source_location': 'A-1-1',
-        'destination_location': '선박-1',
+        'destination_location': '선박-2',
     }
     cycle = AutonomousCycle(
         outbound_ids=['6'], active_move=move,
@@ -182,7 +182,7 @@ def test_active_outbound_is_not_misclassified_as_waiting_for_clear():
         snapshot(cargo(6, 'A-1-1', 3, '8')),
         False,
         reserved_container_ids={'6'},
-        reserved_destinations={'선박-1'},
+        reserved_destinations={'선박-2'},
     )
 
     assert phase == 'EXECUTING_MOVE'
@@ -194,13 +194,13 @@ def test_validate_rejects_blocked_lower_container():
     with pytest.raises(AutonomousPolicyError, match='blocked'):
         validate_first_move({
             'container_id': '1', 'source_location': 'A-1-1',
-            'destination_location': '선박-1', 'destination_floor': 1,
+            'destination_location': '선박-2', 'destination_floor': 1,
         }, state)
 
 
 def test_ship_to_warehouse_compiles_for_both_trailers():
     move = {
-        'container_id': '6', 'source_location': '선박-1',
+        'container_id': '6', 'source_location': '선박-2',
         'destination_location': 'A-1-2', 'destination_floor': 1,
     }
     agv1 = compile_move(move, 'agv1')
@@ -264,18 +264,18 @@ def test_warehouse_upper_floor_targets_supporting_container_not_floor_marker():
 def test_warehouse_to_ship_picks_container_marker_on_agv2_too():
     steps = compile_move({
         'container_id': '6', 'source_location': 'A-2-1',
-        'destination_location': '선박-1', 'destination_floor': 1,
+        'destination_location': '선박-2', 'destination_floor': 1,
     }, 'agv2')
 
     assert steps[3]['source_id'] == 6
-    assert steps[3]['destination_id'] == 18
+    assert steps[3]['destination_id'] == 19
     assert steps[3]['vehicle_id'] == 'agv2'
 
 
 def test_amr_to_ship_recovery_uses_same_loaded_vehicle():
     move = {
         'container_id': '6', 'source_location': 'AMR2',
-        'destination_location': '선박-1', 'destination_floor': 1,
+        'destination_location': '선박-2', 'destination_floor': 1,
     }
 
     steps = compile_move(move, 'agv2')
@@ -284,7 +284,7 @@ def test_amr_to_ship_recovery_uses_same_loaded_vehicle():
         'zone_navigation', 'arm1_pick_place', 'park_command',
     ]
     assert steps[1]['source_id'] == 6
-    assert steps[1]['destination_id'] == 18
+    assert steps[1]['destination_id'] == 19
     with pytest.raises(AutonomousPolicyError, match='must use agv2'):
         compile_move(move, 'agv1')
 

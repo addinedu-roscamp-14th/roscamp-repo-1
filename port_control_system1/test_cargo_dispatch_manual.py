@@ -23,7 +23,7 @@ def test_manual_locations_match_autonomous_canonical_contract():
     assert MANUAL_INVENTORY_LOCATIONS == (
         'A-1-1', 'A-1-2', 'A-2-1', 'A-2-2', 'A-3-1', 'A-3-2',
         'AMR1', 'AMR2',
-        '선박-1', '선박-2', '선박-3', '선박-4', '선박-5', '선박-6',
+        '선박-2', '선박-3', '선박-4', '선박-5', '선박-6',
         '출항완료',
     )
 

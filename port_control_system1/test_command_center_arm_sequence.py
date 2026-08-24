@@ -11,7 +11,8 @@ def test_db_plan_locations_always_include_ship_marker_slots():
     )
 
     assert 'A-2-2' in locations
-    assert '선박-1' in locations
+    assert '선박-1' not in locations
+    assert '선박-2' in locations
     assert '선박-6' in locations
     assert 'AMR1' in locations
     assert 'AMR2' in locations

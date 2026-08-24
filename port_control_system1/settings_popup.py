@@ -138,7 +138,7 @@ class SettingsPopup(ctk.CTkToplevel):
         ctk.CTkLabel(info_frame,
                      text="스마트 항만 통합 관제 시스템 v1.0 (Smart Port ICS)\n"
                           "CustomTkinter\n"
-                          "자율주행차(AGV) 제어 및 화물 배차 관리 시스템\n\n"
+                          "자율주행차(AMR) 제어 및 화물 배차 관리 시스템\n\n"
                           "Build: 2023.10.24-prod",
                      font=("Consolas", 12), text_color="#909090", justify="left").pack(
             anchor="w", padx=30, pady=(0, 15))

@@ -57,7 +57,11 @@ from emergency_control_view import EmergencyControlView
 from stream_view import StreamView
 from slam_stream_processor import SlamStreamProcessor
 from settings_view import SettingsView
-from ros_control_bridge import RosControlBridge
+from ros_control_bridge import (
+    RosControlBridge,
+    operator_vehicle_id,
+    operator_vehicle_text,
+)
 from realtime_llm_agent import RealtimeLLMAgent
 
 ctk.set_appearance_mode("Dark")
@@ -195,11 +199,15 @@ class AGVControlCenter(ctk.CTk):
         if snapshot.ready:
             if snapshot.fleet_states:
                 vehicles = " | ".join(
-                    f"{vehicle.vehicle_id}:{vehicle.state_text}"
+                    f"{operator_vehicle_id(vehicle.vehicle_id)}:"
+                    f"{vehicle.state_text}"
                     f"({vehicle.x:.2f},{vehicle.y:.2f})"
                     for vehicle in snapshot.fleet_states
                 )
-                text = f"{vehicles} | {snapshot.b1_zone}"
+                text = (
+                    f"{vehicles} | "
+                    f"{operator_vehicle_text(snapshot.b1_zone)}"
+                )
             else:
                 text = (
                     "ROS 비상정지"
@@ -301,7 +309,7 @@ class AGVControlCenter(ctk.CTk):
         emergencies = [
             ("ERR-HAZARD-01", "🔥 구역 B 위험물 유출 및 화재 감지!"),
             ("ERR-FOG-002", "🌫️ 항구 앞바다 짙은 해무 발생 (가시거리 50m 이하)"),
-            ("ERR-AGV-OBS", "🚧 AGV 주행 경로상 미확인 장애물 감지"),
+            ("ERR-AMR-OBS", "🚧 AMR 주행 경로상 미확인 장애물 감지"),
         ]
         code, desc = random.choice(emergencies)
         self.show_emergency_popup(code, desc)

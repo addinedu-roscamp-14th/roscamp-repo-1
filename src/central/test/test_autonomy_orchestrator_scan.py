@@ -210,7 +210,7 @@ def test_explicit_incomplete_cache_failure_requests_ship_rescan():
     orchestrator._on_inbound_scan_result(
         'port-1',
         'arrival-1',
-        CompletedFuture(False, 'ship marker cache 18..23 is incomplete'),
+        CompletedFuture(False, 'ship marker cache 19..23 is incomplete'),
     )
 
     assert not orchestrator.arm1_cache_ready
@@ -233,7 +233,7 @@ def test_live_arm1_cache_probe_skips_startup_rescan():
     orchestrator.arm1_cache_probe_pending = True
 
     orchestrator._on_arm1_cache_probe(CompletedServiceFuture(
-        True, 'ARM1 ship marker cache ready: 18..23'
+        True, 'ARM1 ship marker cache ready: 19..23'
     ))
 
     assert orchestrator.arm1_cache_probe_complete

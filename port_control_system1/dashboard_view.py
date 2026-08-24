@@ -27,6 +27,7 @@ from ros_control_bridge import (
     AMR_DISPLAY_NAMES,
     ARM_DISPLAY_NAMES,
     RosControlBridge,
+    operator_vehicle_text,
 )
 
 # Tailwind Color Palette
@@ -655,7 +656,7 @@ class DashboardView(ctk.CTkFrame):
                 if snapshot.last_error:
                     detail += f'\n오류: {snapshot.last_error}'
                 self.lbl_autonomy_detail.configure(
-                    text=detail,
+                    text=operator_vehicle_text(detail),
                     text_color=(
                         ALERT_RED if snapshot.last_error else TEXT_SECONDARY
                     ),
@@ -671,6 +672,7 @@ class DashboardView(ctk.CTkFrame):
                     '중앙관제 실제 전송 명령\n'
                     f'{snapshot.command_payload_json or "없음"}'
                 )
+                command_detail = operator_vehicle_text(command_detail)
                 if command_detail != self._last_autonomy_command_text:
                     self.txt_autonomy_commands.configure(state='normal')
                     self.txt_autonomy_commands.delete('1.0', 'end')

@@ -114,7 +114,16 @@ def world_to_canvas(layout, world_x, world_y):
     return pixel_x, pixel_y
 
 
-def draw_robot_pose(image, layout, world_x, world_y, world_yaw):
+def draw_robot_pose(
+    image,
+    layout,
+    world_x,
+    world_y,
+    world_yaw,
+    body_color=(220, 90, 30),
+    heading_color=(20, 20, 230),
+    label='',
+):
     """Draw the robot position and heading; return false if out of map."""
     grid_dx = world_x - layout.origin_x
     grid_dy = world_y - layout.origin_y
@@ -148,15 +157,26 @@ def draw_robot_pose(image, layout, world_x, world_y, world_yaw):
         int(round(pixel_y - heading_length * math.sin(relative_yaw))),
     )
     cv2.circle(image, center, radius + 2, (255, 255, 255), -1)
-    cv2.circle(image, center, radius, (220, 90, 30), -1)
+    cv2.circle(image, center, radius, body_color, -1)
     cv2.arrowedLine(
         image,
         center,
         endpoint,
-        (20, 20, 230),
+        heading_color,
         3,
         tipLength=0.35,
     )
+    if label:
+        cv2.putText(
+            image,
+            str(label),
+            (center[0] + radius + 4, center[1] - radius - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            body_color,
+            2,
+            cv2.LINE_AA,
+        )
     return True
 
 
@@ -172,6 +192,7 @@ def draw_laser_scan(
     transform_y,
     transform_yaw,
     max_points=720,
+    point_color=(40, 220, 40),
 ):
     """Draw valid planar LaserScan points transformed into the map frame."""
     points = laser_scan_to_canvas_points(
@@ -192,7 +213,7 @@ def draw_laser_scan(
             image,
             (int(x), int(y)),
             point_radius,
-            (40, 220, 40),
+            point_color,
             -1,
         )
     return int(points.shape[0])

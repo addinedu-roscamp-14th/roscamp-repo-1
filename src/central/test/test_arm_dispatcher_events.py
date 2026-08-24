@@ -274,6 +274,24 @@ def test_stop_invalidates_queue_even_when_physical_service_fails():
     assert states[-1][2] == 'STOP_FAILED'
 
 
+def test_resume_changes_stopped_dispatcher_to_ready_without_motion():
+    dispatcher = object.__new__(ArmDispatcher)
+    dispatcher.condition = threading.Condition()
+    dispatcher.active_goals = {'arm1': None, 'arm2': None}
+    states = []
+    dispatcher._set_runtime_state = (
+        lambda arm_id, state, text, error=None:
+        states.append((arm_id, state, text, error))
+    )
+    response = types.SimpleNamespace(success=None, message='')
+
+    result = dispatcher._resume_arm('arm2', response)
+
+    assert result.success is True
+    assert result.message == 'ARM2 dispatcher resumed'
+    assert states == [('arm2', ArmState.READY, 'READY', '')]
+
+
 class StubServiceClient:
     def __init__(self, ready):
         self.ready = ready

@@ -862,14 +862,14 @@ class RealtimeLLMAgent:
             ):
                 return 'ARM1 입항 컨테이너 스캔 완료 대기 중'
             if not autonomy.get('arm1_ship_cache_ready'):
-                return 'ARM1 선박 마커 18~23 캐시 완료 대기 중'
+                return 'ARM1 선박 마커 19~23 캐시 완료 대기 중'
             if not autonomy.get('arm2_destination_cache_ready'):
                 return 'ARM2 창고 목적지 마커 캐시 완료 대기 중'
         if (
             phase == 'LOADING_OUTBOUND'
             and not autonomy.get('arm1_ship_cache_ready')
         ):
-            return 'ARM1 선박 마커 18~23 캐시 완료 대기 중'
+            return 'ARM1 선박 마커 19~23 캐시 완료 대기 중'
         return ''
 
     def _save_cycle(self):

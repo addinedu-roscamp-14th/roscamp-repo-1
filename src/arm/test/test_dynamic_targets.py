@@ -10,6 +10,7 @@ from arm_pick_place.dual_aruco_pose_publisher import DualArucoPosePublisher
 
 def test_coordinator_rejects_invalid_dynamic_target_pairs():
     assert HomographyPickPlace._validate_target_ids(2, 9) == ''
+    assert 'disabled' in HomographyPickPlace._validate_target_ids(2, 18)
     assert 'different' in HomographyPickPlace._validate_target_ids(2, 2)
     assert '0..49' in HomographyPickPlace._validate_target_ids(-1, 9)
     assert '0..49' in HomographyPickPlace._validate_target_ids(2, 50)
@@ -58,7 +59,7 @@ def test_explicit_ship_scan_runs_even_when_cache_is_complete(monkeypatch):
     coordinator = object.__new__(HomographyPickPlace)
     coordinator.command_lock = threading.Lock()
     coordinator.saved_marker_poses = {
-        marker_id: object() for marker_id in range(18, 24)
+        marker_id: object() for marker_id in range(19, 24)
     }
     coordinator.motion_thread = None
     coordinator.stop_event = threading.Event()

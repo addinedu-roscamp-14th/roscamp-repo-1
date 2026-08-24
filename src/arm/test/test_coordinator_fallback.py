@@ -285,6 +285,8 @@ def test_search_scopes_agv_then_station_and_keeps_cross_station_targets(
     coordinator.set_detection_enabled = lambda _enabled: None
     visited = []
     coordinator.move_observation = lambda pose: visited.append(tuple(pose))
+    stopped = []
+    coordinator.wait_until_robot_stopped = stopped.append
     parameters = {
         'observation_settle_sec': 0.0001,
         'maximum_floor_error_m': 0.010,
@@ -308,6 +310,10 @@ def test_search_scopes_agv_then_station_and_keeps_cross_station_targets(
     found = coordinator.search_stations()
 
     assert len(visited) == 2
+    assert stopped == [
+        'station_agv observation',
+        'station_a observation',
+    ]
     assert found['pick'][1].station == 'station_agv'
     assert found['pick'][1].marker_floor == 'agv_1'
     assert found['place'][1].station == 'station_a'
