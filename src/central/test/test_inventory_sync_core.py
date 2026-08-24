@@ -13,7 +13,7 @@ def movement(operation_id='op-1'):
         'operation_id': operation_id,
         'container_id': '6',
         'arm_id': 'arm1',
-        'source_location': '선박-1',
+        'source_location': '선박-2',
         'destination_location': 'AMR1',
         'success': True,
     }

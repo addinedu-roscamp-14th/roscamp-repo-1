@@ -77,6 +77,9 @@ class DashboardStreamNode(Node):
         self.declare_parameter('slam_base_frame', 'base_footprint')
         self.declare_parameter('slam_scan_topic', '/scan')
         self.declare_parameter('slam_pose_topic', '')
+        self.declare_parameter('slam_secondary_base_frame', '')
+        self.declare_parameter('slam_secondary_scan_topic', '')
+        self.declare_parameter('slam_secondary_pose_topic', '')
         self.declare_parameter('slam_enable_scan', True)
         self.declare_parameter('slam_scan_max_age_sec', 0.5)
         self.declare_parameter('slam_live_fps', 15.0)
@@ -114,6 +117,15 @@ class DashboardStreamNode(Node):
         self.slam_pose_topic = str(
             self.get_parameter('slam_pose_topic').value
         )
+        self.slam_secondary_base_frame = str(
+            self.get_parameter('slam_secondary_base_frame').value
+        )
+        self.slam_secondary_scan_topic = str(
+            self.get_parameter('slam_secondary_scan_topic').value
+        )
+        self.slam_secondary_pose_topic = str(
+            self.get_parameter('slam_secondary_pose_topic').value
+        )
         self.slam_enable_scan = bool(
             self.get_parameter('slam_enable_scan').value
         )
@@ -138,6 +150,8 @@ class DashboardStreamNode(Node):
         self.maps = LatestFrameStore()
         self.scans = LatestFrameStore()
         self.poses = LatestFrameStore()
+        self.secondary_scans = LatestFrameStore()
+        self.secondary_poses = LatestFrameStore()
         self.detection_lock = threading.Lock()
         self.latest_detection = None
         self.detection_received_at = 0.0
@@ -149,7 +163,9 @@ class DashboardStreamNode(Node):
         self.slam_tf_error = ''
         self.slam_map_frame = ''
         self.slam_robot_visible = False
+        self.slam_robot_visible_by_vehicle = {}
         self.slam_scan_points = 0
+        self.slam_scan_points_by_vehicle = {}
         self.slam_scan_tf_error = ''
         self.slam_map_image = None
         self.slam_map_png = None
@@ -160,7 +176,14 @@ class DashboardStreamNode(Node):
         self.slam_state_lock = threading.Lock()
         self.tf_buffer = None
         self.tf_listener = None
-        if not self.slam_pose_topic or self.slam_enable_scan:
+        if (
+            not self.slam_pose_topic
+            or (
+                self.slam_secondary_base_frame
+                and not self.slam_secondary_pose_topic
+            )
+            or self.slam_enable_scan
+        ):
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
         self.encoder_thread = threading.Thread(
@@ -223,12 +246,28 @@ class DashboardStreamNode(Node):
                 self._on_pose,
                 scan_qos,
             )
+        self.secondary_pose_subscription = None
+        if self.slam_secondary_pose_topic:
+            self.secondary_pose_subscription = self.create_subscription(
+                PoseWithCovarianceStamped,
+                self.slam_secondary_pose_topic,
+                self._on_secondary_pose,
+                scan_qos,
+            )
         self.scan_subscription = None
         if self.slam_enable_scan:
             self.scan_subscription = self.create_subscription(
                 LaserScan,
                 self.slam_scan_topic,
                 self._on_scan,
+                scan_qos,
+            )
+        self.secondary_scan_subscription = None
+        if self.slam_enable_scan and self.slam_secondary_scan_topic:
+            self.secondary_scan_subscription = self.create_subscription(
+                LaserScan,
+                self.slam_secondary_scan_topic,
+                self._on_secondary_scan,
                 scan_qos,
             )
         self.encoder_thread.start()
@@ -246,6 +285,9 @@ class DashboardStreamNode(Node):
             f'scan={self.slam_scan_topic if self.slam_enable_scan else "off"},'
             ' '
             f'base_frame={self.slam_base_frame}, '
+            f'secondary_pose={self.slam_secondary_pose_topic or "TF"}, '
+            f'secondary_scan={self.slam_secondary_scan_topic or "off"}, '
+            f'secondary_base={self.slam_secondary_base_frame or "off"}, '
             f'mjpeg_fps={self.slam_live_fps:.1f}'
         )
 
@@ -294,6 +336,12 @@ class DashboardStreamNode(Node):
 
     def _on_pose(self, message):
         self.poses.put(message)
+
+    def _on_secondary_scan(self, message):
+        self.secondary_scans.put(message)
+
+    def _on_secondary_pose(self, message):
+        self.secondary_poses.put(message)
 
     def _encode_frames(self):
         interval = 1.0 / self.web_fps
@@ -421,83 +469,128 @@ class DashboardStreamNode(Node):
                 continue
 
             frame = map_image.copy()
-            robot_visible = False
-            tf_error = ''
-            try:
-                pose_snapshot = self.poses.latest()
-                if pose_snapshot is not None:
-                    pose = pose_snapshot.message.pose.pose
-                    world_x = float(pose.position.x)
-                    world_y = float(pose.position.y)
-                    world_yaw = quaternion_to_yaw(pose.orientation)
-                elif self.tf_buffer is not None:
-                    transform = self.tf_buffer.lookup_transform(
-                        map_frame,
-                        self.slam_base_frame,
-                        Time(),
-                    )
-                    translation = transform.transform.translation
-                    rotation = transform.transform.rotation
-                    world_x = float(translation.x)
-                    world_y = float(translation.y)
-                    world_yaw = quaternion_to_yaw(rotation)
-                else:
-                    raise RuntimeError(
-                        f'waiting for pose on {self.slam_pose_topic}'
-                    )
-                robot_visible = draw_robot_pose(
-                    frame,
-                    layout,
-                    world_x,
-                    world_y,
-                    world_yaw,
-                )
-                cv2.putText(
-                    frame,
-                    f'x {world_x:.3f}  y {world_y:.3f}  '
-                    f'yaw {world_yaw * 180.0 / 3.141592653589793:.1f} deg',
-                    (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (30, 30, 230),
-                    2,
-                    cv2.LINE_AA,
-                )
-            except (TransformException, RuntimeError) as exc:
-                tf_error = str(exc)
-
-            scan_points = 0
-            scan_tf_error = ''
-            scan = self.scans.latest() if self.slam_enable_scan else None
-            if (
-                scan is not None
-                and time.monotonic() - scan.received_at
-                <= self.slam_scan_max_age
-            ):
-                scan_frame = scan.message.header.frame_id
-                if scan_frame:
-                    try:
+            robot_visible_by_vehicle = {}
+            tf_errors = {}
+            vehicle_poses = (
+                (
+                    'AMR1', self.poses, self.slam_pose_topic,
+                    self.slam_base_frame, (220, 90, 30), (20, 20, 230),
+                ),
+                (
+                    'AMR2', self.secondary_poses,
+                    self.slam_secondary_pose_topic,
+                    self.slam_secondary_base_frame,
+                    (30, 180, 230), (230, 120, 20),
+                ),
+            )
+            for index, (
+                label, pose_store, pose_topic, base_frame,
+                body_color, heading_color,
+            ) in enumerate(vehicle_poses):
+                if not pose_topic and not base_frame:
+                    continue
+                try:
+                    pose_snapshot = pose_store.latest()
+                    if pose_snapshot is not None:
+                        pose = pose_snapshot.message.pose.pose
+                        world_x = float(pose.position.x)
+                        world_y = float(pose.position.y)
+                        world_yaw = quaternion_to_yaw(pose.orientation)
+                    elif self.tf_buffer is not None and base_frame:
                         transform = self.tf_buffer.lookup_transform(
                             map_frame,
-                            scan_frame,
+                            base_frame,
                             Time(),
                         )
                         translation = transform.transform.translation
                         rotation = transform.transform.rotation
-                        scan_points = draw_laser_scan(
-                            frame,
-                            layout,
-                            scan.message.ranges,
-                            float(scan.message.angle_min),
-                            float(scan.message.angle_increment),
-                            float(scan.message.range_min),
-                            float(scan.message.range_max),
-                            float(translation.x),
-                            float(translation.y),
-                            quaternion_to_yaw(rotation),
+                        world_x = float(translation.x)
+                        world_y = float(translation.y)
+                        world_yaw = quaternion_to_yaw(rotation)
+                    else:
+                        raise RuntimeError(
+                            f'waiting for pose on {pose_topic or base_frame}'
                         )
-                    except TransformException as exc:
-                        scan_tf_error = str(exc)
+                    robot_visible_by_vehicle[label] = draw_robot_pose(
+                        frame,
+                        layout,
+                        world_x,
+                        world_y,
+                        world_yaw,
+                        body_color=body_color,
+                        heading_color=heading_color,
+                        label=label,
+                    )
+                    cv2.putText(
+                        frame,
+                        f'{label} x {world_x:.3f}  y {world_y:.3f}  '
+                        f'yaw {world_yaw * 180.0 / 3.141592653589793:.1f}',
+                        (12, 28 + index * 26),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        body_color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+                except (TransformException, RuntimeError) as exc:
+                    robot_visible_by_vehicle[label] = False
+                    tf_errors[label] = str(exc)
+            robot_visible = any(robot_visible_by_vehicle.values())
+            tf_error = '; '.join(
+                f'{label}: {error}' for label, error in tf_errors.items()
+            )
+
+            scan_points_by_vehicle = {}
+            scan_tf_errors = {}
+            primary_scan = (
+                self.scans.latest() if self.slam_enable_scan else None
+            )
+            secondary_scan = (
+                self.secondary_scans.latest()
+                if self.slam_enable_scan else None
+            )
+            vehicle_scans = (
+                ('AMR1', primary_scan, (40, 220, 40)),
+                ('AMR2', secondary_scan, (220, 180, 40)),
+            )
+            for label, scan, point_color in vehicle_scans:
+                scan_points_by_vehicle[label] = 0
+                if scan is None or (
+                    time.monotonic() - scan.received_at
+                    > self.slam_scan_max_age
+                ):
+                    continue
+                scan_frame = scan.message.header.frame_id
+                if not scan_frame:
+                    continue
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        map_frame,
+                        scan_frame,
+                        Time(),
+                    )
+                    translation = transform.transform.translation
+                    rotation = transform.transform.rotation
+                    scan_points_by_vehicle[label] = draw_laser_scan(
+                        frame,
+                        layout,
+                        scan.message.ranges,
+                        float(scan.message.angle_min),
+                        float(scan.message.angle_increment),
+                        float(scan.message.range_min),
+                        float(scan.message.range_max),
+                        float(translation.x),
+                        float(translation.y),
+                        quaternion_to_yaw(rotation),
+                        point_color=point_color,
+                    )
+                except TransformException as exc:
+                    scan_tf_errors[label] = str(exc)
+            scan_points = sum(scan_points_by_vehicle.values())
+            scan_tf_error = '; '.join(
+                f'{label}: {error}'
+                for label, error in scan_tf_errors.items()
+            )
 
             try:
                 success, encoded = cv2.imencode(
@@ -518,9 +611,12 @@ class DashboardStreamNode(Node):
                     )
             else:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
-                source_sequence = (
-                    scan.sequence if scan is not None else map_version
-                )
+                scan_sequences = [
+                    item.sequence
+                    for item in (primary_scan, secondary_scan)
+                    if item is not None
+                ]
+                source_sequence = max(scan_sequences, default=map_version)
                 self.slam_jpegs.put(
                     encoded.tobytes(),
                     source_sequence,
@@ -530,7 +626,13 @@ class DashboardStreamNode(Node):
                     self.slam_last_error = ''
                     self.slam_tf_error = tf_error
                     self.slam_robot_visible = robot_visible
+                    self.slam_robot_visible_by_vehicle = (
+                        robot_visible_by_vehicle
+                    )
                     self.slam_scan_points = scan_points
+                    self.slam_scan_points_by_vehicle = (
+                        scan_points_by_vehicle
+                    )
                     self.slam_scan_tf_error = scan_tf_error
 
             remaining = interval - (time.monotonic() - started)
@@ -628,6 +730,7 @@ class DashboardStreamNode(Node):
         """Return status for the cached map and composed MJPEG stream."""
         source = self.maps.latest()
         scan_source = self.scans.latest()
+        secondary_scan_source = self.secondary_scans.latest()
         stream = self.slam_jpegs.latest()
         stream_metrics = self.slam_jpegs.metrics()
         with self.slam_state_lock:
@@ -636,8 +739,14 @@ class DashboardStreamNode(Node):
             map_version = self.slam_map_version
             encode_duration = self.slam_map_encode_duration_ms
             robot_visible = self.slam_robot_visible
+            robot_visible_by_vehicle = dict(
+                self.slam_robot_visible_by_vehicle
+            )
             tf_error = self.slam_tf_error
             scan_points = self.slam_scan_points
+            scan_points_by_vehicle = dict(
+                self.slam_scan_points_by_vehicle
+            )
             scan_tf_error = self.slam_scan_tf_error
             last_error = self.slam_last_error
         if source is None or not map_ready:
@@ -657,6 +766,14 @@ class DashboardStreamNode(Node):
             if scan_source is None
             else max(0.0, time.monotonic() - scan_source.received_at)
         )
+        secondary_scan_age = (
+            None
+            if secondary_scan_source is None
+            else max(
+                0.0,
+                time.monotonic() - secondary_scan_source.received_at,
+            )
+        )
         stream_age = (
             None
             if stream is None
@@ -668,8 +785,13 @@ class DashboardStreamNode(Node):
             'map_frame': map_frame,
             'base_frame': self.slam_base_frame,
             'scan_topic': self.slam_scan_topic,
+            'pose_topic': self.slam_pose_topic,
+            'secondary_base_frame': self.slam_secondary_base_frame,
+            'secondary_scan_topic': self.slam_secondary_scan_topic,
+            'secondary_pose_topic': self.slam_secondary_pose_topic,
             'map_count': self.maps.input_count,
             'scan_count': self.scans.input_count,
+            'secondary_scan_count': self.secondary_scans.input_count,
             'map_version': map_version,
             'stream_encoded_count': stream_metrics['encoded_count'],
             'stream_client_count': stream_metrics['client_count'],
@@ -682,13 +804,20 @@ class DashboardStreamNode(Node):
             'scan_age_sec': (
                 None if scan_age is None else round(scan_age, 3)
             ),
+            'secondary_scan_age_sec': (
+                None
+                if secondary_scan_age is None
+                else round(secondary_scan_age, 3)
+            ),
             'map_encode_duration_ms': round(encode_duration, 2),
             'width': width,
             'height': height,
             'resolution': resolution,
             'robot_visible': robot_visible,
+            'robot_visible_by_vehicle': robot_visible_by_vehicle,
             'tf_error': tf_error,
             'scan_points_visible': scan_points,
+            'scan_points_by_vehicle': scan_points_by_vehicle,
             'scan_tf_error': scan_tf_error,
             'last_error': last_error,
         }

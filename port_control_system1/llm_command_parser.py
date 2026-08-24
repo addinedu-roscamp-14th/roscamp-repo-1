@@ -47,12 +47,12 @@ def _positive_int_env(name: str, default: int) -> int:
 
 LLM_NUM_CTX = _positive_int_env("LOCAL_LLM_NUM_CTX", 8192)
 
-# Fixed physical ArUco registry for the six vessel placement positions.
-# A natural-language "vessel slot N" uses the Nth marker in this sequence.
-ARM1_SHIP_DESTINATION_MARKERS = tuple(range(18, 24))
-ARM1_SHIP_SLOT_MARKERS = dict(
-    enumerate(ARM1_SHIP_DESTINATION_MARKERS, start=1)
-)
+# ArUco 18 / vessel slot 1 is physically disabled.
+ARM1_SHIP_DESTINATION_MARKERS = tuple(range(19, 24))
+ARM1_SHIP_SLOT_MARKERS = {
+    marker_id - 17: marker_id
+    for marker_id in ARM1_SHIP_DESTINATION_MARKERS
+}
 VEHICLE_TRAILER_MARKERS = {
     'agv1': 10,  # AMR1
     'agv2': 9,   # AMR2
@@ -227,10 +227,11 @@ ARM1의 source_id와 destination_id는 launch 설정값이 아니라 사용자 �
 PostgreSQL 재고 스냅샷을 바탕으로 매 작업마다 선택하세요. source_id는 집을
 컨테이너 ArUco ID, destination_id는 놓을 support/AGV ArUco ID입니다. 두 ID를
 모르면 추측하지 말고 unknown을 반환하세요. 두 ID는 서로 달라야 합니다.
-선박의 고정 배치 위치는 6개이며 "선박 1번 자리"부터 "선박 6번 자리"까지의
-destination_id는 각각 18, 19, 20, 21, 22, 23입니다. ship/vessel도 선박과 같은
-뜻입니다. 사용자가 선박 자리 번호를 지정하지 않았다면 선박 목적지에는 반드시
-18..23 중 하나만 선택하고, 9번이나 컨테이너의 base_aruco_id를 목적지로 사용하지
+사용 가능한 선박 고정 배치 위치는 5개이며 "선박 2번 자리"부터 "선박 6번
+자리"까지 destination_id는 각각 19, 20, 21, 22, 23입니다. 선박 1번 자리와
+ArUco 18은 사용하지 않습니다. ship/vessel도 선박과 같은 뜻입니다. 사용자가
+선박 자리 번호를 지정하지 않았다면 선박 목적지에는 반드시 19..23 중 하나만
+선택하고, 18번이나 9번 또는 컨테이너의 base_aruco_id를 목적지로 사용하지
 마세요.
 차량 트레일러의 고정 ArUco 매핑은 AMR1(agv1)=10, AMR2(agv2)=9입니다.
 ARM1이 컨테이너를 차량에 놓는 경우 destination_id는 반드시 해당 vehicle_id의
@@ -259,7 +260,7 @@ final_for_vehicle=true를 지정하세요. 이 값이 true인 작업이 최종 �
   navigation 순서로 넣으세요.
 - 차량에 실린 컨테이너를 선박에 놓는 명령은 같은 vehicle_id로 B-1의
   visual_navigation을 먼저 넣고, 그 다음 ARM1의 arm1_pick_place를 넣으세요.
-  이때 선박 destination_id는 위에 등록된 18..23만 사용하고 마지막 ARM1 작업에
+  이때 선박 destination_id는 위에 등록된 19..23만 사용하고 마지막 ARM1 작업에
   final_for_vehicle=true를 지정하세요.
 - 현재 차량이 A 위치에 있어 보여도 A 위치 navigation을 생략하지 마세요.
   중앙 Fleet이 이미 도착한 동일 목표를 중복 제거합니다.
@@ -921,7 +922,8 @@ def _mentioned_ship_destination_id(command):
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            return ARM1_SHIP_SLOT_MARKERS[int(match.group(1))]
+            slot = int(match.group(1))
+            return ARM1_SHIP_SLOT_MARKERS.get(slot, 18)
     marker_match = re.search(
         r'(?:선박|ship|vessel).*?(?:aruco|아루코|마커)\s*'
         r'(18|19|20|21|22|23)\b',
@@ -988,7 +990,11 @@ def _manual_inventory_bypass_issues(
             destination_id = -1
         requested_destination_id = _mentioned_ship_destination_id(command)
         if requested_destination_id is not None:
-            if destination_id != requested_destination_id:
+            if requested_destination_id == 18:
+                issues.append(
+                    f'actions[{index}] 선박 1번/ArUco 18은 사용 중지됨'
+                )
+            elif destination_id != requested_destination_id:
                 issues.append(
                     f'actions[{index}] 지정한 선박 자리는 ArUco '
                     f'{requested_destination_id}인데 destination_id='
@@ -997,7 +1003,7 @@ def _manual_inventory_bypass_issues(
         elif destination_id not in ARM1_SHIP_DESTINATION_MARKERS:
             issues.append(
                 f'actions[{index}] 선박 destination_id={destination_id}는 '
-                '등록된 ArUco 범위 18..23에 없음'
+                '등록된 ArUco 범위 19..23에 없음(18은 사용 중지)'
             )
     return issues
 
@@ -1181,7 +1187,11 @@ def inventory_workflow_issues(
                 command
             )
             if requested_destination_id is not None:
-                if destination_id != requested_destination_id:
+                if requested_destination_id == 18:
+                    issues.append(
+                        f'actions[{index}] 선박 1번/ArUco 18은 사용 중지됨'
+                    )
+                elif destination_id != requested_destination_id:
                     issues.append(
                         f'actions[{index}] 지정한 선박 자리는 ArUco '
                         f'{requested_destination_id}인데 destination_id='
@@ -1190,7 +1200,7 @@ def inventory_workflow_issues(
             elif destination_id not in ARM1_SHIP_DESTINATION_MARKERS:
                 issues.append(
                     f'actions[{index}] 선박 destination_id={destination_id}는 '
-                    '등록된 ArUco 범위 18..23에 없음'
+                    '등록된 ArUco 범위 19..23에 없음(18은 사용 중지)'
                 )
         if selected['location'] in _WAREHOUSE_SLOTS:
             same_slot = [

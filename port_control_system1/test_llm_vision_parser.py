@@ -577,15 +577,15 @@ def test_prompt_exposes_arm1_dynamic_pick_place_contract():
     assert 'ARM1은 아직 중앙 서비스 계약이 없으므로' not in prompt
 
 
-def test_prompt_registers_all_six_vessel_destination_markers():
+def test_prompt_registers_five_enabled_vessel_destination_markers():
     prompt = _SYSTEM_PROMPT_TEMPLATE
 
-    assert ARM1_SHIP_DESTINATION_MARKERS == (18, 19, 20, 21, 22, 23)
+    assert ARM1_SHIP_DESTINATION_MARKERS == (19, 20, 21, 22, 23)
     assert ARM1_SHIP_SLOT_MARKERS == {
-        1: 18, 2: 19, 3: 20, 4: 21, 5: 22, 6: 23,
+        2: 19, 3: 20, 4: 21, 5: 22, 6: 23,
     }
-    assert 'destination_id는 각각 18, 19, 20, 21, 22, 23' in prompt
-    assert '9번이나 컨테이너의 base_aruco_id를 목적지로 사용하지' in prompt
+    assert 'destination_id는 각각 19, 20, 21, 22, 23' in prompt
+    assert '18번이나 9번 또는 컨테이너의 base_aruco_id를 목적지로' in prompt
 
 
 def test_prompt_registers_vehicle_specific_trailer_markers():

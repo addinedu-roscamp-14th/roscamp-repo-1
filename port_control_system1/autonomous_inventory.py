@@ -12,7 +12,7 @@ import uuid
 WAREHOUSE_LOCATIONS = tuple(
     f'A-{bay}-{slot}' for bay in range(1, 4) for slot in range(1, 3)
 )
-SHIP_LOCATIONS = tuple(f'선박-{slot}' for slot in range(1, 7))
+SHIP_LOCATIONS = tuple(f'선박-{slot}' for slot in range(2, 7))
 CANONICAL_LOCATIONS = (
     *WAREHOUSE_LOCATIONS, 'AMR1', 'AMR2', *SHIP_LOCATIONS, '출항완료'
 )
@@ -21,7 +21,8 @@ WAREHOUSE_MARKERS = {
     for index, location in enumerate(WAREHOUSE_LOCATIONS)
 }
 SHIP_MARKERS = {
-    location: str(18 + index) for index, location in enumerate(SHIP_LOCATIONS)
+    f'선박-{marker_id - 17}': str(marker_id)
+    for marker_id in range(19, 24)
 }
 TRAILER_MARKERS = {'agv1': 10, 'agv2': 9}
 
@@ -190,6 +191,8 @@ def compile_move(move, vehicle_id):
     """Compile one validated container move into physical high-level steps."""
     source = str(move['source_location'])
     destination = str(move['destination_location'])
+    if source == '선박-1' or destination == '선박-1':
+        raise AutonomousPolicyError('선박-1 / ArUco 18 is disabled')
     container_id = int(move['container_id'])
     # Moves performed entirely by one stationary arm do not consume an AMR.
     if source.startswith('A-') and destination.startswith('A-'):
@@ -429,8 +432,9 @@ def choose_policy(
             f'창고 3층 최상단 컨테이너 [{ids}] 중 하나만 아래 선박 목적지 '
             '후보 중 하나로 이동하라. moves 배열에는 이동 1건만 반환하고 '
             '선택한 후보의 destination_floor와 destination_base_aruco_id를 '
-            '그대로 사용하라. destination_location에는 반드시 선박-1부터 '
-            '선박-6 중 하나를 정확히 넣어라. 목적지 후보 JSON: '
+            '그대로 사용하라. destination_location에는 반드시 선박-2부터 '
+            '선박-6 중 하나를 정확히 넣어라. 선박-1과 ArUco 18은 사용하지 '
+            '마라. 목적지 후보 JSON: '
             f'{json.dumps(destinations, ensure_ascii=False)}. '
             'ARM1 선박 목적지 ArUco 매핑 JSON: '
             f'{json.dumps(ship_marker_mapping, ensure_ascii=False)}'

@@ -244,7 +244,7 @@ class DualViewCalibrator(ctk.CTkFrame):
 
         ctk.CTkLabel(panels_frame, text="📷 CCTV 관제 카메라", font=self.font_subtitle).grid(
             row=0, column=0, sticky="w", padx=(0, 5))
-        ctk.CTkLabel(panels_frame, text="🗺️ AGV SLAM 지도", font=self.font_subtitle).grid(
+        ctk.CTkLabel(panels_frame, text="🗺️ AMR SLAM 지도", font=self.font_subtitle).grid(
             row=0, column=1, sticky="w", padx=(5, 0))
 
         cctv_container = ctk.CTkFrame(panels_frame, corner_radius=10)

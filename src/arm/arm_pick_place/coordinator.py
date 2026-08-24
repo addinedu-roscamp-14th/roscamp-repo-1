@@ -143,7 +143,7 @@ class HomographyPickPlace(Node):
             self.pick_frame: deque(maxlen=history_length),
             self.place_frame: deque(maxlen=history_length),
         }
-        for marker_id in list(range(9)) + list(range(18, 24)):
+        for marker_id in list(range(9)) + list(range(19, 24)):
             self.histories[f'arm/marker_{marker_id}'] = deque(
                 maxlen=history_length
             )
@@ -266,7 +266,7 @@ class HomographyPickPlace(Node):
         self.declare_parameter('pick_marker_frame', 'arm/pick_marker')
         self.declare_parameter('place_marker_frame', 'arm/place_marker')
         self.declare_parameter('pick_marker_id', 2)
-        self.declare_parameter('place_marker_id', 18)
+        self.declare_parameter('place_marker_id', 19)
         self.declare_parameter(
             'calibration_file',
             str(
@@ -567,6 +567,8 @@ class HomographyPickPlace(Node):
             return 'pick_id must be within the DICT_5X5_50 range 0..49'
         if not 0 <= int(place_id) <= 49:
             return 'place_id must be within the DICT_5X5_50 range 0..49'
+        if int(place_id) == 18:
+            return 'place_id 18 is disabled for vessel operations'
         if int(pick_id) == int(place_id):
             return 'pick_id and place_id must be different'
         return ''
@@ -638,7 +640,7 @@ class HomographyPickPlace(Node):
 
     def scan_ship_destinations(self, _request, response):
         """
-        Freshly scan empty ship slot markers 18..23 for later placement.
+        Freshly scan empty ship slot markers 19..23 for later placement.
 
         An explicit scan command always runs the same two-view observation
         sequence used by normal ChoE-branch pick/place commands.  In
@@ -667,12 +669,12 @@ class HomographyPickPlace(Node):
 
     def ship_cache_status(self, _request, response):
         """Report whether this live ARM1 process has every ship slot pose."""
-        expected = set(range(18, 24))
+        expected = set(range(19, 24))
         present = expected.intersection(self.saved_marker_poses)
         missing = sorted(expected - present)
         response.success = not missing
         response.message = (
-            'ARM1 ship marker cache ready: 18..23'
+            'ARM1 ship marker cache ready: 19..23'
             if not missing
             else f'ARM1 ship marker cache incomplete; missing={missing}'
         )
@@ -686,11 +688,11 @@ class HomographyPickPlace(Node):
             self.publish_work_state('SEARCHING')
             self.publish_status(
                 'ARM1 선박 마커 재스캔: ChoE 순차 관찰 자세를 '
-                '좌/우로 이동하며 18..23을 새로 확인합니다.'
+                '좌/우로 이동하며 19..23을 새로 확인합니다.'
             )
             detections = self.search_stations({
                 str(marker_id): f'arm/marker_{marker_id}'
-                for marker_id in range(18, 24)
+                for marker_id in range(19, 24)
             })
             # search_stations(require_all=True) guarantees a complete fresh
             # result.  Replace the cache only after that guarantee so a failed
@@ -704,10 +706,10 @@ class HomographyPickPlace(Node):
                 marker_id = int(marker_text)
                 self.publish_status(
                     f'saved_marker_poses[{marker_id}] refreshed '
-                    f'({len(self.saved_marker_poses)}/6)'
+                    f'({len(self.saved_marker_poses)}/5)'
                 )
             self.publish_work_state('WORK_COMPLETED')
-            self.publish_status('ARM1 ship marker cache complete: 18..23')
+            self.publish_status('ARM1 ship marker cache complete: 19..23')
         except Exception as exc:
             self.stop_event.set()
             self.publish_work_state(
@@ -722,9 +724,10 @@ class HomographyPickPlace(Node):
     def scan_inbound(self, _request, response):
         """Scan exposed IDs 0..8 and associate them with cached ship slots."""
         with self.command_lock:
-            if len(self.saved_marker_poses) != 6:
+            expected_ship_markers = set(range(19, 24))
+            if not expected_ship_markers.issubset(self.saved_marker_poses):
                 response.success = False
-                response.message = 'ship marker cache 18..23 is incomplete'
+                response.message = 'ship marker cache 19..23 is incomplete'
                 return response
             if self.motion_thread is not None and self.motion_thread.is_alive():
                 response.success = False
@@ -1056,8 +1059,26 @@ class HomographyPickPlace(Node):
                 f'surface={station.calibration_surface}, wanted={remaining}'
             )
             self.move_observation(station.joint_angles_deg)
+            # sync_send_angles() returning only proves that the commanded
+            # observation pose is within its joint tolerance.  The arm can
+            # still be settling mechanically at that point, so keep vision
+            # gated until the controller reports a stable stop and the
+            # configured settling interval has elapsed in full.
+            self.publish_status(
+                f'{station.name} 관찰 정지 확인 대기'
+            )
+            self.wait_until_robot_stopped(
+                f'{station.name} observation'
+            )
+            settle_sec = float(
+                self.parameter('observation_settle_sec')
+            )
+            self.publish_status(
+                f'{station.name} 관찰 안정화: '
+                f'정지 후 {settle_sec:.1f}초 대기'
+            )
             if self.stop_event.wait(
-                float(self.parameter('observation_settle_sec'))
+                settle_sec
             ):
                 raise RuntimeError('operation stopped')
             if not remaining:

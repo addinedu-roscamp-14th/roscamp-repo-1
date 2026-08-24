@@ -57,10 +57,11 @@ _PLANNER_SYSTEM_PROMPT = """당신은 항만 컨테이너 재배치 계획기입
 이동을 반복해서는 안 됩니다. 실제 로봇 명령, ROS 서비스명, DB 갱신 명령은 만들지
 마세요.
 
-선박 목적지는 반드시 "선박-1"부터 "선박-6" 중 정확한 위치 하나를
+선박 목적지는 반드시 "선박-2"부터 "선박-6" 중 정확한 위치 하나를
 destination_location에 넣으세요. "선박", "항구", 빈 문자열처럼 슬롯 번호가 없는
-목적지는 금지합니다. 선박 슬롯의 ARM1 목적지 ArUco 매핑은 선박-1=18,
-선박-2=19, 선박-3=20, 선박-4=21, 선박-5=22, 선박-6=23입니다.
+목적지는 금지합니다. 선박-1과 ArUco 18은 사용하지 않습니다. 선박 슬롯의 ARM1
+목적지 ArUco 매핑은 선박-2=19, 선박-3=20, 선박-4=21, 선박-5=22,
+선박-6=23입니다.
 2층 이상 적재의 destination_base_aruco_id에는 11~23 고정 마커가 아니라
 그 단계 직전 목적지 바로 아래층 컨테이너의 container_id를 넣으세요."""
 
@@ -253,7 +254,7 @@ class InventoryDecisionPlanner:
         A valid exact LLM choice remains authoritative.  This fallback only
         fills a missing/generic vessel slot during an outbound objective, so
         the physical compiler always receives 선박-N and can map it to
-        ARM1 marker 18..23.
+        ARM1 marker 19..23. Marker 18 is disabled.
         """
         destination = str(move.get('destination_location') or '').strip()
         locations = {
@@ -280,7 +281,7 @@ class InventoryDecisionPlanner:
             marker_id = int(marker_value)
         except (TypeError, ValueError):
             marker_id = -1
-        if 18 <= marker_id <= 23:
+        if 19 <= marker_id <= 23:
             canonical = f'선박-{marker_id - 17}'
             if canonical in locations:
                 return canonical

@@ -1,4 +1,4 @@
 {
-    "cctv_url": "http://192.168.0.60:8000/video",
+    "cctv_url": "http://192.168.5.6:8000/video",
     "slam_url": "http://192.168.0.60:8000/slam/video"
 }

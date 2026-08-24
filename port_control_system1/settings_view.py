@@ -175,7 +175,7 @@ class SettingsView(ctk.CTkFrame):
         info_sec.pack(fill="x")
         ctk.CTkLabel(info_sec, text="ℹ️ 시스템 정보 (System Info)", font=self.font_subtitle, text_color="#dce4ee").pack(anchor="w", pady=(0, 15))
         
-        info_text = "스마트 항만 통합 관제 시스템 v1.0 (Smart Port ICS)\nCustomTkinter\n자율주행차(AGV) 제어 및 화물 배차 관리 시스템\n\nBuild: 2023.10.24-prod"
+        info_text = "스마트 항만 통합 관제 시스템 v1.0 (Smart Port ICS)\nCustomTkinter\n자율주행차(AMR) 제어 및 화물 배차 관리 시스템\n\nBuild: 2023.10.24-prod"
         ctk.CTkLabel(info_sec, text=info_text, font=self.font_mono, text_color="#909090", justify="left").pack(anchor="w", padx=30)
 
     def _on_appearance_change(self, mode: str) -> None:

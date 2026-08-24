@@ -15,7 +15,7 @@ WAREHOUSE_MARKERS = {
     'A-2-1': '13', 'A-2-2': '14',
     'A-3-1': '15', 'A-3-2': '16',
 }
-SHIP_MARKERS = {f'선박-{index}': str(17 + index) for index in range(1, 7)}
+SHIP_MARKERS = {f'선박-{index}': str(17 + index) for index in range(2, 7)}
 LOCATION_MARKERS = {
     **WAREHOUSE_MARKERS,
     **SHIP_MARKERS,

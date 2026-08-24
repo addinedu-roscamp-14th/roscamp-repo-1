@@ -1631,7 +1631,7 @@ class CargoDispatchTool(ctk.CTkFrame):
 
         job = self.dispatch_queue[self.active_job_index]
         route: List[RouteStep] = job["route"]
-        label = job.get("label") or job.get("item") or "AGV"
+        label = job.get("label") or job.get("item") or "AMR"
         step = route[self.active_step_index]
 
         if self.active_step_index == 0:
@@ -1677,7 +1677,7 @@ class CargoDispatchTool(ctk.CTkFrame):
             else:
                 # 다음 화물이 남아있으면 버튼 텍스트만 바꿔서 계속 누를 수 있게 함
                 next_job = self.dispatch_queue[self.active_job_index]
-                next_label = next_job.get("label") or next_job.get("item") or "AGV"
+                next_label = next_job.get("label") or next_job.get("item") or "AMR"
                 self.step_button.configure(text=f"다음 화물로 ({next_label})")
         else:
             # 같은 화물의 다음 단계가 남아있는 경우

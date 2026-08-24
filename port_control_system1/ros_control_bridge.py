@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -22,6 +23,27 @@ AMR_DISPLAY_NAMES = {
     "agv1": "AMR 1 (파랑)",
     "agv2": "AMR 2 (노랑)",
 }
+
+AMR_SHORT_NAMES = {
+    "agv1": "amr1",
+    "agv2": "amr2",
+}
+
+
+def operator_vehicle_id(vehicle_id: str) -> str:
+    """Return an AMR name for UI text without changing the ROS identifier."""
+    value = str(vehicle_id or "")
+    return AMR_SHORT_NAMES.get(value.lower(), value)
+
+
+def operator_vehicle_text(value: str) -> str:
+    """Replace embedded agv1/agv2 identifiers in operator-facing text."""
+    return re.sub(
+        r"\bagv([12])\b",
+        lambda match: f"amr{match.group(1)}",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
 
 ARM_DISPLAY_NAMES = {
     "arm1": "로봇팔 1 (ARM1)",
@@ -264,6 +286,9 @@ class RosControlBridge:
                         )
                 for service in ZONE_CLEAR_SERVICES:
                     name = f"/central/fleet/{service}"
+                    owner._clients[name] = self.create_client(Trigger, name)
+                for arm_id in ARM_DISPLAY_NAMES:
+                    name = f"/central/arms/{arm_id}/resume"
                     owner._clients[name] = self.create_client(Trigger, name)
 
                 for vehicle_id in ("agv1", "agv2"):
@@ -710,6 +735,10 @@ class RosControlBridge:
         all_services += [
             f"/central/fleet/{service}" for service in ZONE_CLEAR_SERVICES
         ]
+        all_services += [
+            f"/central/arms/{arm_id}/resume"
+            for arm_id in ARM_DISPLAY_NAMES
+        ]
         self._await_services(all_services)
 
         results = []
@@ -749,6 +778,16 @@ class RosControlBridge:
                 FLEET_EMERGENCY_SERVICE, set_bool_request(False)
             ),
         ))
+
+        # Emergency stop also latches both central ARM dispatcher states.
+        # Resume only those software gates; no robot motion is commanded.
+        for arm_id, display_name in ARM_DISPLAY_NAMES.items():
+            results.append((
+                f"{display_name} 재활성화",
+                *self._call_service_sync(
+                    f"/central/arms/{arm_id}/resume", trigger.Request()
+                ),
+            ))
 
         # 4) In-flight goals: bt_navigator rejects new ones while one runs.
         #    This must precede the zone locks - _clear_zone_lock refuses while

@@ -292,6 +292,12 @@ class CentralControlGateway(Node):
             )
             for arm_id in ('arm1', 'arm2')
         }
+        self._arm_resume_clients = {
+            arm_id: self.create_client(
+                Trigger, f'/central/arms/{arm_id}/resume'
+            )
+            for arm_id in ('arm1', 'arm2')
+        }
         self._fleet_emergency_client = self.create_client(
             SetBool, '/central/fleet/emergency_stop'
         )
@@ -597,6 +603,30 @@ class CentralControlGateway(Node):
             'message': response.message,
         }
 
+    def resume_arm(self, arm_id, timeout_sec=3.0):
+        arm_id = str(arm_id).lower()
+        if arm_id not in self._arm_resume_clients:
+            raise CommandValidationError('arm_id must be arm1 or arm2')
+        client = self._arm_resume_clients[arm_id]
+        if not client.wait_for_service(timeout_sec=0.5):
+            raise RuntimeError(
+                f'central {arm_id.upper()} resume service is unavailable'
+            )
+        future = client.call_async(Trigger.Request())
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise RuntimeError(f'{arm_id.upper()} resume timed out')
+        response = future.result()
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            'accepted': True,
+            'arm_id': arm_id,
+            'message': response.message,
+        }
+
     def dispatch_pixel_goal(self, payload):
         """Validate and publish a target/heading pixel pair exactly once."""
         goal = validate_pixel_goal(
@@ -744,6 +774,25 @@ class CentralControlGateway(Node):
                     }
                     self.get_logger().error(
                         f'Emergency stop could not reach {arm_id.upper()}: {exc}'
+                    )
+        else:
+            # Reset only the central STOPPED latches. The physical arms do
+            # not move until a later, separately validated operation arrives.
+            for arm_id in ('arm1', 'arm2'):
+                try:
+                    result = self.resume_arm(arm_id)
+                    arm_results[arm_id] = {
+                        'resumed': True,
+                        'message': str(result.get('message') or ''),
+                    }
+                except Exception as exc:
+                    arm_results[arm_id] = {
+                        'resumed': False,
+                        'message': str(exc),
+                    }
+                    self.get_logger().error(
+                        f'Emergency release could not resume '
+                        f'{arm_id.upper()}: {exc}'
                     )
         return {
             'accepted': True,

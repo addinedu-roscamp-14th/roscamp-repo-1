@@ -156,7 +156,7 @@ class AutonomyOrchestrator(Node):
             self.arm1_scan_requested = False
             # A failed refresh does not erase ARM1's last known-good in-memory
             # cache: the coordinator replaces saved_marker_poses only after a
-            # complete 18..23 scan.  Keep readiness unless ARM1 explicitly
+            # complete 19..23 scan.  Keep readiness unless ARM1 explicitly
             # reports that its cache is incomplete during an inbound request.
             if success:
                 self.arm1_cache_ready = True
@@ -340,7 +340,7 @@ class AutonomyOrchestrator(Node):
             )
             if not success:
                 # Missing container IDs are an ordinary retriable observation
-                # failure and must not destroy the valid 18..23 slot cache.
+                # failure and must not destroy the valid 19..23 slot cache.
                 # Only ARM1's explicit cache-incomplete response proves that
                 # its process restarted and the slot scan really is required.
                 if self._failure_means_arm1_cache_missing(error):

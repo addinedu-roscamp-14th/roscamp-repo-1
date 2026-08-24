@@ -56,11 +56,20 @@ def generate_launch_description():
     dashboard_slam_pose_topic = LaunchConfiguration(
         'dashboard_slam_pose_topic'
     )
+    dashboard_slam_secondary_scan_topic = LaunchConfiguration(
+        'dashboard_slam_secondary_scan_topic'
+    )
+    dashboard_slam_secondary_pose_topic = LaunchConfiguration(
+        'dashboard_slam_secondary_pose_topic'
+    )
     dashboard_slam_enable_scan = LaunchConfiguration(
         'dashboard_slam_enable_scan'
     )
     dashboard_slam_base_frame = LaunchConfiguration(
         'dashboard_slam_base_frame'
+    )
+    dashboard_slam_secondary_base_frame = LaunchConfiguration(
+        'dashboard_slam_secondary_base_frame'
     )
     nav2_params = LaunchConfiguration('nav2_params_file')
     control_params = LaunchConfiguration('control_params_file')
@@ -89,8 +98,17 @@ def generate_launch_description():
             'slam_map_topic': dashboard_slam_map_topic,
             'slam_scan_topic': dashboard_slam_scan_topic,
             'slam_pose_topic': dashboard_slam_pose_topic,
+            'slam_secondary_scan_topic': (
+                dashboard_slam_secondary_scan_topic
+            ),
+            'slam_secondary_pose_topic': (
+                dashboard_slam_secondary_pose_topic
+            ),
             'slam_enable_scan': dashboard_slam_enable_scan,
             'slam_base_frame': dashboard_slam_base_frame,
+            'slam_secondary_base_frame': (
+                dashboard_slam_secondary_base_frame
+            ),
         }.items(),
     )
     nav2_launch = IncludeLaunchDescription(
@@ -213,7 +231,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'b1_camera_down_offset_m',
-            default_value='0.03',
+            default_value='0.09',
             description=(
                 'B-1 parking goal offset along camera-image down, in meters'
             ),
@@ -225,7 +243,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'b1_waiting_camera_down_offset_m',
-            default_value='0.06',
+            default_value='0.11',
             description='Additional camera-down offset for the B-1 waiting pose',
         ),
         DeclareLaunchArgument(
@@ -260,12 +278,24 @@ def generate_launch_description():
             default_value='',
         ),
         DeclareLaunchArgument(
+            'dashboard_slam_secondary_scan_topic',
+            default_value='',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_secondary_pose_topic',
+            default_value='',
+        ),
+        DeclareLaunchArgument(
             'dashboard_slam_enable_scan',
             default_value='true',
         ),
         DeclareLaunchArgument(
             'dashboard_slam_base_frame',
             default_value='base_footprint',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_slam_secondary_base_frame',
+            default_value='',
         ),
         DeclareLaunchArgument(
             'nav2_params_file',

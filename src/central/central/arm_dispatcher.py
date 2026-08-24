@@ -49,8 +49,8 @@ MARKER_LOCATIONS = {
     9: 'AMR2', 10: 'AMR1',
     11: 'A-1-1', 12: 'A-1-2', 13: 'A-2-1', 14: 'A-2-2',
     15: 'A-3-1', 16: 'A-3-2',
-    18: '선박-1', 19: '선박-2', 20: '선박-3',
-    21: '선박-4', 22: '선박-5', 23: '선박-6',
+    19: '선박-2', 20: '선박-3', 21: '선박-4',
+    22: '선박-5', 23: '선박-6',
 }
 
 
@@ -362,6 +362,18 @@ class ArmDispatcher(Node):
             Trigger,
             '/central/arms/arm2/stop',
             self._stop_arm2,
+            callback_group=self.callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/central/arms/arm1/resume',
+            self._resume_arm1,
+            callback_group=self.callback_group,
+        )
+        self.create_service(
+            Trigger,
+            '/central/arms/arm2/resume',
+            self._resume_arm2,
             callback_group=self.callback_group,
         )
         self.action_server = ActionServer(
@@ -1231,6 +1243,30 @@ class ArmDispatcher(Node):
 
     def _stop_arm1(self, _request, response):
         return self._stop_arm('arm1', self.arm1_stop_client, response)
+
+    def _resume_arm1(self, _request, response):
+        return self._resume_arm('arm1', response)
+
+    def _resume_arm2(self, _request, response):
+        return self._resume_arm('arm2', response)
+
+    def _resume_arm(self, arm_id, response):
+        """Clear the central STOPPED latch without commanding robot motion."""
+        with self.condition:
+            active_goals = getattr(self, 'active_goals', {})
+            active = (
+                active_goals.get(arm_id)
+                if isinstance(active_goals, dict) else None
+            )
+            if active is not None and getattr(active, 'is_active', False):
+                response.success = False
+                response.message = f'{arm_id.upper()} stop is still settling'
+                return response
+            self._set_runtime_state(arm_id, ArmState.READY, 'READY', '')
+            self.condition.notify_all()
+        response.success = True
+        response.message = f'{arm_id.upper()} dispatcher resumed'
+        return response
 
     def _stop_arm(self, arm_id, client, response):
         # Invalidate running and queued commands before waiting for the remote

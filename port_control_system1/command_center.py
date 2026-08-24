@@ -67,7 +67,11 @@ from llm_command_parser import (
 from inventory_decision_planner import InventoryDecisionPlanner
 from inventory_client import InventoryClient, InventoryClientError
 from autonomous_inventory import CANONICAL_LOCATIONS
-from ros_control_bridge import RosControlBridge
+from ros_control_bridge import (
+    RosControlBridge,
+    operator_vehicle_id,
+    operator_vehicle_text,
+)
 from realtime_llm_agent import RealtimeLLMAgent
 from visual_navigation import (
     VisualNavigationError,
@@ -1305,14 +1309,14 @@ class CommandPopup(ctk.CTkToplevel):
             plan_context['predecessor_command_id'] = destination_command_id
         self._log(
             '[실시간 운송 계획 전송] '
-            f'현재 차량={vehicle_id}, '
+            f'현재 차량={operator_vehicle_id(vehicle_id)}, '
             f'{source["label"]}({source_command_id}) → '
             f'{destination["label"]}({destination_command_id})'
         )
         self.result_label.configure(
             text=(
                 '[현재 화면 기준 운송 경로 전송 완료]\n'
-                f'차량={vehicle_id}, '
+                f'차량={operator_vehicle_id(vehicle_id)}, '
                 f'{source["label"]} 도착 후 {destination["label"]} 이동\n'
                 '저장된 화물 위치 데이터는 변경하지 않았습니다.'
             ),
@@ -1588,7 +1592,7 @@ class CommandPopup(ctk.CTkToplevel):
         if route:
             route[-1].action = "도착"
 
-        self._run_route_log("AGV", route)
+        self._run_route_log("AMR", route)
         waypoint_values = []
         missing_coordinates = []
         for step in route:
@@ -1665,7 +1669,9 @@ class CommandPopup(ctk.CTkToplevel):
     def _log(self, text: str) -> None:
         self.log_box.configure(state="normal")
         timestamp = time.strftime("%H:%M:%S")
-        self.log_box.insert("end", f"[{timestamp}] {text}\n")
+        self.log_box.insert(
+            "end", f"[{timestamp}] {operator_vehicle_text(text)}\n"
+        )
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 

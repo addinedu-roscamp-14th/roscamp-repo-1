@@ -131,10 +131,10 @@ class CameraToMapBridge(Node):
         self.declare_parameter('minimum_direction_distance', 0.02)
         self.declare_parameter('validate_calibration_map', True)
         self.declare_parameter('b1_camera_left_offset_m', 0.15)
-        self.declare_parameter('b1_camera_down_offset_m', 0.03)
+        self.declare_parameter('b1_camera_down_offset_m', 0.09)
         self.declare_parameter('b1_waiting_distance_m', 0.25)
         self.declare_parameter(
-            'b1_waiting_camera_down_offset_m', 0.06
+            'b1_waiting_camera_down_offset_m', 0.11
         )
         # A-1/A-2/A-3 cargo bins share one fixed, pre-measured map-frame stop
         # pose (measured with RViz "2D Pose Estimate") instead of a pixel ->

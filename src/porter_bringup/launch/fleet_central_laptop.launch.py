@@ -73,7 +73,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'b1_waiting_camera_down_offset_m',
-            default_value='0.06',
+            default_value='0.11',
             description='Additional camera-down offset for the B-1 waiting pose',
         ),
         DeclareLaunchArgument(
@@ -211,10 +211,17 @@ def generate_launch_description():
                         'dashboard_slam_map_topic': '/agv1/map',
                         'dashboard_slam_scan_topic': '/agv1/scan',
                         'dashboard_slam_pose_topic': '/agv1/amcl_pose',
+                        'dashboard_slam_secondary_scan_topic': '/agv2/scan',
+                        'dashboard_slam_secondary_pose_topic': (
+                            '/agv2/amcl_pose'
+                        ),
                         'dashboard_slam_enable_scan': LaunchConfiguration(
                             'dashboard_enable_scan'
                         ),
                         'dashboard_slam_base_frame': 'agv1/base_footprint',
+                        'dashboard_slam_secondary_base_frame': (
+                            'agv2/base_footprint'
+                        ),
                         'start_nav2': 'false',
                         'start_navigation_control': 'false',
                         'use_rviz': 'false',

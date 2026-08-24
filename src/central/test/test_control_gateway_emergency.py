@@ -36,6 +36,10 @@ def _gateway():
         'agv1': _ServiceClient(),
         'agv2': _ServiceClient(),
     }
+    gateway._arm_resume_clients = {
+        'arm1': _ServiceClient(),
+        'arm2': _ServiceClient(),
+    }
     return gateway
 
 
@@ -67,14 +71,21 @@ def test_arm_dispatch_is_rejected_while_emergency_is_latched():
         })
 
 
-def test_emergency_release_does_not_send_new_arm_motion():
+def test_emergency_release_resumes_both_dispatchers_without_arm_motion():
     gateway = _gateway()
     gateway._emergency_targets.add('fleet')
     stopped = []
+    resumed = []
     gateway.stop_arm = lambda arm_id: stopped.append(arm_id)
+    gateway.resume_arm = lambda arm_id: (
+        resumed.append(arm_id)
+        or {'accepted': True, 'message': 'ready'}
+    )
 
     result = gateway.set_emergency('fleet', False)
 
     assert stopped == []
+    assert resumed == ['arm1', 'arm2']
     assert result['arm_commands_blocked'] is False
-    assert result['arms'] == {}
+    assert result['arms']['arm1']['resumed'] is True
+    assert result['arms']['arm2']['resumed'] is True
