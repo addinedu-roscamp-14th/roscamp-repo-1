@@ -27,3 +27,11 @@ def test_arm2_service_servers_are_allowed_as_central_clients():
 
     assert arm2 <= central
     assert '/arm2/transfer_to_slot' in arm2
+
+
+def test_arm_publishers_are_allowed_as_central_subscribers():
+    central = _service_routes('zenoh_central.json5', 'subscribers')
+
+    for filename in ('zenoh_arm1.json5', 'zenoh_arm2.json5'):
+        publishers = _service_routes(filename, 'publishers')
+        assert publishers <= central

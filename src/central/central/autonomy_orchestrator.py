@@ -176,8 +176,7 @@ class AutonomyOrchestrator(Node):
                 or self.arm1_cache_probe_pending
             )
             probe_arm2 = not (
-                self.arm2_cache_probe_complete
-                or self.arm2_cache_probe_pending
+                self.arm2_cache_probe_pending
             )
         if probe_arm1 and self.arm1_cache_status_client.wait_for_service(
             timeout_sec=0.0
@@ -224,6 +223,8 @@ class AutonomyOrchestrator(Node):
             return
         ready = bool(response.success)
         with self.lock:
+            previous_complete = self.arm2_cache_probe_complete
+            previous_ready = self.arm2_cache_ready
             self.arm2_cache_probe_pending = False
             self.arm2_cache_probe_complete = True
             self.arm2_cache_ready = ready
@@ -232,11 +233,12 @@ class AutonomyOrchestrator(Node):
                 and self.get_parameter('auto_scan_arm2_on_start').value
             )
             self.arm2_scan_retry_not_before = 0.0
-        self._publish_status(
-            'ARM2_DESTINATION_CACHE_READY'
-            if ready else 'ARM2_DESTINATION_SCAN_REQUIRED',
-            note=str(response.message),
-        )
+        if not previous_complete or previous_ready != ready:
+            self._publish_status(
+                'ARM2_DESTINATION_CACHE_READY'
+                if ready else 'ARM2_DESTINATION_SCAN_REQUIRED',
+                note=str(response.message),
+            )
 
     def _on_port_event(self, message):
         if message.event_type == PortEvent.VESSEL_DEPARTED:
@@ -473,18 +475,28 @@ class AutonomyOrchestrator(Node):
         success = bool(result.success)
         with self.lock:
             self.scan_requested = False
-            self.arm2_cache_ready = success
+            # A refresh scan must not erase an already validated cache.  The
+            # ARM2 service is continuously probed and remains the authority
+            # for whether the saved destination markers still exist.
+            self.arm2_cache_ready = bool(
+                self.arm2_cache_ready or success
+            )
             self.arm2_cache_probe_complete = True
-            self.scan_retry_pending = not success
+            self.scan_retry_pending = not self.arm2_cache_ready
             self.arm2_scan_retry_not_before = (
-                0.0 if success
+                0.0 if self.arm2_cache_ready
                 else time.monotonic() + self.arm2_scan_retry_sec
             )
-        if success:
+            cache_ready = self.arm2_cache_ready
+        if cache_ready:
             self._publish_status(
                 'WAITING_FOR_CARGO_POLICY',
                 mission_id,
-                note='ARM2 destination cache ready',
+                note=(
+                    'ARM2 destination cache ready'
+                    if success
+                    else 'ARM2 refresh scan failed; existing cache retained'
+                ),
             )
         else:
             self._publish_status(

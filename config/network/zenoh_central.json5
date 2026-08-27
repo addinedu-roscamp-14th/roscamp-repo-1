@@ -17,7 +17,8 @@
         "publishers": [
           "/agv[12]/initialpose",
           "/agv[12]/goal_pose",
-          "/agv[12]/cmd_vel_manual"
+          "/agv[12]/cmd_vel_manual",
+          "/agv[12]/cmd_vel_parking"
         ],
         "subscribers": [
           "/tf",

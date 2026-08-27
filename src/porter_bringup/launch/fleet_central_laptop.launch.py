@@ -103,8 +103,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'b1_exit_manual_turn',
-            default_value='true',
-            description='Use safety-gated AMCL-verified rotation at B-1',
+            default_value='false',
+            description=(
+                'Bypass Nav2 costmap checking for the B-1 turn; diagnostic '
+                'fallback only'
+            ),
         ),
         DeclareLaunchArgument(
             'b1_exit_turn_speed_rps',

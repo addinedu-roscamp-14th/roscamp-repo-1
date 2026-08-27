@@ -38,7 +38,8 @@
           "/agv1/shared_amcl_pose",
           "/agv2/initialpose",
           "/agv2/goal_pose",
-          "/agv2/cmd_vel_manual"
+          "/agv2/cmd_vel_manual",
+          "/agv2/cmd_vel_parking"
         ],
         "service_servers": [
           "/agv2/safety_hold",

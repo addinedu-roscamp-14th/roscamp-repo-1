@@ -72,6 +72,13 @@ map -> agv1/odom -> agv1/base_footprint -> agv1/base_link
 Nav2의 최종 속도는 `/<vehicle_id>/cmd_vel_safe_input`으로 전달되어 Pinky 안전
 게이트를 거칩니다.
 
+주차의 마지막 후진은 좁은 포켓 때문에 저속 직접 제어를 사용하지만, 시간 경과만으로
+성공 처리하지 않습니다. 후진 종료 뒤 최신 AMCL 자세와 `parked` 기준점을 비교하여
+`parked_xy_tolerance`(기본 `0.035m`) 안에 실제로 도달한 경우에만
+`ParkInSpot` 성공을 반환합니다. 미도달 차량은 중앙에서
+`PARKING_INCOMPLETE`로 표시되고 일반 운송에 재배차되지 않으며, 새 주차 요청으로
+다시 시도할 수 있습니다.
+
 ### 상대 AGV 가상 장애물
 
 다중 차량 launch는 기본적으로 상대 차량의 AMCL 위치를 각 차량의 local 및 global

@@ -384,6 +384,22 @@ class ParkingActionServer(Node):
         return True
 
     def execute_callback(self, goal_handle):
+        """Run one parking command and always restore Nav2's strict yaw gate."""
+        try:
+            return self._execute_parking(goal_handle)
+        finally:
+            # Intermediate parking waypoints temporarily accept any yaw.  A
+            # skipped/direct final approach used to leave that 2*pi value in
+            # controller_server, so later A-zone goals completed without
+            # turning to their requested heading.
+            if not self.set_yaw_goal_tolerance(
+                self.strict_yaw_goal_tolerance
+            ):
+                self.get_logger().error(
+                    'Failed to restore strict Nav2 yaw tolerance after parking'
+                )
+
+    def _execute_parking(self, goal_handle):
         self.last_error_message = ''
         spot_id = goal_handle.request.spot_id
         self.publish_feedback(goal_handle, 'loading_spot', 0.0)
@@ -467,6 +483,25 @@ class ParkingActionServer(Node):
 
         if not self.reverse_to_parked(goal_handle, parked, reverse_distance):
             return self.abort(goal_handle, 'Failed while reversing into parking spot')
+
+        # The reverse leg is time based because Nav2 cannot safely enter the
+        # tight parking pocket.  Motor load, a safety-gate hold, or wheel slip
+        # can therefore make the commanded duration end before the vehicle is
+        # physically parked.  Do not report success until a fresh pose proves
+        # that the calibrated final position was actually reached.
+        if not self.wait_for_pose(goal_handle, timeout_sec=2.0):
+            return self.abort(
+                goal_handle,
+                f'No pose received from {self.amcl_pose_topic} after reverse',
+            )
+        final_xy_error = self.distance_to_parked(parked)
+        if final_xy_error > self.parked_xy_tolerance:
+            return self.abort(
+                goal_handle,
+                'Final parking position error is too large: '
+                f'{final_xy_error:.3f} m > '
+                f'{self.parked_xy_tolerance:.3f} m',
+            )
 
         final_yaw = quaternion_to_yaw(self.latest_pose.orientation)
         final_yaw_error = abs(normalize_angle(final_yaw - parked['yaw']))

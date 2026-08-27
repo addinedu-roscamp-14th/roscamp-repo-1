@@ -201,7 +201,7 @@ class PostgresInventoryWriter:
     @classmethod
     def from_environment(cls, connect):
         return cls(connect, {
-            'host': os.environ.get('PORT_INVENTORY_DB_HOST', '192.168.5.9'),
+            'host': os.environ.get('PORT_INVENTORY_DB_HOST', '192.168.5.5'),
             'port': int(os.environ.get('PORT_INVENTORY_DB_PORT', '5432')),
             'dbname': os.environ.get('PORT_INVENTORY_DB_NAME', 'port_db'),
             'user': os.environ.get('PORT_INVENTORY_DB_USER', 'postgres'),

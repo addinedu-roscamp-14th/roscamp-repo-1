@@ -72,6 +72,9 @@ class VehicleRuntime:
     # never outlive the manoeuvre.
     park_exit_inflation_restore_m: float | None = None
     park_exit_origin_xy: tuple[float, float] | None = None
+    # A failed ParkInSpot result must not be advertised as READY.  A new park
+    # request may retry it, but normal transport dispatch remains blocked.
+    parking_error: str = ''
 
 
 class _ParkingRecoveryGoalHandle:
@@ -298,10 +301,11 @@ class FleetDispatcher(Node):
         self.declare_parameter('b1_exit_forward_distance_m', 0.30)
         self.declare_parameter('b1_exit_forward_speed_mps', 0.05)
         self.declare_parameter('b1_exit_behavior_timeout_sec', 20.0)
-        # Nav2 Spin can reject the turn at the tight B-1 boundary.  Rotate via
-        # the safety-gated manual velocity input and close the loop with AMCL;
-        # translation is forbidden until the measured heading reaches target.
-        self.declare_parameter('b1_exit_manual_turn', True)
+        # B-1 can be shared with a vehicle entering its nearby parking pocket.
+        # Use Nav2 Spin by default so the complete rotation is checked against
+        # the live local costmap (including the peer-vehicle obstacle layer).
+        # The direct safety-gated turn remains an explicit diagnostic fallback.
+        self.declare_parameter('b1_exit_manual_turn', False)
         self.declare_parameter('b1_exit_turn_speed_rps', 0.25)
         # The B-1 stopping pose is close enough to the table/ship boundary that
         # DriveOnHeading can report COLLISION_AHEAD before the vehicle moves.
@@ -313,8 +317,9 @@ class FleetDispatcher(Node):
         # straight back oscillated (+21, -11, +9 deg) and ran out of
         # corrections without ever landing inside the tolerance. Every failure
         # aborted the command before the mandatory forward move could run.
-        # Turn once and advance; set true to restore closed-loop correction.
-        self.declare_parameter('b1_exit_turn_verify', False)
+        # A rejected costmap-checked spin must never be treated as a completed
+        # turn: verify the measured heading before allowing forward motion.
+        self.declare_parameter('b1_exit_turn_verify', True)
         self.declare_parameter('b1_exit_turn_tolerance_deg', 5.0)
         self.declare_parameter('b1_exit_turn_max_corrections', 2)
         self.declare_parameter('b1_exit_pose_update_timeout_sec', 3.0)
@@ -731,6 +736,9 @@ class FleetDispatcher(Node):
         self._preempted_commands = set()
         self._command_condition = threading.Condition(self._lock)
         self._command_outcomes = {}
+        self.command_result_publisher = self.create_publisher(
+            String, '/central/fleet/command_results', 10
+        )
         self._pending_parks = {}
         self._zone_condition = threading.Condition(self._lock)
         self._zone_owner = {zone_id: '' for zone_id in self.exclusive_zone_ids}
@@ -782,10 +790,13 @@ class FleetDispatcher(Node):
         self.local_costmap_clear_clients = {}
         self.park_exit_cmd_publishers = {}
         for vehicle_id in vehicle_ids:
-            # cmd_vel_safety_gate feeds this into the vehicle's cmd_vel, so the
-            # emergency and collision latches still gate the exit crawl.
+            # Direct parking/B-1 exit motion must use the same priority input
+            # as parking_new.  cmd_vel_manual shares the normal gate slot with
+            # velocity_smoother, whose periodic zero commands can otherwise
+            # erase this crawl before it reaches the wheels.  Emergency and
+            # collision holds still stop cmd_vel_parking in the safety gate.
             self.park_exit_cmd_publishers[vehicle_id] = self.create_publisher(
-                Twist, f'/{vehicle_id}/cmd_vel_manual', 10
+                Twist, f'/{vehicle_id}/cmd_vel_parking', 10
             )
             costmap_node = f'/{vehicle_id}/local_costmap/local_costmap'
             self.local_costmap_set_param_clients[vehicle_id] = (
@@ -1095,6 +1106,7 @@ class FleetDispatcher(Node):
         return (
             self._vehicle_operational(vehicle_id, require_waypoints)
             and not self.vehicles[vehicle_id].busy
+            and not self.vehicles[vehicle_id].parking_error
         )
 
     def _vehicle_operational(self, vehicle_id, require_waypoints=False):
@@ -1133,6 +1145,8 @@ class FleetDispatcher(Node):
             reasons.append('busy')
         if runtime.emergency:
             reasons.append('emergency stopped')
+        if runtime.parking_error:
+            reasons.append(f'parking incomplete: {runtime.parking_error}')
         if not self.nav_pose_clients[vehicle_id].server_is_ready():
             reasons.append('NavigateToPose unavailable')
         elif (
@@ -1440,6 +1454,15 @@ class FleetDispatcher(Node):
                 command_id, []
             )
             self._command_condition.notify_all()
+        publisher = getattr(self, 'command_result_publisher', None)
+        if publisher is not None and command_id:
+            message = String()
+            message.data = json.dumps({
+                'command_id': str(command_id),
+                'success': bool(succeeded),
+                'completed_at': time.time(),
+            })
+            publisher.publish(message)
         if succeeded:
             for vehicle_id in pending_parks:
                 self.executor.create_task(
@@ -3361,7 +3384,11 @@ class FleetDispatcher(Node):
             vehicle_id = next(
                 (
                     candidate for candidate in candidates
-                    if self._vehicle_ready(candidate)
+                    # A parking request is also the recovery route for a
+                    # PARKING_INCOMPLETE latch. Keep normal transport blocked,
+                    # but allow this same vehicle to attempt parking again.
+                    if self._vehicle_operational(candidate)
+                    and not self.vehicles[candidate].busy
                     and self.vehicles[candidate].locked_zone
                     != self.park_zone_ids[candidate]
                 ),
@@ -3390,6 +3417,9 @@ class FleetDispatcher(Node):
                 return
             runtime = self.vehicles[vehicle_id]
             runtime.busy = True
+            # Explicit parking is the recovery path for a previous incomplete
+            # attempt, so it is allowed to clear and retry this latch.
+            runtime.parking_error = ''
             command_id = f'park-{time.time_ns()}'
             runtime.current_command_id = command_id
 
@@ -3446,6 +3476,7 @@ class FleetDispatcher(Node):
                     parking_succeeded = True
                     with self._lock:
                         runtime.park_exit_forward_completed = False
+                        runtime.parking_error = ''
                     self.get_logger().info(
                         f'{vehicle_id} parked at {spot_id} on attempt '
                         f'{attempt}/{attempts}: {result.message}'
@@ -3508,6 +3539,11 @@ class FleetDispatcher(Node):
             if acquired_zone and not parking_succeeded:
                 self._release_zone(vehicle_id, zone_id)
             with self._lock:
+                if not parking_succeeded:
+                    runtime.parking_error = (
+                        str(getattr(locals().get('result', None), 'message', ''))
+                        or 'parking action did not reach the verified final pose'
+                    )
                 runtime.busy = False
                 runtime.current_command_id = ''
 
@@ -3640,6 +3676,9 @@ class FleetDispatcher(Node):
                 elif runtime.busy:
                     state = VehicleState.BUSY
                     text = 'BUSY'
+                elif runtime.parking_error:
+                    state = VehicleState.ERROR
+                    text = f'PARKING_INCOMPLETE: {runtime.parking_error}'
                 elif nav_ready:
                     state = VehicleState.READY
                     text = 'READY'
