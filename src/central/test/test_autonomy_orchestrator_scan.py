@@ -256,6 +256,53 @@ def test_live_arm2_cache_probe_skips_startup_rescan():
     assert not orchestrator.scan_retry_pending
 
 
+def test_arm2_cache_is_reprobed_after_initial_missing_response():
+    orchestrator = make_orchestrator()
+    orchestrator.arm2_cache_probe_complete = True
+    orchestrator.arm2_cache_probe_pending = False
+    orchestrator.arm2_cache_ready = False
+    orchestrator.arm1_cache_probe_complete = True
+    orchestrator.arm1_cache_probe_pending = False
+    calls = []
+
+    class CacheClient:
+        @staticmethod
+        def wait_for_service(timeout_sec=0.0):
+            return True
+
+        @staticmethod
+        def call_async(_request):
+            calls.append(True)
+            return SimpleNamespace(add_done_callback=lambda _callback: None)
+
+    orchestrator.arm2_cache_status_client = CacheClient()
+    orchestrator._probe_arm_caches()
+
+    assert calls == [True]
+    assert orchestrator.arm2_cache_probe_pending
+
+
+def test_failed_arm2_refresh_keeps_existing_valid_cache():
+    orchestrator = make_orchestrator()
+    orchestrator.arm2_cache_ready = True
+    orchestrator.scan_requested = True
+    published = []
+    orchestrator._publish_status = lambda state, *args, **kwargs: (
+        published.append((state, kwargs.get('note', '')))
+    )
+
+    orchestrator._on_scan_result(
+        'mission-1', CompletedFuture(False, 'refresh failed')
+    )
+
+    assert orchestrator.arm2_cache_ready
+    assert not orchestrator.scan_retry_pending
+    assert published == [(
+        'WAITING_FOR_CARGO_POLICY',
+        'ARM2 refresh scan failed; existing cache retained',
+    )]
+
+
 def test_empty_live_arm_caches_schedule_fresh_scans():
     orchestrator = make_orchestrator()
     orchestrator.arm1_cache_probe_complete = False

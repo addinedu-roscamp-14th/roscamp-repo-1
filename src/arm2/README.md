@@ -15,6 +15,17 @@
 `package.xml`, `setup.py`, `setup.cfg`, `README.md`, `__init__.py`는 ROS와
 Python이 요구하는 표준 파일명이므로 접두사를 붙이지 않습니다.
 
+## ROS 2 도메인
+
+arm2와 ROS 2로 통신하는 모든 컴퓨터 및 모든 터미널은 도메인 `16`을 사용합니다.
+
+```bash
+export ROS_DOMAIN_ID=16
+```
+
+UDP JSON만 수신하는 컴퓨터는 ROS 2 통신을 사용하지 않으므로 이 설정이 필요하지
+않습니다.
+
 ## 빌드
 
 ```bash
@@ -22,6 +33,7 @@ cd ~/poter_ws
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install --packages-select arm2
 source install/setup.bash
+export ROS_DOMAIN_ID=16
 ```
 
 ## 1. 장치 확인
@@ -46,6 +58,7 @@ Hand-Eye 보정 전에 2번 팔 카메라의 내부 파라미터를 별도로 �
 
 ```bash
 source install/setup.bash
+export ROS_DOMAIN_ID=16
 
 ros2 run v4l2_camera v4l2_camera_node --ros-args \
   -r __ns:=/arm2/gripper_camera \
@@ -61,6 +74,7 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
 
 ```bash
 source install/setup.bash
+export ROS_DOMAIN_ID=16
 
 ros2 run camera_calibration cameracalibrator \
   --size 10x7 \
@@ -102,6 +116,7 @@ ros2 run arm2 arm2_manual_jog --ros-args \
 
 ```bash
 source install/setup.bash
+export ROS_DOMAIN_ID=16
 
 ros2 launch arm2 arm2_handeye_charuco_calibration.launch.py \
   video_device:=/dev/video2 \
@@ -125,6 +140,7 @@ ros2 launch arm2 arm2_handeye_charuco_calibration.launch.py \
 
 ```bash
 source install/setup.bash
+export ROS_DOMAIN_ID=16
 
 ros2 run arm2 arm2_manual_jog --ros-args \
   -p serial_port:=/dev/ttyUSB0 \
@@ -156,6 +172,7 @@ config/arm2/arm2_jetcobot_eye_in_hand.calib
 
 ```bash
 source install/setup.bash
+export ROS_DOMAIN_ID=16
 
 ros2 run arm2 arm2_grasp_offset_calibrator --ros-args \
   -p output_yaml:=config/arm2/arm2_container_pick.yaml
@@ -193,6 +210,7 @@ pregrasp가 컨테이너 중심 위의 안전한 높이에 도달하는 것을 �
 
 ```bash
 source install/setup.bash
+export ROS_DOMAIN_ID=16
 
 ros2 launch arm2 arm2_container_pick_moveit.launch.py \
     camera_info_url:=config/arm2/arm2_gripper_camera_info_v2.yaml \
@@ -314,7 +332,7 @@ place_correction_xyz_m: [0.0, 0.0, 0.0]
 saved_destination_correction_xyz_m: [-0.02, -0.01, -0.005]
 id_transfer_correction_xyz_m: [0.02, 0.0, 0.0]
 id_transfer_a2_place_correction_xyz_m: [-0.015, 0.0, 0.0]
-trailer_correction_xyz_m: [-0.05, 0.0, 0.0]
+trailer_correction_xyz_m: [0.0, 0.0, 0.0]
 trailer_a3_pick_correction_xyz_m: [0.02, -0.03, 0.0]
 ```
 
@@ -344,8 +362,8 @@ trailer_a3_pick_correction_xyz_m: [0.02, -0.03, 0.0]
   반대(`-X`) 방향 15 mm입니다. 집기와 A-1/A-3 놓기는 바뀌지 않습니다.
 - `trailer_correction_xyz_m`: `/arm2/load_id0_to_trailer`부터
   `/arm2/load_id8_to_trailer`까지의 트레일러 놓기에만 적용됩니다. 따라서
-  `[-0.05, 0.0, 0.0]`은 ID 9/10 마커가 회전해도 항상 빨간 축 반대 방향으로
-  50 mm 이동합니다.
+  현재 `[0.0, 0.0, 0.0]`은 기존 빨간 축 반대 방향 30 mm 보정에서 빨간 축
+  방향으로 30 mm 이동한 위치입니다.
 - `trailer_a3_pick_correction_xyz_m`: 위 트레일러 적재 서비스가 소스
   컨테이너를 A-3에서 발견했을 때의 집기점에만 추가됩니다. 현재 값은 이미지
   기준 아래쪽인 빨간 축(`+X`) 20 mm와 왼쪽인 초록 축 반대(`-Y`) 30 mm이며,
@@ -438,8 +456,7 @@ ros2 run tf2_ros tf2_echo arm2/base_link arm2/TCP
 ## A-1/A-2/A-3 세부 목적지 저장 후 개별 이송
 
 터미널 1에서 통합 launch를 계속 실행합니다. 컨테이너 ID는 0~8이고,
-트레일러는 AMR1(agv1)이 ID 10, AMR2(agv2)가 ID 9입니다. 세부 목적지는
-다음과 같습니다.
+트레일러는 ID 9 또는 ID 10입니다. 세부 목적지는 다음과 같습니다.
 
 - A-1-1 = ID 11
 - A-1-2 = ID 12
@@ -503,8 +520,7 @@ ros2 service call /arm2/transfer_to_a3_2 std_srvs/srv/Trigger "{}"
 J1 스캔으로 찾습니다. 선택한 컨테이너와 트레일러 둘 중 하나가 안정적으로
 저장되면 두 좌표를 잠그고, 컨테이너를 집어 선택된 트레일러에 적재한 뒤
 홈으로 복귀합니다. 두 트레일러가 동시에 보이면 ID 9를 우선합니다. 이 스캔은
-기존 ID 11~16 목적지 저장값을 초기화하거나 갱신하지 않습니다. 차량별 고정
-매핑은 AMR1=10, AMR2=9이며, 물리적으로 한 차량만 A 작업 구역에 진입해야 합니다.
+기존 ID 11~16 목적지 저장값을 초기화하거나 갱신하지 않습니다.
 
 ```bash
 ros2 service call /arm2/load_id0_to_trailer std_srvs/srv/Trigger "{}"

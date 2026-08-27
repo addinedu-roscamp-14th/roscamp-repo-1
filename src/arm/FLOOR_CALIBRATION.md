@@ -3,9 +3,9 @@
 통합된 `arm_pick_place` 패키지에서 다음 값을 실기체로 교시하는
 캘리브레이션 기능입니다.
 
-- station 0/1/2/3층과 AGV 0/1층의 `검출된 ArUco base XY -> 실제 controller XY` homography
-- station 1/2/3층과 AGV 1층의 Pick 하강 절대 Z
-- station 1/2/3층과 AGV 1층의 Place 하강 절대 Z
+- station 0/1/2/3층과 AMR 0/1층의 `검출된 ArUco base XY -> 실제 controller XY` homography
+- station 1/2/3층과 AMR 1층의 Pick 하강 절대 Z
+- station 1/2/3층과 AMR 1층의 Place 하강 절대 Z
 - 이후 station/층 판별 범위를 정할 때 사용할 원본 marker XYZ/yaw 샘플
 
 이 노드는 로봇에 이동 명령을 보내지 않습니다. 모든 이동은 기존 `manual_jog`에서
@@ -47,10 +47,11 @@ ros2 run arm_pick_place manual_jog --ros-args \
 
 ```bash
 ros2 launch arm_pick_place floor_calibration.launch.py \
-  video_device:=/dev/video2 \
   target_id:=9 \
   marker_size_m:=0.020
 ```
+
+카메라는 UDEV 고정 링크 `/dev/arm_gripper_camera`를 기본 사용합니다.
 
 검출 영상은 다음 토픽에서 확인합니다.
 
@@ -73,12 +74,12 @@ ros2 param set /arm/floor_calibrator active_station station_a
 `active_surface=floor`에서는 기존 방식 그대로 `active_floor=0..3`을 사용합니다.
 바닥 마커용 0층은 XY/marker plane/H만 수집하며 자체 Pick/Place Z는 없습니다.
 
-AGV도 마커 높이에 따라 두 그룹으로 나눕니다.
+AMR도 마커 높이에 따라 두 그룹으로 나눕니다.
 
 - `agv_0`: 빈 화물칸에 부착된 지지면 마커. XY/H만 교시합니다.
-- `agv_1`: AGV에 실린 컨테이너 마커. XY/H와 Pick/Place Z를 교시합니다.
+- `agv_1`: AMR에 실린 컨테이너 마커. XY/H와 Pick/Place Z를 교시합니다.
 
-빈 AGV 화물칸 마커를 교시하려면 다음처럼 선택합니다.
+빈 AMR 화물칸 마커를 교시하려면 다음처럼 선택합니다.
 
 ```bash
 ros2 param set /arm/floor_calibrator active_surface agv
@@ -86,7 +87,7 @@ ros2 param set /arm/floor_calibrator active_floor 0
 ros2 param set /arm/floor_calibrator active_station station_agv
 ```
 
-적재된 컨테이너 마커와 AGV Pick/Place Z를 교시할 때는 `active_floor`를 1로
+적재된 컨테이너 마커와 AMR Pick/Place Z를 교시할 때는 `active_floor`를 1로
 변경합니다.
 
 ```bash
@@ -108,7 +109,7 @@ ros2 service call /arm/floor_calibration/capture_xy_pair \
 ```
 
 컨테이너 위치를 바꾼 뒤 위 과정을 같은 층에서 최소 4회, 권장 6~10회 반복합니다.
-0층, 2층, 3층도 `active_floor`를 변경해 같은 방식으로 수집합니다. AGV는
+0층, 2층, 3층도 `active_floor`를 변경해 같은 방식으로 수집합니다. AMR은
 `active_surface=agv`에서 `active_floor=0`과 `1`을 각각 수집합니다.
 
 잘못 저장한 마지막 XY 한 쌍은 다음 서비스로 제거합니다.
@@ -149,9 +150,9 @@ ros2 service call /arm/floor_calibration/capture_place_z \
 
 각 높이는 2~3회 반복 교시하면 평균과 표준편차가 YAML에 함께 저장됩니다. 물체를
 누르는 위치가 아니라 실제 그리퍼가 닫히거나 열리는 안전한 Z를 교시해야 합니다.
-AGV 1층도 Pick/Place Z를 모두 교시할 수 있습니다. station 0층과 AGV 0층은
+AMR 1층도 Pick/Place Z를 모두 교시할 수 있습니다. station 0층과 AMR 0층은
 Place support geometry이므로 두 Z 서비스 모두 명시적으로 거부합니다. station
-바닥에 놓을 때는 station 1층 `place_z_m`, 빈 AGV에 놓을 때는 AGV 1층
+바닥에 놓을 때는 station 1층 `place_z_m`, 빈 AMR에 놓을 때는 AMR 1층
 `place_z_m`을 사용합니다.
 
 ## H 계산과 결과 확인
@@ -167,7 +168,7 @@ ros2 service call /arm/floor_calibration/show_status \
 기본 결과 파일은 설치된 패키지의 `config/floor_calibration.yaml`입니다.
 `--symlink-install` 빌드에서는 소스 패키지 내부의 같은 파일에 바로 반영됩니다.
 매 캡처 직후 원본 샘플이 저장되므로 H 계산 전에 노드가 종료돼도 결과는 남습니다. 노드를 다시
-실행하면 이 파일을 자동으로 불러오므로 station B/C나 AGV 데이터를 나중에
+실행하면 이 파일을 자동으로 불러오므로 station B/C나 AMR 데이터를 나중에
 추가해도 기존 station A 데이터가 유지됩니다. 기존 YAML이 손상되었거나 형식이
 맞지 않으면 안전을 위해 노드 시작을 거부하며 파일을 덮어쓰지 않습니다.
 이전 버전에서 저장한 단일 `agv` 그룹은 시작할 때 `agv_1`로 호환 로드됩니다.

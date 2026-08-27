@@ -13,7 +13,7 @@
 - JetCobot 6축 kinematic URDF
 - USB 카메라 intrinsic calibration
 - eye-in-hand static transform calibration
-- floor/AGV homography 및 Pick/Place Z calibration
+- floor/AMR homography 및 Pick/Place Z calibration
 - floor calibration collector와 단일 ArUco 검출기
 - 캘리브레이션 작업용 `manual_jog`
 
@@ -24,23 +24,26 @@ Cartesian 동작은 `send_coords`를 한 번 전송한 뒤 `get_coords`로 직�
 수동 `/start` 호환 경로의 기본값:
 
 - Pick ArUco ID: `2`
-- Place ArUco ID: `19` (선박 2번 자리, 사용 가능 범위는 `19..23`)
+- Place ArUco ID: `19` (마커 18은 미사용, 선박 슬롯은 `19..23`)
 - Station A 관찰 각도:
   `[-86.39, 57.12, -15.46, -88.15, 7.99, -36.82]`
-- Station AGV 관찰 각도:
-  `[15.38, 35.59, -2.81, -90.96, 4.13, -37.26]`
+- Station AMR 관찰 각도:
+  `[10.98, 42.01, -30.58, -72.77, 17.31, -22.14]`
 - 관찰 순서: `station_agv(3초) -> station_a(5초)`
 - Pick nominal tool yaw: `wrap(aruco_yaw - 45도)`
 - 같은 station Place yaw: `wrap(aruco_yaw)`
-- AGV↔station 교차 Place yaw: `wrap(aruco_yaw - 45도)`
-- Safe Z: `0.220 m`
+- AMR↔station 교차 Place yaw: `wrap(aruco_yaw - 45도)`
+- Station AMR Pick/Place: ArUco yaw와 offset은 그대로 적용하되,
+  `nominal + 180도` 대칭 후보를 이용한 최소회전 선택만 비활성화
+- Safe Z: `0.250 m`부터 시작하며 좌표 도착 timeout 시에만
+  `0.240 → 0.230 → 0.220 m` 순서로 최대 3회 낮춰 재시도
 - Pick/Place XY offset: 없음
 - Parallel-gripper symmetric yaw selection: 활성화
 
 ## 동작 순서
 
 1. `작업 시작` 로그 출력
-2. Station AGV 관찰 자세로 이동하고 Pick/Place ID를 탐색
+2. Station AMR 관찰 자세로 이동하고 Pick/Place ID를 탐색
 3. 이 pose의 검출은 `agv_0`, `agv_1`만으로 판별
 4. Station A 관찰 자세로 이동하고 아직 없는 Pick/Place ID를 탐색
 5. 이 pose의 검출은 station `0`, `1`, `2`, `3`층만으로 판별
@@ -59,7 +62,8 @@ Cartesian 동작은 `send_coords`를 한 번 전송한 뒤 `get_coords`로 직�
 18. Place 결과 층의 `place_z_m`으로 하강
 19. 하드웨어 `is_moving()==0`을 연속 3회 확인
 20. 그리퍼 열기 후 선택된 Place safe Z로 상승
-21. `작업 종료` 로그 출력
+21. `WORK_COMPLETED`와 `작업 종료` 발행
+22. 후처리로 첫 번째 관찰 자세인 `station_agv`로 복귀하고 관절 도착 검증
 
 Place에서 H와 Z의 층 인덱스는 의도적으로 다릅니다.
 
@@ -91,7 +95,9 @@ candidate 2 = wrap(candidate 1 + 180도)
 Pick은 현재 로봇 yaw에서 회전량이 작은 후보를 선택합니다. Place는 선택된 Pick
 yaw에서 회전량이 작은 후보를 선택합니다. 선택된 yaw는 해당 역할의 접근·하강·상승
 전체에 동일하게 사용합니다. 두 후보의 회전량이 정확히 같으면 nominal yaw를
-선택합니다. 이 처리는 station과 관계없이 Pick과 Place 모두에 적용됩니다.
+선택합니다. 단, `station_agv`의 Pick/Place는 대칭 후보를 선택하지 않고 ArUco yaw와
+해당 offset으로 계산한 nominal yaw를 그대로 사용합니다. Station A는 기존처럼 두
+후보 중 회전량이 작은 yaw를 선택합니다.
 
 마커 검출은 관찰 자세에서만 활성화됩니다. 이후 Pick/Place 도중에는 처음 동결한
 좌표만 사용합니다.
@@ -110,11 +116,14 @@ source install/setup.bash
 
 ros2 launch arm_pick_place container_pick_place.launch.py \
   serial_port:=/dev/ttyUSB0 \
-  video_device:=/dev/video2 \
   marker_size_m:=0.020
 ```
 
-Floor/AGV 재교시는 [FLOOR_CALIBRATION.md](FLOOR_CALIBRATION.md)를 따릅니다.
+그리퍼 카메라는 UDEV 규칙으로 생성되는 고정 링크
+`/dev/arm_gripper_camera`를 기본 사용합니다. USB를 다시 연결해 커널의
+`/dev/videoN` 번호가 바뀌어도 launch 인자는 변경하지 않습니다.
+
+Floor/AMR 재교시는 [FLOOR_CALIBRATION.md](FLOOR_CALIBRATION.md)를 따릅니다.
 교시 결과는 이 패키지의 `config/floor_calibration.yaml`에 저장되며 Pick/Place
 launch가 같은 파일을 기본으로 읽습니다.
 
@@ -133,7 +142,7 @@ ros2 launch arm_pick_place container_pick_place.launch.py \
 ```bash
 ros2 service call /arm/pick_place/execute \
   porter_interfaces/srv/ExecutePickPlace \
-  "{pick_id: 2, place_id: 19}"
+  "{pick_id: 2, place_id: 10}"
 ```
 
 `pick_id`와 `place_id`는 매 요청마다 변경할 수 있으며 coordinator는 검출기가
@@ -141,7 +150,7 @@ ros2 service call /arm/pick_place/execute \
 두 ID를 지정하지 않습니다.
 
 차량 트레일러 마커는 AMR1(agv1)=10, AMR2(agv2)=9로 고정합니다. 선박 배치
-사용 가능한 선박 마커는 19~23이며, 마커 18은 사용하지 않고 트레일러 마커와도
+마커 18은 사용하지 않으며 선박 배치 마커는 19~23입니다. 트레일러 마커와
 혼용하지 않습니다.
 
 현재 기본 ID로 수동 작업 시작:
@@ -170,6 +179,18 @@ ros2 topic echo /arm/pick_place/status
 ros2 topic echo /arm/pick_place/work_state \
   --qos-durability transient_local \
   --qos-reliability reliable
+```
+19~23 선박 슬롯 스캔:
+
+```bash
+ros2 service call /arm/pick_place/scan_ship_destinations \
+  std_srvs/srv/Trigger "{}"
+```
+0~8 컨테이너 스캔(WORk_COMPLETED 이후):
+
+```bash
+ros2 service call /arm/pick_place/scan_inbound \
+  std_srvs/srv/Trigger "{}"
 ```
 
 `work_state`는 `std_msgs/msg/String`이며 Reliable + Transient Local QoS로 마지막
@@ -200,6 +221,9 @@ WORK_STARTED -> SEARCHING -> PICK_STARTED -> PICK_COMPLETED
 
 `PICK_COMPLETED`는 그리퍼를 닫고 Pick safe Z까지 상승한 뒤 발행합니다.
 `PLACE_COMPLETED`는 그리퍼를 열고 Place safe Z까지 상승한 뒤 발행합니다.
+Place가 완료되면 즉시 `WORK_COMPLETED`를 발행합니다. 그 후 후처리로 첫 번째
+관찰 자세(`station_agv`, `calibration_surface=agv`)에 복귀합니다. 복귀 실패는
+이미 완료된 물류 작업을 `FAILED`로 뒤집지 않고 `WORK_COMPLETED`를 유지합니다.
 오류가 발생하면 즉시 `FAILED`, stop 서비스가 호출되면 `STOP_REQUESTED`와
 `STOPPED`를 발행합니다.
 
@@ -220,7 +244,7 @@ ros2 run rqt_image_view rqt_image_view \
 stations_json: >-
   [{"name":"station_agv",
     "calibration_surface":"agv",
-    "joint_angles_deg":[15.38,35.59,-2.81,-90.96,4.13,-37.26],
+    "joint_angles_deg":[10.98,42.01,-30.58,-72.77,17.31,-22.14],
     "timeout_sec":3.0},
    {"name":"station_a",
     "calibration_surface":"station",
@@ -236,9 +260,9 @@ stations_json: >-
 base-frame 좌표는 유지하고 이후 pose에서는 누락된 ID만 찾습니다. 전 pose를 확인한
 뒤에도 하나라도 없으면 로봇을 정지하고 실패 로그를 출력합니다. 따라서 Pick과
 Place가 서로 다른 station에서 발견되어도 스캔 완료 후 두 위치 사이를 이동합니다.
-AGV의 `agv_0`, `agv_1` H가 아직 모두 교시되지 않았다면 AGV pose에는 이동하지만
-그 surface의 분류는 안전하게 건너뜁니다. 두 AGV 레벨을 fit/save한 다음 실행하면
-코드나 pose 설정을 다시 바꾸지 않고 AGV 검출이 활성화됩니다.
+AMR의 `agv_0`, `agv_1` H가 아직 모두 교시되지 않았다면 AMR pose에는 이동하지만
+그 surface의 분류는 안전하게 건너뜁니다. 두 AMR 레벨을 fit/save한 다음 실행하면
+코드나 pose 설정을 다시 바꾸지 않고 AMR 검출이 활성화됩니다.
 
 ## 적용된 안전 검사
 

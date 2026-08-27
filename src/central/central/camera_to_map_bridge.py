@@ -130,8 +130,8 @@ class CameraToMapBridge(Node):
         self.declare_parameter('frame_id', 'map')
         self.declare_parameter('minimum_direction_distance', 0.02)
         self.declare_parameter('validate_calibration_map', True)
-        self.declare_parameter('b1_camera_left_offset_m', 0.15)
-        self.declare_parameter('b1_camera_down_offset_m', 0.09)
+        self.declare_parameter('b1_camera_left_offset_m', 0.17)
+        self.declare_parameter('b1_camera_down_offset_m', 0.02)
         self.declare_parameter('b1_waiting_distance_m', 0.25)
         self.declare_parameter(
             'b1_waiting_camera_down_offset_m', 0.11

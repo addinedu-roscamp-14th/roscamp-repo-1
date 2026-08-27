@@ -3,12 +3,12 @@
 import math
 
 from arm2.arm2_jetcobot_trajectory_bridge import (
-    JetCobotTrajectoryBridge,
     adaptive_joint_command_degrees,
     clamp_measured_joints_for_planning,
     cumulative_joint_travel_degrees,
     duration_seconds,
     interpolate_positions,
+    JetCobotTrajectoryBridge,
     joint_errors_degrees,
     validate_home_angles,
 )
@@ -111,12 +111,12 @@ def test_validate_home_angles_rejects_wrong_length_and_limit():
         validate_home_angles([0.0, 0.0, 0.0, 0.0, 161.0, 0.0])
 
 
-def test_j6_is_limited_to_plus_or_minus_150_degrees():
+def test_j6_is_limited_to_plus_or_minus_155_degrees():
     positions = [0.0] * 6
-    positions[5] = math.radians(150.0)
+    positions[5] = math.radians(155.0)
     JetCobotTrajectoryBridge._validate_joint_limits(positions)
 
-    positions[5] = math.radians(150.1)
+    positions[5] = math.radians(155.1)
     with pytest.raises(RuntimeError, match='J6 target'):
         JetCobotTrajectoryBridge._validate_joint_limits(positions)
 

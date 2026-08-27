@@ -1550,6 +1550,14 @@ class RealtimeLLMAgent:
             vehicle = (((fleet_status.get('telemetry') or {}).get(
                 'vehicles', {}
             )).get(move.get('_vehicle_id')) or {})
+            navigation_result = (
+                telemetry.get('navigation_results') or {}
+            ).get(command_id)
+            if navigation_result and navigation_result.get('success') is False:
+                return (
+                    'failed',
+                    f'{move.get("_vehicle_id")} 이동 명령 {command_id} 실패',
+                )
             if str(vehicle.get('state')).upper() in {'ERROR', 'FAILED'}:
                 return 'failed', f'{move.get("_vehicle_id")} 이동 실패'
             age = time.time() - float(move.get('_dispatched_at') or 0.0)
@@ -1607,6 +1615,13 @@ class RealtimeLLMAgent:
                         )
                     except Exception as exc:
                         return 'failed', str(exc)
+                    return 'waiting', ''
+                # A zone lock is acquired before the final Nav2 alignment.
+                # READY + locked_zone alone can therefore be observed in the
+                # dispatch gap and must never release the following ARM step.
+                if not navigation_result or (
+                    navigation_result.get('success') is not True
+                ):
                     return 'waiting', ''
             elif step['type'] == 'park_command' and not (
                 locked.startswith('PARK') or not locked

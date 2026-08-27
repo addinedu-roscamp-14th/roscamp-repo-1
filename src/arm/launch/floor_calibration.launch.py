@@ -69,7 +69,6 @@ def generate_launch_description():
         package_share / 'urdf' / 'jetcobot_kinematics.urdf'
     ).read_text(encoding='utf-8')
     arguments = [
-        DeclareLaunchArgument('video_device', default_value='/dev/video2'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value=str(
@@ -151,7 +150,7 @@ def generate_launch_description():
         name='floor_calibration_camera',
         output='screen',
         parameters=[{
-            'video_device': LaunchConfiguration('video_device'),
+            'video_device': '/dev/arm_gripper_camera',
             'image_size': [640, 480],
             'time_per_frame': [1, 10],
             'pixel_format': 'YUYV',

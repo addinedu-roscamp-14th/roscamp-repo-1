@@ -1,5 +1,6 @@
 import json
 import math
+from pathlib import Path
 import threading
 import time
 
@@ -19,6 +20,9 @@ from central.fleet_dispatcher import (
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 import pytest
+
+
+ROOT = Path(__file__).parents[1]
 from std_msgs.msg import String
 
 
@@ -1179,6 +1183,15 @@ def test_open_loop_exit_drives_forward_then_stops():
     assert commands[-1] == 0.0
 
 
+def test_direct_exit_uses_the_priority_parking_velocity_topic():
+    source = (ROOT / 'central' / 'fleet_dispatcher.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert "f'/{vehicle_id}/cmd_vel_parking'" in source
+    assert "Twist, f'/{vehicle_id}/cmd_vel_manual', 10" not in source
+
+
 def test_open_loop_exit_stops_on_an_emergency_latch():
     dispatcher = make_open_loop_dispatcher()
     dispatcher.vehicles['agv1'].emergency = True
@@ -1266,3 +1279,30 @@ def test_b1_manual_turn_waits_for_measured_ninety_degrees_before_success():
     assert all(value == 0.0 for value in (
         dispatcher.park_exit_cmd_publishers['agv1'].commands
     ))
+
+
+def test_b1_exit_defaults_to_costmap_checked_nav2_spin():
+    dispatcher_source = (ROOT / 'central' / 'fleet_dispatcher.py').read_text(
+        encoding='utf-8'
+    )
+    launch_source = (
+        ROOT.parent / 'porter_bringup' / 'launch'
+        / 'fleet_central_laptop.launch.py'
+    ).read_text(encoding='utf-8')
+
+    assert "declare_parameter('b1_exit_manual_turn', False)" in (
+        dispatcher_source
+    )
+    assert "declare_parameter('b1_exit_turn_verify', True)" in (
+        dispatcher_source
+    )
+    argument = launch_source.index("'b1_exit_manual_turn'")
+    assert "default_value='false'" in launch_source[argument:argument + 400]
+
+
+def test_incomplete_parking_is_not_advertised_as_ready():
+    dispatcher = make_dispatcher()
+    runtime = dispatcher.vehicles['agv1']
+    runtime.parking_error = 'final pose mismatch'
+
+    assert not FleetDispatcher._vehicle_ready(dispatcher, 'agv1')

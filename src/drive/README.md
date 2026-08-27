@@ -72,15 +72,22 @@ map -> agv1/odom -> agv1/base_footprint -> agv1/base_link
 Nav2의 최종 속도는 `/<vehicle_id>/cmd_vel_safe_input`으로 전달되어 Pinky 안전
 게이트를 거칩니다.
 
-### 상대 AGV 가상 장애물
+주차의 마지막 후진은 좁은 포켓 때문에 저속 직접 제어를 사용하지만, 시간 경과만으로
+성공 처리하지 않습니다. 후진 종료 뒤 최신 AMCL 자세와 `parked` 기준점을 비교하여
+`parked_xy_tolerance`(기본 `0.035m`) 안에 실제로 도달한 경우에만
+`ParkInSpot` 성공을 반환합니다. 미도달 차량은 중앙에서
+`PARKING_INCOMPLETE`로 표시되고 일반 운송에 재배차되지 않으며, 새 주차 요청으로
+다시 시도할 수 있습니다.
+
+### 상대 AMR 가상 장애물
 
 다중 차량 launch는 기본적으로 상대 차량의 AMCL 위치를 각 차량의 local 및 global
 costmap에 가상 장애물로 추가합니다. local costmap은 근접 충돌을 막고, global
 costmap은 planner가 상대 차량을 우회하는 경로를 다시 생성하게 합니다.
 
 ```text
-AGV1 AMCL -> /agv1/shared_amcl_pose -> AGV2 obstacle node
-AGV2 AMCL -> /agv2/shared_amcl_pose -> AGV1 obstacle node
+AMR1 AMCL -> /agv1/shared_amcl_pose -> AMR2 obstacle node
+AMR2 AMCL -> /agv2/shared_amcl_pose -> AMR1 obstacle node
 ```
 
 `amcl_pose_heartbeat` 노드는 자기 AMCL 위치를 주기적으로 공유하고,
@@ -128,8 +135,8 @@ ros2 topic hz /agv1/other_robot_obstacle
 ros2 topic hz /agv2/other_robot_obstacle
 ```
 
-차량별 DDS domain이 분리된 Zenoh 구성에서는 AGV1 bridge가
-`/agv2/shared_amcl_pose`, AGV2 bridge가 `/agv1/shared_amcl_pose`를
+차량별 DDS domain이 분리된 Zenoh 구성에서는 AMR1 bridge가
+`/agv2/shared_amcl_pose`, AMR2 bridge가 `/agv1/shared_amcl_pose`를
 subscriber로 허용해야 합니다. 저장소의 `config/network/zenoh_agv1.json5`와
 `zenoh_agv2.json5`에 이 설정이 포함되어 있습니다.
 
@@ -232,7 +239,7 @@ Nav2 action status와 `/amcl_pose`를 감시해 자율주행 시작/종료 이�
 
 시작 시 현재 위치가 `start_position_1_x/y` 반경 `start_position_tolerance_m` 안이면
 `start_type`을 `position_1`로, 아니면 `other`로 발행합니다. 기본 `position_1`은
-AGV2 `parking_yellow`의 최종 주차 좌표인 `x=1.635464`, `y=0.168810`입니다.
+AMR2 `parking_yellow`의 최종 주차 좌표인 `x=1.635464`, `y=0.168810`입니다.
 시작/종료 시 현재 위치가 `params/navigation_areas.yaml`에 등록된 좌표 반경 안인지 검사해
 `current_area`와 `matched_area`를 함께 발행합니다. 기본 area는
 `A:0.192099:0.043845`, `B:0.200000:0.100000`,
@@ -288,13 +295,13 @@ Nav2 `NavigateToPose` goal로 순차 실행합니다. 마지막 구간은 `parke
 설정: params/parking_spots.yaml
 ```
 
-현재 AGV1 기본 접근값과 AGV2 캘리브레이션값:
+현재 AMR1 기본 접근값과 AMR2 캘리브레이션값:
 
 ```text
 approach: x=1.218242, y=0.375254, yaw=-3.095542
 auto pre-approach: x=1.392214, y=0.261071, yaw=-3.095542
-AGV2 approach: x=1.365431, y=0.176245, yaw=-3.136509
-AGV2 parked: x=1.635464, y=0.168810, yaw=-3.098530
+AMR2 approach: x=1.365431, y=0.176245, yaw=-3.136509
+AMR2 parked: x=1.635464, y=0.168810, yaw=-3.098530
 reverse_distance_m: 0.476720       # [m] 약 47.7 cm 고정 후진
 reverse_speed: 0.095344            # [m/s] 약 5.0초 후진
 ```
@@ -460,7 +467,7 @@ strict_yaw_goal_tolerance: 0.05    # [rad] 최종 approach yaw 허용 오차
 
 각 주차 위치에는 `auto_pre_approach_distance_m`과 `reverse_distance_m`을
 선택적으로 지정할 수 있습니다. 생략하면 위 노드 기본값을 사용합니다.
-`parking_yellow`는 AGV2에서 측정한 접근 자세로 바로 이동한 뒤 약 `0.270 m`를
+`parking_yellow`는 AMR2에서 측정한 접근 자세로 바로 이동한 뒤 약 `0.270 m`를
 후진하도록 별도로 설정되어 있습니다.
 
 ## 한 번에 실행

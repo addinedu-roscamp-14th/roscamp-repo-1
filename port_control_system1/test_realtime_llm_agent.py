@@ -851,6 +851,80 @@ def test_missing_navigation_command_is_resent_when_not_arrived():
     assert move['_current_command_id'] == ''
 
 
+def test_a_navigation_does_not_advance_before_exact_command_result():
+    agent = object.__new__(RealtimeLLMAgent)
+    move = {
+        'container_id': '6',
+        '_vehicle_id': 'agv1',
+        '_steps': [{
+            'type': 'zone_navigation', 'zone': 'A',
+            'vehicle_id': 'agv1',
+        }],
+        '_step_index': 0,
+        '_current_command_id': 'nav-aligning',
+        '_dispatched_at': time.time() - 2.0,
+        '_nav_missing_since': 0.0,
+        '_step_retry_counts': {},
+    }
+    agent._cycle = SimpleNamespace(active_move=move)
+    status = {'telemetry': {
+        'vehicles': {'agv1': {
+            'state': 'READY',
+            'current_command_id': '',
+            'locked_zone': 'A',
+        }},
+        'navigation_results': {},
+    }}
+    inventory = {'cargos': [{
+        'container_id': '6', 'location': 'AMR1', 'floor': 1,
+    }]}
+
+    outcome, detail = agent._advance_active_move(None, status, inventory)
+
+    assert (outcome, detail) == ('waiting', '')
+    assert move['_step_index'] == 0
+
+
+def test_a_navigation_advances_after_exact_success_result():
+    agent = object.__new__(RealtimeLLMAgent)
+    move = {
+        'container_id': '6',
+        'destination_location': 'A-1-1',
+        '_vehicle_id': 'agv1',
+        '_steps': [{
+            'type': 'zone_navigation', 'zone': 'A',
+            'vehicle_id': 'agv1',
+        }],
+        '_step_index': 0,
+        '_current_command_id': 'nav-aligned',
+        '_dispatched_at': time.time() - 2.0,
+        '_nav_missing_since': 0.0,
+        '_step_retry_counts': {},
+    }
+    agent._cycle = SimpleNamespace(active_move=move)
+    agent._save_cycle = lambda: None
+    status = {'telemetry': {
+        'vehicles': {'agv1': {
+            'state': 'READY',
+            'current_command_id': '',
+            'locked_zone': 'A',
+        }},
+        'navigation_results': {
+            'nav-aligned': {
+                'command_id': 'nav-aligned', 'success': True,
+            },
+        },
+    }}
+    inventory = {'cargos': [{
+        'container_id': '6', 'location': 'A-1-1', 'floor': 1,
+    }]}
+
+    outcome, detail = agent._advance_active_move(None, status, inventory)
+
+    assert (outcome, detail) == ('completed', '')
+    assert move['_step_index'] == 1
+
+
 def test_navigation_resends_stop_at_finite_limit():
     agent = object.__new__(RealtimeLLMAgent)
     agent.nav_command_retry_grace_sec = 1.0

@@ -237,7 +237,7 @@ export PORT_CONTROL_API_TOKEN='porter1234'
 export OLLAMA_HOST='http://agent.sds.codes'
 export LOCAL_LLM_MODEL='gemma4:31b'
 
-export PORT_INVENTORY_DB_HOST='192.168.5.'
+export PORT_INVENTORY_DB_HOST='192.168.5.5'
 export PORT_INVENTORY_DB_PORT='5432'
 export PORT_INVENTORY_DB_NAME='port_db'
 export PORT_INVENTORY_DB_USER='postgres'

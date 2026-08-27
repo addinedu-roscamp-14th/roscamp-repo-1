@@ -22,8 +22,8 @@ from arm2.arm2_container_pick_coordinator import (
     quaternion_from_rpy_degrees,
     quaternion_to_rpy_degrees,
     stack_layer_z_offset,
-    trailer_placement_layer,
     symmetric_marker_yaw_degrees,
+    trailer_placement_layer,
     visual_servo_within_tolerance,
 )
 import numpy as np

@@ -224,14 +224,14 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'b1_camera_left_offset_m',
-            default_value='0.15',
+            default_value='0.17',
             description=(
                 'B-1 parking goal offset along camera-image left, in meters'
             ),
         ),
         DeclareLaunchArgument(
             'b1_camera_down_offset_m',
-            default_value='0.09',
+            default_value='0.02',
             description=(
                 'B-1 parking goal offset along camera-image down, in meters'
             ),

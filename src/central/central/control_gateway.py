@@ -160,6 +160,9 @@ class CentralControlGateway(Node):
             # ARM1 and ARM2 may finish concurrently, so one shared slot is not
             # sufficient for the autonomous executor to acknowledge both.
             'arm_results': {},
+            # Exact fleet command completion is required before an autonomous
+            # sequence may advance from navigation to an ARM operation.
+            'navigation_results': {},
             'inventory_sync': {
                 'state': 'OFFLINE',
                 'pending_count': 0,
@@ -246,6 +249,12 @@ class CentralControlGateway(Node):
             String,
             '/central/fleet/zones',
             self._on_zone_state,
+            10,
+        )
+        self.create_subscription(
+            String,
+            '/central/fleet/command_results',
+            self._on_navigation_result,
             10,
         )
         for arm_id in ('arm1', 'arm2'):
@@ -406,6 +415,21 @@ class CentralControlGateway(Node):
     def _on_zone_state(self, message):
         with self._lock:
             self._telemetry['b1_zone'] = message.data
+
+    def _on_navigation_result(self, message):
+        try:
+            result = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        command_id = str(result.get('command_id') or '')
+        if not command_id or not isinstance(result.get('success'), bool):
+            return
+        with self._lock:
+            results = self._telemetry.setdefault('navigation_results', {})
+            results.pop(command_id, None)
+            results[command_id] = result
+            while len(results) > 200:
+                results.pop(next(iter(results)))
 
     def _on_arm_state(self, message):
         value = {

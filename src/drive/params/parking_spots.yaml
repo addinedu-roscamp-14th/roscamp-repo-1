@@ -1,6 +1,6 @@
 parking_spots:
   park_red:
-    # AMR1 only: Nav2/costmaps are used to reach the nearby pre-approach.
+    # Nav2/costmaps are used to reach the nearby pre-approach.
     # From there, final approach + yaw alignment + reverse parking are direct
     # AMCL closed-loop motions and do not consult local/global costmaps.
     parking_maneuver_ignore_costmap: true

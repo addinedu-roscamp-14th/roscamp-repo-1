@@ -146,6 +146,10 @@ B-1 점유 차량이 B-1 이외의 목적지 명령을 받으면 최종 이동�
 추가 보정합니다. B-1 잠금이 위치 오차로 먼저 해제되는 경우를 위해 B-1 목표
 `b1_exit_detection_radius_m`(기본 `0.35m`) 안의 차량에도 같은 이탈 시퀀스를
 적용합니다.
+`Spin`은 각 차량의 로컬 코스트맵과 footprint로 회전 궤적을 검사합니다. 따라서
+주차 중인 상대 차량이나 실제 장애물이 회전 영역에 들어오면 회전은 실패하고,
+dispatcher는 뒤의 B-1 직진 및 목적지 주행을 시작하지 않습니다. 직접 속도 회전은
+`b1_exit_manual_turn:=true`로 명시한 진단 상황에서만 사용합니다.
 중앙 노드를 재시작한 경우에도 `b1_zone_map_x`, `b1_zone_map_y`로 등록된 B-1
 기준점과 각 차량의 최신 AMCL 위치를 비교해 B-1 점유 차량을 복원합니다. 따라서
 메모리 잠금이 없어도 B-1 반경 안에 있는 명령 대상 차량에는 같은 이탈 시퀀스가
@@ -162,7 +166,7 @@ B-1 이탈 회전과 전진이 중간에 재시작되지 않으며, 실제로 �
 `park_red`(구역 `PARK1`), `agv2`는 `parking_yellow`(구역 `PARK2`)입니다
 (`drive/params/parking_spots.yaml`). 서로 다른 자리라서 B-1/A처럼 FIFO 대기가
 필요 없고, 항상 자기 자리로만 갑니다. `parking_yellow`의 approach 좌표와 두
-yaw 값은 AGV2에서 측정한 전용 캘리브레이션 값입니다.
+yaw 값은 AMR2에서 측정한 전용 캘리브레이션 값입니다.
 
 `fleet_dispatcher`는 두 가지 경로로 주차를 트리거합니다.
 
@@ -684,7 +688,7 @@ target id 변경:
 
 ```bash
 ros2 run central camera_to_map_bridge --ros-args \
-  -p target_id:=AGV_goal_1
+  -p target_id:=AMR_goal_1
 ```
 
 rqt mouse 입력 토픽 변경:

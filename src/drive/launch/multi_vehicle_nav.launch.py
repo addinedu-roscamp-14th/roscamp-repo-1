@@ -304,7 +304,7 @@ def generate_launch_description():
                         'parking_spots_yaml': LaunchConfiguration(
                             'parking_spots_yaml'
                         ),
-                        'cmd_vel_topic': 'cmd_vel_safe_input',
+                        'cmd_vel_topic': 'cmd_vel_parking',
                     }],
                 ),
             ],

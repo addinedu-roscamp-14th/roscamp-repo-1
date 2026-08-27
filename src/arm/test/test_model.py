@@ -38,22 +38,48 @@ def floors():
 def observation_from_sample(floors, floor_number, index=0):
     """Create an observation from one real calibration point."""
     xyz = floors[floor_number].marker_points[index]
-    return MarkerObservation(*xyz, -94.0, 'station_a')
+    station = (
+        'station_agv'
+        if str(floor_number).startswith('agv_')
+        else 'station_a'
+    )
+    return MarkerObservation(*xyz, -94.0, station)
+
+
+def levels_for_observation(floors, observation):
+    """Mirror the coordinator's station-scoped floor classification."""
+    surface = 'agv' if observation.station == 'station_agv' else 'station'
+    return calibration_levels_for_surface(floors, surface)
+
+
+def calibrate_sample(observation, floors):
+    """Calibrate using only levels visible from the observation station."""
+    return calibrate_target(
+        observation,
+        levels_for_observation(floors, observation),
+    )
 
 
 def test_every_training_marker_is_classified_to_its_floor(floors):
     """Every captured TF point, including floor 0, retains its floor."""
     for number, floor in floors.items():
         for xyz in floor.marker_points:
-            observation = MarkerObservation(*xyz, -94.0, 'station_a')
-            result, _ = classify_floor(observation, floors)
+            station = (
+                'station_agv' if str(number).startswith('agv_')
+                else 'station_a'
+            )
+            observation = MarkerObservation(*xyz, -94.0, station)
+            result, _ = classify_floor(
+                observation,
+                levels_for_observation(floors, observation),
+            )
             assert result == number
 
 
 def test_homography_projects_an_inlier_to_taught_xy(floors):
     """A floor-1 inlier maps close to its corresponding taught XY."""
     observation = observation_from_sample(floors, 1, 0)
-    target, _ = calibrate_target(observation, floors)
+    target, _ = calibrate_sample(observation, floors)
     expected = floors[1].taught_points[0]
     assert target.marker_floor == 1
     assert target.x_m == pytest.approx(expected[0], abs=0.002)
@@ -76,10 +102,12 @@ def test_classification_rejects_a_surface_with_only_one_level(floors):
 
 def test_sequence_uses_floor_specific_pick_and_place_z(floors):
     """Place support floor N selects destination-floor N+1 Place Z."""
-    pick, _ = calibrate_target(
+    pick, _ = calibrate_sample(
         observation_from_sample(floors, 2, 0), floors
     )
-    place, _ = calibrate_target(observation_from_sample(floors, 1, 2), floors)
+    place, _ = calibrate_sample(
+        observation_from_sample(floors, 1, 2), floors
+    )
     steps = build_pick_place_steps(
         pick, place, floors, 0.200, 0.210, -45.0
     )
@@ -98,10 +126,10 @@ def test_sequence_uses_floor_specific_pick_and_place_z(floors):
 
 def test_floor_zero_support_uses_floor_one_place_z(floors):
     """A bare station marker uses H[0] and destination-floor-1 Place Z."""
-    pick, _ = calibrate_target(
+    pick, _ = calibrate_sample(
         observation_from_sample(floors, 1, 0), floors
     )
-    place, _ = calibrate_target(
+    place, _ = calibrate_sample(
         observation_from_sample(floors, 0, 0), floors
     )
 
@@ -115,10 +143,10 @@ def test_floor_zero_support_uses_floor_one_place_z(floors):
 
 def test_floor_zero_cannot_be_used_as_a_pick_height(floors):
     """Geometry-only floor 0 must not generate a Pick descent."""
-    pick, _ = calibrate_target(
+    pick, _ = calibrate_sample(
         observation_from_sample(floors, 0, 0), floors
     )
-    place, _ = calibrate_target(
+    place, _ = calibrate_sample(
         observation_from_sample(floors, 1, 0), floors
     )
 
@@ -130,10 +158,10 @@ def test_floor_zero_cannot_be_used_as_a_pick_height(floors):
 
 def test_split_sequence_separates_xy_motion_and_target_rotation(floors):
     """Fallback preserves RPY during XY moves and rotates only afterward."""
-    pick, _ = calibrate_target(
+    pick, _ = calibrate_sample(
         observation_from_sample(floors, 1, 0), floors
     )
-    place, _ = calibrate_target(
+    place, _ = calibrate_sample(
         observation_from_sample(floors, 1, 2), floors
     )
     current_rpy = (-139.09, -18.37, -143.59)
@@ -165,10 +193,10 @@ def test_split_sequence_separates_xy_motion_and_target_rotation(floors):
 
 def test_place_on_floor_three_is_rejected_without_floor_four(floors):
     """A detected third-floor support must not silently reuse floor-three Z."""
-    pick, _ = calibrate_target(
+    pick, _ = calibrate_sample(
         observation_from_sample(floors, 1, 0), floors
     )
-    place, _ = calibrate_target(
+    place, _ = calibrate_sample(
         observation_from_sample(floors, 3, 2), floors
     )
     with pytest.raises(ValueError, match='unsupported destination floor 4'):

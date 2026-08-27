@@ -16,6 +16,7 @@ from arm_pick_place.model import (
 )
 
 import pytest
+import yaml
 
 
 @pytest.fixture
@@ -39,10 +40,11 @@ def make_coordinator(floors):
     """Construct the planning subset of the ROS node."""
     coordinator = object.__new__(HomographyPickPlace)
     coordinator.floors = floors
-    coordinator.safe_z = 0.220
+    coordinator.safe_z = 0.250
     coordinator.yaw_offset = -45.0
-    coordinator.place_yaw_offset = 0.0
+    coordinator.place_yaw_offset = -45.0
     coordinator.cross_station_place_yaw_offset = -45.0
+    coordinator.disable_agv_symmetric_yaw_selection = True
     coordinator.serial_lock = threading.Lock()
     coordinator.stop_event = threading.Event()
     coordinator.statuses = []
@@ -53,6 +55,9 @@ def make_coordinator(floors):
         'minimum_safe_clearance_m': 0.020,
         'safe_z_lowering_step_m': 0.010,
         'maximum_safe_z_lowering_steps': 3,
+        'place_stop_poll_interval_sec': 0.01,
+        'place_stop_timeout_sec': 1.0,
+        'place_stop_required_samples': 1,
     }
     coordinator.parameter = parameters.__getitem__
 
@@ -66,13 +71,49 @@ def make_coordinator(floors):
 
 def make_targets(floors):
     """Use a 1-floor Pick and a 2-floor support/3-floor destination."""
+    station_floors = {
+        level: calibration
+        for level, calibration in floors.items()
+        if isinstance(level, int) and not isinstance(level, bool)
+    }
     pick, _ = calibrate_target(
-        observation_from_sample(floors, 1), floors
+        observation_from_sample(floors, 1), station_floors
     )
     place, _ = calibrate_target(
-        observation_from_sample(floors, 2), floors
+        observation_from_sample(floors, 2), station_floors
     )
     return {'pick': pick, 'place': place}
+
+
+def test_runtime_config_disables_agv_symmetric_yaw_selection():
+    """AGV symmetric yaw selection is disabled by launch-time config."""
+    config_path = (
+        Path(__file__).parents[1]
+        / 'config'
+        / 'container_pick_place.yaml'
+    )
+    parameters = yaml.safe_load(config_path.read_text())[
+        '/arm/pick_place'
+    ]['ros__parameters']
+
+    assert parameters['disable_agv_symmetric_yaw_selection'] is True
+
+
+def test_runtime_config_uses_arm1_measured_place_yaw_offsets():
+    """The integrated YAML retains ARM1's measured -45-degree offsets."""
+    config_path = (
+        Path(__file__).parents[1]
+        / 'config'
+        / 'container_pick_place.yaml'
+    )
+    parameters = yaml.safe_load(config_path.read_text())[
+        '/arm/pick_place'
+    ]['ros__parameters']
+
+    assert parameters['place_marker_yaw_offset_deg'] == pytest.approx(-45.0)
+    assert parameters[
+        'cross_station_place_yaw_offset_deg'
+    ] == pytest.approx(-45.0)
 
 
 def test_planning_skips_ik_and_starts_with_combined_approach(floors):
@@ -90,16 +131,16 @@ def test_planning_skips_ik_and_starts_with_combined_approach(floors):
     steps = coordinator.select_feasible_plan(make_targets(floors))
 
     assert len(steps) == 9
-    assert steps[1].pose[2] == pytest.approx(0.190)
+    assert steps[1].pose[2] == pytest.approx(0.250)
     assert steps[1].pose[3:] == pytest.approx((-180.0, 0.0, -139.0))
-    assert steps[4].pose[2] == pytest.approx(0.190)
-    assert steps[5].pose[2] == pytest.approx(0.210)
+    assert steps[4].pose[2] == pytest.approx(0.250)
+    assert steps[5].pose[2] == pytest.approx(0.250)
     assert any('IK precheck disabled' in text
                for text in coordinator.statuses)
 
 
-def test_same_station_place_uses_zero_yaw_offset(floors):
-    """A same-station Place aligns with marker yaw modulo 180 degrees."""
+def test_same_station_place_uses_measured_yaw_offset(floors):
+    """A same-station Place applies ARM1's measured -45-degree offset."""
     coordinator = make_coordinator(floors)
     targets = make_targets(floors)
     targets['place'] = replace(targets['place'], yaw_deg=86.0)
@@ -108,30 +149,59 @@ def test_same_station_place_uses_zero_yaw_offset(floors):
 
     assert steps[1].pose[5] == pytest.approx(-139.0)
     assert steps[2].pose[5] == pytest.approx(-139.0)
-    assert steps[5].pose[5] == pytest.approx(-94.0)
-    assert steps[6].pose[5] == pytest.approx(-94.0)
-    assert steps[8].pose[5] == pytest.approx(-94.0)
+    assert steps[5].pose[5] == pytest.approx(-139.0)
+    assert steps[6].pose[5] == pytest.approx(-139.0)
+    assert steps[8].pose[5] == pytest.approx(-139.0)
     assert any('cross_station=False' in text
                for text in coordinator.statuses)
-    assert any('place_offset=0.00' in text for text in coordinator.statuses)
+    assert any('place_offset=-45.00' in text for text in coordinator.statuses)
 
 
-@pytest.mark.parametrize(
-    ('pick_station', 'place_station'),
-    (
-        ('station_agv', 'station_a'),
-        ('station_a', 'station_agv'),
-    ),
-)
-def test_cross_station_place_uses_minus_45_degree_offset(
-    floors, pick_station, place_station
-):
-    """Crossing AGV/station applies the dedicated Place correction."""
+def test_agv_pick_uses_nominal_aruco_yaw_without_symmetric_branch(floors):
+    """AGV Pick keeps nominal ArUco yaw even when +180 is nearer."""
     coordinator = make_coordinator(floors)
     targets = make_targets(floors)
-    targets['pick'] = replace(targets['pick'], station=pick_station)
+    targets['pick'] = replace(
+        targets['pick'], station='station_agv', yaw_deg=35.0
+    )
     targets['place'] = replace(
-        targets['place'], station=place_station, yaw_deg=86.0
+        targets['place'], station='station_a', yaw_deg=86.0
+    )
+
+    steps = coordinator.select_feasible_plan(targets)
+
+    assert steps[1].pose[5] == pytest.approx(-10.0)
+    assert steps[5].pose[5] == pytest.approx(41.0)
+    assert any('pick_yaw_mode=nominal' in text
+               for text in coordinator.statuses)
+
+
+def test_agv_place_uses_nominal_aruco_yaw_without_symmetric_branch(floors):
+    """AGV Place keeps nominal ArUco yaw even when +180 is nearer."""
+    coordinator = make_coordinator(floors)
+    targets = make_targets(floors)
+    targets['pick'] = replace(targets['pick'], station='station_a')
+    targets['place'] = replace(
+        targets['place'], station='station_agv', yaw_deg=-53.0
+    )
+
+    steps = coordinator.select_feasible_plan(targets)
+
+    assert steps[1].pose[5] == pytest.approx(-139.0)
+    assert steps[5].pose[5] == pytest.approx(-98.0)
+    assert steps[6].pose[5] == pytest.approx(-98.0)
+    assert steps[8].pose[5] == pytest.approx(-98.0)
+    assert any('place_yaw_mode=nominal' in text
+               for text in coordinator.statuses)
+
+
+def test_other_different_stations_use_configured_cross_station_offset(floors):
+    """All cross-station routes use the configured measured correction."""
+    coordinator = make_coordinator(floors)
+    targets = make_targets(floors)
+    targets['pick'] = replace(targets['pick'], station='station_a')
+    targets['place'] = replace(
+        targets['place'], station='station_b', yaw_deg=86.0
     )
 
     steps = coordinator.select_feasible_plan(targets)
@@ -141,8 +211,7 @@ def test_cross_station_place_uses_minus_45_degree_offset(
     assert steps[8].pose[5] == pytest.approx(-139.0)
     assert any('cross_station=True' in text
                for text in coordinator.statuses)
-    assert any('place_offset=-45.00' in text
-               for text in coordinator.statuses)
+    assert any('place_offset=-45.00' in text for text in coordinator.statuses)
 
 
 def test_pick_is_split_only_after_combined_controller_move_fails(floors):
@@ -206,55 +275,148 @@ def test_successful_combined_pick_does_not_add_split_moves(floors):
     ]
 
 
-def test_safe_approaches_confirm_hardware_stop_before_each_descent(floors):
-    """Pick and Place may descend only after their approach has stopped."""
+def test_pick_safe_z_lowers_after_each_coordinate_timeout(floors):
+    """Pick tries 250, 240, then 230 mm and rises to the successful Z."""
     coordinator = make_coordinator(floors)
     steps = coordinator.select_feasible_plan(make_targets(floors))
-    events = []
-    coordinator.command_gripper = lambda opened: events.append(
-        ('gripper', opened)
-    )
-    coordinator.move_coords = lambda pose: events.append(('move', pose))
-    coordinator.wait_until_robot_stopped = lambda context='PLACE': (
-        events.append(('stopped', context))
-    )
 
+    class Robot:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def get_coords(self):
+            return [0.0, -180.0, 250.0, -140.0, -18.0, -143.0]
+
+        def stop(self):
+            self.stop_calls += 1
+
+    coordinator.robot = Robot()
+    coordinator.command_gripper = lambda opened: None
+    coordinator.wait_until_robot_stopped = lambda context='PLACE': None
+    commanded = []
+
+    def move_coords(pose):
+        commanded.append(pose)
+        if (
+            pose[:2] == steps[1].pose[:2]
+            and pose[2] in (0.250, 0.240)
+        ):
+            raise CoordinateMoveError('get_coords polling timed out')
+
+    coordinator.move_coords = move_coords
     coordinator.execute_steps(steps)
 
-    pick_approach = events.index(('move', steps[1].pose))
-    pick_stopped = events.index(('stopped', 'PICK safe approach'))
-    pick_descent = events.index(('move', steps[2].pose))
-    place_approach = events.index(('move', steps[5].pose))
-    place_stopped = events.index(('stopped', 'PLACE safe approach'))
-    place_descent = events.index(('move', steps[6].pose))
-    assert pick_approach < pick_stopped < pick_descent
-    assert place_approach < place_stopped < place_descent
+    assert [pose[2] for pose in commanded[:3]] == pytest.approx(
+        [0.250, 0.240, 0.230]
+    )
+    assert commanded[4][2] == pytest.approx(0.230)
+    assert coordinator.robot.stop_calls == 2
+    assert any('retrying at 240 mm' in text for text in coordinator.statuses)
+    assert any('retrying at 230 mm' in text for text in coordinator.statuses)
 
 
-def test_completion_returns_to_second_observation_pose(floors):
-    """A completed transfer returns to the ChoE home observation pose."""
+def test_place_safe_z_lowers_and_rises_to_successful_height(floors):
+    """Place retries a timed-out 250 mm approach at 240 mm."""
     coordinator = make_coordinator(floors)
-    coordinator.stations = [
-        type('Station', (), {
-            'name': 'station_agv',
-            'calibration_surface': 'agv',
-            'joint_angles_deg': (1, 2, 3, 4, 5, 6),
-        })(),
-        type('Station', (), {
-            'name': 'station_a',
-            'calibration_surface': 'station',
-            'joint_angles_deg': (6, 5, 4, 3, 2, 1),
-        })(),
+    steps = coordinator.select_feasible_plan(make_targets(floors))
+
+    class Robot:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def get_coords(self):
+            return [0.0, -180.0, 250.0, -140.0, -18.0, -143.0]
+
+        def stop(self):
+            self.stop_calls += 1
+
+    coordinator.robot = Robot()
+    coordinator.command_gripper = lambda opened: None
+    coordinator.wait_until_robot_stopped = lambda context='PLACE': None
+    commanded = []
+    place_failed = False
+
+    def move_coords(pose):
+        nonlocal place_failed
+        commanded.append(pose)
+        if pose == steps[5].pose and not place_failed:
+            place_failed = True
+            raise CoordinateMoveError('get_coords polling timed out')
+
+    coordinator.move_coords = move_coords
+    coordinator.execute_steps(steps)
+
+    place_attempts = [
+        pose for pose in commanded
+        if pose[:2] == steps[5].pose[:2]
     ]
-    coordinator.set_detection_enabled = lambda enabled: None
-    moved = []
-    coordinator.move_observation = moved.append
+    assert place_attempts[0][2] == pytest.approx(0.250)
+    assert place_attempts[1][2] == pytest.approx(0.240)
+    assert place_attempts[-1][2] == pytest.approx(0.240)
+    assert coordinator.robot.stop_calls == 1
+    assert any('retrying at 240 mm' in text for text in coordinator.statuses)
+
+
+def test_job_returns_to_second_station_observation_pose(floors):
+    """Final homing uses the second configured station-A observation pose."""
+    coordinator = make_coordinator(floors)
+    coordinator.stations = parse_stations(
+        '[{"name":"station_agv","calibration_surface":"agv",'
+        '"joint_angles_deg":[10.98,42.01,-30.58,-72.77,17.31,-22.14],'
+        '"timeout_sec":3.0},'
+        '{"name":"station_a","calibration_surface":"station",'
+        '"joint_angles_deg":[-86.39,57.12,-15.46,-88.15,7.99,-36.82],'
+        '"timeout_sec":5.0}]'
+    )
+    coordinator.active_station = ''
+    detection_states = []
+    coordinator.set_detection_enabled = detection_states.append
+    visited = []
+    coordinator.move_observation = lambda pose: visited.append(tuple(pose))
+    coordinator.wait_until_robot_stopped = lambda _context: None
+
+    coordinator.return_to_second_observation_pose()
+
+    assert coordinator.active_station == 'station_a'
+    assert detection_states == [False]
+    assert visited == [coordinator.stations[1].joint_angles_deg]
+    assert any('surface=station' in text for text in coordinator.statuses)
+
+
+def test_work_completed_is_published_before_observation_cleanup(floors):
+    """Place completion precedes the best-effort final observation move."""
+    coordinator = make_coordinator(floors)
+    events = []
+    coordinator.publish_work_state = lambda state: events.append(
+        ('state', state)
+    )
+    coordinator.publish_status = lambda status: events.append(
+        ('status', status)
+    )
+    coordinator.return_to_second_observation_pose = lambda: events.append(
+        ('cleanup', 'station_a')
+    )
 
     coordinator.complete_work_then_cleanup()
 
-    assert moved == [(6, 5, 4, 3, 2, 1)]
-    assert coordinator.work_states[-1] == 'WORK_COMPLETED'
-    assert any('작업 종료 복귀 도착' in text
+    assert events[0] == ('state', 'WORK_COMPLETED')
+    assert events[1] == ('status', '작업 종료: Place 완료')
+    assert events[2] == ('cleanup', 'station_a')
+
+
+def test_cleanup_failure_does_not_reverse_completed_work(floors):
+    """A post-work homing failure leaves the completed state intact."""
+    coordinator = make_coordinator(floors)
+
+    def fail_cleanup():
+        raise RuntimeError('homing failed')
+
+    coordinator.return_to_second_observation_pose = fail_cleanup
+
+    coordinator.complete_work_then_cleanup()
+
+    assert coordinator.work_states == ['WORK_COMPLETED']
+    assert any('WORK_COMPLETED 유지' in text
                for text in coordinator.statuses)
 
 
@@ -270,7 +432,7 @@ def test_search_scopes_agv_then_station_and_keeps_cross_station_targets(
     }
     coordinator.stations = parse_stations(
         '[{"name":"station_agv","calibration_surface":"agv",'
-        '"joint_angles_deg":[15.38,35.59,-2.81,-90.96,4.13,-37.26],'
+        '"joint_angles_deg":[10.98,42.01,-30.58,-72.77,17.31,-22.14],'
         '"timeout_sec":0.01},'
         '{"name":"station_a","calibration_surface":"station",'
         '"joint_angles_deg":[-86.39,57.12,-15.46,-88.15,7.99,-36.82],'
@@ -283,16 +445,18 @@ def test_search_scopes_agv_then_station_and_keeps_cross_station_targets(
     coordinator.statuses = []
     coordinator.publish_status = coordinator.statuses.append
     coordinator.set_detection_enabled = lambda _enabled: None
+    coordinator.wait_until_robot_stopped = lambda _context: None
     visited = []
     coordinator.move_observation = lambda pose: visited.append(tuple(pose))
-    stopped = []
-    coordinator.wait_until_robot_stopped = stopped.append
     parameters = {
         'observation_settle_sec': 0.0001,
         'maximum_floor_error_m': 0.010,
         'minimum_floor_separation_m': 0.015,
         'maximum_h_extrapolation_m': 0.025,
         'command_area_margin_m': 0.020,
+        'place_stop_poll_interval_sec': 0.01,
+        'place_stop_timeout_sec': 1.0,
+        'place_stop_required_samples': 1,
     }
     coordinator.parameter = parameters.__getitem__
 
@@ -310,10 +474,6 @@ def test_search_scopes_agv_then_station_and_keeps_cross_station_targets(
     found = coordinator.search_stations()
 
     assert len(visited) == 2
-    assert stopped == [
-        'station_agv observation',
-        'station_a observation',
-    ]
     assert found['pick'][1].station == 'station_agv'
     assert found['pick'][1].marker_floor == 'agv_1'
     assert found['place'][1].station == 'station_a'

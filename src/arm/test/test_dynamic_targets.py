@@ -10,10 +10,10 @@ from arm_pick_place.dual_aruco_pose_publisher import DualArucoPosePublisher
 
 def test_coordinator_rejects_invalid_dynamic_target_pairs():
     assert HomographyPickPlace._validate_target_ids(2, 9) == ''
-    assert 'disabled' in HomographyPickPlace._validate_target_ids(2, 18)
     assert 'different' in HomographyPickPlace._validate_target_ids(2, 2)
     assert '0..49' in HomographyPickPlace._validate_target_ids(-1, 9)
     assert '0..49' in HomographyPickPlace._validate_target_ids(2, 50)
+    assert 'disabled' in HomographyPickPlace._validate_target_ids(2, 18)
 
 
 def test_detector_switches_role_frames_to_requested_ids():
