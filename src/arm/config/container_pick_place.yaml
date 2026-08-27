@@ -13,7 +13,7 @@
     stations_json: >-
       [{"name":"station_agv",
         "calibration_surface":"agv",
-        "joint_angles_deg":[15.38,35.59,-2.81,-90.96,4.13,-37.26],
+        "joint_angles_deg":[10.98,42.01,-30.58,-72.77,17.31,-22.14],
         "timeout_sec":3.0},
        {"name":"station_a",
         "calibration_surface":"station",
@@ -21,7 +21,7 @@
         "timeout_sec":5.0}]
 
     observation_settle_sec: 1.0
-    observation_speed: 10
+    observation_speed: 50
     observation_joint_tolerance_deg: 3.0
     observation_correction_attempts: 2
 
@@ -32,7 +32,7 @@
 
     # Floor is selected by residual to z = ax + by + c learned from each
     # floor's calibration XYZ samples.
-    maximum_floor_error_m: 0.010
+    maximum_floor_error_m: 0.015
     minimum_floor_separation_m: 0.015
 
     # Reject H extrapolation and corrected coordinates outside taught areas.
@@ -41,16 +41,19 @@
     command_area_margin_m: 0.020
 
     safe_z_m: 0.220
-    # Generate 220, 210, 200, then 190 mm independently for Pick and Place,
-    # and use the lowest candidate retaining 20 mm over its taught descend Z.
+    # Try 250 mm first. On each coordinate timeout, retry at 240, 230, then
+    # 220 mm, while retaining at least 20 mm over the taught descend Z.
     safe_z_lowering_step_m: 0.010
     maximum_safe_z_lowering_steps: 3
     minimum_safe_clearance_m: 0.020
     # Place uses no extra correction within one station. Crossing between
-    # station and AGV applies the measured -45 degree correction.
+    # station A and the AGV applies the measured +90 degree correction.
     marker_yaw_offset_deg: -45.0
     place_marker_yaw_offset_deg: -45.0
     cross_station_place_yaw_offset_deg: -45.0
+    # AGV still uses ArUco yaw and the configured offset, but does not replace
+    # that nominal yaw with its +180-degree minimum-rotation alternative.
+    disable_agv_symmetric_yaw_selection: true
 
     serial_port: /dev/ttyUSB0
     baud_rate: 1000000

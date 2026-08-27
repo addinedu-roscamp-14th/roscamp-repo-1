@@ -72,7 +72,6 @@ def generate_launch_description():
     ).read_text(encoding='utf-8')
     arguments = [
         DeclareLaunchArgument('serial_port', default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument('video_device', default_value='/dev/video2'),
         DeclareLaunchArgument(
             'camera_info_url',
             default_value=str(
@@ -154,7 +153,7 @@ def generate_launch_description():
         name='pick_place_camera',
         output='screen',
         parameters=[{
-            'video_device': LaunchConfiguration('video_device'),
+            'video_device': '/dev/arm_gripper_camera',
             'image_size': [640, 480],
             'time_per_frame': [1, 10],
             'pixel_format': 'YUYV',
@@ -174,7 +173,7 @@ def generate_launch_description():
         parameters=[{
             'camera_frame_id': LaunchConfiguration('camera_frame_id'),
             'pick_marker_id': 2,
-            'place_marker_id': 19,
+            'place_marker_id': 18,
             'pick_marker_frame': 'arm/pick_marker',
             'place_marker_frame': 'arm/place_marker',
             'marker_size_m': ParameterValue(

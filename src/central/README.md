@@ -166,7 +166,7 @@ B-1 이탈 회전과 전진이 중간에 재시작되지 않으며, 실제로 �
 `park_red`(구역 `PARK1`), `agv2`는 `parking_yellow`(구역 `PARK2`)입니다
 (`drive/params/parking_spots.yaml`). 서로 다른 자리라서 B-1/A처럼 FIFO 대기가
 필요 없고, 항상 자기 자리로만 갑니다. `parking_yellow`의 approach 좌표와 두
-yaw 값은 AGV2에서 측정한 전용 캘리브레이션 값입니다.
+yaw 값은 AMR2에서 측정한 전용 캘리브레이션 값입니다.
 
 `fleet_dispatcher`는 두 가지 경로로 주차를 트리거합니다.
 
@@ -688,7 +688,7 @@ target id 변경:
 
 ```bash
 ros2 run central camera_to_map_bridge --ros-args \
-  -p target_id:=AGV_goal_1
+  -p target_id:=AMR_goal_1
 ```
 
 rqt mouse 입력 토픽 변경:

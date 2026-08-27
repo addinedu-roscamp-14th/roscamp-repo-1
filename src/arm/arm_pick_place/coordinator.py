@@ -42,6 +42,7 @@ from .model import (
     destination_level,
     load_floor_calibration,
     MarkerObservation,
+    MotionStep,
     parse_stations,
     safe_z_candidates,
     select_symmetric_yaw,
@@ -125,6 +126,9 @@ class HomographyPickPlace(Node):
         )
         self.cross_station_place_yaw_offset = float(
             self.parameter('cross_station_place_yaw_offset_deg')
+        )
+        self.disable_agv_symmetric_yaw_selection = bool(
+            self.parameter('disable_agv_symmetric_yaw_selection')
         )
         self.position_tolerance = float(
             self.parameter('position_tolerance_m')
@@ -310,6 +314,9 @@ class HomographyPickPlace(Node):
         self.declare_parameter('place_marker_yaw_offset_deg', 0.0)
         self.declare_parameter(
             'cross_station_place_yaw_offset_deg', -45.0
+        )
+        self.declare_parameter(
+            'disable_agv_symmetric_yaw_selection', True
         )
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
         self.declare_parameter('baud_rate', 1000000)
@@ -867,7 +874,7 @@ class HomographyPickPlace(Node):
                         f'destination_floor={destination}, '
                         + common
                     )
-                    if 18 <= self.place_marker_id <= 23:
+                    if 19 <= self.place_marker_id <= 23:
                         self.saved_marker_poses[self.place_marker_id] = (
                             observation, target, errors
                         )
@@ -980,8 +987,8 @@ class HomographyPickPlace(Node):
                 f'configured Place safe_z={self.safe_z:.3f} m is below '
                 f'required minimum {minimum_place_safe_z:.3f} m'
             )
-        pick_safe_z = pick_candidates[-1]
-        place_safe_z = place_candidates[-1]
+        pick_safe_z = pick_candidates[0]
+        place_safe_z = place_candidates[0]
         with self.serial_lock:
             current_coords = self.robot.get_coords()
         if not isinstance(current_coords, (list, tuple)) or len(
@@ -997,9 +1004,18 @@ class HomographyPickPlace(Node):
                 f'current yaw is non-finite: {current_yaw}'
             )
         pick_nominal_yaw = wrap_degrees(pick.yaw_deg + self.yaw_offset)
-        pick_yaw, pick_branch, pick_rotation = select_symmetric_yaw(
-            pick_nominal_yaw, current_yaw
+        pick_uses_symmetric_yaw = not (
+            self.disable_agv_symmetric_yaw_selection
+            and pick.station == 'station_agv'
         )
+        if pick_uses_symmetric_yaw:
+            pick_yaw, pick_branch, pick_rotation = select_symmetric_yaw(
+                pick_nominal_yaw, current_yaw
+            )
+        else:
+            pick_yaw = pick_nominal_yaw
+            pick_branch = 0.0
+            pick_rotation = abs(wrap_degrees(pick_yaw - current_yaw))
         cross_station = pick.station != place.station
         applied_place_offset = (
             self.cross_station_place_yaw_offset
@@ -1008,9 +1024,18 @@ class HomographyPickPlace(Node):
         place_nominal_yaw = wrap_degrees(
             place.yaw_deg + applied_place_offset
         )
-        place_yaw, place_branch, place_rotation = select_symmetric_yaw(
-            place_nominal_yaw, pick_yaw
+        place_uses_symmetric_yaw = not (
+            self.disable_agv_symmetric_yaw_selection
+            and place.station == 'station_agv'
         )
+        if place_uses_symmetric_yaw:
+            place_yaw, place_branch, place_rotation = select_symmetric_yaw(
+                place_nominal_yaw, pick_yaw
+            )
+        else:
+            place_yaw = place_nominal_yaw
+            place_branch = 0.0
+            place_rotation = abs(wrap_degrees(place_yaw - pick_yaw))
         pick = target_with_command_yaw(
             pick, pick_yaw, self.yaw_offset
         )
@@ -1021,11 +1046,15 @@ class HomographyPickPlace(Node):
             'symmetric yaw selection: '
             f'current={current_yaw:.2f}, '
             f'pick_nominal={pick_nominal_yaw:.2f}, '
+            f'pick_yaw_mode='
+            f'{"symmetric" if pick_uses_symmetric_yaw else "nominal"}, '
             f'pick_offset={self.yaw_offset:.2f}, '
             f'pick_selected={pick_yaw:.2f}, '
             f'pick_branch={pick_branch:.0f}, '
             f'pick_rotation={pick_rotation:.2f}, '
             f'place_nominal={place_nominal_yaw:.2f}, '
+            f'place_yaw_mode='
+            f'{"symmetric" if place_uses_symmetric_yaw else "nominal"}, '
             f'cross_station={cross_station}, '
             f'place_offset={applied_place_offset:.2f}, '
             f'place_selected={place_yaw:.2f}, '
@@ -1033,7 +1062,11 @@ class HomographyPickPlace(Node):
             f'place_rotation_from_pick={place_rotation:.2f}; '
             'IK precheck disabled; trying combined Pick approach first: '
             f'pick_safe_z={pick_safe_z:.3f} m, '
-            f'place_safe_z={place_safe_z:.3f} m'
+            f'place_safe_z={place_safe_z:.3f} m, '
+            f'pick_safe_z_candidates='
+            f'{[round(value, 3) for value in pick_candidates]}, '
+            f'place_safe_z_candidates='
+            f'{[round(value, 3) for value in place_candidates]}'
         )
         return build_pick_place_steps(
             pick,
@@ -1202,6 +1235,7 @@ class HomographyPickPlace(Node):
             raise RuntimeError(
                 f'unsupported motion plan length: {len(steps)}'
             )
+        steps = list(steps)
         labels = (
             'PICK: gripper open',
             'PICK: try combined safe XY + vertical gripper approach',
@@ -1222,22 +1256,29 @@ class HomographyPickPlace(Node):
                 self.publish_work_state('PLACE_STARTED')
             self.publish_status(labels[index])
             if step.action == 'move':
-                try:
-                    self.move_coords(step.pose)
-                except CoordinateMoveError as exc:
-                    if index != 1:
-                        raise
-                    self.execute_split_pick_approach(step.pose, exc)
                 if index in (1, 5):
                     context = (
                         'PICK safe approach'
                         if index == 1
                         else 'PLACE safe approach'
                     )
+                    descent_index = 2 if index == 1 else 6
+                    rise_index = 4 if index == 1 else 8
+                    successful_pose = self.execute_safe_z_approach(
+                        context,
+                        step.pose,
+                        steps[descent_index].pose[2],
+                        allow_split_fallback=index == 1,
+                    )
+                    steps[rise_index] = MotionStep(
+                        'move', successful_pose
+                    )
                     self.publish_status(
                         f'{context}: waiting for hardware stop before descent'
                     )
                     self.wait_until_robot_stopped(context)
+                else:
+                    self.move_coords(step.pose)
             elif step.action == 'gripper_open':
                 self.command_gripper(True)
             elif step.action == 'gripper_open_after_stop':
@@ -1249,6 +1290,67 @@ class HomographyPickPlace(Node):
             else:
                 raise RuntimeError(f'unknown motion action: {step.action}')
         self.publish_work_state('PLACE_COMPLETED')
+
+    def execute_safe_z_approach(
+        self,
+        context,
+        target_pose,
+        descent_z_m,
+        allow_split_fallback=False,
+    ):
+        """Retry a timed-out safe approach at successively lower Z."""
+        minimum_z = float(descent_z_m) + float(
+            self.parameter('minimum_safe_clearance_m')
+        )
+        candidates = safe_z_candidates(
+            target_pose[2],
+            float(self.parameter('safe_z_lowering_step_m')),
+            int(self.parameter('maximum_safe_z_lowering_steps')),
+            minimum_z,
+        )
+        if not candidates:
+            raise RuntimeError(
+                f'{context}: no safe-Z candidate at or above '
+                f'{minimum_z:.3f} m'
+            )
+
+        for attempt, candidate_z in enumerate(candidates, start=1):
+            if self.stop_event.is_set():
+                raise RuntimeError('operation stopped')
+            candidate_pose = (
+                *target_pose[:2],
+                candidate_z,
+                *target_pose[3:],
+            )
+            self.publish_status(
+                f'{context}: safe-Z attempt {attempt}/{len(candidates)}, '
+                f'z={candidate_z * 1000.0:.0f} mm'
+            )
+            try:
+                self.move_coords(candidate_pose)
+                return candidate_pose
+            except CoordinateMoveError as exc:
+                timed_out = 'polling timed out' in str(exc)
+                has_lower_candidate = attempt < len(candidates)
+                if timed_out and has_lower_candidate:
+                    next_z = candidates[attempt]
+                    self.publish_status(
+                        f'{context}: timed out at '
+                        f'{candidate_z * 1000.0:.0f} mm; stopping and '
+                        f'retrying at {next_z * 1000.0:.0f} mm'
+                    )
+                    with self.serial_lock:
+                        self.robot.stop()
+                    self.wait_until_robot_stopped(
+                        f'{context} safe-Z retry'
+                    )
+                    continue
+                if allow_split_fallback:
+                    self.execute_split_pick_approach(candidate_pose, exc)
+                    return candidate_pose
+                raise
+
+        raise RuntimeError(f'{context}: safe-Z candidates exhausted')
 
     def execute_split_pick_approach(self, target_pose, direct_error):
         """Retry only a failed Pick approach as XY then vertical RPY."""

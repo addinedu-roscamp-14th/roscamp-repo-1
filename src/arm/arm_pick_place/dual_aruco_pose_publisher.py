@@ -90,7 +90,7 @@ class DualArucoPosePublisher(Node):
         self.declare_parameter('max_reprojection_error_px', 3.0)
         self.declare_parameter('use_node_time_for_pose', True)
         self.declare_parameter(
-            'scan_marker_ids', list(range(9)) + list(range(19, 24))
+            'scan_marker_ids', list(range(9)) + list(range(18, 24))
         )
 
         self.image_topic = str(self.get_parameter('image_topic').value)

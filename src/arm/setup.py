@@ -22,6 +22,7 @@ setup(
         ),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         ('share/' + package_name + '/config', glob('config/*')),
+        ('share/' + package_name + '/udev', glob('udev/*.rules')),
         ('share/' + package_name + '/urdf', glob('urdf/*.urdf')),
     ],
     install_requires=['setuptools'],

@@ -1,0 +1,2 @@
+# Sonix USB 2.0 gripper camera. Select only its V4L2 capture node (index 0).
+SUBSYSTEM=="video4linux", KERNEL=="video*", ATTR{index}=="0", ENV{ID_VENDOR_ID}=="0c45", ENV{ID_MODEL_ID}=="6340", SYMLINK+="arm_gripper_camera"
